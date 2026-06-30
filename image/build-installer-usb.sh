@@ -19,7 +19,9 @@ cd "$REPO_ROOT"
 # Channel base the installer is built on (vanilla, no baked key for community).
 BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:prod}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
-OUT="${OUT:-${REPO_ROOT}/.bib-installer}"
+# bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
+# pollutes the workspace (a root-owned file there breaks the next CI checkout).
+OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
 OUT_NAME="${OUT_NAME:-}"            # if set, copy the final raw to <REPO>/<OUT_NAME>.img
 BG_SRC="${BG_SRC:-${REPO_ROOT}/image/branding/grub-bg.png}"
 CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer.toml}"
