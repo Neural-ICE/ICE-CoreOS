@@ -11,16 +11,18 @@ access is requested with `--device nvidia.com/gpu=all`.
 
 ## 1. Verify GPU access from a container
 
-Blackwell (GB10) needs **CUDA ≥ 12.8** and driver **R570+** — ICE-CoreOS ships
-r595, so use a current CUDA image (latest 13.x; pick a tag from
+Blackwell (GB10) needs **CUDA ≥ 12.8**. The container's CUDA version must be
+**≤ the driver's CUDA version** — run `nvidia-smi` and read the `CUDA Version`
+field (it shows **13.2** with the bundled r595 driver). So pick a CUDA image at
+or below that (e.g. `13.2.1-base-ubi9`; see
 <https://hub.docker.com/r/nvidia/cuda/tags>):
 
 ```sh
 podman run --rm --device nvidia.com/gpu=all \
-  docker.io/nvidia/cuda:13.3.0-base-ubi9 nvidia-smi
+  docker.io/nvidia/cuda:13.2.1-base-ubi9 nvidia-smi
 ```
 
-You should see the GB10 GPU listed.
+You should see the GB10 GPU and `CUDA Version: 13.2` listed.
 
 ## 2. Ollama (one-liner)
 
