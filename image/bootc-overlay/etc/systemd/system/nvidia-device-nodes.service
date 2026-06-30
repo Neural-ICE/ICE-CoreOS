@@ -1,0 +1,15 @@
+[Unit]
+Description=Neural ICE — create /dev/nvidia* nodes (baked-in r595 driver)
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+ConditionPathExists=/usr/bin/nvidia-modprobe
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+# Creates /dev/nvidiactl + /dev/nvidia0 and the Unified Memory (UVM) nodes.
+# '-' prefix: a failure (e.g. a machine with no GPU) does not block boot.
+ExecStart=-/usr/bin/nvidia-modprobe -c 0 -u
+
+[Install]
+WantedBy=multi-user.target

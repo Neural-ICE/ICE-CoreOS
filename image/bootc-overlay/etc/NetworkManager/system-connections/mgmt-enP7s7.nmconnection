@@ -1,0 +1,16 @@
+[connection]
+# DGX Spark management NIC (Realtek 10GbE, ACPI name verified on the hardware).
+# DHCP -> guarantees admin/SSH access even if the ConnectX-7 is down/bricked.
+id=mgmt-enP7s7
+type=ethernet
+interface-name=enP7s7
+autoconnect=true
+autoconnect-priority=100
+
+[ethernet]
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto

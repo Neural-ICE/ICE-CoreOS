@@ -1,0 +1,75 @@
+name: release-installer
+
+# Build a flashable USB installer (.img) for a given channel and attach it to a
+# GitHub Release so the community can install ICE-CoreOS on a DGX Spark.
+#
+# The image baked into the installer is the PUBLIC, VANILLA channel image (no
+# SSH key). Anyone installing it injects their own key at install time (drop an
+# authorized_keys file on the USB, or a neuralice.sshkey= karg — see README).
+# Self-hosted ARM64 runner (needs bib + the staged artifacts + native aarch64).
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel image to package'
+        type: choice
+        options: [prod, beta, alpha]
+        default: prod
+      release_tag:
+        description: 'Release tag to create/update (e.g. v0.1.0). Blank = installer-<channel>-<run>.'
+        default: ''
+
+permissions:
+  contents: write   # create releases + upload assets
+  packages: read
+
+jobs:
+  installer:
+    runs-on: [self-hosted, linux, ARM64]
+    env:
+      REGISTRY: ghcr.io/neural-ice
+      IMAGE: neural-ice-coreos
+      CHANNEL: ${{ github.event.inputs.channel || 'prod' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
+            | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build vanilla installer .img for channel
+        id: build
+        env:
+          BASE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ env.CHANNEL }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          OUT="ice-coreos-installer-${CHANNEL}-${VERSION}"
+          # Builds the dual-mode (Live + Install) raw installer for $BASE_IMAGE.
+          BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
+          RAW="$(ls -1 *.img 2>/dev/null | head -1 || true)"
+          [ -n "$RAW" ] || RAW="$(find . -name 'disk.raw' | head -1)"
+          xz -T0 -9 -c "$RAW" > "${OUT}.img.xz"
+          sha256sum "${OUT}.img.xz" > "${OUT}.img.xz.sha256"
+          echo "out=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || format('installer-{0}-{1}', env.CHANNEL, github.run_number) }}
+          name: ICE-CoreOS installer (${{ env.CHANNEL }} ${{ steps.build.outputs.version }})
+          body: |
+            Flashable USB installer for **ICE-CoreOS** (`${{ env.CHANNEL }}` channel).
+
+            Flash with:
+            ```
+            xz -dc ice-coreos-installer-*.img.xz | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress
+            ```
+            Boot the USB on a DGX Spark and pick **Install**. To get SSH access,
+            drop your public key on the USB before flashing-back, or pass a
+            `neuralice.sshkey=` karg — see the README.
+          files: |
+            ${{ steps.build.outputs.out }}.img.xz
+            ${{ steps.build.outputs.out }}.img.xz.sha256

@@ -1,0 +1,17 @@
+[Unit]
+Description=Neural ICE — generate the NVIDIA CDI spec (GPU access inside containers)
+After=nvidia-device-nodes.service systemd-modules-load.service local-fs.target
+Wants=nvidia-device-nodes.service
+ConditionPathExists=/usr/bin/nvidia-ctk
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+# Generates /etc/cdi/nvidia.yaml from the GPU/driver actually present.
+# Must run on the hardware (not at build time) -> at boot.
+ExecStartPre=/usr/bin/mkdir -p /etc/cdi
+ExecStart=/usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+# Podman consomme ensuite: podman run --device nvidia.com/gpu=all ...
+
+[Install]
+WantedBy=multi-user.target

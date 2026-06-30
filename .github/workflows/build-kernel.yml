@@ -1,0 +1,45 @@
+name: build-kernel
+
+# RARELY run: rebuild the heavy GB10 artifacts (kernel-64k RPMs + signed NVIDIA
+# modules + nvidia userspace + signed boot binaries) and stage them into the
+# image/ tree so the build-image workflow can consume them. Manual only.
+#
+# This is a long, hardware/source-specific build (kernel-64k from the Red Hat
+# nvidia-gb10 tree). It runs on the self-hosted ARM64 runner that holds the
+# upstream sources and signing keys. Output artifacts are gitignored and stay
+# on the runner (staged under image/rpms, image/driver-modules, ...).
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: 'kernel-64k source ref/branch'
+        default: latest
+      nvidia_driver_version:
+        description: 'NVIDIA open driver version'
+        default: 595.58.03
+
+jobs:
+  kernel:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 600
+    env:
+      KERNEL_REF: ${{ github.event.inputs.kernel_ref }}
+      NVIDIA_DRIVER_VERSION: ${{ github.event.inputs.nvidia_driver_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kernel-64k + NVIDIA driver artifacts
+        run: ./build/build-kernel.sh aarch64
+
+      - name: Stage artifacts into image/ tree
+        run: ./ci/stage-artifacts.sh
+
+      - name: Report staged artifacts
+        run: |
+          {
+            echo "### Staged GB10 artifacts"
+            for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boot; do
+              echo "- \`$d\`: $(ls -1 "$d" 2>/dev/null | wc -l) files"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

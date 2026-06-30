@@ -1,0 +1,25 @@
+[Unit]
+Description=Neural ICE - automatic install to internal disk (GRUB "Install" entry)
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+# Runs ONLY when the GRUB "Install" entry was selected.
+ConditionKernelCommandLine=neuralice.autoinstall
+After=multi-user.target getty@tty1.service
+Wants=network-online.target
+# Takes over the tty1 console (otherwise getty fights for the keyboard -> read impossible).
+Conflicts=getty@tty1.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/bin/neural-ice-autoinstall.sh
+# Interactive console: we must be able to DISPLAY and READ [Enter].
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

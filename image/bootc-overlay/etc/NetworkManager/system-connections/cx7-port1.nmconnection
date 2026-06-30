@@ -1,0 +1,19 @@
+[connection]
+# ConnectX-7 QSFP port 1 (mlx5). Interface name verified on the DGX Spark.
+# NVIDIA cluster plan: 10.100.1.0/24 subnet (see Sync Cluster Assistant).
+# PER-NODE IP -> to be finalized by onboarding / Cluster Assistant (template here).
+id=cx7-port1
+type=ethernet
+interface-name=enp1s0f1np1
+autoconnect=true
+
+[ethernet]
+mtu=9000
+
+[ipv4]
+method=manual
+addresses=10.100.1.10/24
+may-fail=true
+
+[ipv6]
+method=disabled

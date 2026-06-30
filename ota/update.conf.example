@@ -1,0 +1,30 @@
+# Neural ICE CoreOS — configuration of the OTA wrapper and the driver injector.
+# Deployed at /etc/neural-ice/update.conf (machine-specific) via Ignition.
+# CONTAINS NO SECRETS: the mTLS certs and the license are separate files.
+
+# --- OS image on GHCR (lowercase namespace) ---
+GHCR_IMAGE="ghcr.io/neural-ice/neural-ice-coreos:latest"
+GHCR_USER="neural-ice"
+
+# --- Keygen.sh (subscription entitlements) ---
+KEYGEN_API="https://api.keygen.sh/v1"
+KEYGEN_ACCOUNT_ID="REPLACE_WITH_KEYGEN_ACCOUNT_UUID"
+
+# --- Local license (pushed by the Tauri thin client via the appliance) ---
+LICENCE_FILE="/var/lib/neural-ice/licence.json"
+
+# --- Neural ICE appliance (mints the ephemeral GHCR token, over mTLS) ---
+APPLIANCE_URL="https://appliance.neural-ice.local"
+MTLS_CERT="/etc/neural-ice/pki/client.crt"
+MTLS_KEY="/etc/neural-ice/pki/client.key"
+MTLS_CA="/etc/neural-ice/pki/ca.crt"
+
+# --- Update policy ---
+AUTO_REBOOT="false"          # true => immediate reboot if a new deployment is staged
+OFFLINE_GRACE_HOURS="168"    # offline tolerance (7 days) before blocking updates — HPC/maintenance resilience
+VERIFY_SIGNATURE="false"     # true => ostree-image-signed: (cosign, see ADR-0001)
+
+# --- NVIDIA r595 driver injector ---
+NVIDIA_DRIVER_VERSION="595.58.03"
+DRIVER_IMAGE_REPO="ghcr.io/neural-ice/nvidia-driver-r595"
+DRIVER_IMAGE_DIGEST=""       # recommended in prod: pin by sha256 (immutability)

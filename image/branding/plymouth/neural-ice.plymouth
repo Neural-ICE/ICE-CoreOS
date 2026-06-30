@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Neural ICE
+Description=Neural ICE CoreOS boot splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/neural-ice
+ScriptFile=/usr/share/plymouth/themes/neural-ice/neural-ice.script
