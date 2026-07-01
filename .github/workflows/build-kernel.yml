@@ -1,11 +1,12 @@
 name: build-kernel
 
-# RARELY run: rebuild the heavy GB10 artifacts (kernel-64k RPMs + signed NVIDIA
-# modules + nvidia userspace + signed boot binaries) and stage them into the
-# image/ tree so the build-image workflow can consume them. Manual only.
+# RARELY run: rebuild the heavy GB10 artifacts (GB10 kernel (4k) RPMs + signed
+# NVIDIA modules + nvidia userspace + signed boot binaries) and stage them into
+# the image/ tree so the build-image workflow can consume them. Manual only.
 #
-# This is a long, hardware/source-specific build (kernel-64k from the Red Hat
-# nvidia-gb10 tree). It runs on the self-hosted ARM64 runner that holds the
+# This is a long, hardware/source-specific build (the GB10 kernel, STANDARD 4k
+# flavor, from the Red Hat nvidia-gb10 tree — see ADR-0006). It runs on the
+# self-hosted ARM64 runner that holds the
 # upstream sources and signing keys. Output artifacts are gitignored and stay
 # on the runner (staged under image/rpms, image/driver-modules, ...).
 
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_ref:
-        description: 'kernel-64k source ref/branch'
+        description: 'nvidia-gb10 kernel source ref/branch'
         default: latest
       nvidia_driver_version:
         description: 'NVIDIA open driver version'
@@ -29,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build kernel-64k + NVIDIA driver artifacts
+      - name: Build GB10 kernel (4k) + NVIDIA driver artifacts
         run: ./build/build-kernel.sh aarch64
 
       - name: Stage artifacts into image/ tree

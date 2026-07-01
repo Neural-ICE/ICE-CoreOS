@@ -6,6 +6,11 @@
 - **Supersedes**: the parts of [ADR-0001](ADR-0001-ota-licence-gate.md) that
   gated the **OS** by license and masked Zincati on Fedora CoreOS.
 
+> **Amendment (2026-07-01, [[ADR-0006-kernel-4k-page-size]])**: the base and the
+> update model are unchanged, but the kernel flavor is now the **standard 4k**
+> `kernel` (not `kernel-64k`) — for compatibility with the container AI stack.
+> The "64k tested/QA" rationale below is superseded on the page-size point only.
+
 ## Context (the path taken)
 
 The real need, as formulated by the decider: *"an immutable read-only OS with

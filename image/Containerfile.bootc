@@ -1,7 +1,14 @@
 # Neural ICE CoreOS — Deliverable 2 (bootc / image mode variant, ARM64 GB10)
-# CentOS Stream 10 bootc base: SAME el10 lineage as the kernel-64k kernel
+# CentOS Stream 10 bootc base: SAME el10 lineage as the GB10 kernel
 # (6.12.0-*.el10) -> clean kernel swap. Self-contained image, deposited offline
 # by bootc-image-builder.
+#
+# Kernel: the GB10 SoC (Grace-Blackwell) is NOT in the stock el10 kernel, so we
+# ship the Red Hat `nvidia-gb10` kernel — but built as the STANDARD 4k-page
+# flavor (`kernel`, not `kernel-64k`). 4k restores compatibility with the
+# container workloads run on top (qdrant/jemalloc, vLLM, prebuilt aarch64 wheels)
+# that break under 64k pages; NVIDIA recommends the regular kernel too. Secure
+# Boot signing is unchanged by the page size (see ADR-0002). See ADR-0006.
 #
 # Build (root storage, required by bootc-image-builder --local):
 #   sudo podman build --platform linux/arm64 -f image/Containerfile.bootc \
@@ -11,19 +18,24 @@ FROM quay.io/centos-bootc/centos-bootc:stream10
 ARG NVIDIA_DRIVER_VERSION=595.58.03
 
 # --------------------------------------------------------------------------- #
-# 1) Swap the stock el10 kernel -> kernel-64k GB10 (identical lineage => clean)
+# 1) Swap the stock el10 kernel -> GB10 `nvidia-gb10` kernel, STANDARD 4k flavor
+#    (identical 6.12.0-*.el10 lineage => clean swap). The stock kernel lacks GB10
+#    enablement; the custom tree adds it. We install the 4k `kernel*` RPMs (NOT
+#    `kernel-64k*`) so userspace runs on 4 KiB pages. The globs are anchored on
+#    `-6.12` so they match ONLY the 4k flavor even if the build also emits the
+#    64k RPMs into image/rpms/. See ADR-0006.
 # --------------------------------------------------------------------------- #
 COPY image/rpms/ /tmp/rpms/
 RUN set -euxo pipefail; \
     dnf -y remove --noautoremove kernel kernel-core kernel-modules kernel-modules-core; \
     dnf -y install --setopt=install_weak_deps=False \
-        /tmp/rpms/kernel-64k-core-*.rpm \
-        /tmp/rpms/kernel-64k-modules-core-*.rpm \
-        /tmp/rpms/kernel-64k-modules-6.12*.rpm \
-        /tmp/rpms/kernel-64k-6.12*.rpm; \
+        /tmp/rpms/kernel-core-6.12*.rpm \
+        /tmp/rpms/kernel-modules-core-6.12*.rpm \
+        /tmp/rpms/kernel-modules-6.12*.rpm \
+        /tmp/rpms/kernel-6.12*.rpm; \
     rm -rf /tmp/rpms
 
-# Open NVIDIA r595 driver PRE-COMPILED against kernel-64k (identical vermagic),
+# Open NVIDIA r595 driver PRE-COMPILED against the GB10 4k kernel (identical vermagic),
 # baked into /usr/lib/modules/<kver>/extra/nvidia + depmod. ATOMIC kernel<->driver
 # coupling: no privileged injector container, no GHCR pull.
 COPY image/driver-modules/*.ko /tmp/nvidia/
@@ -128,7 +140,7 @@ RUN set -euxo pipefail; \
 # --------------------------------------------------------------------------- #
 # 3b) Neural ICE branding: OS name (GRUB title + firmware label) + kargs.
 #     NO Plymouth and NO dracut regeneration: the splash renders black on the
-#     GB10 DRM (abandoned), and the STOCK kernel-64k initramfs already contains
+#     GB10 DRM (abandoned), and the GB10 kernel's initramfs already contains
 #     crypt + tpm2 (LUKS/TPM unlock). Not regenerating the initramfs =
 #     faster builds + tiny OTA deltas (a config change no longer rewrites the
 #     ~180 MB initramfs image).
@@ -149,7 +161,7 @@ RUN rm -rf /var/cache/* /var/lib/dnf /var/log/* /tmp/* 2>/dev/null || true
 RUN bootc container lint
 
 LABEL org.opencontainers.image.title="ICE-CoreOS" \
-      org.opencontainers.image.description="Immutable bootc GPU appliance OS for NVIDIA DGX Spark (GB10) — CentOS Stream 10 (el10), kernel-64k, NVIDIA r595, Secure Boot signed, TPM2/LUKS. OTA source." \
+      org.opencontainers.image.description="Immutable bootc GPU appliance OS for NVIDIA DGX Spark (GB10) — CentOS Stream 10 (el10), GB10 kernel (4k pages), NVIDIA r595, Secure Boot signed, TPM2/LUKS. OTA source." \
       org.opencontainers.image.vendor="Neural ICE" \
       org.opencontainers.image.source="https://github.com/Neural-ICE/ICE-CoreOS" \
       org.opencontainers.image.licenses="Apache-2.0" \

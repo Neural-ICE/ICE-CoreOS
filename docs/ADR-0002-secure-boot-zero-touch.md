@@ -5,6 +5,13 @@
 - **Decider**: Business/Security Owner (human)
 - **Guiding principle**: *installation must happen WITHOUT human action.*
 
+> **Amendment (2026-07-01, [[ADR-0006-kernel-4k-page-size]])**: the shipped kernel
+> is now the **standard 4k-page flavor** of the same `nvidia-gb10` tree, not
+> `kernel-64k`. This ADR is otherwise **unchanged**: the kernel is still
+> self-compiled → still self-signed, and the Microsoft `shim-review` plan below
+> still applies verbatim (page size does not affect signing). Read every
+> "kernel-64k" below as "the GB10 kernel (4k)".
+
 ## Context
 
 The Neural ICE CoreOS appliance ships an **in-house compiled kernel** (`kernel-64k`

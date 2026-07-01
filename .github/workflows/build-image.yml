@@ -4,7 +4,7 @@ name: build-image
 # Default channel is "alpha": every push to main produces a fresh alpha build
 # (moving :alpha tag + an immutable :<version>-alpha.<run> tag).
 # Runs on a SELF-HOSTED ARM64 runner because the build needs the staged GB10
-# artifacts (kernel-64k RPMs, signed NVIDIA modules, signed boot binaries) and
+# artifacts (GB10 kernel (4k) RPMs, signed NVIDIA modules, signed boot binaries) and
 # native aarch64. See README "CI runner".
 
 on:

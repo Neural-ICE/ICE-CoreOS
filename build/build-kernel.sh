@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 #
 # Neural ICE CoreOS — Deliverable 1
-# Compilation orchestrator: GB10 kernel (kernel-64k / standard) + NVIDIA r595
-# driver, inside an isolated Podman container.
+# Compilation orchestrator: GB10 kernel (STANDARD 4k flavor) + NVIDIA r595
+# driver, inside an isolated Podman container. 4k pages (NOT kernel-64k) for
+# userspace compatibility with the container AI stack (qdrant/vLLM/...). The GB10
+# SoC is not in the stock el10 kernel, hence we still build from the Red Hat
+# `nvidia-gb10` tree — just the 4k flavor. See ADR-0006 (and ADR-0002 signing).
 #
 # Designed for the ARM64 build host : <user>@<arm64-build-host> (DGX Spark)
 # Portable as-is to the x86_64 host : <x86_64-build-host>.
@@ -46,9 +49,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
+# aarch64 now builds the STANDARD 4k `kernel` flavor (was `kernel-64k`). The
+# nvidia-gb10 tree emits both flavors from `make dist-rpms`; downstream we select
+# the 4k `kernel*` RPMs (see image/Containerfile.bootc). See ADR-0006.
 case "$ARCH" in
-  aarch64) KERNEL_FLAVOR="64k"  ; RPM_GLOB="kernel-64k-*.rpm" ;;
-  x86_64)  KERNEL_FLAVOR="std"  ; RPM_GLOB="kernel-*.rpm"     ;;
+  aarch64) KERNEL_FLAVOR="std"  ; RPM_GLOB="kernel-*.rpm" ;;
+  x86_64)  KERNEL_FLAVOR="std"  ; RPM_GLOB="kernel-*.rpm" ;;
   *) echo "Usage: $0 <aarch64|x86_64> [--shell] [--no-driver]" >&2; exit 2 ;;
 esac
 
@@ -134,7 +140,7 @@ if [[ "\${BUILD_DRIVER}" == "true" ]]; then
   if [[ -f "\${SPEC}" ]]; then
     rpmbuild -bb --define "_disable_source_fetch 0" \
              --define "kver \$(rpm -qp --qf '%{VERSION}-%{RELEASE}.%{ARCH}' \\
-                        \$(ls /output/kernel-*-core-*.rpm | head -1))" \
+                        \$(ls /output/kernel-core-*.rpm | head -1))" \
              "\${SPEC}" || echo "    (driver build failed — check the .spec and network access)"
     cp -v "\${HOME}"/rpmbuild/RPMS/\${ARCH}/kmod-nvidia-open-*.rpm /output/ 2>/dev/null || true
   else

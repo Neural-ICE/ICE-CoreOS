@@ -11,7 +11,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-RPM_SRC="${RPM_SRC:-$HOME/neural-ice-build/output}"   # kernel-64k-*.rpm, kmod-nvidia-open-*.rpm
+RPM_SRC="${RPM_SRC:-$HOME/neural-ice-build/output}"   # kernel-*.rpm (4k flavor), kmod-nvidia-open-*.rpm
 DRIVER_SRC="${DRIVER_SRC:-$HOME/neural-ice-build/driver-modules}"  # signed *.ko
 USERSPACE_SRC="${USERSPACE_SRC:-$HOME/neural-ice-build/nvidia-userspace}"  # usr/ tree
 SIGNEDBOOT_SRC="${SIGNEDBOOT_SRC:-$HOME/neural-ice-build/signed-boot}"     # signed vmlinuz/shim/grub + DER

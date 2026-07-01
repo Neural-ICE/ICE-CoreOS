@@ -38,7 +38,7 @@ REF="${REGISTRY}/${IMAGE}"
 for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boot; do
   if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
     echo "ERROR: missing staged GB10 artifacts in '$d'." >&2
-    echo "       Build/stage them first (kernel-64k RPMs, signed driver modules," >&2
+    echo "       Build/stage them first (GB10 kernel (4k) RPMs, signed driver modules," >&2
     echo "       nvidia userspace, signed boot binaries). See README + ci/build-kernel.sh." >&2
     exit 3
   fi

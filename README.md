@@ -5,7 +5,7 @@ Immutable, container-native, **sovereign** operating system for **NVIDIA DGX Spa
 
 ICE-CoreOS is the open-core base layer of the [Neural ICE](https://github.com/Neural-ICE)
 stack. It is a [bootc](https://bootc.dev) image built on **CentOS Stream 10**, with the
-GB10 **kernel-64k**, the NVIDIA open driver (r595), Secure Boot signing, and optional
+GB10 kernel (**4 KiB pages**), the NVIDIA open driver (r595), Secure Boot signing, and optional
 **two-domain TPM2/LUKS full-disk encryption**. The OS updates over-the-air from a public
 container registry (`bootc upgrade`), atomically, with rollback.
 
@@ -20,8 +20,11 @@ container registry (`bootc upgrade`), atomically, with rollback.
 
 - **Immutable / image-based** — `/usr` read-only (ostree/composefs), `/var` persistent,
   atomic updates and rollback (`bootc`).
-- **GB10-native** — kernel-64k (64 KiB pages, NVIDIA-recommended for Grace/Blackwell),
-  NVIDIA open driver baked & signed, GPU works out of the box (`nvidia-smi`).
+- **GB10-native** — GB10 kernel from the Red Hat `nvidia-gb10` tree, built with
+  **4 KiB pages** for broad software compatibility (qdrant/vLLM/wheels break under
+  64k; NVIDIA recommends the regular kernel — see
+  [ADR-0006](docs/ADR-0006-kernel-4k-page-size.md)). NVIDIA open driver baked &
+  signed, GPU works out of the box (`nvidia-smi`).
 - **Encrypted, zero-touch** — system + client-data LUKS2 volumes, both auto-unlocked by
   the **TPM2** at boot (PCR 7); recovery keys escrowed at install. See
   [ADR-0004](docs/ADR-0004-disk-encryption-tpm-luks.md).
@@ -101,7 +104,7 @@ the encrypted `/var/lib/neural-ice/data` volume.
 ## Build
 
 The OS image needs **staged GB10 artifacts** that are produced rarely and live outside git
-(kernel-64k RPMs, signed NVIDIA modules, NVIDIA userspace, signed boot binaries):
+(GB10 kernel (4k) RPMs, signed NVIDIA modules, NVIDIA userspace, signed boot binaries):
 
 ```
 image/rpms/  image/driver-modules/  image/nvidia-userspace/  image/signed-boot/
@@ -143,7 +146,7 @@ to override. Keep the `neural-ice-coreos` package **public** for free community 
 image/          bootc OS image + installer (Containerfiles, overlay, branding, bib config)
 ota/            auto-install service + script (dual-mode installer logic)
 ignition/       Butane/Ignition for first-boot provisioning (SSH key, etc.)
-build/          kernel-64k + driver build (heavy, rare)
+build/          GB10 kernel (4k) + driver build (heavy, rare)
 ci/             build/stage/version helper scripts used by CI and locally
 docs/           Architecture Decision Records (ADR-0001..0005)
 .github/        CI workflows (build-image, promote, release-installer, build-kernel)
@@ -156,6 +159,7 @@ VERSION         semantic version base for channel tags
 - [ADR-0003 — Base OS, update model & open-core](docs/ADR-0003-base-and-update-model.md)
 - [ADR-0004 — TPM2/LUKS two-domain encryption](docs/ADR-0004-disk-encryption-tpm-luks.md)
 - [ADR-0005 — Release channels & promotion](docs/ADR-0005-release-channels.md)
+- [ADR-0006 — Kernel page size: 4k instead of kernel-64k](docs/ADR-0006-kernel-4k-page-size.md)
 
 ## License
 
