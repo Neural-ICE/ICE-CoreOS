@@ -38,7 +38,7 @@ done
 
 # Configuration (overridable via the environment)
 KERNEL_REPO="${KERNEL_REPO:-https://gitlab.com/redhat/edge/kernel/nvidia-gb10.git}"
-KERNEL_BRANCH="${KERNEL_BRANCH:-main}"                 # edge/kernel/nvidia-gb10 branch
+KERNEL_BRANCH="${KERNEL_BRANCH:-latest}"               # nvidia-gb10 default branch (has redhat/); 'main' is a mainline mirror WITHOUT redhat/
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-595.58.03}"
 BUILDER_IMAGE="${BUILDER_IMAGE:-neural-ice/kernel-builder:stream10}"
 WORKSPACE="${WORKSPACE:-${HOME}/neural-ice-build}"     # persistent across runs (git cache)
@@ -100,8 +100,11 @@ cd /workspace
 if [[ -d nvidia-gb10/.git ]]; then
   echo "==> Source present: git fetch"
   git -C nvidia-gb10 fetch --depth=1 origin "\${KERNEL_BRANCH}"
-  git -C nvidia-gb10 checkout "\${KERNEL_BRANCH}"
-  git -C nvidia-gb10 reset --hard "origin/\${KERNEL_BRANCH}"
+  # Reset the local branch to exactly what we fetched. Robust even when the local
+  # clone has no 'main' branch and no origin/<branch> tracking ref (in which case
+  # 'checkout main' + 'reset --hard origin/main' both fail); FETCH_HEAD always
+  # points at the just-fetched tip.
+  git -C nvidia-gb10 checkout -B "\${KERNEL_BRANCH}" FETCH_HEAD
 else
   echo "==> Clone \${KERNEL_REPO} (\${KERNEL_BRANCH})"
   git clone --depth=1 --branch "\${KERNEL_BRANCH}" "\${KERNEL_REPO}" nvidia-gb10
