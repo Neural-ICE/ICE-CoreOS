@@ -1,0 +1,38 @@
+# Generated artifacts / secrets — never commit
+
+# Build artifacts (regenerated from sources / RPMs / .run)
+image/rpms/
+image/rpms-driver/
+image/driver-modules/
+image/driver-modules-unsigned/
+image/nvidia-userspace/
+image/signed-boot/
+image/labkey/
+image/bib-output/
+build/output/
+*.iso
+*.img
+*.img.xz
+*.raw
+*.run
+
+# CI scratch
+build.out
+
+# Generated Ignition (machine-specific values / resolved placeholders)
+ignition/*.ign
+
+# Secrets / PKI / licenses
+*.key
+*.pem
+**/pki/*.crt
+!**/pki/ca.crt.example
+# The overlay placeholder CA is tracked (not a secret). This negation MUST come
+# after the broad **/pki/*.crt rule above (later rules win in .gitignore).
+!image/bootc-overlay/etc/neural-ice/pki/ca.crt
+*licence.json
+*.token
+
+# Misc
+*.log
+.DS_Store

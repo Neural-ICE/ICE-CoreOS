@@ -1,0 +1,2 @@
+# Named volume for Ollama models (persists across container updates).
+[Volume]

@@ -1,0 +1,83 @@
+name: build-image
+
+# Build the ICE-CoreOS bootc OS image and publish it to GHCR.
+# Default channel is "alpha": every push to main produces a fresh alpha build
+# (moving :alpha tag + an immutable :<version>-alpha.<run> tag).
+# Runs on a SELF-HOSTED ARM64 runner because the build needs the staged GB10
+# artifacts (GB10 kernel (4k) RPMs, signed NVIDIA modules, signed boot binaries) and
+# native aarch64. See README "CI runner".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'image/**'
+      - 'ota/**'
+      - 'ignition/**'
+      - 'ci/build-image.sh'
+      - 'VERSION'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel to publish'
+        default: alpha
+        type: choice
+        options: [alpha, beta, prod]
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, ARM64]
+    env:
+      REGISTRY: ghcr.io/neural-ice
+      IMAGE: neural-ice-coreos
+      CHANNEL: ${{ github.event.inputs.channel || 'alpha' }}
+      BUILD_ID: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage GB10 artifacts
+        # Path on the self-hosted runner holding the prebuilt GB10 artifacts.
+        # Set the repo/org variable ARTIFACTS_DIR; falls back to a neutral default.
+        env:
+          ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
+        run: |
+          for d in rpms driver-modules nvidia-userspace signed-boot; do
+            if [ ! -d "$ARTIFACTS_DIR/$d" ]; then
+              echo "::error::missing artifacts dir $ARTIFACTS_DIR/$d on the runner"; exit 1
+            fi
+            rm -rf "image/$d"; cp -a "$ARTIFACTS_DIR/$d" "image/$d"
+          done
+          echo "Staged GB10 artifacts from $ARTIFACTS_DIR"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
+            | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
+        env:
+          PUSH: '1'
+          PODMAN_SUDO: '1'
+        run: ./ci/build-image.sh | tee build.out
+
+      - name: Summary
+        run: |
+          {
+            echo "### ICE-CoreOS image published"
+            echo ""
+            echo '| field | value |'
+            echo '| --- | --- |'
+            echo "| channel | \`$CHANNEL\` |"
+            echo "| version | \`$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)\` |"
+            echo "| ref | \`$(grep -m1 '^REF=' build.out | cut -d= -f2):$CHANNEL\` |"
+            echo "| digest | \`$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

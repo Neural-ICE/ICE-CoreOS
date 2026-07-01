@@ -1,0 +1,10 @@
+# bootc-image-builder config for the Neural ICE installer USB (--type raw).
+#
+# Enlarge the LIVE root filesystem. The auto-install runs
+# `bootc image copy-to-storage` (duplicates the OS image, ~10 GiB) on the live
+# USB before deploying it to the encrypted internal disk. bib's default root is
+# only max(minsize, 2x base container) ≈ 8 GiB → copy-to-storage runs out of
+# space. 40 GiB gives ample headroom on the live media.
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "40 GiB"

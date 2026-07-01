@@ -1,0 +1,2 @@
+# Named volume for the Hugging Face cache (models/datasets), shared by AI jobs.
+[Volume]

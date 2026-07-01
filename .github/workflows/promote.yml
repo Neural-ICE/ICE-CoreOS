@@ -1,0 +1,78 @@
+name: promote
+
+# Channel promotion WITHOUT rebuilding: re-tag an already-built, tested digest
+# from one channel to another (the staging mechanism).
+#
+#   dev pushes  ->  :alpha            (build-image workflow, automatic)
+#   promote     ->  alpha -> :beta    (this workflow, manual, less frequent)
+#   promote     ->  beta  -> :prod    (this workflow, manual, when validated)
+#
+# Because it only copies the manifest+layers by DIGEST, the exact bits validated
+# in alpha are what land in beta and then prod (no drift, no rebuild).
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_channel:
+        description: 'Source channel'
+        type: choice
+        options: [alpha, beta, prod]
+        default: alpha
+      to_channel:
+        description: 'Target channel'
+        type: choice
+        options: [beta, prod, alpha]
+        default: beta
+      source_ref:
+        description: 'Optional explicit source (e.g. 0.1.0-alpha.42 or sha256:...). Blank = current from_channel tag.'
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    container: quay.io/skopeo/stable:latest
+    env:
+      REF: ghcr.io/neural-ice/neural-ice-coreos
+    steps:
+      - name: Validate
+        run: |
+          if [ '${{ inputs.from_channel }}' = '${{ inputs.to_channel }}' ]; then
+            echo "::error::from_channel and to_channel must differ"; exit 1
+          fi
+
+      - name: Log in to GHCR
+        run: skopeo login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}"
+
+      - name: Resolve source digest
+        id: src
+        run: |
+          SRC='${{ inputs.source_ref }}'
+          [ -n "$SRC" ] || SRC='${{ inputs.from_channel }}'
+          case "$SRC" in
+            sha256:*) SPEC="${REF}@${SRC}" ;;
+            *)        SPEC="${REF}:${SRC}" ;;
+          esac
+          DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${SPEC}")"
+          echo "spec=${SPEC}"     >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${SPEC} -> ${DIGEST}"
+
+      - name: Promote (re-tag the digest onto the target channel)
+        run: |
+          skopeo copy --all \
+            "docker://${REF}@${{ steps.src.outputs.digest }}" \
+            "docker://${REF}:${{ inputs.to_channel }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Promoted ${{ inputs.from_channel }} → ${{ inputs.to_channel }}"
+            echo ""
+            echo "- source: \`${{ steps.src.outputs.spec }}\`"
+            echo "- digest: \`${{ steps.src.outputs.digest }}\`"
+            echo "- now tagged: \`${REF}:${{ inputs.to_channel }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

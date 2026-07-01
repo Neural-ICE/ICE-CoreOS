@@ -1,0 +1,170 @@
+# Neural ICE CoreOS — Deliverable 2 (bootc / image mode variant, ARM64 GB10)
+# CentOS Stream 10 bootc base: SAME el10 lineage as the GB10 kernel
+# (6.12.0-*.el10) -> clean kernel swap. Self-contained image, deposited offline
+# by bootc-image-builder.
+#
+# Kernel: the GB10 SoC (Grace-Blackwell) is NOT in the stock el10 kernel, so we
+# ship the Red Hat `nvidia-gb10` kernel — but built as the STANDARD 4k-page
+# flavor (`kernel`, not `kernel-64k`). 4k restores compatibility with the
+# container workloads run on top (qdrant/jemalloc, vLLM, prebuilt aarch64 wheels)
+# that break under 64k pages; NVIDIA recommends the regular kernel too. Secure
+# Boot signing is unchanged by the page size (see ADR-0002). See ADR-0006.
+#
+# Build (root storage, required by bootc-image-builder --local):
+#   sudo podman build --platform linux/arm64 -f image/Containerfile.bootc \
+#        -t ghcr.io/neural-ice/neural-ice-coreos:stream10-bootc .
+FROM quay.io/centos-bootc/centos-bootc:stream10
+
+ARG NVIDIA_DRIVER_VERSION=595.58.03
+
+# --------------------------------------------------------------------------- #
+# 1) Swap the stock el10 kernel -> GB10 `nvidia-gb10` kernel, STANDARD 4k flavor
+#    (identical 6.12.0-*.el10 lineage => clean swap). The stock kernel lacks GB10
+#    enablement; the custom tree adds it. We install the 4k `kernel*` RPMs (NOT
+#    `kernel-64k*`) so userspace runs on 4 KiB pages. The build now emits only the
+#    4k flavor (build/build-kernel.sh flips the tree's `-arm64_4k` BUILDOPTS), but
+#    the globs stay anchored on `-6.12` so they select the 4k non-debug RPMs even
+#    if debug/64k variants are ever present. See ADR-0006.
+# --------------------------------------------------------------------------- #
+COPY image/rpms/ /tmp/rpms/
+RUN set -euxo pipefail; \
+    dnf -y remove --noautoremove kernel kernel-core kernel-modules kernel-modules-core; \
+    dnf -y install --setopt=install_weak_deps=False \
+        /tmp/rpms/kernel-core-6.12*.rpm \
+        /tmp/rpms/kernel-modules-core-6.12*.rpm \
+        /tmp/rpms/kernel-modules-6.12*.rpm \
+        /tmp/rpms/kernel-6.12*.rpm; \
+    rm -rf /tmp/rpms
+
+# Open NVIDIA r595 driver PRE-COMPILED against the GB10 4k kernel (identical vermagic),
+# baked into /usr/lib/modules/<kver>/extra/nvidia + depmod. ATOMIC kernel<->driver
+# coupling: no privileged injector container, no GHCR pull.
+COPY image/driver-modules/*.ko /tmp/nvidia/
+RUN set -euxo pipefail; \
+    KVER="$(ls /usr/lib/modules | head -1)"; \
+    install -d "/usr/lib/modules/${KVER}/extra/nvidia"; \
+    cp /tmp/nvidia/*.ko "/usr/lib/modules/${KVER}/extra/nvidia/"; \
+    depmod -a "${KVER}"; \
+    modinfo "/usr/lib/modules/${KVER}/extra/nvidia/nvidia.ko" | grep -E '^(version|vermagic):'; \
+    rm -rf /tmp/nvidia
+
+# GSP firmware + r595 userspace driver (extracted from the official .run bundle):
+#  - firmware -> /usr/lib/firmware/nvidia/595.58.03 (REQUIRED to initialize the GPU)
+#  - libs -> /usr/lib64 (+ SONAME symlinks); binaries -> /usr/bin
+#  - nvidia-modprobe setuid (creation of the /dev/nvidia* nodes)
+COPY image/nvidia-userspace/ /
+RUN set -euxo pipefail; \
+    V=595.58.03; cd /usr/lib64; \
+    for lib in libnvidia-ml libcuda libnvidia-cfg libnvidia-ptxjitcompiler; do \
+        ln -sf "${lib}.so.${V}" "${lib}.so.1"; \
+        ln -sf "${lib}.so.1"     "${lib}.so"; \
+    done; \
+    chmod 4755 /usr/bin/nvidia-modprobe; \
+    chmod 0755 /usr/bin/nvidia-smi /usr/bin/nvidia-persistenced; \
+    ldconfig; \
+    ldconfig -p | grep -E 'libcuda|libnvidia-ml'
+
+# --------------------------------------------------------------------------- #
+# 2) OTA tooling + /etc overlay (CX-7 network, config, injector)
+# --------------------------------------------------------------------------- #
+RUN dnf -y install jq && dnf clean all
+
+# nvidia-container-toolkit (CDI): GPU access inside Podman containers.
+# The CDI spec is generated AT BOOT (on the hardware) by nvidia-cdi-generate.service.
+RUN curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+        -o /etc/yum.repos.d/nvidia-container-toolkit.repo \
+ && dnf -y install nvidia-container-toolkit \
+ && dnf clean all \
+ && install -d -m 0755 /etc/cdi
+
+COPY image/bootc-overlay/            /
+
+RUN set -euxo pipefail; \
+    chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \
+    chmod 0700 /etc/neural-ice/pki
+
+# Admin user 'core' — key-only SSH (key lives in /usr = immutable, independent
+# of /home). No baked password -> safe even when the image is public.
+#
+# The authorized key is a BUILD-ARG:
+#   - empty (default) => VANILLA public image: NO baked key. Anyone reusing the
+#     distro injects their own key at install time via Ignition (see ignition/),
+#     which lands in ~core/.ssh/authorized_keys (also honored by the sshd config
+#     below). The base image stays a clean, reusable, key-less distro.
+#   - set (appliance / dev builds) => bake the operator key, e.g.:
+#       podman build --build-arg SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" ...
+ARG SSH_AUTHORIZED_KEY=""
+RUN set -euxo pipefail; \
+    useradd -m -G wheel -s /bin/bash core; \
+    install -d -m 0755 /usr/ssh; \
+    printf '%s\n' "${SSH_AUTHORIZED_KEY}" > /usr/ssh/core.keys; \
+    chmod 0644 /usr/ssh/core.keys; \
+    printf 'AuthorizedKeysFile .ssh/authorized_keys /usr/ssh/%%u.keys\n' > /etc/ssh/sshd_config.d/10-neural-ice-keys.conf; \
+    echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/10-wheel-nopasswd; \
+    chmod 0440 /etc/sudoers.d/10-wheel-nopasswd
+
+# [LAB] Boot binaries SIGNED with the lab key (vmlinuz + shim) that replace the
+# unsigned ones, + the DER cert for firmware/MOK enrollment.
+# The NVIDIA modules in driver-modules/ are already signed (sign-file).
+# PROD: replaced by a Neural ICE shim signed by Microsoft (see docs/ADR-0002).
+COPY image/signed-boot/ /
+
+# --------------------------------------------------------------------------- #
+# 3) OS update = native bootc (public, free image) — no gate on the OS
+#    (ADR-0003: gating lives in the private container layer, not in the OS).
+# --------------------------------------------------------------------------- #
+# First-boot SSH-key provisioning: lets a VANILLA install receive an operator
+# key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
+COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
+COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
+
+# Headless appliance: target multi-user (no GUI). Otherwise graphical.target
+# reserves tty1 for a non-existent display manager and the console login lands
+# on tty2 (HDMI looks blank). multi-user => getty on tty1, visible console.
+RUN set -euxo pipefail; \
+    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh; \
+    systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
+                     neural-ice-firstboot-sshkey.service; \
+    systemctl set-default multi-user.target
+
+# Client DATA volume (2nd LUKS domain) auto-unlock — config-in-image (bootc way),
+# not post-install /etc surgery. crypttab references the partition by its stable
+# GPT label "data-luks" (set by the installer), opens it via the TPM2 token
+# enrolled at install. `none` + `nofail` => never hangs boot if absent (e.g. live
+# USB). The mount itself is injected per-install via a `systemd.mount-extra` karg.
+RUN set -euxo pipefail; \
+    printf 'data /dev/disk/by-partlabel/data-luks none tpm2-device=auto,nofail\n' > /etc/crypttab; \
+    chmod 0600 /etc/crypttab; \
+    printf 'd /var/lib/neural-ice 0755 root root -\nd /var/lib/neural-ice/data 0700 root root -\n' \
+        > /usr/lib/tmpfiles.d/neural-ice-data.conf
+
+# --------------------------------------------------------------------------- #
+# 3b) Neural ICE branding: OS name (GRUB title + firmware label) + kargs.
+#     NO Plymouth and NO dracut regeneration: the splash renders black on the
+#     GB10 DRM (abandoned), and the GB10 kernel's initramfs already contains
+#     crypt + tpm2 (LUKS/TPM unlock). Not regenerating the initramfs =
+#     faster builds + tiny OTA deltas (a config change no longer rewrites the
+#     ~180 MB initramfs image).
+# --------------------------------------------------------------------------- #
+RUN set -euxo pipefail; \
+    sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
+    install -d -m 0755 /usr/lib/bootc/kargs.d; \
+    printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml
+
+# --------------------------------------------------------------------------- #
+# 4) bootc hygiene: /var must stay empty (runtime state, not image)
+# --------------------------------------------------------------------------- #
+RUN rm -rf /var/cache/* /var/lib/dnf /var/log/* /tmp/* 2>/dev/null || true
+
+# --------------------------------------------------------------------------- #
+# 5) bootc validation of the image
+# --------------------------------------------------------------------------- #
+RUN bootc container lint
+
+LABEL org.opencontainers.image.title="ICE-CoreOS" \
+      org.opencontainers.image.description="Immutable bootc GPU appliance OS for NVIDIA DGX Spark (GB10) — CentOS Stream 10 (el10), GB10 kernel (4k pages), NVIDIA r595, Secure Boot signed, TPM2/LUKS. OTA source." \
+      org.opencontainers.image.vendor="Neural ICE" \
+      org.opencontainers.image.source="https://github.com/Neural-ICE/ICE-CoreOS" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      neural-ice.nvidia.driver="r${NVIDIA_DRIVER_VERSION}" \
+      neural-ice.base="centos-bootc:stream10"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Neural ICE - provision operator SSH key on first boot
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+ConditionPathExists=!/var/lib/neural-ice/.sshkey-provisioned
+After=local-fs.target
+Before=sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neural-ice-firstboot-sshkey.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
