@@ -21,9 +21,10 @@ ARG NVIDIA_DRIVER_VERSION=595.58.03
 # 1) Swap the stock el10 kernel -> GB10 `nvidia-gb10` kernel, STANDARD 4k flavor
 #    (identical 6.12.0-*.el10 lineage => clean swap). The stock kernel lacks GB10
 #    enablement; the custom tree adds it. We install the 4k `kernel*` RPMs (NOT
-#    `kernel-64k*`) so userspace runs on 4 KiB pages. The globs are anchored on
-#    `-6.12` so they match ONLY the 4k flavor even if the build also emits the
-#    64k RPMs into image/rpms/. See ADR-0006.
+#    `kernel-64k*`) so userspace runs on 4 KiB pages. The build now emits only the
+#    4k flavor (build/build-kernel.sh flips the tree's `-arm64_4k` BUILDOPTS), but
+#    the globs stay anchored on `-6.12` so they select the 4k non-debug RPMs even
+#    if debug/64k variants are ever present. See ADR-0006.
 # --------------------------------------------------------------------------- #
 COPY image/rpms/ /tmp/rpms/
 RUN set -euxo pipefail; \

@@ -78,8 +78,14 @@ Everything else is unchanged:
 
 ## Implementation (delta)
 
-1. `build/build-kernel.sh` — aarch64 builds the **std (4k)** flavor; the NVIDIA
-   driver `kver` is derived from `kernel-core-*.rpm` (4k), not `kernel-64k-core`.
+1. `build/build-kernel.sh` — the `nvidia-gb10` tree ships **"aarch64 64k only"**
+   (`redhat/Makefile`: `BUILDOPTS += … -arm64_4k …`, and `-arm64_4k` forces
+   `with_up=0` → no 4k `up` kernel; see `kernel.spec.template`). The script
+   **flips that token to `-arm64_64k` at build time** (the tree is
+   `git reset --hard` on every run, so this cannot live in a tree commit), so it
+   builds the **4k `up` kernel** and drops 64k. A guard **fails the build** if no
+   `kernel-core-*.rpm` (4k) is produced. The NVIDIA driver `kver` is derived from
+   `kernel-core-*.rpm`.
 2. `image/Containerfile.bootc` — install the `kernel-core / kernel-modules-core /
    kernel-modules / kernel` **4k** RPMs (globs anchored on `-6.12` so they never
    catch the 64k RPMs).

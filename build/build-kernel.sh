@@ -123,6 +123,21 @@ fi
 # 3) Empty localversion to avoid a stray version suffix
 : > localversion || true
 
+# 3b) Force the STANDARD 4k aarch64 flavor (ADR-0006). The nvidia-gb10 tree ships
+#     "aarch64 64k only": redhat/Makefile sets BUILDOPTS with -arm64_4k, which
+#     forces with_up=0 (no 4k 'up' kernel; see kernel.spec.template). We flip that
+#     token to -arm64_64k so the build produces the 4k kernel and drops the 64k
+#     variant we no longer ship. Patched here (not via a tree commit) because
+#     build-kernel.sh does a hard git reset every run.
+if grep -qE '^BUILDOPTS \+=.*-arm64_4k' Makefile; then
+  sed -i -E '/^BUILDOPTS \+=/ s/-arm64_4k\b/-arm64_64k/' Makefile
+  echo "==> Patched BUILDOPTS: build aarch64 4k, drop 64k:"
+  grep -E '^BUILDOPTS \+=' Makefile | sed 's/^/      /'
+else
+  echo "WARN: '-arm64_4k' not found in redhat/Makefile BUILDOPTS — upstream flavor" >&2
+  echo "      selection changed; verify the 4k kernel is actually built below." >&2
+fi
+
 # 4) Compilation + RPM packaging
 echo "==> Compiling the kernel (make dist-rpms) — may take a while"
 make dist-rpms
@@ -131,6 +146,12 @@ make dist-rpms
 RPMDIR="\$(pwd)/rpm/RPMS/\${ARCH}"
 echo "==> Kernel RPMs produced in \${RPMDIR}"
 ls -1 "\${RPMDIR}" | sed 's/^/      /'
+# Guard: the 4k 'up' kernel MUST be present (kernel-core-*), else the flavor flip
+# failed and the image build would break later. Fail here, loudly, not silently.
+if ! ls "\${RPMDIR}"/kernel-core-*.rpm >/dev/null 2>&1; then
+  echo "ERROR: no 4k kernel-core-*.rpm produced — 4k flavor not built (see ADR-0006)." >&2
+  exit 5
+fi
 cp -v "\${RPMDIR}"/*.rpm /output/
 
 # 6) NVIDIA r595 driver (open GPU kernel modules) via kmod spec
