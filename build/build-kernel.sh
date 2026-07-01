@@ -129,12 +129,13 @@ fi
 # 3b) Force the STANDARD 4k aarch64 flavor (ADR-0006). The nvidia-gb10 tree ships
 #     "aarch64 64k only": redhat/Makefile sets BUILDOPTS with -arm64_4k, which
 #     forces with_up=0 (no 4k 'up' kernel; see kernel.spec.template). We flip that
-#     token to -arm64_64k so the build produces the 4k kernel and drops the 64k
-#     variant we no longer ship. Patched here (not via a tree commit) because
+#     token to -arm64_64k and add -debug, so the build produces the 4k kernel and
+#     drops the 64k and debug variants we don't ship (debug ~doubles build time).
+#     Patched here (not via a tree commit) because
 #     build-kernel.sh does a hard git reset every run.
 if grep -qE '^BUILDOPTS \+=.*-arm64_4k' Makefile; then
-  sed -i -E '/^BUILDOPTS \+=/ s/-arm64_4k\b/-arm64_64k/' Makefile
-  echo "==> Patched BUILDOPTS: build aarch64 4k, drop 64k:"
+  sed -i -E '/^BUILDOPTS \+=/ s/-arm64_4k\b/-arm64_64k -debug/' Makefile
+  echo "==> Patched BUILDOPTS: build aarch64 4k, drop 64k + debug:"
   grep -E '^BUILDOPTS \+=' Makefile | sed 's/^/      /'
 else
   echo "WARN: '-arm64_4k' not found in redhat/Makefile BUILDOPTS — upstream flavor" >&2
