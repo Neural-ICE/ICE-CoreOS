@@ -90,9 +90,9 @@ Everything else is unchanged:
    kernel-modules / kernel` **4k** RPMs (globs anchored on `-6.12` so they never
    catch the 64k RPMs).
 3. Regenerate + **re-sign** the 4k kernel + 4k-vermagic driver `.ko` on the build
-   host (**.63**), re-stage into `ARTIFACTS_DIR`, then run `build-image` → GHCR.
-4. Validate on **.63** (qdrant/vLLM boot + `nvidia-smi`), then promote the digest
-   to **.72 (live)** via the normal channel promotion (ADR-0005).
+   host, re-stage into the artifacts dir, then run `build-image` → GHCR.
+4. Validate on a test unit (`getconf PAGESIZE`, `nvidia-smi`, a workload smoke),
+   then promote the digest through the channels (ADR-0005).
 5. Docs/labels updated (README, `nvidia.conf`, CI comments).
 
 ## References
