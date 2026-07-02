@@ -249,6 +249,50 @@ podman run --rm --privileged --pid=host \
   || die "bootc install to-filesystem failed"
 
 # --------------------------------------------------------------------------- #
+# 5a) Firmware boot-menu hygiene (docs/INSTALLER-UX-HARDENING.md):
+#     - branded shim CSV on the INSTALLED ESP: if fallback.efi ever runs (NVRAM
+#       loss), the recreated entry says "Neural ICE", never "Red Hat Enterprise
+#       Linux" (the label baked into our RHEL-sourced signed shim).
+#     - our own NVRAM entry "Neural ICE", first in BootOrder.
+#     - drop stale HD() entries pointing at partitions that no longer exist
+#       (wiped OSes) or at the live USB (a one-shot installer leaves no trace).
+#     Best-effort: NVRAM quirks must never fail a successful install.
+# --------------------------------------------------------------------------- #
+shim_rel=""
+shim_abs="$(find "$TGT/boot/efi/EFI" -maxdepth 2 -iname 'shimaa64.efi' 2>/dev/null | head -1)"
+[[ -n "$shim_abs" ]] && shim_rel="${shim_abs#"$TGT"/boot/efi}"
+for csv in "$TGT"/boot/efi/EFI/*/BOOT*.CSV; do
+  [[ -f "$csv" ]] || continue
+  loader="$(iconv -f UTF-16 -t UTF-8 "$csv" 2>/dev/null | head -1 | cut -d, -f1 | tr -d '\r\n')"
+  : "${loader:=shimaa64.efi}"
+  { printf '\xff\xfe'
+    printf '%s,Neural ICE,,Neural ICE CoreOS appliance\r\n' "$loader" | iconv -f UTF-8 -t UTF-16LE
+  } > "$csv" 2>/dev/null && log "Branded shim CSV: ${csv#"$TGT"/boot/efi/} -> Neural ICE" || true
+done
+if command -v efibootmgr >/dev/null && [[ -d /sys/firmware/efi/efivars && -n "$shim_rel" ]]; then
+  present_guids="$(lsblk -rno PARTUUID | tr '[:upper:]' '[:lower:]')"
+  usb_guids="$(lsblk -rno PARTUUID "/dev/$live_disk" | tr '[:upper:]' '[:lower:]')"
+  while IFS= read -r line; do
+    num="$(sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' <<<"$line")"; [[ -n "$num" ]] || continue
+    label="$(sed -e 's/^Boot[0-9A-Fa-f]\{4\}[* ]*//' -e 's/\t.*//' <<<"$line")"
+    guid="$(sed -n 's/.*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1/p' <<<"$line" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$label" == "Neural ICE" ]] \
+       || { [[ -n "$guid" ]] && ! grep -qx "$guid" <<<"$present_guids"; } \
+       || { [[ -n "$guid" ]] && grep -qx "$guid" <<<"$usb_guids"; }; then
+      efibootmgr -b "$num" -B >/dev/null 2>&1 && log "NVRAM: dropped entry Boot$num ($label)" || true
+    fi
+  done < <(efibootmgr -v 2>/dev/null | grep '^Boot[0-9A-Fa-f]\{4\}')
+  if efibootmgr --create --disk "$target" --part 1 --label "Neural ICE" \
+       --loader "${shim_rel//\//\\}" >/dev/null 2>&1; then
+    log "NVRAM: created 'Neural ICE' boot entry (first in BootOrder)"
+  else
+    log "warn: efibootmgr create failed — firmware will fall back to the branded CSV on first boot"
+  fi
+else
+  log "warn: efibootmgr/efivars/shim unavailable — skipping NVRAM branding (CSV fallback stays branded)"
+fi
+
+# --------------------------------------------------------------------------- #
 # 5b) PRELOADED seed staging (only if the installer media carries a seed partition).
 #     Copy the READY podman overlay store + the base HF models onto the (already-
 #     formatted, open) encrypted data volume. The image's storage.conf.d drop-in

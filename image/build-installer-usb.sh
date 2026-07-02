@@ -65,22 +65,23 @@ ENTRIES="$MNT/loader/entries"
 live="$(find "$ENTRIES" -name 'ostree-*.conf' ! -name '*install*' | head -1)"
 [[ -n "$live" ]] || { echo "ERROR: no BLS entry produced by bib" >&2; exit 1; }
 
-# Live entry is the default (highest version). Title already branded via os-release.
-sudo sed -i 's/^version .*/version 1/' "$live"
-
-# Install entry = Live + autoinstall karg, lower version (shown second).
-inst="$ENTRIES/ostree-0-install.conf"
-sudo cp "$live" "$inst"
+# Live entry is the default. Distinct title so the USB menu can never be
+# confused with the installed NVMe menu (field note: identical titles).
 sudo sed -i \
-  -e 's/^title .*/title Neural ICE - Install (wipes the internal disk)/' \
-  -e 's/^version .*/version 0/' \
-  "$inst"
-# Append the autoinstall karg + boot the installer SELinux-permissive (bootc
-# install needs to relabel the target; the enforcing live policy denies it).
-sudo grep -q 'neuralice.autoinstall=1' "$inst" || \
-  sudo sed -i 's@^\(options .*\)$@\1 neuralice.autoinstall=1@' "$inst"
-sudo grep -q 'enforcing=0' "$inst" || \
-  sudo sed -i 's@^\(options .*\)$@\1 enforcing=0@' "$inst"
+  -e 's/^title .*/title Neural ICE Installer (Live)/' \
+  -e 's/^version .*/version 1/' \
+  "$live"
+sudo rm -f "$ENTRIES/ostree-0-install.conf"   # legacy BLS clone (rendered non-deterministically)
+
+# Install entry = STATIC menuentry in grub.cfg, NOT a BLS clone: blscfg rendering
+# of a cloned entry is not deterministic (bootloader-update.service regenerates
+# entries between boots) — a static entry is always rendered, always second.
+# kargs: autoinstall gate + SELinux-permissive (bootc install relabels the
+# target; the enforcing live policy denies it).
+klinux="$(sudo sed -n 's/^linux //p' "$live" | head -1)"
+kinitrd="$(sudo sed -n 's/^initrd //p' "$live" | head -1)"
+kopts="$(sudo sed -n 's/^options //p' "$live" | head -1)"
+[[ -n "$klinux" && -n "$kinitrd" ]] || { echo "ERROR: cannot parse kernel/initrd from $live" >&2; exit 1; }
 
 # Background + visible 30s menu.
 if [[ -f "$BG_SRC" ]]; then sudo cp "$BG_SRC" "$MNT/grub2/neural-ice-bg.png"; fi
@@ -89,10 +90,37 @@ sudo grep -q 'background_image /grub2/neural-ice-bg.png' "$GCFG" || \
   sudo sed -i '0,/^set timeout=/s//if background_image \/grub2\/neural-ice-bg.png ; then true ; fi\nset timeout=/' "$GCFG"
 sudo sed -i -e 's/^set timeout=.*/set timeout=30/' -e 's/^set timeout_style=.*/set timeout_style=menu/' "$GCFG"
 
+if ! sudo grep -q 'neural-ice-install' "$GCFG"; then
+  sudo tee -a "$GCFG" >/dev/null <<EOF
+
+# Neural ICE static install entry (deterministic — see docs/INSTALLER-UX-HARDENING.md)
+menuentry 'Neural ICE - Install (wipes the internal disk)' --id neural-ice-install {
+    linux ${klinux} ${kopts} neuralice.autoinstall=1 enforcing=0
+    initrd ${kinitrd}
+}
+EOF
+fi
+
 sync
 echo "==> Dual-mode entries:"
-echo "    [default] $(sudo sed -n 's/^title //p' "$live")"
-echo "    [install] $(sudo sed -n 's/^title //p' "$inst")"
+echo "    [default] $(sudo sed -n 's/^title //p' "$live")  (BLS)"
+echo "    [install] Neural ICE - Install (wipes the internal disk)  (static grub.cfg)"
+sudo umount "$MNT"
+
+# Installer ESP: kill the shim fallback dance. \EFI\BOOT\BOOTAA64.EFI chain-loads
+# fbaa64.efi, which re-creates NVRAM entries from BOOTAA64.CSV (labelled "Red Hat
+# Enterprise Linux") and RESETS the machine — the scary "restore" screen. A
+# one-shot installer must never touch the customer's NVRAM: remove the fallback
+# binary + CSVs so the firmware boot-menu entry goes straight to our GRUB.
+ESPPART=""
+for p in "${LOOP}"p*; do
+  [[ "$(sudo blkid -s LABEL -o value "$p" 2>/dev/null)" == "EFI-SYSTEM" ]] && { ESPPART="$p"; break; }
+done
+[[ -n "$ESPPART" ]] || { echo "ERROR: installer ESP not found" >&2; exit 1; }
+sudo mount "$ESPPART" "$MNT"
+sudo find "$MNT/EFI" -maxdepth 2 \( -iname 'fbaa64.efi' -o -iname 'BOOT*.CSV' \) -print -delete
+sync
+sudo umount "$MNT"; sudo losetup -d "$LOOP"; trap - EXIT
 
 if [[ -n "$OUT_NAME" ]]; then
   cp "$RAW" "${REPO_ROOT}/${OUT_NAME}.img"
