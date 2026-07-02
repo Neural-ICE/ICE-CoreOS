@@ -40,8 +40,10 @@ echo "==> 2. build the READY overlay image store (ONCE, here) + size the seed"
 # is much bigger than the *.tar archives (e.g. vllm-node ≈ 19 GB extracted vs a few GB packed), so
 # the ni-seed partition MUST be sized from the store, not the archives. Refs (e.g.
 # ghcr.io/neural-ice/vllm-node:latest) are preserved so the Quadlets resolve them offline.
-STORE_TMP="$(mktemp -d /var/tmp/ni-seed-store.XXXXXX)"
-RUNROOT="$(mktemp -d /run/ni-seed-runroot.XXXXXX)"
+# Both dirs are created with sudo (root-owned): /run is not user-writable, and rootful podman
+# wants a root-owned graphroot. All reads/copies/cleanup below therefore go through sudo.
+STORE_TMP="$(sudo mktemp -d /var/tmp/ni-seed-store.XXXXXX)"
+RUNROOT="$(sudo mktemp -d /run/ni-seed-runroot.XXXXXX)"
 storecleanup(){ sudo rm -rf "$STORE_TMP" "$RUNROOT" 2>/dev/null||true; }
 trap storecleanup EXIT
 shopt -s nullglob
@@ -54,7 +56,7 @@ done
 echo "    store images:"
 sudo podman --root "$STORE_TMP" --runroot "$RUNROOT" --storage-driver overlay images
 STORE_BYTES="$(sudo du -sb "$STORE_TMP" | cut -f1)"
-MODELS_BYTES="$(du -sb "$SEED_MODELS" | cut -f1)"
+MODELS_BYTES="$(sudo du -sb "$SEED_MODELS" | cut -f1)"
 SEED_BYTES=$(( STORE_BYTES + MODELS_BYTES ))
 GROW=$(( SEED_BYTES + SEED_BYTES/10 + 4*1024*1024*1024 ))   # store+models + 10% + 4 GiB headroom
 echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
@@ -80,7 +82,7 @@ sudo cp -a "$STORE_TMP/." /mnt/ni-seed/store/
 sudo cp -a "$SEED_MODELS/." /mnt/ni-seed/models/
 sudo sync
 echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
-sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; sudo rm -rf "$RUNROOT"; trap - EXIT
+sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; storecleanup; trap - EXIT
 
 echo "==> 5. compress (${COMPRESS})"
 case "$COMPRESS" in
