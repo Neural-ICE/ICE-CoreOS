@@ -206,6 +206,10 @@ RUN set -euxo pipefail; \
     else \
         printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         systemctl mask sshd.service; \
+        # Sealed console: no shell anywhere. tty1 is the TUI (getty@tty1 already masked); mask the
+        # getty@/autovt@ templates too so no login prompt can autospawn on any secondary VT
+        # (Ctrl+Alt+F2..F6). Debug keeps its VT gettys + serial + ssh; prod does not.
+        systemctl mask getty@.service autovt@.service; \
     fi
 
 # OTA imgref self-description: the CI bakes the exact channel+variant tag this image
