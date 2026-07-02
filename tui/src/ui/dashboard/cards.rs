@@ -60,21 +60,18 @@ fn render_gpu_card(app: &App, area: Rect, buf: &mut Buffer) {
     title.push(' ');
 
     let detail = if gpu.is_available() {
-        // GB10 / DGX Spark: GPU memory is the system RAM (unified). nvidia-smi
-        // reports memory.total as [N/A] there (parsed as 0) — show the real
-        // unified pool from /proc/meminfo instead of a bogus "0 / 0".
+        // GB10 / DGX Spark: no dedicated VRAM — memory is the unified system
+        // RAM, already shown on the MEM card. nvidia-smi reports memory.total
+        // as [N/A] there (parsed as 0): show the GPU name, not a bogus "0 / 0".
         if gpu.memory_total_gb == 0 {
             Line::from(Span::styled(
-                format!(
-                    " unified mem {:.0} / {:.0} GB (system RAM)",
-                    app.mem.used_gb, app.mem.total_gb
-                ),
+                format!(" {} · unified RAM (see MEM)", gpu.name),
                 THEME.muted,
             ))
         } else {
             Line::from(Span::styled(
                 format!(
-                    " VRAM {} / {} GB (unified)",
+                    " VRAM {} / {} GB",
                     gpu.memory_used_gb, gpu.memory_total_gb
                 ),
                 THEME.muted,
