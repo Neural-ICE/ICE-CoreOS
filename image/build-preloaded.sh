@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+#
+# TODO(perf): store the seed COMPRESSED in ni-seed (zstd) and have the autoinstall decompress it
+# on-the-fly while writing to the fast NVMe data volume — smaller USB payload + leverages NVMe
+# write speed (Owner insight 2026-07-02). Models compress little (safetensors) but archives do.
 # Build the PRELOADED installer: the normal (LIGHT) installer raw + an extra `ni-seed`
 # partition carrying the appliance's container-image OCI archives and the base HF models.
 # The autoinstall stages that partition onto the encrypted data volume; first boot imports
