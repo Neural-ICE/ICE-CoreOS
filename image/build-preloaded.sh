@@ -30,7 +30,9 @@ COMPRESS="${COMPRESS:-zstd-fast}"
 [ -d "$SEED_MODELS" ] || { echo "missing SEED_MODELS $SEED_MODELS" >&2; exit 1; }
 
 echo "==> 1. build the base installer raw FROM ${BASE_IMAGE}  (uncompressed)"
-BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
+# OUT means "output NAME" here but "bib output DIR" in build-installer-usb.sh —
+# drop it from the child env so an exported OUT never leaks in as a bogus bib dir.
+env -u OUT BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
 RAW="${REPO_ROOT}/${OUT}.img"
 [ -f "$RAW" ] || { echo "base raw not produced ($RAW)" >&2; exit 1; }
 
