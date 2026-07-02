@@ -28,8 +28,13 @@ log()  { logger -t "$LOG_TAG" -- "$*"; printf '\n[%s] %s\n' "$LOG_TAG" "$*" > /d
 die()  { log "FAILED: $*"; exit 1; }
 
 # OTA origin recorded on the installed system = the PUBLIC channel tag, so
-# `bootc upgrade` follows that channel from GHCR (overridable via neuralice.imgref=).
+# `bootc upgrade` follows that channel from GHCR. Default = the imgref the CI baked into
+# THIS image (channel+variant self-description, e.g. :<channel>-debug), so a debug install
+# stays on the debug channel instead of jumping to :prod. Overridable via neuralice.imgref=.
 IMGREF="ghcr.io/neural-ice/neural-ice-coreos:prod"
+if [ -r /usr/lib/neural-ice/ota-imgref ]; then
+  IMGREF="$(tr -d '[:space:]' < /usr/lib/neural-ice/ota-imgref)"
+fi
 if grep -qE 'neuralice\.imgref=([^ ]+)' /proc/cmdline; then
   IMGREF="$(sed -n 's/.*neuralice\.imgref=\([^ ]*\).*/\1/p' /proc/cmdline)"
 fi

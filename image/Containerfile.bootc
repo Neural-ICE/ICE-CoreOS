@@ -168,13 +168,27 @@ RUN set -euxo pipefail; \
     sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
     install -d -m 0755 /usr/lib/bootc/kargs.d; \
     if [ "${VARIANT}" = "debug" ]; then \
-        printf 'kargs = ["console=tty1", "console=ttyAMA0,115200", "enforcing=0"]\n' \
+        printf 'kargs = ["console=tty1", "console=ttyAMA0,115200", "enforcing=0", "consoleblank=0"]\n' \
             > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS (debug)"/' /usr/lib/os-release; \
+        install -d /etc/systemd/system/getty@tty1.service.d /etc/systemd/system/serial-getty@ttyAMA0.service.d; \
+        printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear %%I $TERM\n' \
+            > /etc/systemd/system/getty@tty1.service.d/autologin.conf; \
+        printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %%I $TERM\n' \
+            > /etc/systemd/system/serial-getty@ttyAMA0.service.d/autologin.conf; \
+        systemctl enable serial-getty@ttyAMA0.service; \
     else \
         printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         systemctl mask sshd.service; \
     fi
+
+# OTA imgref self-description: the CI bakes the exact channel+variant tag this image
+# should follow (build-image.sh passes OTA_IMGREF). The installer reads it so a debug
+# install pins :<channel>-debug (not :prod). Overridable at install via neuralice.imgref=.
+ARG OTA_IMGREF="ghcr.io/neural-ice/neural-ice-coreos:prod"
+RUN set -euxo pipefail; \
+    install -d -m 0755 /usr/lib/neural-ice; \
+    printf '%s\n' "${OTA_IMGREF}" > /usr/lib/neural-ice/ota-imgref
 
 # --------------------------------------------------------------------------- #
 # 4) bootc hygiene: /var must stay empty (runtime state, not image)
