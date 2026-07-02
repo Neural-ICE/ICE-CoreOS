@@ -79,6 +79,9 @@ jobs:
         env:
           PUSH: '1'
           PODMAN_SUDO: '1'
+          # Operator key baked into DEBUG builds only — prod/alpha default images
+          # stay VANILLA (no key) as documented in image/Containerfile.bootc.
+          SSH_AUTHORIZED_KEY: ${{ (github.event.inputs.variant || 'prod') == 'debug' && secrets.SSH_AUTHORIZED_KEY || '' }}
         run: ./ci/build-image.sh | tee build.out
 
       - name: Summary

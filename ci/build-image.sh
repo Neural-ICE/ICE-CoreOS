@@ -71,6 +71,7 @@ echo "==> Building ${REF}:${SEMVER}  (channel ${REF}:${CHANNEL}${SUFFIX})  varia
   --build-arg "SSH_AUTHORIZED_KEY=${SSH_AUTHORIZED_KEY}" \
   --build-arg "VARIANT=${VARIANT}" \
   --build-arg "OTA_IMGREF=${REF}:${CHANNEL}${SUFFIX}" \
+  --build-arg "OS_VERSION=${SEMVER}" \
   -f image/Containerfile.bootc \
   -t "${REF}:${SEMVER}" \
   -t "${REF}:${CHANNEL}${SUFFIX}" \

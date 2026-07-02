@@ -224,9 +224,13 @@ RUN set -euxo pipefail; \
 # should follow (build-image.sh passes OTA_IMGREF). The installer reads it so a debug
 # install pins :<channel>-debug (not :prod). Overridable at install via neuralice.imgref=.
 ARG OTA_IMGREF="ghcr.io/neural-ice/neural-ice-coreos:prod"
+# OS version self-description (SEMVER from the CI, e.g. 0.9.0-alpha.42-debug).
+# The console TUI displays this file — never the TUI crate version.
+ARG OS_VERSION=""
 RUN set -euxo pipefail; \
     install -d -m 0755 /usr/lib/neural-ice; \
-    printf '%s\n' "${OTA_IMGREF}" > /usr/lib/neural-ice/ota-imgref
+    printf '%s\n' "${OTA_IMGREF}" > /usr/lib/neural-ice/ota-imgref; \
+    if [ -n "${OS_VERSION}" ]; then printf '%s\n' "${OS_VERSION}" > /usr/lib/neural-ice/version; fi
 
 # --------------------------------------------------------------------------- #
 # 4) bootc hygiene: /var must stay empty (runtime state, not image)
