@@ -23,33 +23,77 @@ pub enum ServiceState {
 pub struct ServiceStatus {
     pub name: String,
     pub state: ServiceState,
-    /// Human-readable uptime (e.g. "3h12m"), present only while running.
+    /// Display-ready detail: "up 3h12m" when the whole row runs, "2/4 up"
+    /// when only part of an aggregated row is running.
     pub uptime: Option<String>,
 }
 
-/// Collect status for every service in [`paths::AI_STACK`].
-// TODO(ICE-AC1): confirm real Quadlet unit names
+/// Collect status for every row in [`paths::AI_STACK`]. A row aggregates one
+/// or more Quadlet units (e.g. "vllm" = the four vllm-*.service units): the
+/// row state is the WORST unit state, and a partially-up row shows "x/y up"
+/// instead of an uptime.
 pub fn collect_ai_stack() -> Vec<ServiceStatus> {
     paths::AI_STACK
         .iter()
-        .map(|&name| collect_one(name))
+        .map(|&(name, units)| collect_group(name, units))
         .collect()
 }
 
-fn collect_one(name: &str) -> ServiceStatus {
-    let unit = format!("{name}.service");
-    let state = is_active(&unit);
-    let uptime = if state == ServiceState::Running {
-        active_uptime(&unit)
+fn collect_group(name: &str, units: &[&str]) -> ServiceStatus {
+    let states: Vec<(ServiceState, String)> = units
+        .iter()
+        .map(|u| {
+            let unit = format!("{u}.service");
+            (is_active(&unit), unit)
+        })
+        .collect();
+
+    let worst = states
+        .iter()
+        .map(|(s, _)| *s)
+        .max_by_key(|s| match s {
+            ServiceState::Running => 0,
+            ServiceState::Unknown => 1,
+            ServiceState::Inactive => 2,
+            ServiceState::Failed => 3,
+        })
+        .unwrap_or(ServiceState::Unknown);
+
+    let uptime = if worst == ServiceState::Running {
+        // All units running: show the most recent start (shortest uptime).
+        states
+            .iter()
+            .filter_map(|(_, u)| active_uptime(u))
+            .min_by_key(|s| parse_duration_key(s))
+            .map(|d| format!("up {d}"))
     } else {
-        None
+        let up = states
+            .iter()
+            .filter(|(s, _)| *s == ServiceState::Running)
+            .count();
+        (up > 0).then(|| format!("{up}/{} up", states.len()))
     };
 
     ServiceStatus {
         name: name.to_string(),
-        state,
+        state: worst,
         uptime,
     }
+}
+
+/// Sort key so "3m" < "2h5m" < "1d4h" without re-deriving raw seconds.
+fn parse_duration_key(s: &str) -> u64 {
+    let (mut days, mut hours, mut mins, mut num) = (0u64, 0u64, 0u64, 0u64);
+    for c in s.chars() {
+        match c {
+            '0'..='9' => num = num * 10 + (c as u64 - '0' as u64),
+            'd' => { days = num; num = 0 }
+            'h' => { hours = num; num = 0 }
+            'm' => { mins = num; num = 0 }
+            _ => {}
+        }
+    }
+    (days * 24 + hours) * 60 + mins
 }
 
 fn is_active(unit: &str) -> ServiceState {

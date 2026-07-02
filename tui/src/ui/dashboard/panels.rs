@@ -55,11 +55,8 @@ fn render_ai_stack(app: &App, area: Rect, buf: &mut Buffer) {
                 ServiceState::Inactive => ("inactive", theme::status::WARN),
                 ServiceState::Unknown => ("unknown", theme::status::UNKNOWN),
             };
-            let uptime = svc
-                .uptime
-                .as_ref()
-                .map(|u| format!("up {u}"))
-                .unwrap_or_default();
+            // Already formatted by ai_stack ("up 3h12m" or "2/4 up").
+            let uptime = svc.uptime.clone().unwrap_or_default();
             Line::from(vec![
                 Span::styled(" ● ", Style::default().fg(color)),
                 Span::styled(format!("{:<14}", svc.name), THEME.value),
