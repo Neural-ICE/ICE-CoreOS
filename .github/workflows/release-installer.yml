@@ -16,6 +16,11 @@ on:
         type: choice
         options: [prod, beta, alpha]
         default: prod
+      variant:
+        description: 'Variant to package (prod = sealed; debug = sshd+serial+permissive)'
+        type: choice
+        options: [prod, debug]
+        default: prod
       release_tag:
         description: 'Release tag to create/update (e.g. v0.1.0). Blank = installer-<channel>-<run>.'
         default: ''
@@ -42,10 +47,12 @@ jobs:
       - name: Build vanilla installer .img for channel
         id: build
         env:
-          BASE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ env.CHANNEL }}
+          VARIANT: ${{ github.event.inputs.variant || 'prod' }}
         run: |
+          SUFFIX=""; [ "$VARIANT" = "debug" ] && SUFFIX="-debug"
+          BASE_IMAGE="${REGISTRY}/${IMAGE}:${CHANNEL}${SUFFIX}"
           VERSION="$(tr -d '[:space:]' < VERSION)"
-          OUT="ice-coreos-installer-${CHANNEL}-${VERSION}"
+          OUT="ice-coreos-installer-${CHANNEL}${SUFFIX}-${VERSION}"
           # Builds the dual-mode (Live + Install) raw installer for $BASE_IMAGE.
           BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
           RAW="$(ls -1 *.img 2>/dev/null | head -1 || true)"
