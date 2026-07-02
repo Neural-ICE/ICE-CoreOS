@@ -24,6 +24,11 @@ on:
         default: alpha
         type: choice
         options: [alpha, beta, prod]
+      variant:
+        description: 'Build variant (prod = sealed; debug = sshd+serial+permissive)'
+        default: prod
+        type: choice
+        options: [prod, debug]
 
 concurrency:
   group: build-image-${{ github.ref }}
@@ -40,6 +45,7 @@ jobs:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
       CHANNEL: ${{ github.event.inputs.channel || 'alpha' }}
+      VARIANT: ${{ github.event.inputs.variant || 'prod' }}
       BUILD_ID: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
