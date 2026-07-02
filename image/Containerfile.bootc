@@ -135,13 +135,21 @@ COPY image/tui/neural-ice-tui         /usr/local/bin/neural-ice-tui
 COPY image/tui/neural-ice-tui.service /usr/lib/systemd/system/neural-ice-tui.service
 # PRELOADED edition: the installer stages a ready-built podman overlay store onto the encrypted
 # data volume; we register it as a READ-ONLY additional image store so the appliance's images are
-# visible INSTANTLY at first boot — no `podman load`, no CPU re-hash/untar of ~20 GB. Harmless
-# no-op for LIGHT (a missing store path is ignored). containers-storage has NO storage.conf.d
-# drop-in mechanism (verified: containers-storage.conf(5)), so we edit /etc/containers/storage.conf
-# directly, APPEND-SAFE — preserving any additionalimagestores the base already sets (bound images).
+# visible INSTANTLY at first boot — no `podman load`, no CPU re-hash/untar of ~20 GB.
+# IMPORTANT (field-learned 2026-07-03): containers-storage HARD-FAILS if an additionalimagestores
+# path does not exist (no silent skip) — so the directory must exist EVERYWHERE podman runs:
+#   - baked into the image (covers the LIVE installer, where the data volume isn't mounted),
+#   - tmpfiles.d recreates it under the mounted data volume on every boot (covers LIGHT installs),
+#   - the autoinstall also mkdirs it on the data volume at install time (belt and braces).
+# containers-storage has NO storage.conf.d drop-in mechanism (verified: containers-storage.conf(5)),
+# so we edit /etc/containers/storage.conf directly, APPEND-SAFE — preserving any
+# additionalimagestores the base already sets (bound images).
 RUN set -euxo pipefail; \
     src=/etc/containers/storage.conf; \
     store=/var/lib/neural-ice/data/seed-store; \
+    install -d -m 0700 "$store"; \
+    printf 'd /var/lib/neural-ice/data/seed-store 0700 root root -\n' \
+        > /usr/lib/tmpfiles.d/neural-ice-seed-store.conf; \
     install -d /etc/containers; \
     if [ ! -f "$src" ]; then \
         if [ -f /usr/share/containers/storage.conf ]; then cp /usr/share/containers/storage.conf "$src"; \

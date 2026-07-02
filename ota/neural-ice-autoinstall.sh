@@ -259,13 +259,17 @@ podman run --rm --privileged --pid=host \
 #     context= override, so per-file xattr labels persist).
 # --------------------------------------------------------------------------- #
 SEED_PART="/dev/disk/by-partlabel/ni-seed"
+# The seed-store dir must exist on the data volume in ALL editions — containers-storage
+# HARD-FAILS on a missing additionalimagestores path (no silent skip). LIGHT gets an empty
+# store; PRELOADED fills it below. (tmpfiles.d also recreates it on every boot.)
+mkdir -p /run/seed-dst
+mount /dev/mapper/data /run/seed-dst
+mkdir -p /run/seed-dst/seed-store
 if [ -b "$SEED_PART" ]; then
   log "PRELOADED: staging seed (overlay store + base models) onto the data volume…"
-  mkdir -p /run/seed-src /run/seed-dst
+  mkdir -p /run/seed-src
   mount -o ro "$SEED_PART" /run/seed-src
-  mount /dev/mapper/data /run/seed-dst
   if [ -d /run/seed-src/store ]; then
-    mkdir -p /run/seed-dst/seed-store
     cp -a /run/seed-src/store/. /run/seed-dst/seed-store/
     # Label for the container runtime. Prefer the read-only image-store type; fall back to the
     # universally-present container_file_t (readable by container_t). The store is used
