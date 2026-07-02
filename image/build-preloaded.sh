@@ -59,6 +59,7 @@ STORE_BYTES="$(sudo du -sb "$STORE_TMP" | cut -f1)"
 MODELS_BYTES="$(sudo du -sb "$SEED_MODELS" | cut -f1)"
 SEED_BYTES=$(( STORE_BYTES + MODELS_BYTES ))
 GROW=$(( SEED_BYTES + SEED_BYTES/10 + 4*1024*1024*1024 ))   # store+models + 10% + 4 GiB headroom
+GROW=$(( (GROW + 1048575) / 1048576 * 1048576 ))            # round up to 1 MiB (avoid sub-sector GPT gaps)
 echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
 truncate -s "+${GROW}" "$RAW"
 
