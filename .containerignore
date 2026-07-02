@@ -1,0 +1,9 @@
+# Keep the `podman build .` context lean. Exclude heavy build products and outputs that the
+# Containerfile never COPYs. The staged TUI binary (image/tui/neural-ice-tui) and all image/**,
+# ota/**, ignition/** inputs are NOT excluded — those are consumed by the build.
+.git
+tui/target
+*.img
+*.img.zst
+*.img.xz
+*.sha256

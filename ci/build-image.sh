@@ -48,6 +48,19 @@ for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boo
   fi
 done
 
+# Console TUI: build the Rust dashboard natively (the runner has the toolchain) and stage the
+# binary where the Containerfile COPYs it. Kept out of the image build itself (no rust toolchain
+# baked, no docker.io rust pull) — same "stage then COPY" pattern as the GB10 artifacts.
+echo "==> Building console TUI (neural-ice-tui, ${PLATFORM})"
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "ERROR: cargo not found — the TUI binary must be built on this host." >&2
+  echo "       Install the Rust toolchain (rustup) or pre-stage image/tui/neural-ice-tui." >&2
+  exit 4
+fi
+cargo build --release --manifest-path tui/Cargo.toml
+install -Dm0755 tui/target/release/neuralice-tui image/tui/neural-ice-tui
+echo "    staged image/tui/neural-ice-tui ($(du -h image/tui/neural-ice-tui | cut -f1))"
+
 # Use the root container store (matches bib --local and caches the base) when
 # PODMAN_SUDO=1 (CI); rootless otherwise (local dev).
 if [ "${PODMAN_SUDO:-0}" = "1" ]; then PODMAN=(sudo podman); else PODMAN=(podman); fi

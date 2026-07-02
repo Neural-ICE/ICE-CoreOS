@@ -20,7 +20,7 @@ ARG NVIDIA_DRIVER_VERSION=595.58.03
 # Appliance variant (A4): controls the security/console posture, NOT the release
 # channel (that's the image tag). Default = prod (secure, sealed).
 #   prod  : sshd MASKED (sealed appliance, ADR-0003), kargs=["quiet"], SELinux enforcing.
-#   debug : sshd enabled (core key), serial console (ttyAMA0) + tty1, verbose boot,
+#   debug : sshd enabled (core key), serial console (ttyS0) + tty1, verbose boot,
 #           SELinux permissive (enforcing=0) — for lab/field troubleshooting only.
 # Build both: --build-arg VARIANT=prod  ->  :prod ; --build-arg VARIANT=debug -> :debug
 ARG VARIANT=prod
@@ -128,21 +128,44 @@ COPY image/signed-boot/ /
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
 COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
-# First-boot seed import (PRELOADED edition): load the OCI archives the installer staged on
-# the data volume into podman storage, so the appliance starts offline. No-op for LIGHT.
-COPY image/firstboot/neural-ice-seed-import.sh      /usr/local/bin/neural-ice-seed-import.sh
-COPY image/firstboot/neural-ice-seed-import.service /usr/lib/systemd/system/neural-ice-seed-import.service
-
-# Headless appliance: target multi-user (no GUI). Otherwise graphical.target
-# reserves tty1 for a non-existent display manager and the console login lands
-# on tty2 (HDMI looks blank). multi-user => getty on tty1, visible console.
+# Appliance console dashboard (TUI). The binary is pre-built ARM64 on the runner and staged at
+# image/tui/neural-ice-tui by ci/build-image.sh (gitignored, like the other GB10 artifacts).
+# The TUI owns tty1 in ALL variants; getty@tty1 is masked below (console = dashboard, not a login).
+COPY image/tui/neural-ice-tui         /usr/local/bin/neural-ice-tui
+COPY image/tui/neural-ice-tui.service /usr/lib/systemd/system/neural-ice-tui.service
+# PRELOADED edition: the installer stages a ready-built podman overlay store onto the encrypted
+# data volume; we register it as a READ-ONLY additional image store so the appliance's images are
+# visible INSTANTLY at first boot — no `podman load`, no CPU re-hash/untar of ~20 GB. Harmless
+# no-op for LIGHT (a missing store path is ignored). containers-storage has NO storage.conf.d
+# drop-in mechanism (verified: containers-storage.conf(5)), so we edit /etc/containers/storage.conf
+# directly, APPEND-SAFE — preserving any additionalimagestores the base already sets (bound images).
 RUN set -euxo pipefail; \
-    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-seed-import.sh; \
+    src=/etc/containers/storage.conf; \
+    store=/var/lib/neural-ice/data/seed-store; \
+    install -d /etc/containers; \
+    if [ ! -f "$src" ]; then \
+        if [ -f /usr/share/containers/storage.conf ]; then cp /usr/share/containers/storage.conf "$src"; \
+        else printf '[storage]\ndriver = "overlay"\n\n[storage.options]\n' > "$src"; fi; \
+    fi; \
+    if grep -Eq '^[[:space:]]*additionalimagestores[[:space:]]*=[[:space:]]*\[' "$src"; then \
+        sed -i "s#^\([[:space:]]*additionalimagestores[[:space:]]*=[[:space:]]*\[\)#\1 \"$store\",#" "$src"; \
+    else \
+        grep -q '^\[storage.options\]' "$src" || printf '\n[storage.options]\n' >> "$src"; \
+        sed -i "/^\[storage.options\]/a additionalimagestores = [\"$store\"]" "$src"; \
+    fi; \
+    grep -n 'additionalimagestores' "$src"
+
+# Headless appliance: target multi-user (no GUI). Otherwise graphical.target reserves tty1 for
+# a non-existent display manager. tty1 is owned by the TUI dashboard (getty@tty1 masked), so the
+# HDMI console shows the appliance status dashboard instead of a login prompt.
+RUN set -euxo pipefail; \
+    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-tui; \
     systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
-                     neural-ice-seed-import.service \
+                     neural-ice-tui.service \
                      bootc-fetch-apply-updates.timer; \
+    systemctl mask getty@tty1.service; \
     systemctl set-default multi-user.target
 
 # Unattended OS OTA (ADR-0003): native `bootc upgrade` on a timer, from the public
@@ -173,15 +196,13 @@ RUN set -euxo pipefail; \
     sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
     install -d -m 0755 /usr/lib/bootc/kargs.d; \
     if [ "${VARIANT}" = "debug" ]; then \
-        printf 'kargs = ["console=tty1", "console=ttyAMA0,115200", "enforcing=0", "consoleblank=0"]\n' \
+        printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0"]\n' \
             > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS (debug)"/' /usr/lib/os-release; \
-        install -d /etc/systemd/system/getty@tty1.service.d /etc/systemd/system/serial-getty@ttyAMA0.service.d; \
-        printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear %%I $TERM\n' \
-            > /etc/systemd/system/getty@tty1.service.d/autologin.conf; \
+        install -d /etc/systemd/system/serial-getty@ttyS0.service.d; \
         printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %%I $TERM\n' \
-            > /etc/systemd/system/serial-getty@ttyAMA0.service.d/autologin.conf; \
-        systemctl enable serial-getty@ttyAMA0.service; \
+            > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf; \
+        systemctl enable serial-getty@ttyS0.service; \
     else \
         printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         systemctl mask sshd.service; \

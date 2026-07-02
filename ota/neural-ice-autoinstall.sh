@@ -250,20 +250,31 @@ podman run --rm --privileged --pid=host \
 
 # --------------------------------------------------------------------------- #
 # 5b) PRELOADED seed staging (only if the installer media carries a seed partition).
-#     Copy the image OCI archives + the base HF models onto the (already-formatted,
-#     open) encrypted data volume. First boot's neural-ice-seed-import.service then
-#     imports the images into podman storage → the appliance starts fully offline.
+#     Copy the READY podman overlay store + the base HF models onto the (already-
+#     formatted, open) encrypted data volume. The image's storage.conf.d drop-in
+#     registers /var/lib/neural-ice/data/seed-store as a READ-ONLY additional image
+#     store, so the appliance sees the images INSTANTLY at first boot — no import,
+#     no `podman load`. The store files get the container_ro_file_t SELinux label so
+#     the container runtime can read them (the data volume is mounted without a
+#     context= override, so per-file xattr labels persist).
 # --------------------------------------------------------------------------- #
 SEED_PART="/dev/disk/by-partlabel/ni-seed"
 if [ -b "$SEED_PART" ]; then
-  log "PRELOADED: staging seed (images + base models) onto the data volume…"
+  log "PRELOADED: staging seed (overlay store + base models) onto the data volume…"
   mkdir -p /run/seed-src /run/seed-dst
   mount -o ro "$SEED_PART" /run/seed-src
   mount /dev/mapper/data /run/seed-dst
-  if [ -d /run/seed-src/images ]; then
-    mkdir -p /run/seed-dst/seed/images
-    cp -a /run/seed-src/images/. /run/seed-dst/seed/images/
-    log "  images: $(ls /run/seed-dst/seed/images | wc -l) archive(s)"
+  if [ -d /run/seed-src/store ]; then
+    mkdir -p /run/seed-dst/seed-store
+    cp -a /run/seed-src/store/. /run/seed-dst/seed-store/
+    # Label for the container runtime. Prefer the read-only image-store type; fall back to the
+    # universally-present container_file_t (readable by container_t). The store is used
+    # read-only via podman's additionalimagestores regardless of the exact type. The data
+    # volume is mounted without a context= override, so these per-file xattr labels persist.
+    chcon -R -t container_ro_file_t /run/seed-dst/seed-store 2>/dev/null \
+      || chcon -R -t container_file_t /run/seed-dst/seed-store 2>/dev/null \
+      || log "  warn: chcon on seed-store failed (SELinux off in installer?) — relabel on first boot if needed"
+    log "  images: staged as ready overlay store (zero first-boot import)"
   fi
   if [ -d /run/seed-src/models ]; then
     mkdir -p /run/seed-dst/huggingface

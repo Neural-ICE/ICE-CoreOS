@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 #
 #
+# Build the PRELOADED installer: the normal (LIGHT) installer raw + an extra `ni-seed`
+# partition carrying a READY podman overlay image store + the base HF models. The autoinstall
+# stages that partition onto the encrypted data volume and registers the store as a read-only
+# additional image store — so the appliance starts fully offline (no registry pulls) with
+# ZERO first-boot import: the `podman load` (untar + sha256 of ~20 GB) happens once here on
+# the build host, never on the client.
+#
 # TODO(perf): store the seed COMPRESSED in ni-seed (zstd) and have the autoinstall decompress it
 # on-the-fly while writing to the fast NVMe data volume — smaller USB payload + leverages NVMe
 # write speed (Owner insight 2026-07-02). Models compress little (safetensors) but archives do.
-# Build the PRELOADED installer: the normal (LIGHT) installer raw + an extra `ni-seed`
-# partition carrying the appliance's container-image OCI archives and the base HF models.
-# The autoinstall stages that partition onto the encrypted data volume; first boot imports
-# the images into podman storage → the appliance starts fully offline (no registry pulls).
 #
 # Run on the .63 ARM64 build host (has the seed + models). Needs sudo (losetup/mount/mkfs).
 #   SEED_IMAGES=/home/user/ice-seed/images \
@@ -44,19 +47,33 @@ SEEDNUM="$(sudo sgdisk -p "$RAW" | awk '/ni-seed/{n=$1} END{print n}')"
 [ -n "$SEEDNUM" ] || { echo "ni-seed partition not created" >&2; exit 1; }
 echo "    ni-seed = partition #${SEEDNUM}"
 
-echo "==> 4. mkfs + copy the seed into ni-seed"
+echo "==> 4. mkfs + build the seed into ni-seed"
+RUNROOT="/run/ni-seed-runroot"
 LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
-cleanup(){ sudo umount /mnt/ni-seed 2>/dev/null||true; sudo losetup -d "$LOOP" 2>/dev/null||true; }
+cleanup(){ sudo umount /mnt/ni-seed 2>/dev/null||true; sudo losetup -d "$LOOP" 2>/dev/null||true; sudo rm -rf "$RUNROOT" 2>/dev/null||true; }
 trap cleanup EXIT
 SEEDPART="${LOOP}p${SEEDNUM}"
 sudo mkfs.xfs -q -L ni-seed "$SEEDPART"
 sudo mkdir -p /mnt/ni-seed; sudo mount "$SEEDPART" /mnt/ni-seed
-sudo mkdir -p /mnt/ni-seed/images /mnt/ni-seed/models
-sudo cp -a "$SEED_IMAGES/." /mnt/ni-seed/images/
+sudo mkdir -p /mnt/ni-seed/store /mnt/ni-seed/models "$RUNROOT"
+# Build a READY overlay image store on the seed — the untar + sha256 happens ONCE here on the
+# build host, never on the client. The appliance mounts this as a read-only additional image
+# store (storage.conf.d drop-in), so first boot needs zero `podman load`. Refs (e.g.
+# ghcr.io/neural-ice/vllm-node:latest) are preserved so the Quadlets resolve them offline.
+shopt -s nullglob
+archives=("$SEED_IMAGES"/*.tar)
+[ ${#archives[@]} -gt 0 ] || { echo "no *.tar archives in $SEED_IMAGES" >&2; exit 1; }
+for a in "${archives[@]}"; do
+  echo "    + loading $(basename "$a") into the seed overlay store"
+  sudo podman --root /mnt/ni-seed/store --runroot "$RUNROOT" --storage-driver overlay \
+    load -i "$a"
+done
+echo "    seed store images:"
+sudo podman --root /mnt/ni-seed/store --runroot "$RUNROOT" --storage-driver overlay images
 sudo cp -a "$SEED_MODELS/." /mnt/ni-seed/models/
 sudo sync
-echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/images /mnt/ni-seed/models
-sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; trap - EXIT
+echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
+sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; sudo rm -rf "$RUNROOT"; trap - EXIT
 
 echo "==> 5. compress (${COMPRESS})"
 case "$COMPRESS" in

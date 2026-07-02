@@ -14,6 +14,7 @@ on:
       - 'image/**'
       - 'ota/**'
       - 'ignition/**'
+      - 'tui/**'
       - 'ci/build-image.sh'
       - 'VERSION'
       - '.github/workflows/build-image.yml'
@@ -49,6 +50,11 @@ jobs:
       BUILD_ID: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Rust (console TUI build)
+        # ci/build-image.sh compiles the neural-ice-tui dashboard natively (aarch64) and stages
+        # the binary for the Containerfile to COPY. Pin the same toolchain as the TUI CI.
+        uses: dtolnay/rust-toolchain@1.93.0
 
       - name: Stage GB10 artifacts
         # Path on the self-hosted runner holding the prebuilt GB10 artifacts.

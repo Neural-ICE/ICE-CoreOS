@@ -36,3 +36,7 @@ ignition/*.ign
 # Misc
 *.log
 .DS_Store
+
+# Console TUI build products (source tracked under tui/, binary staged like GB10 artifacts)
+tui/target/
+image/tui/neural-ice-tui
