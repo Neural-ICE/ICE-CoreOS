@@ -249,6 +249,33 @@ podman run --rm --privileged --pid=host \
   || die "bootc install to-filesystem failed"
 
 # --------------------------------------------------------------------------- #
+# 5b) PRELOADED seed staging (only if the installer media carries a seed partition).
+#     Copy the image OCI archives + the base HF models onto the (already-formatted,
+#     open) encrypted data volume. First boot's neural-ice-seed-import.service then
+#     imports the images into podman storage → the appliance starts fully offline.
+# --------------------------------------------------------------------------- #
+SEED_PART="/dev/disk/by-partlabel/ni-seed"
+if [ -b "$SEED_PART" ]; then
+  log "PRELOADED: staging seed (images + base models) onto the data volume…"
+  mkdir -p /run/seed-src /run/seed-dst
+  mount -o ro "$SEED_PART" /run/seed-src
+  mount /dev/mapper/data /run/seed-dst
+  if [ -d /run/seed-src/images ]; then
+    mkdir -p /run/seed-dst/seed/images
+    cp -a /run/seed-src/images/. /run/seed-dst/seed/images/
+    log "  images: $(ls /run/seed-dst/seed/images | wc -l) archive(s)"
+  fi
+  if [ -d /run/seed-src/models ]; then
+    mkdir -p /run/seed-dst/huggingface
+    cp -a /run/seed-src/models/. /run/seed-dst/huggingface/
+    log "  models: staged into data/huggingface"
+  fi
+  sync
+  umount /run/seed-dst; umount /run/seed-src
+  log "PRELOADED: seed staged."
+fi
+
+# --------------------------------------------------------------------------- #
 # 6) DATA volume config is NOT written post-install (an ostree deployment's /etc
 #    is read-only right after bootc finalizes it). Unlock is image-baked
 #    (/etc/crypttab by GPT label) and the mount is a systemd.mount-extra karg

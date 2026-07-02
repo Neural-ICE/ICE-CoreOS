@@ -128,15 +128,20 @@ COPY image/signed-boot/ /
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
 COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
+# First-boot seed import (PRELOADED edition): load the OCI archives the installer staged on
+# the data volume into podman storage, so the appliance starts offline. No-op for LIGHT.
+COPY image/firstboot/neural-ice-seed-import.sh      /usr/local/bin/neural-ice-seed-import.sh
+COPY image/firstboot/neural-ice-seed-import.service /usr/lib/systemd/system/neural-ice-seed-import.service
 
 # Headless appliance: target multi-user (no GUI). Otherwise graphical.target
 # reserves tty1 for a non-existent display manager and the console login lands
 # on tty2 (HDMI looks blank). multi-user => getty on tty1, visible console.
 RUN set -euxo pipefail; \
-    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh; \
+    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-seed-import.sh; \
     systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
+                     neural-ice-seed-import.service \
                      bootc-fetch-apply-updates.timer; \
     systemctl set-default multi-user.target
 
