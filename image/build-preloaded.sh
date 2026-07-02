@@ -34,10 +34,30 @@ BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
 RAW="${REPO_ROOT}/${OUT}.img"
 [ -f "$RAW" ] || { echo "base raw not produced ($RAW)" >&2; exit 1; }
 
-echo "==> 2. grow the raw to fit the seed"
-SEED_BYTES="$(du -sbc "$SEED_IMAGES" "$SEED_MODELS" | tail -1 | cut -f1)"
-GROW=$(( SEED_BYTES + SEED_BYTES/20 + 3*1024*1024*1024 ))   # seed + 5% + 3 GiB headroom
-echo "    seed ≈ $((SEED_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
+echo "==> 2. build the READY overlay image store (ONCE, here) + size the seed"
+# The untar + sha256 of the images happens once here on the build host — never on the client.
+# Build to a TEMP store first so we can measure its REAL (extracted) size: a loaded overlay store
+# is much bigger than the *.tar archives (e.g. vllm-node ≈ 19 GB extracted vs a few GB packed), so
+# the ni-seed partition MUST be sized from the store, not the archives. Refs (e.g.
+# ghcr.io/neural-ice/vllm-node:latest) are preserved so the Quadlets resolve them offline.
+STORE_TMP="$(mktemp -d /var/tmp/ni-seed-store.XXXXXX)"
+RUNROOT="$(mktemp -d /run/ni-seed-runroot.XXXXXX)"
+storecleanup(){ sudo rm -rf "$STORE_TMP" "$RUNROOT" 2>/dev/null||true; }
+trap storecleanup EXIT
+shopt -s nullglob
+archives=("$SEED_IMAGES"/*.tar)
+[ ${#archives[@]} -gt 0 ] || { echo "no *.tar archives in $SEED_IMAGES" >&2; exit 1; }
+for a in "${archives[@]}"; do
+  echo "    + loading $(basename "$a") into the overlay store"
+  sudo podman --root "$STORE_TMP" --runroot "$RUNROOT" --storage-driver overlay load -i "$a"
+done
+echo "    store images:"
+sudo podman --root "$STORE_TMP" --runroot "$RUNROOT" --storage-driver overlay images
+STORE_BYTES="$(sudo du -sb "$STORE_TMP" | cut -f1)"
+MODELS_BYTES="$(du -sb "$SEED_MODELS" | cut -f1)"
+SEED_BYTES=$(( STORE_BYTES + MODELS_BYTES ))
+GROW=$(( SEED_BYTES + SEED_BYTES/10 + 4*1024*1024*1024 ))   # store+models + 10% + 4 GiB headroom
+echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
 truncate -s "+${GROW}" "$RAW"
 
 echo "==> 3. relocate GPT backup header + append the ni-seed partition"
@@ -47,29 +67,16 @@ SEEDNUM="$(sudo sgdisk -p "$RAW" | awk '/ni-seed/{n=$1} END{print n}')"
 [ -n "$SEEDNUM" ] || { echo "ni-seed partition not created" >&2; exit 1; }
 echo "    ni-seed = partition #${SEEDNUM}"
 
-echo "==> 4. mkfs + build the seed into ni-seed"
-RUNROOT="/run/ni-seed-runroot"
+echo "==> 4. mkfs + copy the store + models into ni-seed"
 LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
-cleanup(){ sudo umount /mnt/ni-seed 2>/dev/null||true; sudo losetup -d "$LOOP" 2>/dev/null||true; sudo rm -rf "$RUNROOT" 2>/dev/null||true; }
+cleanup(){ sudo umount /mnt/ni-seed 2>/dev/null||true; sudo losetup -d "$LOOP" 2>/dev/null||true; storecleanup; }
 trap cleanup EXIT
 SEEDPART="${LOOP}p${SEEDNUM}"
 sudo mkfs.xfs -q -L ni-seed "$SEEDPART"
 sudo mkdir -p /mnt/ni-seed; sudo mount "$SEEDPART" /mnt/ni-seed
-sudo mkdir -p /mnt/ni-seed/store /mnt/ni-seed/models "$RUNROOT"
-# Build a READY overlay image store on the seed — the untar + sha256 happens ONCE here on the
-# build host, never on the client. The appliance mounts this as a read-only additional image
-# store (storage.conf.d drop-in), so first boot needs zero `podman load`. Refs (e.g.
-# ghcr.io/neural-ice/vllm-node:latest) are preserved so the Quadlets resolve them offline.
-shopt -s nullglob
-archives=("$SEED_IMAGES"/*.tar)
-[ ${#archives[@]} -gt 0 ] || { echo "no *.tar archives in $SEED_IMAGES" >&2; exit 1; }
-for a in "${archives[@]}"; do
-  echo "    + loading $(basename "$a") into the seed overlay store"
-  sudo podman --root /mnt/ni-seed/store --runroot "$RUNROOT" --storage-driver overlay \
-    load -i "$a"
-done
-echo "    seed store images:"
-sudo podman --root /mnt/ni-seed/store --runroot "$RUNROOT" --storage-driver overlay images
+sudo mkdir -p /mnt/ni-seed/store /mnt/ni-seed/models
+# cp -a preserves the overlay store faithfully (hardlinks + trusted.* xattrs, hence sudo).
+sudo cp -a "$STORE_TMP/." /mnt/ni-seed/store/
 sudo cp -a "$SEED_MODELS/." /mnt/ni-seed/models/
 sudo sync
 echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
