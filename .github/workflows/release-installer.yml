@@ -21,6 +21,11 @@ on:
         type: choice
         options: [prod, debug]
         default: prod
+      compress:
+        description: 'Compression (zstd-fast = dev, zstd-max/xz = release)'
+        type: choice
+        options: [zstd-fast, zstd-max, xz]
+        default: zstd-max
       release_tag:
         description: 'Release tag to create/update (e.g. v0.1.0). Blank = installer-<channel>-<run>.'
         default: ''
@@ -48,6 +53,7 @@ jobs:
         id: build
         env:
           VARIANT: ${{ github.event.inputs.variant || 'prod' }}
+          COMPRESS: ${{ github.event.inputs.compress || 'zstd-max' }}
         run: |
           SUFFIX=""; [ "$VARIANT" = "debug" ] && SUFFIX="-debug"
           BASE_IMAGE="${REGISTRY}/${IMAGE}:${CHANNEL}${SUFFIX}"
@@ -57,9 +63,16 @@ jobs:
           BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
           RAW="$(ls -1 *.img 2>/dev/null | head -1 || true)"
           [ -n "$RAW" ] || RAW="$(find . -name 'disk.raw' | head -1)"
-          xz -T0 -9 -c "$RAW" > "${OUT}.img.xz"
-          sha256sum "${OUT}.img.xz" > "${OUT}.img.xz.sha256"
+          # COMPRESS lever (speed vs size): zstd-fast (dev) | zstd-max (release) | xz (legacy).
+          case "${COMPRESS:-zstd-fast}" in
+            zstd-fast) zstd -3 -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
+            zstd-max)  zstd -19 --long -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
+            xz)        xz -T0 -9 -c "$RAW" > "${OUT}.img.xz"; ART="${OUT}.img.xz" ;;
+            *) echo "invalid COMPRESS"; exit 2 ;;
+          esac
+          sha256sum "${ART}" > "${ART}.sha256"
           echo "out=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "art=${ART}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
@@ -70,13 +83,13 @@ jobs:
           body: |
             Flashable USB installer for **ICE-CoreOS** (`${{ env.CHANNEL }}` channel).
 
-            Flash with:
+            Flash with (zstd artifact: `zstd -dc … | sudo dd …`; xz artifact: `xz -dc …`):
             ```
-            xz -dc ice-coreos-installer-*.img.xz | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress
+            zstd -dc ice-coreos-installer-*.img.zst | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress
             ```
             Boot the USB on a DGX Spark and pick **Install**. To get SSH access,
             drop your public key on the USB before flashing-back, or pass a
             `neuralice.sshkey=` karg — see the README.
           files: |
-            ${{ steps.build.outputs.out }}.img.xz
-            ${{ steps.build.outputs.out }}.img.xz.sha256
+            ${{ steps.build.outputs.art }}
+            ${{ steps.build.outputs.art }}.sha256
