@@ -17,6 +17,14 @@ FROM quay.io/centos-bootc/centos-bootc:stream10
 
 ARG NVIDIA_DRIVER_VERSION=595.58.03
 
+# Appliance variant (A4): controls the security/console posture, NOT the release
+# channel (that's the image tag). Default = prod (secure, sealed).
+#   prod  : sshd MASKED (sealed appliance, ADR-0003), kargs=["quiet"], SELinux enforcing.
+#   debug : sshd enabled (core key), serial console (ttyAMA0) + tty1, verbose boot,
+#           SELinux permissive (enforcing=0) — for lab/field troubleshooting only.
+# Build both: --build-arg VARIANT=prod  ->  :prod ; --build-arg VARIANT=debug -> :debug
+ARG VARIANT=prod
+
 # --------------------------------------------------------------------------- #
 # 1) Swap the stock el10 kernel -> GB10 `nvidia-gb10` kernel, STANDARD 4k flavor
 #    (identical 6.12.0-*.el10 lineage => clean swap). The stock kernel lacks GB10
@@ -65,8 +73,11 @@ RUN set -euxo pipefail; \
     ldconfig -p | grep -E 'libcuda|libnvidia-ml'
 
 # --------------------------------------------------------------------------- #
-# 2) OTA tooling + /etc overlay (CX-7 network, config, injector)
+# 2) Base tooling + /etc overlay (CX-7 network)
 # --------------------------------------------------------------------------- #
+# jq: first-boot/CDI helpers. (mDNS/`_neuralice._tcp` service advertisement is an
+# APPLICATION concern — it lives in the private app layer ICE-AC1 as a Quadlet, not
+# in this community OS image, which stays free of product-service config.)
 RUN dnf -y install jq && dnf clean all
 
 # nvidia-container-toolkit (CDI): GPU access inside Podman containers.
@@ -123,9 +134,16 @@ COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system
 # on tty2 (HDMI looks blank). multi-user => getty on tty1, visible console.
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh; \
+    systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
-                     neural-ice-firstboot-sshkey.service; \
+                     neural-ice-firstboot-sshkey.service \
+                     bootc-fetch-apply-updates.timer; \
     systemctl set-default multi-user.target
+
+# Unattended OS OTA (ADR-0003): native `bootc upgrade` on a timer, from the public
+# GHCR image (no license gate on the OS, no custom wrapper, no Zincati). The timer is
+# shipped-but-masked in the base — we unmask+enable it above. Reboot policy can later be
+# constrained to a maintenance window via a bootc-fetch-apply-updates.service drop-in.
 
 # Client DATA volume (2nd LUKS domain) auto-unlock — config-in-image (bootc way),
 # not post-install /etc surgery. crypttab references the partition by its stable
@@ -149,7 +167,14 @@ RUN set -euxo pipefail; \
 RUN set -euxo pipefail; \
     sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
     install -d -m 0755 /usr/lib/bootc/kargs.d; \
-    printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml
+    if [ "${VARIANT}" = "debug" ]; then \
+        printf 'kargs = ["console=tty1", "console=ttyAMA0,115200", "enforcing=0"]\n' \
+            > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
+        sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS (debug)"/' /usr/lib/os-release; \
+    else \
+        printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
+        systemctl mask sshd.service; \
+    fi
 
 # --------------------------------------------------------------------------- #
 # 4) bootc hygiene: /var must stay empty (runtime state, not image)

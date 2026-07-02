@@ -1,17 +1,26 @@
-# Neural ICE CoreOS — Deliverable 3
-# Initial Standalone configuration (Butane -> Ignition).
+# Neural ICE CoreOS — first-boot provisioning (Butane -> Ignition)
 #
 # Generation:
 #   butane --pretty --strict ignition/neural-ice.bu > ignition/neural-ice.ign
 #
-# Scope: machine-specific config (ConnectX-7 network, secrets/PKI, license,
-# service activation). The OS binary (kernel, driver, OTA scripts) comes from
-# the GHCR image; Ignition does NO business logic.
+# SCOPE — this file is the UNIQUE PERSONALITY of one deployed appliance, applied
+# ONCE at first boot to the immutable OS. Machine-specific only, NO business logic:
+#   - hostname (the machine's network identity; the app-layer mDNS advertiser uses it)
+#   - ConnectX-7 network (per-site static IPs)
+#   - appliance PKI material (CA pinning + state dirs)
+#   - admin access (LAB only; prod masks sshd)
+#
+# NOT here (moved out, ADR-0003): OS OTA is native `bootc upgrade` on a timer baked
+# into the image (`bootc-fetch-apply-updates.timer`); the NVIDIA driver is baked into
+# the image (no injector); licensing/gating AND the product-service mDNS advertisement
+# (`_neuralice._tcp`) live in the private app layer (ICE-AC1). The OS binary (kernel,
+# driver) comes entirely from the GHCR image.
 variant: fcos
 version: 1.5.0
 
 # --------------------------------------------------------------------------- #
-# Administrator access
+# Administrator access — LAB ONLY. In prod, sshd is masked (sealed appliance,
+# management via the Tauri thin client over mTLS); omit this block for prod .ign.
 # --------------------------------------------------------------------------- #
 passwd:
   users:
@@ -20,16 +29,9 @@ passwd:
         - sudo
         - wheel
       ssh_authorized_keys:
-        # REPLACE with your own public key(s) before provisioning. The public
-        # base image bakes no key; this is where you (or `butane`) inject yours.
+        # REPLACE with your own public key(s) before provisioning. The public base
+        # image bakes no key; this is where you (or `butane`) inject yours.
         - ssh-ed25519 AAAA...REPLACE_WITH_YOUR_PUBLIC_KEY... you@example.com
-
-# --------------------------------------------------------------------------- #
-# Container-native deployment origin (rebase to GHCR on first boot)
-# --------------------------------------------------------------------------- #
-# Note: the initial pull requires GHCR auth. During provisioning, either the image
-# is already installed via coreos-installer (--image-pull), or the first OTA cycle
-# (neural-ice-update.service) performs the rebase once the license is in place.
 
 storage:
   directories:
@@ -39,29 +41,20 @@ storage:
       mode: 0700
 
   files:
-    # ----- OTA wrapper / injector configuration (machine-specific) -----
-    - path: /etc/neural-ice/update.conf
+    # ----- Per-appliance identity: hostname -----
+    # The machine's network identity. The app-layer mDNS advertiser (ICE-AC1)
+    # publishes `_neuralice._tcp` :443 against this host, so the Tauri client
+    # discovers `neuralice-<id>.local`. Make <id> unique per appliance
+    # (e.g. a short serial/machine-id fragment).
+    - path: /etc/hostname
       mode: 0644
+      overwrite: true
       contents:
         inline: |
-          GHCR_IMAGE="ghcr.io/neural-ice/neural-ice-coreos:latest"
-          GHCR_USER="neural-ice"
-          KEYGEN_API="https://api.keygen.sh/v1"
-          KEYGEN_ACCOUNT_ID="REPLACE_WITH_KEYGEN_ACCOUNT_UUID"
-          LICENCE_FILE="/var/lib/neural-ice/licence.json"
-          APPLIANCE_URL="https://appliance.neural-ice.local"
-          MTLS_CERT="/etc/neural-ice/pki/client.crt"
-          MTLS_KEY="/etc/neural-ice/pki/client.key"
-          MTLS_CA="/etc/neural-ice/pki/ca.crt"
-          AUTO_REBOOT="false"
-          OFFLINE_GRACE_HOURS="168"
-          VERIFY_SIGNATURE="false"
-          NVIDIA_DRIVER_VERSION="595.58.03"
-          DRIVER_IMAGE_REPO="ghcr.io/neural-ice/nvidia-driver-r595"
-          DRIVER_IMAGE_DIGEST=""
+          neuralice-REPLACE_WITH_UNIQUE_ID
 
-    # ----- mTLS: appliance CA (pinning). The client cert/key are injected
-    #       out-of-image (secure provisioning / Tauri onboarding), not here. -----
+    # ----- Appliance PKI: pin the appliance CA (if pre-provisioned). The client
+    #       cert/key are issued at onboarding (Tauri enrollment), never injected here.
     - path: /etc/neural-ice/pki/ca.crt
       mode: 0644
       contents:
@@ -118,101 +111,11 @@ storage:
           [ipv6]
           method=disabled
 
-    # ----- Explicit loading of the ConnectX-7 module (in case it isn't auto) -----
-    - path: /etc/modules-load.d/mlx5.conf
-      mode: 0644
-      contents:
-        inline: |
-          mlx5_core
-
-    # ----- Embedded OTA plumbing (consistency if deployed on a stock FCOS base) -----
-    # Referenced via `local:` (butane --files-dir = repo root).
-    - path: /usr/local/bin/neural-ice-update.sh
-      mode: 0755
-      contents:
-        local: ota/neural-ice-update.sh
-    - path: /usr/local/bin/nvidia-driver-injector.sh
-      mode: 0755
-      contents:
-        local: ota/nvidia-driver-injector.sh
-
 # --------------------------------------------------------------------------- #
-# Services systemd
+# Services — single OTA path: keep Zincati masked (defense in depth; the OS uses
+# native bootc, and Zincati would imply centralized fleet coordination = telemetry).
 # --------------------------------------------------------------------------- #
 systemd:
   units:
-    # ----- NVIDIA r595 driver injector (privileged container at boot) -----
-    - name: nvidia-driver-injector.service
-      enabled: true
-      contents: |
-        [Unit]
-        Description=Neural ICE — dynamic injection of the NVIDIA r595 driver
-        Documentation=https://github.com/neural-ice/neural-ice-coreos
-        # Must precede any GPU workload (inference containers).
-        After=network-online.target
-        Wants=network-online.target
-        Before=neural-ice-update.service
-        ConditionPathExists=/usr/local/bin/nvidia-driver-injector.sh
-
-        [Service]
-        Type=oneshot
-        RemainAfterExit=true
-        # The helper launches the privileged container and loads the modules on the host.
-        ExecStart=/usr/local/bin/nvidia-driver-injector.sh
-        # Reload on transient failure (driver image not yet pulled, etc.).
-        Restart=on-failure
-        RestartSec=30
-        StartLimitIntervalSec=600
-        StartLimitBurst=5
-        TimeoutStartSec=600
-
-        [Install]
-        WantedBy=multi-user.target
-
-    # ----- Gated OTA service (embedded content for consistency on a stock base) -----
-    - name: neural-ice-update.service
-      enabled: false
-      contents: |
-        [Unit]
-        Description=Neural ICE — gated OTA update (license + GHCR)
-        Wants=network-online.target
-        After=network-online.target
-        ConditionPathExists=/etc/neural-ice/update.conf
-
-        [Service]
-        Type=oneshot
-        ExecStart=/usr/local/bin/neural-ice-update.sh
-        NoNewPrivileges=true
-        ProtectHome=true
-        PrivateTmp=true
-        RuntimeDirectory=ostree
-        RuntimeDirectoryMode=0700
-        RuntimeDirectoryPreserve=no
-        Restart=on-failure
-        RestartSec=300
-        SyslogIdentifier=neural-ice-update
-
-        [Install]
-        WantedBy=multi-user.target
-
-    # ----- Activation of the gated OTA cycle (8 h trigger) -----
-    - name: neural-ice-update.timer
-      enabled: true
-      contents: |
-        [Unit]
-        Description=Neural ICE — OTA trigger (8 h cycle)
-
-        [Timer]
-        OnCalendar=*-*-* 00/8:00:00
-        RandomizedDelaySec=1800
-        Persistent=true
-        OnBootSec=10min
-        Unit=neural-ice-update.service
-
-        [Install]
-        WantedBy=timers.target
-
-    # ----- Single update path: Zincati masked (defense in depth,
-    #       already masked in the image) -----
     - name: zincati.service
       mask: true

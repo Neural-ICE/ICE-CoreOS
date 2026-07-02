@@ -7,6 +7,8 @@
 #   REGISTRY            registry/namespace      (default ghcr.io/neural-ice)
 #   IMAGE               package name            (default neural-ice-coreos)
 #   CHANNEL             alpha | beta | prod      (default alpha)
+#   VARIANT             prod | debug             (default prod; debug => -debug tags,
+#                                                 sshd on, serial console, permissive)
 #   BUILD_ID            build counter suffix     (e.g. CI run number; optional)
 #   SSH_AUTHORIZED_KEY  bake an admin key        (empty => VANILLA, no key)
 #   PUSH                "1" to push after build  (default 0)
@@ -24,14 +26,16 @@ cd "$REPO_ROOT"
 REGISTRY="${REGISTRY:-ghcr.io/neural-ice}"
 IMAGE="${IMAGE:-neural-ice-coreos}"
 CHANNEL="${CHANNEL:-alpha}"
+VARIANT="${VARIANT:-prod}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 SSH_AUTHORIZED_KEY="${SSH_AUTHORIZED_KEY:-}"
 PUSH="${PUSH:-0}"
 
 case "$CHANNEL" in alpha|beta|prod) ;; *) echo "ERROR: invalid CHANNEL '$CHANNEL' (alpha|beta|prod)" >&2; exit 2 ;; esac
+case "$VARIANT" in prod) SUFFIX="" ;; debug) SUFFIX="-debug" ;; *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|debug)" >&2; exit 2 ;; esac
 
 VERSION="$(tr -d '[:space:]' < VERSION)"
-SEMVER="${VERSION}-${CHANNEL}${BUILD_ID:+.${BUILD_ID}}"
+SEMVER="${VERSION}-${CHANNEL}${BUILD_ID:+.${BUILD_ID}}${SUFFIX}"
 REF="${REGISTRY}/${IMAGE}"
 
 # Fail early with a clear message if the heavy artifacts are not staged.
@@ -48,22 +52,23 @@ done
 # PODMAN_SUDO=1 (CI); rootless otherwise (local dev).
 if [ "${PODMAN_SUDO:-0}" = "1" ]; then PODMAN=(sudo podman); else PODMAN=(podman); fi
 
-echo "==> Building ${REF}:${SEMVER}  (channel ${REF}:${CHANNEL})  key=$([ -n "$SSH_AUTHORIZED_KEY" ] && echo baked || echo vanilla)"
+echo "==> Building ${REF}:${SEMVER}  (channel ${REF}:${CHANNEL}${SUFFIX})  variant=${VARIANT}  key=$([ -n "$SSH_AUTHORIZED_KEY" ] && echo baked || echo vanilla)"
 "${PODMAN[@]}" build \
   --platform "$PLATFORM" \
   --build-arg "SSH_AUTHORIZED_KEY=${SSH_AUTHORIZED_KEY}" \
+  --build-arg "VARIANT=${VARIANT}" \
   -f image/Containerfile.bootc \
   -t "${REF}:${SEMVER}" \
-  -t "${REF}:${CHANNEL}" \
+  -t "${REF}:${CHANNEL}${SUFFIX}" \
   .
 
 echo "SEMVER=${SEMVER}"
 echo "REF=${REF}"
 
 if [ "$PUSH" = "1" ]; then
-  echo "==> Pushing ${REF}:${SEMVER} and ${REF}:${CHANNEL}"
+  echo "==> Pushing ${REF}:${SEMVER} and ${REF}:${CHANNEL}${SUFFIX}"
   "${PODMAN[@]}" push "${REF}:${SEMVER}"
-  "${PODMAN[@]}" push "${REF}:${CHANNEL}"
+  "${PODMAN[@]}" push "${REF}:${CHANNEL}${SUFFIX}"
   DIGEST="$("${PODMAN[@]}" image inspect "${REF}:${SEMVER}" --format '{{.Digest}}' 2>/dev/null || true)"
   echo "DIGEST=${DIGEST}"
 fi
