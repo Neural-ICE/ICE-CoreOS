@@ -131,6 +131,11 @@ COPY image/signed-boot/ /
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
 COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
+# Generic installer-payload apply (one-shot): the PRELOADED installer may stage a
+# payload/ dir on the data volume; this runs its apply.sh once on first boot. The
+# payload CONTENT is product-side (ICE-Fabric) — the OS ships only the mechanism.
+COPY image/payload/neural-ice-payload-apply.sh      /usr/local/bin/neural-ice-payload-apply.sh
+COPY image/payload/neural-ice-payload-apply.service /usr/lib/systemd/system/neural-ice-payload-apply.service
 # Appliance console dashboard (TUI). PRODUCT code — built in ICE-AC1 (tui-rust/) and staged
 # pre-built at image/tui/neural-ice-tui (gitignored, like the other GB10 artifacts); this
 # vanilla OS repo carries no product source. ci/build-image.sh fails early if it is missing.
@@ -175,12 +180,14 @@ RUN set -euxo pipefail; \
 # HDMI console shows the appliance status dashboard instead of a login prompt.
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-tui \
-               /usr/local/bin/neural-ice-hostname-init.sh; \
+               /usr/local/bin/neural-ice-hostname-init.sh \
+               /usr/local/bin/neural-ice-payload-apply.sh; \
     systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
                      neural-ice-tui.service \
                      neural-ice-hostname-init.service \
+                     neural-ice-payload-apply.service \
                      avahi-daemon.service \
                      bootc-fetch-apply-updates.timer; \
     systemctl mask getty@tty1.service; \

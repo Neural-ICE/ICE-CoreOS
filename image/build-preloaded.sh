@@ -22,12 +22,17 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
 
 SEED_IMAGES="${SEED_IMAGES:-/home/user/ice-seed/images}"
 SEED_MODELS="${SEED_MODELS:-/data/models/Neural-ICE_cache_models/local/model-assets/huggingface/hub}"
+# Optional product payload dir (e.g. ICE-Fabric scripts/build-seed-payload.sh output):
+# staged onto the data volume by the autoinstall, applied once on first boot by the
+# image's generic neural-ice-payload-apply.service. KB-sized — headroom covers it.
+SEED_PAYLOAD="${SEED_PAYLOAD:-}"
 BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:alpha-debug}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
 
 [ -d "$SEED_IMAGES" ] || { echo "missing SEED_IMAGES $SEED_IMAGES" >&2; exit 1; }
 [ -d "$SEED_MODELS" ] || { echo "missing SEED_MODELS $SEED_MODELS" >&2; exit 1; }
+[ -z "$SEED_PAYLOAD" ] || [ -x "$SEED_PAYLOAD/apply.sh" ] || { echo "SEED_PAYLOAD set but $SEED_PAYLOAD/apply.sh missing/not executable" >&2; exit 1; }
 
 echo "==> 1. build the base installer raw FROM ${BASE_IMAGE}  (uncompressed)"
 # OUT means "output NAME" here but "bib output DIR" in build-installer-usb.sh —
@@ -83,6 +88,11 @@ sudo mkdir -p /mnt/ni-seed/store /mnt/ni-seed/models
 # cp -a preserves the overlay store faithfully (hardlinks + trusted.* xattrs, hence sudo).
 sudo cp -a "$STORE_TMP/." /mnt/ni-seed/store/
 sudo cp -a "$SEED_MODELS/." /mnt/ni-seed/models/
+if [ -n "$SEED_PAYLOAD" ]; then
+  sudo mkdir -p /mnt/ni-seed/payload
+  sudo cp -a "$SEED_PAYLOAD/." /mnt/ni-seed/payload/
+  echo "    payload: $(basename "$SEED_PAYLOAD") ($(sudo du -sh /mnt/ni-seed/payload | cut -f1))"
+fi
 sudo sync
 echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
 sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; storecleanup; trap - EXIT
