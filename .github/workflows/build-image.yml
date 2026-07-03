@@ -14,7 +14,6 @@ on:
       - 'image/**'
       - 'ota/**'
       - 'ignition/**'
-      - 'tui/**'
       - 'ci/build-image.sh'
       - 'VERSION'
       - '.github/workflows/build-image.yml'
@@ -51,14 +50,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust (console TUI build)
-        # ci/build-image.sh compiles the neural-ice-tui dashboard natively (aarch64) and stages
-        # the binary for the Containerfile to COPY. Pin the same toolchain as the TUI CI.
-        uses: dtolnay/rust-toolchain@1.93.0
-
-      - name: Stage GB10 artifacts
+      - name: Stage GB10 artifacts + console TUI binary
         # Path on the self-hosted runner holding the prebuilt GB10 artifacts.
         # Set the repo/org variable ARTIFACTS_DIR; falls back to a neutral default.
+        # The console TUI is PRODUCT code: its source lives in ICE-AC1 (tui-rust/);
+        # this vanilla OS repo only consumes the pre-built ARM64 binary, staged on
+        # the runner next to the GB10 artifacts (refresh it from an ICE-AC1
+        # checkout: `make -C tui-rust stage COREOS_DIR=...` then copy to the runner).
         env:
           ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
         run: |
@@ -68,7 +66,11 @@ jobs:
             fi
             rm -rf "image/$d"; cp -a "$ARTIFACTS_DIR/$d" "image/$d"
           done
-          echo "Staged GB10 artifacts from $ARTIFACTS_DIR"
+          if [ ! -f "$ARTIFACTS_DIR/tui/neural-ice-tui" ]; then
+            echo "::error::missing $ARTIFACTS_DIR/tui/neural-ice-tui on the runner (build in ICE-AC1: make -C tui-rust stage)"; exit 1
+          fi
+          install -Dm0755 "$ARTIFACTS_DIR/tui/neural-ice-tui" image/tui/neural-ice-tui
+          echo "Staged GB10 artifacts + console TUI from $ARTIFACTS_DIR"
 
       - name: Log in to GHCR
         run: |

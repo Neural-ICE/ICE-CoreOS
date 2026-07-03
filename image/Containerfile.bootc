@@ -131,8 +131,9 @@ COPY image/signed-boot/ /
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
 COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
-# Appliance console dashboard (TUI). The binary is pre-built ARM64 on the runner and staged at
-# image/tui/neural-ice-tui by ci/build-image.sh (gitignored, like the other GB10 artifacts).
+# Appliance console dashboard (TUI). PRODUCT code — built in ICE-AC1 (tui-rust/) and staged
+# pre-built at image/tui/neural-ice-tui (gitignored, like the other GB10 artifacts); this
+# vanilla OS repo carries no product source. ci/build-image.sh fails early if it is missing.
 # The TUI owns tty1 in ALL variants; getty@tty1 is masked below (console = dashboard, not a login).
 COPY image/tui/neural-ice-tui         /usr/local/bin/neural-ice-tui
 COPY image/tui/neural-ice-tui.service /usr/lib/systemd/system/neural-ice-tui.service
