@@ -75,10 +75,13 @@ RUN set -euxo pipefail; \
 # --------------------------------------------------------------------------- #
 # 2) Base tooling + /etc overlay (CX-7 network)
 # --------------------------------------------------------------------------- #
-# jq: first-boot/CDI helpers. (mDNS/`_neuralice._tcp` service advertisement is an
-# APPLICATION concern — it lives in the private app layer ICE-AC1 as a Quadlet, not
-# in this community OS image, which stays free of product-service config.)
-RUN dnf -y install jq && dnf clean all
+# jq: first-boot/CDI helpers.
+# avahi + avahi-tools: mDNS responder that publishes this host's <hostname>.local
+# (the hostname is derived from the management NIC MAC by neural-ice-hostname-init).
+# This is HOST publication only — the `_neuralice._tcp` SERVICE advertisement is an
+# APPLICATION concern that lives in the private app layer ICE-AC1 as a Quadlet, not
+# in this community OS image, which stays free of product-service config.
+RUN dnf -y install jq avahi avahi-tools && dnf clean all
 
 # nvidia-container-toolkit (CDI): GPU access inside Podman containers.
 # The CDI spec is generated AT BOOT (on the hardware) by nvidia-cdi-generate.service.
@@ -133,6 +136,9 @@ COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system
 # The TUI owns tty1 in ALL variants; getty@tty1 is masked below (console = dashboard, not a login).
 COPY image/tui/neural-ice-tui         /usr/local/bin/neural-ice-tui
 COPY image/tui/neural-ice-tui.service /usr/lib/systemd/system/neural-ice-tui.service
+# Deterministic hostname/mDNS name from the management NIC MAC (ni-coreos-<mac4>).
+# The unit ships in the /etc overlay; avahi (installed above) publishes the name.
+COPY image/mdns/neural-ice-hostname-init.sh /usr/local/bin/neural-ice-hostname-init.sh
 # PRELOADED edition: the installer stages a ready-built podman overlay store onto the encrypted
 # data volume; we register it as a READ-ONLY additional image store so the appliance's images are
 # visible INSTANTLY at first boot — no `podman load`, no CPU re-hash/untar of ~20 GB.
@@ -167,11 +173,14 @@ RUN set -euxo pipefail; \
 # a non-existent display manager. tty1 is owned by the TUI dashboard (getty@tty1 masked), so the
 # HDMI console shows the appliance status dashboard instead of a login prompt.
 RUN set -euxo pipefail; \
-    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-tui; \
+    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-tui \
+               /usr/local/bin/neural-ice-hostname-init.sh; \
     systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
                      neural-ice-tui.service \
+                     neural-ice-hostname-init.service \
+                     avahi-daemon.service \
                      bootc-fetch-apply-updates.timer; \
     systemctl mask getty@tty1.service; \
     systemctl set-default multi-user.target
