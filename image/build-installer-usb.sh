@@ -30,8 +30,16 @@ BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest}"
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 
 # Build the dual-mode installer image FROM the chosen channel base.
+# LOCAL-FIRST (lesson 2026-07-04): a freshly built local tag MUST NOT be clobbered
+# by a stale registry pull — the parity flash installed an old GHCR alpha-debug
+# because the unconditional pull replaced the just-built local image. Refresh
+# explicitly (podman pull) when a newer remote is wanted.
 echo "==> build installer image  FROM ${BASE_IMAGE}"
-sudo podman pull "$BASE_IMAGE" 2>/dev/null || echo "    (using local ${BASE_IMAGE})"
+if sudo podman image exists "$BASE_IMAGE"; then
+  echo "    (using LOCAL ${BASE_IMAGE} — pull explicitly to refresh from the registry)"
+else
+  sudo podman pull "$BASE_IMAGE"
+fi
 sudo podman build --platform linux/arm64 \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
