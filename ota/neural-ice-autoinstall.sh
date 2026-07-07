@@ -329,6 +329,14 @@ if [ -b "$SEED_PART" ]; then
     cp -a /run/seed-src/models/. /run/seed-dst/huggingface/
     log "  models: staged into data/huggingface"
   fi
+  if [ -d /run/seed-src/payload ]; then
+    # Product payload (e.g. the ICE-AC1 appliance layer). Applied ONCE on first
+    # boot by the image's generic neural-ice-payload-apply.service — the target
+    # /etc is read-only here (§6), so the installer only STAGES it on data.
+    mkdir -p /run/seed-dst/payload
+    cp -a /run/seed-src/payload/. /run/seed-dst/payload/
+    log "  payload: staged (applied on first boot by neural-ice-payload-apply)"
+  fi
   sync
   umount /run/seed-dst; umount /run/seed-src
   log "PRELOADED: seed staged."
