@@ -1,0 +1,24 @@
+# ICE-CoreOS — vLLM (GPU) OpenAI-compatible server as a Podman Quadlet.
+# Set the model via the MODEL env / Exec line. GPU via the CDI spec generated
+# at boot. Copy to /etc/containers/systemd/ then daemon-reload + start vllm.
+
+[Unit]
+Description=vLLM OpenAI-compatible server (GPU) on ICE-CoreOS
+After=nvidia-cdi-generate.service network-online.target
+Wants=nvidia-cdi-generate.service
+
+[Container]
+Image=docker.io/vllm/vllm-openai:latest
+AddDevice=nvidia.com/gpu=all
+PublishPort=8000:8000
+Volume=hf-cache.volume:/root/.cache/huggingface
+Environment=HF_HOME=/root/.cache/huggingface
+# Pick a model that fits GB10 memory; pass HF token via a secret if gated.
+Exec=--model meta-llama/Llama-3.2-3B-Instruct --host 0.0.0.0 --port 8000
+
+[Service]
+Restart=always
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

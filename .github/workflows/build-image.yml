@@ -1,0 +1,100 @@
+name: build-image
+
+# Build the ICE-CoreOS bootc OS image and publish it to GHCR.
+# Default channel is "alpha": every push to main produces a fresh alpha build
+# (moving :alpha tag + an immutable :<version>-alpha.<run> tag).
+# Runs on a SELF-HOSTED ARM64 runner because the build needs the staged GB10
+# artifacts (GB10 kernel (4k) RPMs, signed NVIDIA modules, signed boot binaries) and
+# native aarch64. See README "CI runner".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'image/**'
+      - 'ota/**'
+      - 'ignition/**'
+      - 'ci/build-image.sh'
+      - 'VERSION'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel to publish'
+        default: alpha
+        type: choice
+        options: [alpha, beta, prod]
+      variant:
+        description: 'Build variant (prod = sealed; debug = sshd+serial+permissive)'
+        default: prod
+        type: choice
+        options: [prod, debug]
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, ARM64]
+    env:
+      REGISTRY: ghcr.io/neural-ice
+      IMAGE: neural-ice-coreos
+      CHANNEL: ${{ github.event.inputs.channel || 'alpha' }}
+      VARIANT: ${{ github.event.inputs.variant || 'prod' }}
+      BUILD_ID: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage GB10 artifacts + console TUI binary
+        # Path on the self-hosted runner holding the prebuilt GB10 artifacts.
+        # Set the repo/org variable ARTIFACTS_DIR; falls back to a neutral default.
+        # The console TUI is PRODUCT code: its source lives out of this repo;
+        # this vanilla OS repo only consumes the pre-built ARM64 binary, staged on
+        # the runner next to the GB10 artifacts (refresh it from the product
+        # repo: `make -C tui-rust stage COREOS_DIR=...` then copy to the runner).
+        env:
+          ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
+        run: |
+          for d in rpms driver-modules nvidia-userspace signed-boot; do
+            if [ ! -d "$ARTIFACTS_DIR/$d" ]; then
+              echo "::error::missing artifacts dir $ARTIFACTS_DIR/$d on the runner"; exit 1
+            fi
+            rm -rf "image/$d"; cp -a "$ARTIFACTS_DIR/$d" "image/$d"
+          done
+          if [ ! -f "$ARTIFACTS_DIR/tui/neural-ice-tui" ]; then
+            echo "::error::missing $ARTIFACTS_DIR/tui/neural-ice-tui on the runner (build it in the product repo: make -C tui-rust stage)"; exit 1
+          fi
+          install -Dm0755 "$ARTIFACTS_DIR/tui/neural-ice-tui" image/tui/neural-ice-tui
+          echo "Staged GB10 artifacts + console TUI from $ARTIFACTS_DIR"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
+            | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
+        env:
+          PUSH: '1'
+          PODMAN_SUDO: '1'
+          # Operator key baked into DEBUG builds only — prod/alpha default images
+          # stay VANILLA (no key) as documented in image/Containerfile.bootc.
+          SSH_AUTHORIZED_KEY: ${{ (github.event.inputs.variant || 'prod') == 'debug' && secrets.SSH_AUTHORIZED_KEY || '' }}
+        run: ./ci/build-image.sh | tee build.out
+
+      - name: Summary
+        run: |
+          {
+            echo "### ICE-CoreOS image published"
+            echo ""
+            echo '| field | value |'
+            echo '| --- | --- |'
+            echo "| channel | \`$CHANNEL\` |"
+            echo "| version | \`$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)\` |"
+            echo "| ref | \`$(grep -m1 '^REF=' build.out | cut -d= -f2):$CHANNEL\` |"
+            echo "| digest | \`$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

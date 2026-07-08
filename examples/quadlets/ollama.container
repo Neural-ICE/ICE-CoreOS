@@ -1,0 +1,31 @@
+# ICE-CoreOS — Ollama (GPU) as a Podman Quadlet.
+#
+# AI workloads run as CONTAINERS on the immutable OS (that is the whole point):
+# the GPU is exposed via the NVIDIA CDI spec that ICE-CoreOS generates at boot
+# (nvidia-cdi-generate.service). No tools are baked into the base image.
+#
+# Install (as the 'core' user, rootful here for simplicity — see ai-quickstart.md
+# for rootless): copy to /etc/containers/systemd/ then
+#   sudo systemctl daemon-reload && sudo systemctl start ollama
+# Pull a model:
+#   podman exec ollama ollama run llama3.2
+
+[Unit]
+Description=Ollama (GPU) on ICE-CoreOS
+After=nvidia-cdi-generate.service network-online.target
+Wants=nvidia-cdi-generate.service
+
+[Container]
+Image=docker.io/ollama/ollama:latest
+AddDevice=nvidia.com/gpu=all
+PublishPort=11434:11434
+Volume=ollama.volume:/root/.ollama
+# If SELinux blocks GPU device nodes, uncomment:
+# SecurityLabelDisable=true
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

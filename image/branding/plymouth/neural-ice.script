@@ -1,0 +1,56 @@
+// Neural ICE CoreOS — Plymouth boot splash (navy background + logo + cyan bar)
+
+// --- Navy background (brand color) ---
+Window.SetBackgroundTopColor(0.039, 0.055, 0.102);
+Window.SetBackgroundBottomColor(0.020, 0.030, 0.055);
+
+screen_w = Window.GetWidth();
+screen_h = Window.GetHeight();
+
+// --- Neural ICE logo centered (slightly above the center) ---
+logo.image  = Image("logo.png");
+logo.sprite = Sprite(logo.image);
+logo.sprite.SetX((screen_w - logo.image.GetWidth())  / 2);
+logo.sprite.SetY((screen_h - logo.image.GetHeight()) / 2 - screen_h * 0.06);
+logo.sprite.SetZ(10);
+
+// --- Progress bar ---
+bar.w     = screen_w * 0.34;
+bar.h     = 8;
+bar.x     = (screen_w - bar.w) / 2;
+bar.y     = screen_h * 0.82;
+
+// Track (bar background, dark blue-gray)
+track.sprite = Sprite(Image("bar-bg.png").Scale(bar.w, bar.h));
+track.sprite.SetX(bar.x);
+track.sprite.SetY(bar.y);
+track.sprite.SetZ(5);
+
+// Cyan fill (width = progress)
+fill.base = Image("bar.png");
+fun draw_progress(p) {
+    w = bar.w * p;
+    if (w < 2) w = 2;
+    fill.sprite = Sprite(fill.base.Scale(w, bar.h));
+    fill.sprite.SetX(bar.x);
+    fill.sprite.SetY(bar.y);
+    fill.sprite.SetZ(6);
+}
+draw_progress(0.02);
+
+// Actual boot progress (Plymouth provides p in [0,1])
+fun progress_callback(duration, p) {
+    draw_progress(p);
+}
+Plymouth.SetBootProgressFunction(progress_callback);
+
+// --- Messages (e.g. "Neural ICE — loading…", disk password entry, etc.) ---
+message.sprite = Sprite();
+fun message_callback(text) {
+    message.image = Image.Text(text, 0.80, 0.88, 0.96);
+    message.sprite.SetImage(message.image);
+    message.sprite.SetX((screen_w - message.image.GetWidth()) / 2);
+    message.sprite.SetY(screen_h * 0.88);
+    message.sprite.SetZ(20);
+}
+Plymouth.SetMessageFunction(message_callback);
