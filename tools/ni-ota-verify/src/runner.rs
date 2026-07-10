@@ -58,8 +58,8 @@ pub(crate) fn verify_blob(
         .find(|l| !l.trim().is_empty())
         .unwrap_or("no error output")
         .trim();
-    let mut reason = reason.to_string();
-    reason.truncate(200);
+    // char-boundary-safe cap (String::truncate panics mid-codepoint)
+    let reason: String = reason.chars().take(200).collect();
     // ExitStatus's Display already reads "exit status: N"
     Ok(Err(format!("cosign {}: {reason}", output.status)))
 }
