@@ -104,9 +104,13 @@ echo "SEMVER=${SEMVER}"
 echo "REF=${REF}"
 
 if [ "$PUSH" = "1" ]; then
-  echo "==> Pushing ${REF}:${SEMVER} and ${REF}:${CHANNEL}${SUFFIX} (GHCR — upstream + community)"
+  # ORDER MATTERS (Codex #8 P2): advance the *moving* channel tags LAST, and the GHCR community
+  # channel only AFTER the sovereign channel exists. Otherwise a mirror failure would leave the
+  # GHCR channel pointing at an image whose baked OTA origin is the sovereign registry, while the
+  # sovereign channel was never updated — a fresh community install would then track a stale/missing
+  # sovereign tag. Sequence: GHCR :SEMVER (immutable) → sovereign :SEMVER + :CHANNEL → GHCR :CHANNEL.
+  echo "==> Pushing ${REF}:${SEMVER} (GHCR immutable)"
   "${PODMAN[@]}" push "${REF}:${SEMVER}"
-  "${PODMAN[@]}" push "${REF}:${CHANNEL}${SUFFIX}"
   DIGEST="$("${PODMAN[@]}" image inspect "${REF}:${SEMVER}" --format '{{.Digest}}' 2>/dev/null || true)"
   echo "DIGEST=${DIGEST}"
 
@@ -116,8 +120,19 @@ if [ "$PUSH" = "1" ]; then
   # quadlet mirror does not cover it). Requires a prior `podman login "$OTA_REGISTRY host"`.
   if [ "$MIRROR" = "1" ]; then
     echo "==> Mirroring to ${OTA_REF}:${SEMVER} and ${OTA_REF}:${CHANNEL}${SUFFIX} (fleet OTA target)"
-    "${PODMAN[@]}" push "${REF}:${SEMVER}"          "docker://${OTA_REF}:${SEMVER}"
+    "${PODMAN[@]}" push "${REF}:${SEMVER}"           "docker://${OTA_REF}:${SEMVER}"
     "${PODMAN[@]}" push "${REF}:${CHANNEL}${SUFFIX}" "docker://${OTA_REF}:${CHANNEL}${SUFFIX}"
     echo "OTA_REF=${OTA_REF}"
   fi
+
+  # GHCR moving channel LAST — only now that the immutable + sovereign channel are in place.
+  echo "==> Pushing ${REF}:${CHANNEL}${SUFFIX} (GHCR community channel)"
+  "${PODMAN[@]}" push "${REF}:${CHANNEL}${SUFFIX}"
+
+  # ⚠ Channel-promotion caveat (Codex #8 P1): this build bakes OTA_IMGREF = the BUILD channel
+  # (${OTA_REF}:${CHANNEL}${SUFFIX}). promote.yml re-tags a validated digest across channels by COPY
+  # (ADR-0005: no rebuild), so a promoted :beta/:prod image still carries the *build* channel in
+  # /usr/lib/neural-ice/ota-imgref. Fleet appliances must therefore be INSTALLED with the target
+  # channel set explicitly (BASE_IMAGE=…:prod + kernel arg `neuralice.imgref=…:prod`, which the
+  # installer honours over the baked default) — see ota/neural-ice-autoinstall.sh and the README.
 fi

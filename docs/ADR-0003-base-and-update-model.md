@@ -18,6 +18,20 @@
 > the sovereign registry** and the appliance's baked OTA imgref points there. Where this
 > ADR says "OTA from GHCR", read "GHCR for community; `registry.neural-ice.ch` for the
 > fleet" (ADR-0006/0007 sovereign egress).
+>
+> **Two migration caveats (Codex on the OTA PR — the baked imgref is set at INSTALL, day-2
+> `bootc upgrade` just follows it):**
+> 1. **Existing installs stay on GHCR** until migrated — the sovereign imgref is only baked into
+>    *new* installs. Migrate an already-installed appliance with a one-shot
+>    `sudo bootc switch registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>` (can be
+>    OTA-delivered). Until then it keeps polling GHCR (which still works — no regression).
+> 2. **Promoted channels carry the build channel's baked imgref** — `promote.yml` re-tags a
+>    validated digest across channels by *copy* (ADR-0005: no rebuild), so a promoted `:beta`/`:prod`
+>    image still says `…:alpha` in `/usr/lib/neural-ice/ota-imgref`. Fleet `:beta`/`:prod` appliances
+>    must therefore be **installed with the channel set explicitly** (`BASE_IMAGE=…:prod` +
+>    `neuralice.imgref=…:prod`, which the installer honours over the baked default). A proper
+>    installer-side fix (write the target-channel imgref at install, not the build default) is a
+>    follow-up in ICE-CoreOS's installer, coordinated separately.
 
 ## Context (the path taken)
 
