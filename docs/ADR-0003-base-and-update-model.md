@@ -10,6 +10,15 @@
 > `kernel` (not `kernel-64k`) — for compatibility with the container AI stack.
 > The "64k tested/QA" rationale below is superseded on the page-size point only.
 
+> **Amendment (2026-07-10, ICE-Fabric ADR-0023 — uniform packaging & OTA)**: for the
+> **appliance fleet**, `bootc upgrade` now follows **`registry.neural-ice.ch`** (the
+> sovereign R2-backed registry), not GHCR directly. The OS image is still built and
+> published to `ghcr.io/neural-ice/neural-ice-coreos` (upstream + **public community
+> pull** — `bootc` from GHCR still works for open-core users), but it is **mirrored to
+> the sovereign registry** and the appliance's baked OTA imgref points there. Where this
+> ADR says "OTA from GHCR", read "GHCR for community; `registry.neural-ice.ch` for the
+> fleet" (ADR-0006/0007 sovereign egress).
+
 ## Context (the path taken)
 
 The real need, as formulated by the decider: *"an immutable read-only OS with

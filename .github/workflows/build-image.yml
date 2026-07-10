@@ -77,10 +77,33 @@ jobs:
           echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
             | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Log in to the sovereign registry (enables the fleet OTA mirror)
+        # Gated on the secret being set (the `secrets` context is not allowed in `if:`). Present ->
+        # the OS is ALSO pushed to registry.neural-ice.ch and the baked OTA imgref points there, so
+        # fleet `bootc upgrade` follows the sovereign registry (ADR-0023). Absent -> GHCR-only, GHCR
+        # OTA imgref (today's behaviour) — safe degradation until the Owner adds the secrets.
+        id: r2login
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASS: ${{ secrets.REGISTRY_PASS }}
+        run: |
+          if [ -n "${REGISTRY_PASS}" ]; then
+            echo "${REGISTRY_PASS}" | sudo podman login registry.neural-ice.ch -u "${REGISTRY_USER}" --password-stdin
+            echo "mirror=1" >> "$GITHUB_OUTPUT"
+            echo "sovereign registry login OK — OS will mirror + OTA imgref = registry.neural-ice.ch"
+          else
+            echo "::warning::REGISTRY_USER/PASS not set — OS pushed to GHCR only; fleet OTA mirror + sovereign OTA imgref DISABLED until the secrets are added (ADR-0023)"
+            echo "mirror=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push image
         env:
           PUSH: '1'
           PODMAN_SUDO: '1'
+          MIRROR: ${{ steps.r2login.outputs.mirror }}
+          # Bake the sovereign OTA imgref ONLY when we actually mirror there (else keep GHCR).
+          OTA_REGISTRY: ${{ steps.r2login.outputs.mirror == '1' && 'registry.neural-ice.ch/neural-ice' || 'ghcr.io/neural-ice' }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
           # Operator key baked into DEBUG builds only — prod/alpha default images
           # stay VANILLA (no key) as documented in image/Containerfile.bootc.
           SSH_AUTHORIZED_KEY: ${{ (github.event.inputs.variant || 'prod') == 'debug' && secrets.SSH_AUTHORIZED_KEY || '' }}
