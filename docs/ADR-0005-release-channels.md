@@ -3,7 +3,13 @@
 - **Status**: Accepted
 - **Date**: 2026-06-30
 - **Decider**: Business/Security Owner (human)
-- **Related**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc OS, native OTA, open-core)
+- **Related**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc OS, native OTA, open-core); ICE-Fabric **ADR-0023** (uniform packaging & OTA)
+
+> **Amendment (2026-07-10, ICE-Fabric ADR-0023)**: the alpha/beta/prod channel *model*
+> below is unchanged, but for the **appliance fleet** the channel tags now also live on
+> **`registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>`** (the sovereign OTA
+> target), and `promote.yml` moves the channel pointer on **both** GHCR and the sovereign
+> registry by the same digest. The GHCR channel tags remain for community/open-core pulls.
 
 ## Context
 

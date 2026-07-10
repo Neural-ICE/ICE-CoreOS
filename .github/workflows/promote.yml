@@ -61,11 +61,31 @@ jobs:
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Resolved ${SPEC} -> ${DIGEST}"
 
-      - name: Promote (re-tag the digest onto the target channel)
+      - name: Promote on GHCR (re-tag the digest onto the target channel)
         run: |
           skopeo copy --all \
             "docker://${REF}@${{ steps.src.outputs.digest }}" \
             "docker://${REF}:${{ inputs.to_channel }}"
+
+      - name: Promote on the sovereign registry (fleet OTA target)
+        # The fleet OTAs from registry.neural-ice.ch (ADR-0023), so the channel pointer must move
+        # THERE too — else `bootc upgrade` on the appliances never sees the promotion. Copies the
+        # SAME digest GHCR -> registry.neural-ice.ch:<channel> (idempotent; the bits were mirrored
+        # at build). Gated on the secrets — absent = GHCR-only promotion (safe degradation).
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASS: ${{ secrets.REGISTRY_PASS }}
+          OTA_REF: registry.neural-ice.ch/neural-ice/neural-ice-coreos
+        run: |
+          if [ -z "${REGISTRY_PASS}" ]; then
+            echo "::warning::REGISTRY_USER/PASS not set — promoted on GHCR only; the fleet OTA channel on registry.neural-ice.ch was NOT moved (add the secrets, ADR-0023)"
+            exit 0
+          fi
+          skopeo login registry.neural-ice.ch -u "${REGISTRY_USER}" -p "${REGISTRY_PASS}"
+          skopeo copy --all \
+            "docker://${REF}@${{ steps.src.outputs.digest }}" \
+            "docker://${OTA_REF}:${{ inputs.to_channel }}"
+          echo "sovereign channel moved: ${OTA_REF}:${{ inputs.to_channel }} -> ${{ steps.src.outputs.digest }}"
 
       - name: Summary
         run: |
@@ -74,5 +94,6 @@ jobs:
             echo ""
             echo "- source: \`${{ steps.src.outputs.spec }}\`"
             echo "- digest: \`${{ steps.src.outputs.digest }}\`"
-            echo "- now tagged: \`${REF}:${{ inputs.to_channel }}\`"
+            echo "- GHCR channel: \`${REF}:${{ inputs.to_channel }}\`"
+            echo "- fleet OTA channel: \`registry.neural-ice.ch/neural-ice/neural-ice-coreos:${{ inputs.to_channel }}\` (if secrets set)"
           } >> "$GITHUB_STEP_SUMMARY"
