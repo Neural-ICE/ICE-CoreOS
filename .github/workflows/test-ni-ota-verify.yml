@@ -1,0 +1,50 @@
+name: test-ni-ota-verify
+
+# PR gate for the on-device OTA verifier (tools/ni-ota-verify — ICE-Fabric
+# ADR-0026 / PLAN-ADR-0026-SIGNING P2): fmt + clippy + tests on a cheap hosted
+# runner. The tests stub cosign via NI_OTA_COSIGN, so no signing infrastructure
+# is needed here. The heavy self-hosted OS build (build-image.yml) is
+# deliberately untouched — it picks the verifier up via its normal image/**
+# trigger when the Containerfile lands on main.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/ni-ota-verify/**'
+      - '.github/workflows/test-ni-ota-verify.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/ni-ota-verify/**'
+      - '.github/workflows/test-ni-ota-verify.yml'
+
+concurrency:
+  group: test-ni-ota-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/ni-ota-verify
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust stable toolchain (rustfmt + clippy)
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
