@@ -10,13 +10,15 @@ name: build-image
 on:
   push:
     branches: [main]
+    # OS source only — the workflow file itself is intentionally NOT here: this is a heavy
+    # self-hosted OS build (alpha channel = every OS-source push), and a comment/doc edit to the
+    # workflow must not rebuild the whole OS. A workflow-logic change is validated via dispatch.
     paths:
       - 'image/**'
       - 'ota/**'
       - 'ignition/**'
       - 'ci/build-image.sh'
       - 'VERSION'
-      - '.github/workflows/build-image.yml'
   workflow_dispatch:
     inputs:
       channel:
