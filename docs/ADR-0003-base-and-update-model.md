@@ -29,10 +29,13 @@
 >    validated digest across channels by *copy* (ADR-0005: no rebuild), so a promoted `:stable`
 >    image still says `…:beta` in `/usr/lib/neural-ice/ota-imgref` (channels are the two-ring
 >    `beta|stable` set since 2026-07-11 — ADR-0005 top note + ICE-Fabric ADR-0028). Fleet
->    `:stable` appliances must therefore be **installed with the channel set explicitly**
->    (`BASE_IMAGE=…:stable` + `neuralice.imgref=…:stable`, which the installer honours over the
->    baked default). A proper installer-side fix (write the target-channel imgref at install,
->    not the build default) is a follow-up in ICE-CoreOS's installer, coordinated separately.
+>    `:stable` appliances must therefore be **installed with the channel set explicitly**.
+>    The installer path enforces this (2026-07-11): `image/build-installer-usb.sh` injects
+>    `neuralice.imgref=<packaged channel>` into the install menu entry (`TARGET_IMGREF`,
+>    wired from `release-installer.yml`), and the autoinstall honours that karg over the
+>    baked default — the baked imgref is never trusted for installs. On-device, the baked
+>    value only matters until the next re-bake; the digest-pinned `bootc switch` flow
+>    (ICE-Fabric ADR-0026 P2) supersedes tag-following entirely.
 
 ## Context (the path taken)
 

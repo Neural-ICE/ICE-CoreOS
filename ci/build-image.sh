@@ -142,7 +142,8 @@ if [ "$PUSH" = "1" ]; then
   # ⚠ Channel-promotion caveat (Codex #8 P1): this build bakes OTA_IMGREF = the BUILD channel
   # (${OTA_REF}:${CHANNEL}${SUFFIX}). promote.yml re-tags a validated digest across channels by COPY
   # (ADR-0005: no rebuild), so a promoted :stable image still carries the *build* channel (:beta) in
-  # /usr/lib/neural-ice/ota-imgref. Fleet appliances must therefore be INSTALLED with the target
-  # channel set explicitly (BASE_IMAGE=…:stable + kernel arg `neuralice.imgref=…:stable`, which the
-  # installer honours over the baked default) — see ota/neural-ice-autoinstall.sh and the README.
+  # /usr/lib/neural-ice/ota-imgref. Installers close this gap (Codex #13 P1): build-installer-usb.sh
+  # injects `neuralice.imgref=<packaged channel>` (TARGET_IMGREF, default = BASE_IMAGE) into the
+  # install entry, and the autoinstall honours that karg over the baked default — never rely on the
+  # baked imgref on the installer path. See ota/neural-ice-autoinstall.sh and the README.
 fi

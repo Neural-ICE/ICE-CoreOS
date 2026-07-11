@@ -60,7 +60,11 @@ jobs:
           VERSION="$(tr -d '[:space:]' < VERSION)"
           OUT="ice-coreos-installer-${CHANNEL}${SUFFIX}-${VERSION}"
           # Builds the dual-mode (Live + Install) raw installer for $BASE_IMAGE.
-          BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
+          # TARGET_IMGREF: the installed system must follow the PACKAGED channel via an
+          # explicit neuralice.imgref= karg — a promoted :stable image still carries its
+          # BUILD channel (:beta) in the baked ota-imgref (promotion re-tags by digest,
+          # no rebuild), so the baked default must never be trusted here (Codex P1, #13).
+          BASE_IMAGE="$BASE_IMAGE" TARGET_IMGREF="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
           RAW="$(ls -1 *.img 2>/dev/null | head -1 || true)"
           [ -n "$RAW" ] || RAW="$(find . -name 'disk.raw' | head -1)"
           # COMPRESS lever (speed vs size): zstd-fast (dev) | zstd-max (release) | xz (legacy).

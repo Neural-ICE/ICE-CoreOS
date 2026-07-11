@@ -10,6 +10,13 @@ name: promote
 #
 # Because it only copies the manifest+layers by DIGEST, the exact bits validated
 # in beta are what land in stable (no drift, no rebuild).
+#
+# Consequence of no-rebuild: a promoted :stable image keeps its BUILD-time baked
+# /usr/lib/neural-ice/ota-imgref (:beta). Installers therefore inject an explicit
+# neuralice.imgref=<packaged channel> karg (build-installer-usb.sh TARGET_IMGREF),
+# which the autoinstall honours over the baked default. On an installed device the
+# baked value only matters until the next re-bake; the digest-pinned bootc switch
+# flow (ICE-Fabric ADR-0026 P2) supersedes tag-following entirely.
 
 on:
   workflow_dispatch:
