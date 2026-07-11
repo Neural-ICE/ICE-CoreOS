@@ -39,3 +39,6 @@ ignition/*.ign
 
 # Console TUI binary, staged like the GB10 artifacts (source lives in the product repo)
 image/tui/neural-ice-tui
+
+# Rust build artifacts (ni-ota-verify — Cargo.lock IS committed, the build must be hermetic)
+tools/ni-ota-verify/target/
