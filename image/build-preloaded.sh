@@ -15,7 +15,7 @@
 # Run on an ARM64 build host with the seed staged locally. Needs sudo (losetup/mount/mkfs).
 #   SEED_IMAGES=$HOME/ice-seed/images \
 #   SEED_MODELS=$HOME/ice-seed/models \
-#   BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:alpha-debug \
+#   BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:beta-debug \
 #   VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
@@ -26,7 +26,7 @@ SEED_MODELS="${SEED_MODELS:-${HOME}/ice-seed/models}"
 # data volume by the autoinstall, applied once on first boot by the image's generic
 # neural-ice-payload-apply.service. KB-sized — headroom covers it.
 SEED_PAYLOAD="${SEED_PAYLOAD:-}"
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:alpha-debug}"
+BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:beta-debug}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
 

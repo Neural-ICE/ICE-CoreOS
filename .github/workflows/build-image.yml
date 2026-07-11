@@ -1,8 +1,10 @@
 name: build-image
 
 # Build the ICE-CoreOS bootc OS image and publish it to GHCR.
-# Default channel is "alpha": every push to main produces a fresh alpha build
-# (moving :alpha tag + an immutable :<version>-alpha.<run> tag).
+# Two-ring channel set (beta|stable — see ADR-0005 top note + ICE-Fabric ADR-0028).
+# Default channel is "beta": every push to main produces a fresh beta build
+# (moving :beta tag + an immutable :<version>-beta.<run> tag). :stable is normally
+# reached by promotion (promote.yml), not by a direct build.
 # Runs on a SELF-HOSTED ARM64 runner because the build needs the staged GB10
 # artifacts (GB10 kernel (4k) RPMs, signed NVIDIA modules, signed boot binaries) and
 # native aarch64. See README "CI runner".
@@ -11,7 +13,7 @@ on:
   push:
     branches: [main]
     # OS source only — the workflow file itself is intentionally NOT here: this is a heavy
-    # self-hosted OS build (alpha channel = every OS-source push), and a comment/doc edit to the
+    # self-hosted OS build (beta channel = every OS-source push), and a comment/doc edit to the
     # workflow must not rebuild the whole OS. A workflow-logic change is validated via dispatch.
     paths:
       - 'image/**'
@@ -25,9 +27,9 @@ on:
     inputs:
       channel:
         description: 'Channel to publish'
-        default: alpha
+        default: beta
         type: choice
-        options: [alpha, beta, prod]
+        options: [beta, stable]
       variant:
         description: 'Build variant (prod = sealed; debug = sshd+serial+permissive)'
         default: prod
@@ -55,7 +57,7 @@ jobs:
     env:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
-      CHANNEL: ${{ github.event.inputs.channel || 'alpha' }}
+      CHANNEL: ${{ github.event.inputs.channel || 'beta' }}
       VARIANT: ${{ github.event.inputs.variant || 'prod' }}
       BUILD_ID: ${{ github.run_number }}
     steps:
@@ -115,8 +117,8 @@ jobs:
           # Bake the sovereign OTA imgref ONLY when we actually mirror there (else keep GHCR).
           OTA_REGISTRY: ${{ steps.r2login.outputs.mirror == '1' && 'registry.neural-ice.ch/neural-ice' || 'ghcr.io/neural-ice' }}
           SOURCE_URL: https://github.com/${{ github.repository }}
-          # Operator key baked into DEBUG builds only — prod/alpha default images
-          # stay VANILLA (no key) as documented in image/Containerfile.bootc.
+          # Operator key baked into DEBUG builds only — default prod-variant images
+          # (any channel) stay VANILLA (no key) as documented in image/Containerfile.bootc.
           SSH_AUTHORIZED_KEY: ${{ (github.event.inputs.variant || 'prod') == 'debug' && secrets.SSH_AUTHORIZED_KEY || '' }}
         run: ./ci/build-image.sh | tee build.out
 

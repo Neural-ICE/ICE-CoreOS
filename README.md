@@ -31,7 +31,7 @@ install it on a DGX Spark and inject their own SSH key.
   [ADR-0002](docs/ADR-0002-secure-boot-zero-touch.md) and [secureboot/](secureboot/).
 - **OTA from GHCR** — `ghcr.io/neural-ice/neural-ice-coreos`, free pull egress, atomic,
   rollback. See [ADR-0003](docs/ADR-0003-base-and-update-model.md).
-- **Release channels** — `alpha` / `beta` / `prod`, with promotion-by-digest (no rebuild).
+- **Release channels** — two rings, `beta` / `stable`, with promotion-by-digest (no rebuild).
 - **Flashable USB installer** — dual-mode (Live / Install), light or preloaded
   edition (see [docs/PRELOADED-EDITION.md](docs/PRELOADED-EDITION.md)).
 
@@ -39,25 +39,24 @@ install it on a DGX Spark and inject their own SSH key.
 
 ## Release channels & promotion (staging)
 
-Three moving channel tags on the package, plus immutable `:<version>-<channel>.<n>` tags:
+Two moving channel tags on the package, plus immutable `:<version>-<channel>.<n>` tags
+(ring set unified with the appliance-bundle channels — see ICE-Fabric ADR-0028):
 
 | Channel | Tag | Cadence | Use |
 | --- | --- | --- | --- |
-| **alpha** | `…:alpha` | every push to `main` (CI) | active development |
-| **beta** | `…:beta` | promoted, occasional | wider validation |
-| **prod** | `…:prod` | promoted, when validated | production / community |
+| **beta** | `…:beta` | every push to `main` (CI) | validation ring |
+| **stable** | `…:stable` | promoted, when validated | production / community |
 
-The flow is a **staging pipeline** — the exact bits validated in `alpha` are what reach
-`beta` and then `prod`, because promotion only **re-tags the digest** (no rebuild, no drift):
+The flow is a **staging pipeline** — the exact bits validated in `beta` are what reach
+`stable`, because promotion only **re-tags the digest** (no rebuild, no drift):
 
 ```
-push → CI builds  → :alpha            (.github/workflows/build-image.yml)
-promote alpha→beta → :beta            (.github/workflows/promote.yml, manual)
-promote beta→prod  → :prod            (.github/workflows/promote.yml, manual)
+push → CI builds    → :beta           (.github/workflows/build-image.yml)
+promote beta→stable → :stable         (.github/workflows/promote.yml, manual)
 ```
 
 A device or installer subscribes to a channel via its OTA origin
-(`--target-imgref …:prod`), so `bootc upgrade` follows that channel.
+(`--target-imgref …:stable`), so `bootc upgrade` follows that channel.
 
 ---
 
@@ -70,7 +69,7 @@ attached to [Releases](https://github.com/Neural-ICE/ICE-CoreOS/releases) when
 published; you can always build one locally for any channel:
 
 ```sh
-BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:prod ./image/build-installer-usb.sh
+BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:stable ./image/build-installer-usb.sh
 ```
 
 Then:
@@ -118,17 +117,17 @@ then build:
 
 ```sh
 # Vanilla public image (no SSH key):
-CHANNEL=alpha ./ci/build-image.sh
+CHANNEL=beta ./ci/build-image.sh
 
 # Dev image with a baked SSH key (lab only — keys in the image do not survive
 # a `bootc switch` to a keyless image; prefer the persistent authorized_keys):
-SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" CHANNEL=alpha PUSH=1 ./ci/build-image.sh
+SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" CHANNEL=beta PUSH=1 ./ci/build-image.sh
 ```
 
 Build a flashable USB installer for a channel:
 
 ```sh
-BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:prod ./image/build-installer-usb.sh
+BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:stable ./image/build-installer-usb.sh
 ```
 
 ### CI runner

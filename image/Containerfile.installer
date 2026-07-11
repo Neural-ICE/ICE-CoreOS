@@ -4,9 +4,9 @@
 #
 # The base image is a build-arg so the installer can be built for any channel:
 #   sudo podman build --platform linux/arm64 -f image/Containerfile.installer \
-#     --build-arg BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:prod \
-#     -t ghcr.io/neural-ice/neural-ice-coreos:installer-prod .
-ARG BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:prod
+#     --build-arg BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:stable \
+#     -t ghcr.io/neural-ice/neural-ice-coreos:installer-stable .
+ARG BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:stable
 FROM ${BASE_IMAGE}
 
 # All the partitioning/encryption tools required by the auto-install are

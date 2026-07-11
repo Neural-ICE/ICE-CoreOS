@@ -17,7 +17,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # Channel base the installer is built on (vanilla, no baked key for community).
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:prod}"
+BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:stable}"
+# OTA imgref the INSTALLED system will follow — injected as a `neuralice.imgref=` karg on
+# the install entry, which ota/neural-ice-autoinstall.sh honours OVER the image's baked
+# default. Installers must NEVER rely on the baked imgref: a promoted :stable image is a
+# re-tagged beta build (ADR-0005: promotion = copy by digest, no rebuild), so its baked
+# /usr/lib/neural-ice/ota-imgref still names the BUILD channel (:beta) — without this karg
+# a stable installer would ship devices that follow the validation ring (Codex P1, PR #13).
+# Default = BASE_IMAGE (the packaged channel+variant tag). Override for pinned/local bases.
+TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
@@ -85,7 +93,8 @@ sudo rm -f "$ENTRIES/ostree-0-install.conf"   # legacy BLS clone (rendered non-d
 # of a cloned entry is not deterministic (bootloader-update.service regenerates
 # entries between boots) — a static entry is always rendered, always second.
 # kargs: autoinstall gate + SELinux-permissive (bootc install relabels the
-# target; the enforcing live policy denies it).
+# target; the enforcing live policy denies it) + the explicit OTA target
+# (neuralice.imgref= — see TARGET_IMGREF above; never rely on the baked default).
 klinux="$(sudo sed -n 's/^linux //p' "$live" | head -1)"
 kinitrd="$(sudo sed -n 's/^initrd //p' "$live" | head -1)"
 kopts="$(sudo sed -n 's/^options //p' "$live" | head -1)"
@@ -103,7 +112,7 @@ if ! sudo grep -q 'neural-ice-install' "$GCFG"; then
 
 # Neural ICE static install entry (deterministic — see docs/INSTALLER-UX-HARDENING.md)
 menuentry 'Neural ICE - Install (wipes the internal disk)' --id neural-ice-install {
-    linux ${klinux} ${kopts} neuralice.autoinstall=1 enforcing=0
+    linux ${klinux} ${kopts} neuralice.autoinstall=1 enforcing=0 neuralice.imgref=${TARGET_IMGREF}
     initrd ${kinitrd}
 }
 EOF
@@ -113,6 +122,7 @@ sync
 echo "==> Dual-mode entries:"
 echo "    [default] $(sudo sed -n 's/^title //p' "$live")  (BLS)"
 echo "    [install] Neural ICE - Install (wipes the internal disk)  (static grub.cfg)"
+echo "    [install] OTA target: neuralice.imgref=${TARGET_IMGREF}"
 sudo umount "$MNT"
 
 # Installer ESP: kill the shim fallback dance. \EFI\BOOT\BOOTAA64.EFI chain-loads
