@@ -14,8 +14,8 @@ on:
       channel:
         description: 'Channel image to package'
         type: choice
-        options: [prod, beta, alpha]
-        default: prod
+        options: [stable, beta]
+        default: stable
       variant:
         description: 'Variant to package (prod = sealed; debug = sshd+serial+permissive)'
         type: choice
@@ -40,7 +40,7 @@ jobs:
     env:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
-      CHANNEL: ${{ github.event.inputs.channel || 'prod' }}
+      CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
     steps:
       - uses: actions/checkout@v4
 

@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # Channel base the installer is built on (vanilla, no baked key for community).
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:prod}"
+BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:stable}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).

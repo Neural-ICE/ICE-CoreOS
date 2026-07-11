@@ -26,12 +26,13 @@
 >    `sudo bootc switch registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>` (can be
 >    OTA-delivered). Until then it keeps polling GHCR (which still works — no regression).
 > 2. **Promoted channels carry the build channel's baked imgref** — `promote.yml` re-tags a
->    validated digest across channels by *copy* (ADR-0005: no rebuild), so a promoted `:beta`/`:prod`
->    image still says `…:alpha` in `/usr/lib/neural-ice/ota-imgref`. Fleet `:beta`/`:prod` appliances
->    must therefore be **installed with the channel set explicitly** (`BASE_IMAGE=…:prod` +
->    `neuralice.imgref=…:prod`, which the installer honours over the baked default). A proper
->    installer-side fix (write the target-channel imgref at install, not the build default) is a
->    follow-up in ICE-CoreOS's installer, coordinated separately.
+>    validated digest across channels by *copy* (ADR-0005: no rebuild), so a promoted `:stable`
+>    image still says `…:beta` in `/usr/lib/neural-ice/ota-imgref` (channels are the two-ring
+>    `beta|stable` set since 2026-07-11 — ADR-0005 top note + ICE-Fabric ADR-0028). Fleet
+>    `:stable` appliances must therefore be **installed with the channel set explicitly**
+>    (`BASE_IMAGE=…:stable` + `neuralice.imgref=…:stable`, which the installer honours over the
+>    baked default). A proper installer-side fix (write the target-channel imgref at install,
+>    not the build default) is a follow-up in ICE-CoreOS's installer, coordinated separately.
 
 ## Context (the path taken)
 

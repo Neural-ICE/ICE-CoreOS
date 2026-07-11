@@ -6,7 +6,8 @@
 # Env:
 #   REGISTRY            registry/namespace      (default ghcr.io/neural-ice)
 #   IMAGE               package name            (default neural-ice-coreos)
-#   CHANNEL             alpha | beta | prod      (default alpha)
+#   CHANNEL             beta | stable            (default beta; two-ring set,
+#                                                 ADR-0005 top note + ICE-Fabric ADR-0028)
 #   VARIANT             prod | debug             (default prod; debug => -debug tags,
 #                                                 sshd on, serial console, permissive)
 #   BUILD_ID            build counter suffix     (e.g. CI run number; optional)
@@ -33,7 +34,7 @@ cd "$REPO_ROOT"
 
 REGISTRY="${REGISTRY:-ghcr.io/neural-ice}"
 IMAGE="${IMAGE:-neural-ice-coreos}"
-CHANNEL="${CHANNEL:-alpha}"
+CHANNEL="${CHANNEL:-beta}"
 VARIANT="${VARIANT:-prod}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 SSH_AUTHORIZED_KEY="${SSH_AUTHORIZED_KEY:-}"
@@ -45,13 +46,22 @@ OTA_REGISTRY="${OTA_REGISTRY:-$REGISTRY}"
 MIRROR="${MIRROR:-0}"
 SOURCE_URL="${SOURCE_URL:-https://github.com/Neural-ICE/ICE-CoreOS}"
 
-case "$CHANNEL" in alpha|beta|prod) ;; *) echo "ERROR: invalid CHANNEL '$CHANNEL' (alpha|beta|prod)" >&2; exit 2 ;; esac
+case "$CHANNEL" in beta|stable) ;; *) echo "ERROR: invalid CHANNEL '$CHANNEL' (beta|stable)" >&2; exit 2 ;; esac
 case "$VARIANT" in prod) SUFFIX="" ;; debug) SUFFIX="-debug" ;; *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|debug)" >&2; exit 2 ;; esac
 
 VERSION="$(tr -d '[:space:]' < VERSION)"
 SEMVER="${VERSION}-${CHANNEL}${BUILD_ID:+.${BUILD_ID}}${SUFFIX}"
 REF="${REGISTRY}/${IMAGE}"            # GHCR push target (upstream + community pull)
 OTA_REF="${OTA_REGISTRY}/${IMAGE}"    # what the fleet OTAs from (baked as the OTA imgref)
+
+# Ring transition (2026-07-11): the channel set moved from alpha|beta|prod to the two-ring
+# beta|stable set (ADR-0005 top note; unified with the bundle channels — ICE-Fabric ADR-0028).
+# Devices built before the switch may carry a baked OTA imgref of :alpha or :prod: those tags
+# stay on the registries but NO LONGER MOVE. Such a device keeps working and re-bakes onto
+# :beta / :stable at its next re-seed or `bootc switch`. No tag aliases are maintained
+# (explicitly accepted — no customer fleet at switch time).
+# Version-counter note: BUILD_ID is the CI run number of build-image.yml, monotonic across the
+# rename — the immutable tags continue (…-alpha.28 → …-beta.29+), no reset, no collision.
 
 # Guard: baking a sovereign OTA imgref we never mirror to would brick fleet OTA.
 if [ "$OTA_REF" != "$REF" ] && [ "$MIRROR" != "1" ]; then
@@ -131,8 +141,8 @@ if [ "$PUSH" = "1" ]; then
 
   # ⚠ Channel-promotion caveat (Codex #8 P1): this build bakes OTA_IMGREF = the BUILD channel
   # (${OTA_REF}:${CHANNEL}${SUFFIX}). promote.yml re-tags a validated digest across channels by COPY
-  # (ADR-0005: no rebuild), so a promoted :beta/:prod image still carries the *build* channel in
+  # (ADR-0005: no rebuild), so a promoted :stable image still carries the *build* channel (:beta) in
   # /usr/lib/neural-ice/ota-imgref. Fleet appliances must therefore be INSTALLED with the target
-  # channel set explicitly (BASE_IMAGE=…:prod + kernel arg `neuralice.imgref=…:prod`, which the
+  # channel set explicitly (BASE_IMAGE=…:stable + kernel arg `neuralice.imgref=…:stable`, which the
   # installer honours over the baked default) — see ota/neural-ice-autoinstall.sh and the README.
 fi

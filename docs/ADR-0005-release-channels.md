@@ -5,6 +5,16 @@
 - **Decider**: Business/Security Owner (human)
 - **Related**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc OS, native OTA, open-core); ICE-Fabric **ADR-0023** (uniform packaging & OTA)
 
+> **Ring set superseded (2026-07-11)**: the three-ring `alpha|beta|prod` set decided below
+> is reduced to **two rings: `beta|stable`**, unified with the appliance-bundle channels —
+> see ICE-Fabric **ADR-0028**. `beta` = validation ring (every push to `main`, runs on the
+> lab validation appliance); `stable` = customers/community (promoted). The promotion
+> mechanics (re-tag by digest, never rebuild) are unchanged; the flow is now simply
+> `beta → stable`. The old `:alpha`/`:prod` tags remain on the registries for rollback and
+> forensics but **no longer move**; devices still following them re-bake onto the new rings
+> at their next re-seed or `bootc switch` (no tag aliases are maintained — accepted, no
+> customer fleet at switch time). The rest of this ADR is kept as decided for the record.
+
 > **Amendment (2026-07-10, ICE-Fabric ADR-0023)**: the alpha/beta/prod channel *model*
 > below is unchanged, but for the **appliance fleet** the channel tags now also live on
 > **`registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>`** (the sovereign OTA
