@@ -42,7 +42,14 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, ARM64]
+    # `spark` = the dedicated .63 build host — the ONLY runner with the staged GB10
+    # artifacts (/home/user/neural-ice/image/{rpms,driver-modules,nvidia-userspace,
+    # signed-boot} + the console TUI binary). Since the runner fleet moved to org
+    # level, a bare [self-hosted, linux, ARM64] also matches the dgx-spark APPLIANCE
+    # runners (which run the product, not builds) — jobs landing there die on
+    # "missing artifacts dir" (runs 2026-07-10 15:04 + 23:19). Same pinning rationale
+    # as ICE-AC1's build-ice-ac1.yml.
+    runs-on: [self-hosted, linux, ARM64, spark]
     env:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
