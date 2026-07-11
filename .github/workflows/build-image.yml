@@ -19,6 +19,8 @@ on:
       - 'ignition/**'
       - 'ci/build-image.sh'
       - 'VERSION'
+      # the image bakes this tool (Containerfile.bootc stage 0 → /usr/bin/ni-ota-verify)
+      - 'tools/ni-ota-verify/**'
   workflow_dispatch:
     inputs:
       channel:
