@@ -25,8 +25,24 @@ readonly PREFIX="ni-coreos"
 readonly NM_CONN_DIR="/etc/NetworkManager/system-connections"
 readonly RUN_DIR="/run/neural-ice"
 readonly MDNS_FILE="${RUN_DIR}/mdns-hostname"
+readonly AVAHI_CONF="/etc/avahi/avahi-daemon.conf"
 
 log() { echo "neural-ice-hostname-init: $*"; }
+
+# Pin avahi to the management NIC so mDNS advertises ONLY that port's routable
+# LAN address. Without this, avahi publishes every interface — the podman
+# bridges (podman1 -> 10.89.0.1), the per-container veth link-locals, and
+# loopback — so `<hostname>.local` resolves to a SET of addresses and a client
+# routinely picks an unreachable one (the .72 bring-up hit exactly this: the mac
+# could not reach the appliance until avahi was pinned). We run before
+# avahi-daemon, so setting the config here needs no restart. Idempotent.
+configure_avahi_interface() {
+    local iface="$1"
+    [ -f "$AVAHI_CONF" ] || { log "WARN: $AVAHI_CONF missing, skipping mDNS interface pin"; return 0; }
+    sed -i -E '/^\[server\]/,/^\[/ { /^allow-interfaces=/d }' "$AVAHI_CONF"
+    sed -i -E "/^\[server\]/a allow-interfaces=${iface}" "$AVAHI_CONF"
+    log "pinned avahi mDNS to management interface: $iface"
+}
 
 # Deterministically resolve the RJ45 management interface name.
 #   1. The interface-name pinned in the management NM profile (mgmt-*.nmconnection)
@@ -89,6 +105,9 @@ main() {
     printf '%s\n' "$desired" > "$MDNS_FILE"
     chmod 0644 "$MDNS_FILE"
     log "published short hostname to $MDNS_FILE"
+
+    # Pin mDNS to the same management NIC (before avahi-daemon starts).
+    configure_avahi_interface "$iface"
 }
 
 main "$@"
