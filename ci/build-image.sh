@@ -81,15 +81,8 @@ for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boo
 done
 
 # Console TUI: PRODUCT code — its source lives out of this vanilla OS repo.
-# The pre-built ARM64 binary must be staged where the Containerfile COPYs it —
-# same "stage then COPY" pattern as the GB10 artifacts (from the product repo:
-# `make -C tui-rust stage COREOS_DIR=<this repo>`).
-if [ ! -f image/tui/neural-ice-tui ]; then
-  echo "ERROR: missing staged console TUI binary 'image/tui/neural-ice-tui'." >&2
-  echo "       Build it from the product repo: make -C tui-rust stage COREOS_DIR=$PWD" >&2
-  exit 4
-fi
-echo "    staged image/tui/neural-ice-tui ($(du -h image/tui/neural-ice-tui | cut -f1))"
+# The console TUI is product code (ICE-Console) composed onto this vanilla base by
+# ICE-Fabric (ADR-0032) — it is deliberately NOT staged or COPYd here.
 
 # Use the root container store (matches bib --local and caches the base) when
 # PODMAN_SUDO=1 (CI); rootless otherwise (local dev).

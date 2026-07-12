@@ -247,12 +247,10 @@ COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system
 # payload CONTENT is product-side — the OS ships only the mechanism.
 COPY image/payload/neural-ice-payload-apply.sh      /usr/local/bin/neural-ice-payload-apply.sh
 COPY image/payload/neural-ice-payload-apply.service /usr/lib/systemd/system/neural-ice-payload-apply.service
-# Appliance console dashboard (TUI). PRODUCT code — built out-of-repo and staged
-# pre-built at image/tui/neural-ice-tui (gitignored, like the other GB10 artifacts); this
-# vanilla OS repo carries no product source. ci/build-image.sh fails early if it is missing.
-# The TUI owns tty1 in ALL variants; getty@tty1 is masked below (console = dashboard, not a login).
-COPY image/tui/neural-ice-tui         /usr/local/bin/neural-ice-tui
-COPY image/tui/neural-ice-tui.service /usr/lib/systemd/system/neural-ice-tui.service
+# NOTE (ADR-0032): the branded console dashboard (TUI) is PRODUCT code and lives
+# in ICE-Console. It is NOT part of this open-core OS — ICE-Fabric composes it
+# onto this vanilla base (derivation FROM this image + the TUI layer). This repo
+# builds a generic OS: a normal login getty owns tty1 (see below).
 # Deterministic hostname/mDNS name from the management NIC MAC (ni-coreos-<mac4>).
 # The unit ships in the /etc overlay; avahi (installed above) publishes the name.
 COPY image/mdns/neural-ice-hostname-init.sh /usr/local/bin/neural-ice-hostname-init.sh
@@ -287,21 +285,20 @@ RUN set -euxo pipefail; \
     grep -n 'additionalimagestores' "$src"
 
 # Headless appliance: target multi-user (no GUI). Otherwise graphical.target reserves tty1 for
-# a non-existent display manager. tty1 is owned by the TUI dashboard (getty@tty1 masked), so the
-# HDMI console shows the appliance status dashboard instead of a login prompt.
+# a non-existent display manager. This vanilla OS keeps the normal login getty on tty1; the
+# BRANDED appliance masks getty@tty1 and puts the console dashboard there in the Fabric
+# derivation (ADR-0032) — that product concern is NOT baked here.
 RUN set -euxo pipefail; \
-    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh /usr/local/bin/neural-ice-tui \
+    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh \
                /usr/local/bin/neural-ice-hostname-init.sh \
                /usr/local/bin/neural-ice-payload-apply.sh; \
     systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
-                     neural-ice-tui.service \
                      neural-ice-hostname-init.service \
                      neural-ice-payload-apply.service \
                      avahi-daemon.service \
                      bootc-fetch-apply-updates.timer; \
-    systemctl mask getty@tty1.service; \
     systemctl set-default multi-user.target
 
 # Unattended OS OTA (ADR-0003): native `bootc upgrade` on a timer, from the public
