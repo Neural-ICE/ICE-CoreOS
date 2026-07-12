@@ -415,11 +415,17 @@ readonly TTY=/dev/tty1
 
 if read -r _ < "$TTY" 2>/dev/null; then
   log "Confirmed — rebooting onto the internal disk…"
-  # The internal disk is already finalized + unmounted (steps above); the live
-  # root is on the USB. Use an IMMEDIATE, forced reboot (-ff) so the reset does
-  # NOT depend on writing/unmounting the USB fs — this survives an operator who
-  # pulls the USB a moment too early instead of thrashing on I/O errors.
-  sync 2>/dev/null || true
+  # Cleanly unmount the TARGET filesystems FIRST — this flushes them, so the forced
+  # reset below never leaves the freshly-installed system/data XFS dirty. The LIGHT
+  # path leaves the data volume mounted at /run/seed-dst (its umount lives only in the
+  # seed-present branch), and $TGT may still hold system/boot/esp. `umount` flushes,
+  # so no separate global `sync` (a bare `sync` would also hit the USB live-root/ESP
+  # and thrash if the operator pulls the USB a moment early — Codex #15).
+  umount -R /run/seed-dst 2>/dev/null || true
+  umount -R "$TGT"        2>/dev/null || true
+  # IMMEDIATE forced reset: does NOT depend on writing/unmounting the USB fs (the
+  # discarded installer media), so it survives an operator who pulls the USB a moment
+  # too early instead of thrashing on I/O errors. Targets are already flushed above.
   systemctl reboot -ff || reboot -f
   # No interactive console: do NOT reboot (avoids the loop).
   log "No interactive console: remove the USB and power-cycle manually."
