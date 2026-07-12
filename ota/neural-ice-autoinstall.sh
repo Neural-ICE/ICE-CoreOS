@@ -406,15 +406,21 @@ readonly TTY=/dev/tty1
   printf '       \033[1;37m%s\033[0m\n' "$DATA_RECOVERY"
   printf '   %s\n' "$usb_saved"
   printf '  ------------------------------------------------------------\n'
-  printf '   1) Remove the USB drive now\n'
-  printf '   2) Press [Enter] to reboot onto the internal disk\n'
+  printf '   1) Press [Enter] to reboot onto the internal disk\n'
+  printf '   2) Remove the USB drive DURING the reboot (once the screen clears)\n'
+  printf '      — do NOT pull it before pressing Enter: the live installer runs\n'
+  printf '        FROM the USB and needs it until the machine actually resets.\n'
   printf '  ============================================================\n\n'
 } > "$TTY" 2>/dev/null || log "Installation complete (encrypted) — DATA recovery key: $DATA_RECOVERY"
 
 if read -r _ < "$TTY" 2>/dev/null; then
   log "Confirmed — rebooting onto the internal disk…"
-  systemctl reboot
-else
+  # The internal disk is already finalized + unmounted (steps above); the live
+  # root is on the USB. Use an IMMEDIATE, forced reboot (-ff) so the reset does
+  # NOT depend on writing/unmounting the USB fs — this survives an operator who
+  # pulls the USB a moment too early instead of thrashing on I/O errors.
+  sync 2>/dev/null || true
+  systemctl reboot -ff || reboot -f
   # No interactive console: do NOT reboot (avoids the loop).
   log "No interactive console: remove the USB and power-cycle manually."
 fi
