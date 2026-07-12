@@ -63,13 +63,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stage GB10 artifacts + console TUI binary
+      - name: Stage GB10 artifacts
         # Path on the self-hosted runner holding the prebuilt GB10 artifacts.
         # Set the repo/org variable ARTIFACTS_DIR; falls back to a neutral default.
-        # The console TUI is PRODUCT code: its source lives out of this repo;
-        # this vanilla OS repo only consumes the pre-built ARM64 binary, staged on
-        # the runner next to the GB10 artifacts (refresh it from the product
-        # repo: `make -C tui-rust stage COREOS_DIR=...` then copy to the runner).
+        # The console TUI is PRODUCT code (ICE-Console) composed onto this vanilla
+        # base by ICE-Fabric (ADR-0032) — NOT staged here.
         env:
           ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
         run: |
@@ -79,11 +77,7 @@ jobs:
             fi
             rm -rf "image/$d"; cp -a "$ARTIFACTS_DIR/$d" "image/$d"
           done
-          if [ ! -f "$ARTIFACTS_DIR/tui/neural-ice-tui" ]; then
-            echo "::error::missing $ARTIFACTS_DIR/tui/neural-ice-tui on the runner (build it in the product repo: make -C tui-rust stage)"; exit 1
-          fi
-          install -Dm0755 "$ARTIFACTS_DIR/tui/neural-ice-tui" image/tui/neural-ice-tui
-          echo "Staged GB10 artifacts + console TUI from $ARTIFACTS_DIR"
+          echo "Staged GB10 artifacts from $ARTIFACTS_DIR"
 
       - name: Log in to GHCR
         run: |
