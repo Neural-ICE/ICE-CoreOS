@@ -406,15 +406,27 @@ readonly TTY=/dev/tty1
   printf '       \033[1;37m%s\033[0m\n' "$DATA_RECOVERY"
   printf '   %s\n' "$usb_saved"
   printf '  ------------------------------------------------------------\n'
-  printf '   1) Remove the USB drive now\n'
-  printf '   2) Press [Enter] to reboot onto the internal disk\n'
+  printf '   1) Press [Enter] to reboot onto the internal disk\n'
+  printf '   2) Remove the USB drive DURING the reboot (once the screen clears)\n'
+  printf '      — do NOT pull it before pressing Enter: the live installer runs\n'
+  printf '        FROM the USB and needs it until the machine actually resets.\n'
   printf '  ============================================================\n\n'
 } > "$TTY" 2>/dev/null || log "Installation complete (encrypted) — DATA recovery key: $DATA_RECOVERY"
 
 if read -r _ < "$TTY" 2>/dev/null; then
   log "Confirmed — rebooting onto the internal disk…"
-  systemctl reboot
-else
+  # Cleanly unmount the TARGET filesystems FIRST — this flushes them, so the forced
+  # reset below never leaves the freshly-installed system/data XFS dirty. The LIGHT
+  # path leaves the data volume mounted at /run/seed-dst (its umount lives only in the
+  # seed-present branch), and $TGT may still hold system/boot/esp. `umount` flushes,
+  # so no separate global `sync` (a bare `sync` would also hit the USB live-root/ESP
+  # and thrash if the operator pulls the USB a moment early — Codex #15).
+  umount -R /run/seed-dst 2>/dev/null || true
+  umount -R "$TGT"        2>/dev/null || true
+  # IMMEDIATE forced reset: does NOT depend on writing/unmounting the USB fs (the
+  # discarded installer media), so it survives an operator who pulls the USB a moment
+  # too early instead of thrashing on I/O errors. Targets are already flushed above.
+  systemctl reboot -ff || reboot -f
   # No interactive console: do NOT reboot (avoids the loop).
   log "No interactive console: remove the USB and power-cycle manually."
 fi
