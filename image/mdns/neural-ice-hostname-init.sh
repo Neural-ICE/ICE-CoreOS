@@ -87,11 +87,36 @@ main() {
     desired="${PREFIX}-${suffix}"
     log "management interface=$iface mac-suffix=$suffix hostname=$desired"
 
-    # Persist the system hostname (idempotent: only touch it when it differs).
-    current="$(hostnamectl --static 2>/dev/null || true)"
+    # 1) Runtime contract for the console TUI + the avahi NIC pin FIRST. These
+    #    must land on EVERY boot even if hostname persistence below hiccups —
+    #    on the first enforcing boot of the .72 GB10 (2026-07-13) a failed
+    #    hostnamectl aborted the script mid-way and the TUI showed a bare IP
+    #    while the avahi pin was skipped. Publish, then persist.
+    install -d -m 0755 "$RUN_DIR"
+    printf '%s\n' "$desired" > "$MDNS_FILE"
+    chmod 0644 "$MDNS_FILE"
+    log "published short hostname to $MDNS_FILE"
+    configure_avahi_interface "$iface"
+
+    # 2) Kernel (runtime) hostname — what avahi/NM/the journal actually use.
+    #    Direct /proc write: NO dbus, NO systemd-hostnamed. Both have failed
+    #    us here (dbus not yet up on a degraded boot; hostnamed's sandbox
+    #    refused the static write under enforcing). Deterministic instead.
+    current="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
     if [ "$current" != "$desired" ]; then
-        log "setting static hostname: '${current:-<unset>}' -> '$desired'"
-        hostnamectl set-hostname "$desired"
+        if printf '%s' "$desired" > /proc/sys/kernel/hostname 2>/dev/null; then
+            log "runtime hostname: '${current:-<unset>}' -> '$desired'"
+        else
+            log "WARN: cannot write /proc/sys/kernel/hostname (unit sandbox?)"
+        fi
+    fi
+
+    # 3) Persist for the next boots (PID1 applies /etc/hostname at early boot).
+    current="$(cat /etc/hostname 2>/dev/null || true)"
+    if [ "$current" != "$desired" ]; then
+        log "persisting static hostname: '${current:-<unset>}' -> '$desired'"
+        printf '%s\n' "$desired" > /etc/hostname \
+            || log "WARN: could not write /etc/hostname (will retry next boot)"
         # Map the FQDN in /etc/hosts so `hostname -f` and local lookups resolve.
         if grep -qE '^127\.0\.1\.1' /etc/hosts; then
             sed -i -E "s/^127\.0\.1\.1.*/127.0.1.1\t${desired}.local ${desired}/" /etc/hosts
@@ -99,15 +124,6 @@ main() {
             printf '127.0.1.1\t%s.local %s\n' "$desired" "$desired" >> /etc/hosts
         fi
     fi
-
-    # Runtime contract for the console TUI (repopulated every boot; /run is tmpfs).
-    install -d -m 0755 "$RUN_DIR"
-    printf '%s\n' "$desired" > "$MDNS_FILE"
-    chmod 0644 "$MDNS_FILE"
-    log "published short hostname to $MDNS_FILE"
-
-    # Pin mDNS to the same management NIC (before avahi-daemon starts).
-    configure_avahi_interface "$iface"
 }
 
 main "$@"

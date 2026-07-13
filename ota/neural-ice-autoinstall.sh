@@ -346,6 +346,58 @@ if [ -b "$SEED_PART" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# 5c) SELinux: label EVERYTHING this install created, with the TARGET's policy.
+#     The installer runs permissive (§0) and bootc labels the image content, but
+#     the deployment's /etc DIRECTORY itself and everything staged by this
+#     script (payload, models, data dirs) end up unlabeled_t. On the first
+#     ENFORCING boot a single unlabeled /etc is fatal: every confined service
+#     (dbus-broker, journald, avahi, podman) is denied { search } on /etc and
+#     the whole userspace collapses (root-caused live on the .72 GB10,
+#     2026-07-13). Label with setfiles -F against the deployment's own
+#     file_contexts, then VERIFY — an unlabeled install must not ship.
+# --------------------------------------------------------------------------- #
+log "SELinux: labeling deployment /etc,/var,/boot + data volume (target policy)…"
+command -v setfiles >/dev/null || die "setfiles not available in the installer image"
+dep="$(ls -d "$TGT"/ostree/deploy/*/deploy/*.0 2>/dev/null | head -1)"
+[[ -n "$dep" && -d "$dep" ]] || die "cannot locate the ostree deployment under $TGT"
+stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
+setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null | head -1)"
+: "${setype:=targeted}"
+fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"
+[[ -f "$fc" ]] || die "target policy file_contexts not found: $fc"
+# Deployment /etc (the runtime /etc): -r makes paths match the policy as /etc/…
+setfiles -F -r "$dep" "$fc" "$dep/etc" || die "setfiles failed on deployment /etc"
+# Stateroot /var (the runtime /var): pre-created dirs get their policy labels.
+setfiles -F -r "$stateroot" "$fc" "$stateroot/var" || die "setfiles failed on stateroot /var"
+# /boot (kernel/initramfs/BLS entries; the ESP is vfat = no xattrs, skipped).
+setfiles -F -r "$TGT" "$fc" "$TGT/boot" || true
+# Data volume: bind it at its RUNTIME path under a fake root so file_contexts
+# matches /var/lib/neural-ice/data/…; EXCLUDE seed-store (chcon'd to
+# container_ro_file_t in §5b — the policy has no entry for it and -F would
+# strip that label back to var_lib_t).
+mountpoint -q /run/seed-dst || mount /dev/mapper/data /run/seed-dst
+mkdir -p /run/nid-root/var/lib/neural-ice/data
+mount --bind /run/seed-dst /run/nid-root/var/lib/neural-ice/data
+setfiles -F -r /run/nid-root -e /run/nid-root/var/lib/neural-ice/data/seed-store \
+  "$fc" /run/nid-root/var/lib/neural-ice/data \
+  || die "setfiles failed on the data volume"
+umount /run/nid-root/var/lib/neural-ice/data
+# seed-store label for ALL editions. LIGHT creates the (empty) dir too but
+# never runs the §5b chcon (seed branch only) — and podman stats this
+# additionalimagestores path on EVERY invocation, so an unlabeled_t dir is
+# denied under enforcing (Codex P1, PR #18). Idempotent for PRELOADED.
+chcon -R -t container_ro_file_t /run/seed-dst/seed-store 2>/dev/null \
+  || chcon -R -t container_file_t /run/seed-dst/seed-store 2>/dev/null \
+  || die "cannot label seed-store for the container runtime"
+# VERIFY (fail-closed): the two labels whose absence bricked the enforcing boot.
+stat -c %C "$dep/etc" | grep -q ':etc_t:' \
+  || die "deployment /etc is still not etc_t after setfiles — refusing to ship"
+stat -c %C /run/seed-dst | grep -Eq ':(var_lib_t|var_t):' \
+  || die "data volume root is still unlabeled after setfiles — refusing to ship"
+umount /run/seed-dst 2>/dev/null || true
+log "SELinux: labels applied and verified (deployment /etc = etc_t, data = policy defaults)."
+
+# --------------------------------------------------------------------------- #
 # 6) DATA volume config is NOT written post-install (an ostree deployment's /etc
 #    is read-only right after bootc finalizes it). Unlock is image-baked
 #    (/etc/crypttab by GPT label) and the mount is a systemd.mount-extra karg
