@@ -382,6 +382,13 @@ setfiles -F -r /run/nid-root -e /run/nid-root/var/lib/neural-ice/data/seed-store
   "$fc" /run/nid-root/var/lib/neural-ice/data \
   || die "setfiles failed on the data volume"
 umount /run/nid-root/var/lib/neural-ice/data
+# seed-store label for ALL editions. LIGHT creates the (empty) dir too but
+# never runs the §5b chcon (seed branch only) — and podman stats this
+# additionalimagestores path on EVERY invocation, so an unlabeled_t dir is
+# denied under enforcing (Codex P1, PR #18). Idempotent for PRELOADED.
+chcon -R -t container_ro_file_t /run/seed-dst/seed-store 2>/dev/null \
+  || chcon -R -t container_file_t /run/seed-dst/seed-store 2>/dev/null \
+  || die "cannot label seed-store for the container runtime"
 # VERIFY (fail-closed): the two labels whose absence bricked the enforcing boot.
 stat -c %C "$dep/etc" | grep -q ':etc_t:' \
   || die "deployment /etc is still not etc_t after setfiles — refusing to ship"
