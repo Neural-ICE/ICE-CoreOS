@@ -1,8 +1,10 @@
 # Neural ICE CoreOS — deterministic hostname + mDNS name from the management NIC.
 #
-# Runs on EVERY boot (ordered before avahi-daemon): sets the static hostname
-# `ni-coreos-<mac4>` the first time and repopulates /run/neural-ice/mdns-hostname
-# (tmpfs) thereafter. Idempotent — the hostnamectl call is a no-op once set.
+# Runs on EVERY boot (ordered before avahi-daemon): sets the runtime + static
+# hostname `ni-coreos-<mac4>` and repopulates /run/neural-ice/mdns-hostname
+# (tmpfs). Idempotent. NO dbus/hostnamed involved: the script writes
+# /proc/sys/kernel/hostname + /etc/hostname directly (deterministic on a
+# degraded boot and under SELinux enforcing — see the .72 2026-07-13 incident).
 
 [Unit]
 Description=Neural ICE — set hostname + mDNS name from management NIC MAC
@@ -24,7 +26,9 @@ StandardError=journal
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes
-ProtectKernelTunables=yes
+# NOT ProtectKernelTunables: the script SETS the runtime hostname by writing
+# /proc/sys/kernel/hostname (its core purpose) — the dbus/hostnamed path was
+# dropped after it failed on a degraded boot and under enforcing (2026-07-13).
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
