@@ -81,6 +81,8 @@ Then:
    ```
 3. **Inject your SSH key** (the vanilla image has none) — either:
    - drop your public key onto the USB's EFI partition at `ice-coreos/authorized_keys`
+     after flashing and byte-verifying the raw image; debug CI images keep sshd
+     enabled but are keyless by default, so this per-USB injection is the normal path
      (the EFI partition is FAT and mounts on any OS), **or**
    - pass `neuralice.sshkey=<base64-of-your-pubkey>` as a kernel argument.
 4. Boot the USB on the DGX Spark (GPT raw disk; the firmware only boots GPT, not El-Torito

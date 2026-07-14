@@ -35,6 +35,10 @@ on:
         default: prod
         type: choice
         options: [prod, debug]
+      bake_ssh_key:
+        description: 'Bake the Actions SSH key into a debug image (lab fallback; EFI injection is preferred)'
+        default: false
+        type: boolean
 
 concurrency:
   group: build-image-${{ github.ref }}
@@ -60,6 +64,7 @@ jobs:
       CHANNEL: ${{ github.event.inputs.channel || 'beta' }}
       VARIANT: ${{ github.event.inputs.variant || 'prod' }}
       BUILD_ID: ${{ github.run_number }}
+      BAKE_SSH_KEY: ${{ github.event.inputs.bake_ssh_key || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -111,9 +116,11 @@ jobs:
           # Bake the sovereign OTA imgref ONLY when we actually mirror there (else keep GHCR).
           OTA_REGISTRY: ${{ steps.r2login.outputs.mirror == '1' && 'registry.neural-ice.ch/neural-ice' || 'ghcr.io/neural-ice' }}
           SOURCE_URL: https://github.com/${{ github.repository }}
-          # Operator key baked into DEBUG builds only — default prod-variant images
-          # (any channel) stay VANILLA (no key) as documented in image/Containerfile.bootc.
-          SSH_AUTHORIZED_KEY: ${{ (github.event.inputs.variant || 'prod') == 'debug' && secrets.SSH_AUTHORIZED_KEY || '' }}
+          # Debug enables sshd but remains keyless by default. The installer USB
+          # injects the per-operator key from EFI:/ice-coreos/authorized_keys.
+          # Baking the repo secret is an explicit lab-only fallback, never an
+          # automatic side effect of selecting the debug variant.
+          SSH_AUTHORIZED_KEY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.variant == 'debug' && github.event.inputs.bake_ssh_key == 'true' && secrets.SSH_AUTHORIZED_KEY || '' }}
         run: ./ci/build-image.sh | tee build.out
 
       - name: Summary
@@ -127,4 +134,5 @@ jobs:
             echo "| version | \`$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)\` |"
             echo "| ref | \`$(grep -m1 '^REF=' build.out | cut -d= -f2):$CHANNEL\` |"
             echo "| digest | \`$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)\` |"
+            echo "| SSH key | \`$([ "$BAKE_SSH_KEY" = true ] && echo 'baked Actions secret' || echo 'keyless; inject from USB EFI')\` |"
           } >> "$GITHUB_STEP_SUMMARY"
