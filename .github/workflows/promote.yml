@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   promote:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     container: quay.io/skopeo/stable:latest
     env:
       REF: ghcr.io/neural-ice/neural-ice-coreos
