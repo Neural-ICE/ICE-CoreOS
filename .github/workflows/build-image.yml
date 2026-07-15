@@ -38,7 +38,7 @@ jobs:
       BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
       SOURCE_REVISION: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Stage GB10 artifacts
         env:
@@ -67,7 +67,9 @@ jobs:
           # Debug remains keyless. The installer injects the operator key from
           # EFI:/ice-coreos/authorized_keys; no CI signing/key secret is baked.
           SSH_AUTHORIZED_KEY: ""
-        run: ./ci/build-image.sh | tee build.out
+        run: |
+          set -o pipefail
+          ./ci/build-image.sh | tee build.out
 
       - name: Assert the shipping platform and summarize the handoff
         run: |

@@ -102,12 +102,25 @@ echo "REF=${REF}"
 if [ "$PUSH" = "1" ]; then
   # Producers publish one run-unique immutable GHCR tag. Mirroring and product
   # channel movement belong to ICE-Fabric's centralized, signed release train.
-  digest_file="$(mktemp "${TMPDIR:-/tmp}/ice-coreos-digest.XXXXXX")"
-  trap 'rm -f "$digest_file"' EXIT
+  if [ "${PODMAN_SUDO:-0}" = "1" ]; then
+    digest_file="$(sudo mktemp "${TMPDIR:-/tmp}/ice-coreos-digest.XXXXXX")"
+  else
+    digest_file="$(mktemp "${TMPDIR:-/tmp}/ice-coreos-digest.XXXXXX")"
+  fi
+  cleanup_digest_file() {
+    if [ "${PODMAN_SUDO:-0}" = "1" ]; then sudo rm -f "$digest_file"
+    else rm -f "$digest_file"
+    fi
+  }
+  trap cleanup_digest_file EXIT
   echo "==> Pushing immutable source ${REF}:${SEMVER}"
   "${PODMAN[@]}" push --digestfile "$digest_file" "${REF}:${SEMVER}"
-  DIGEST="$(tr -d '[:space:]' < "$digest_file")"
+  if [ "${PODMAN_SUDO:-0}" = "1" ]; then DIGEST="$(sudo cat "$digest_file")"
+  else DIGEST="$(cat "$digest_file")"
+  fi
   [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || { echo "ERROR: push returned invalid digest '$DIGEST'" >&2; exit 4; }
   echo "DIGEST=${DIGEST}"
+  cleanup_digest_file
+  trap - EXIT
 fi
