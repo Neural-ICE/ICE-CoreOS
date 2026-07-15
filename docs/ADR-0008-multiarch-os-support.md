@@ -1,6 +1,7 @@
 # ADR-0008 — Multi-architecture OS support (aarch64 + x86_64, aarch64 first)
 
-- **Status**: Proposed
+- **Status**: Deferred for the current shipping train by ADR-0009; retained as the
+  target architecture for a future RTX PRO Blackwell SKU
 - **Date**: 2026-07-09
 - **Decider**: Business/Security Owner (human)
 - **Links**: [[ADR-0002-secure-boot-zero-touch]] (per-arch shim chain),
@@ -9,6 +10,12 @@
   [[ADR-0006-kernel-4k-page-size]] (aarch64-specific; does not apply to x86_64).
 - **Guiding principle**: *one OS, one update model, both platforms — aarch64 ships
   first and stays the priority.*
+
+> **2026-07-15 shipping decision:** ADR-0009 narrows the supported bootc image and
+> installer for the current product train to the hardware-qualified DGX Spark/GB10
+> ARM64 SKU. This proposal remains the design target for a future x86_64 SKU, but it
+> must not be represented by a synthetic `linux/amd64` manifest entry before that
+> hardware, Secure Boot, installer, TPM and rollback path exist and are validated.
 
 ## Context
 
