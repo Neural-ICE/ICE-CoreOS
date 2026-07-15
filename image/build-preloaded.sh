@@ -15,7 +15,7 @@
 # Run on an ARM64 build host with the seed staged locally. Needs sudo (losetup/mount/mkfs).
 #   SEED_IMAGES=$HOME/ice-seed/images \
 #   SEED_MODELS=$HOME/ice-seed/models \
-#   BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:beta-debug \
+#   BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<digest> \
 #   VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
@@ -26,10 +26,12 @@ SEED_MODELS="${SEED_MODELS:-${HOME}/ice-seed/models}"
 # data volume by the autoinstall, applied once on first boot by the image's generic
 # neural-ice-payload-apply.service. KB-sized — headroom covers it.
 SEED_PAYLOAD="${SEED_PAYLOAD:-}"
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:beta-debug}"
+BASE_IMAGE="${BASE_IMAGE:-}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
 
+[[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
+  || { echo "BASE_IMAGE is required as the signed train's digest-pinned appliance ref" >&2; exit 1; }
 [ -d "$SEED_IMAGES" ] || { echo "missing SEED_IMAGES $SEED_IMAGES" >&2; exit 1; }
 [ -d "$SEED_MODELS" ] || { echo "missing SEED_MODELS $SEED_MODELS" >&2; exit 1; }
 [ -z "$SEED_PAYLOAD" ] || [ -x "$SEED_PAYLOAD/apply.sh" ] || { echo "SEED_PAYLOAD set but $SEED_PAYLOAD/apply.sh missing/not executable" >&2; exit 1; }

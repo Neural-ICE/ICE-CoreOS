@@ -1,48 +1,27 @@
 name: build-image
 
-# Build the ICE-CoreOS bootc OS image and publish it to GHCR.
-# Two-ring channel set (beta|stable — see ADR-0005 top note + ICE-Fabric ADR-0028).
-# Default channel is "beta": every push to main produces a fresh beta build
-# (moving :beta tag + an immutable :<version>-beta.<run> tag). :stable is normally
-# reached by promotion (promote.yml), not by a direct build.
-# Runs on a SELF-HOSTED ARM64 runner because the build needs the staged GB10
-# artifacts (GB10 kernel (4k) RPMs, signed NVIDIA modules, signed boot binaries) and
-# native aarch64. See README "CI runner".
-
+# The hardware-bound GB10 bootc producer publishes one immutable GHCR artifact.
+# ICE-Fabric alone mirrors its approved digest to the sovereign registry, and
+# only a signed release train moves beta/stable product pointers.
 on:
   push:
     branches: [main]
-    # OS source only — the workflow file itself is intentionally NOT here: this is a heavy
-    # self-hosted OS build (beta channel = every OS-source push), and a comment/doc edit to the
-    # workflow must not rebuild the whole OS. A workflow-logic change is validated via dispatch.
     paths:
-      - 'image/**'
-      - 'ota/**'
-      - 'ignition/**'
-      - 'ci/build-image.sh'
-      - 'VERSION'
-      # the image bakes this tool (Containerfile.bootc stage 0 → /usr/bin/ni-ota-verify)
-      - 'tools/ni-ota-verify/**'
-  workflow_dispatch:
-    inputs:
-      channel:
-        description: 'Channel to publish'
-        default: beta
-        type: choice
-        options: [beta, stable]
-      variant:
-        description: 'Build variant (prod = sealed; debug = sshd+serial+permissive)'
-        default: prod
-        type: choice
-        options: [prod, debug]
-      bake_ssh_key:
-        description: 'Bake the Actions SSH key into a debug image (lab fallback; EFI injection is preferred)'
-        default: false
-        type: boolean
+      - "image/**"
+      - "ota/**"
+      - "ignition/**"
+      - "ci/build-image.sh"
+      - "VERSION"
+      - "tools/ni-ota-verify/**"
+  # Unlike workflow_dispatch, repository_dispatch always executes the workflow
+  # from the default branch. It provides a safe way to request the debug variant
+  # without allowing a selected branch to replace commands on the org runner.
+  repository_dispatch:
+    types: [build-coreos]
 
 concurrency:
-  group: build-image-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-image-gb10
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -50,89 +29,63 @@ permissions:
 
 jobs:
   build:
-    # `spark` = the dedicated .63 build host — the ONLY runner with the staged GB10
-    # artifacts (/home/user/neural-ice/image/{rpms,driver-modules,nvidia-userspace,
-    # signed-boot} + the console TUI binary). Since the runner fleet moved to org
-    # level, a bare [self-hosted, linux, ARM64] also matches the dgx-spark APPLIANCE
-    # runners (which run the product, not builds) — jobs landing there die on
-    # "missing artifacts dir" (runs 2026-07-10 15:04 + 23:19). Same pinning rationale
-    # as ICE-AC1's build-ice-ac1.yml.
-    runs-on: [self-hosted, linux, ARM64, spark]
+    runs-on: [self-hosted, Linux, ARM64, spark]
+    timeout-minutes: 120
     env:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
-      CHANNEL: ${{ github.event.inputs.channel || 'beta' }}
-      VARIANT: ${{ github.event.inputs.variant || 'prod' }}
-      BUILD_ID: ${{ github.run_number }}
-      BAKE_SSH_KEY: ${{ github.event.inputs.bake_ssh_key || 'false' }}
+      VARIANT: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.variant || 'prod' }}
+      BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
+      SOURCE_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Stage GB10 artifacts
-        # Path on the self-hosted runner holding the prebuilt GB10 artifacts.
-        # Set the repo/org variable ARTIFACTS_DIR; falls back to a neutral default.
-        # The console TUI is PRODUCT code (ICE-Console) composed onto this vanilla
-        # base by ICE-Fabric (ADR-0032) — NOT staged here.
         env:
           ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
         run: |
+          set -euo pipefail
           for d in rpms driver-modules nvidia-userspace signed-boot; do
             if [ ! -d "$ARTIFACTS_DIR/$d" ]; then
-              echo "::error::missing artifacts dir $ARTIFACTS_DIR/$d on the runner"; exit 1
+              echo "::error::missing artifacts dir $ARTIFACTS_DIR/$d on the runner"
+              exit 1
             fi
-            rm -rf "image/$d"; cp -a "$ARTIFACTS_DIR/$d" "image/$d"
+            rm -rf "image/$d"
+            cp -a "$ARTIFACTS_DIR/$d" "image/$d"
           done
-          echo "Staged GB10 artifacts from $ARTIFACTS_DIR"
 
       - name: Log in to GHCR
         run: |
           echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
             | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Log in to the sovereign registry (enables the fleet OTA mirror)
-        # Gated on the secret being set (the `secrets` context is not allowed in `if:`). Present ->
-        # the OS is ALSO pushed to registry.neural-ice.ch and the baked OTA imgref points there, so
-        # fleet `bootc upgrade` follows the sovereign registry (ADR-0023). Absent -> GHCR-only, GHCR
-        # OTA imgref (today's behaviour) — safe degradation until the Owner adds the secrets.
-        id: r2login
+      - name: Build and publish immutable source artifact
         env:
-          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
-          REGISTRY_PASS: ${{ secrets.REGISTRY_PASS }}
-        run: |
-          if [ -n "${REGISTRY_PASS}" ]; then
-            echo "${REGISTRY_PASS}" | sudo podman login registry.neural-ice.ch -u "${REGISTRY_USER}" --password-stdin
-            echo "mirror=1" >> "$GITHUB_OUTPUT"
-            echo "sovereign registry login OK — OS will mirror + OTA imgref = registry.neural-ice.ch"
-          else
-            echo "::warning::REGISTRY_USER/PASS not set — OS pushed to GHCR only; fleet OTA mirror + sovereign OTA imgref DISABLED until the secrets are added (ADR-0023)"
-            echo "mirror=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build and push image
-        env:
-          PUSH: '1'
-          PODMAN_SUDO: '1'
-          MIRROR: ${{ steps.r2login.outputs.mirror }}
-          # Bake the sovereign OTA imgref ONLY when we actually mirror there (else keep GHCR).
-          OTA_REGISTRY: ${{ steps.r2login.outputs.mirror == '1' && 'registry.neural-ice.ch/neural-ice' || 'ghcr.io/neural-ice' }}
+          PUSH: "1"
+          PODMAN_SUDO: "1"
           SOURCE_URL: https://github.com/${{ github.repository }}
-          # Debug enables sshd but remains keyless by default. The installer USB
-          # injects the per-operator key from EFI:/ice-coreos/authorized_keys.
-          # Baking the repo secret is an explicit lab-only fallback, never an
-          # automatic side effect of selecting the debug variant.
-          SSH_AUTHORIZED_KEY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.variant == 'debug' && github.event.inputs.bake_ssh_key == 'true' && secrets.SSH_AUTHORIZED_KEY || '' }}
+          # Debug remains keyless. The installer injects the operator key from
+          # EFI:/ice-coreos/authorized_keys; no CI signing/key secret is baked.
+          SSH_AUTHORIZED_KEY: ""
         run: ./ci/build-image.sh | tee build.out
 
-      - name: Summary
+      - name: Assert the shipping platform and summarize the handoff
         run: |
+          set -euo pipefail
+          semver="$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)"
+          ref="$(grep -m1 '^REF=' build.out | cut -d= -f2)"
+          digest="$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)"
+          sudo podman image inspect "$ref:$semver" --format '{{.Os}}/{{.Architecture}}' \
+            | grep -qx linux/arm64
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::invalid published digest '$digest'"; exit 1; }
           {
-            echo "### ICE-CoreOS image published"
+            echo "### Immutable ICE-CoreOS source artifact"
             echo ""
-            echo '| field | value |'
-            echo '| --- | --- |'
-            echo "| channel | \`$CHANNEL\` |"
-            echo "| version | \`$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)\` |"
-            echo "| ref | \`$(grep -m1 '^REF=' build.out | cut -d= -f2):$CHANNEL\` |"
-            echo "| digest | \`$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)\` |"
-            echo "| SSH key | \`$([ "$BAKE_SSH_KEY" = true ] && echo 'baked Actions secret' || echo 'keyless; inject from USB EFI')\` |"
+            echo "- source: \`$ref@$digest\`"
+            echo "- immutable tag: \`$ref:$semver\`"
+            echo "- variant: \`$VARIANT\`"
+            echo "- platform: \`linux/arm64\` (GB10 ADR-0009)"
+            echo "- next gate: ICE-Fabric central mirror + signed beta train"
+            echo "- channel/alias mutation: none"
           } >> "$GITHUB_STEP_SUMMARY"

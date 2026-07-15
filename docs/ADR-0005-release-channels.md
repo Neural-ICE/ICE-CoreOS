@@ -5,6 +5,14 @@
 - **Decider**: Business/Security Owner (human)
 - **Related**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc OS, native OTA, open-core); ICE-Fabric **ADR-0023** (uniform packaging & OTA)
 
+> **Superseded for product delivery (Owner GO, 2026-07-15):** ICE-CoreOS no
+> longer owns or mutates release channels. Its CI publishes one immutable,
+> run-unique GHCR artifact and hands the digest to ICE-Fabric. The centralized
+> mirror copies that digest to the sovereign registry, and signed appliance
+> trains alone own the `beta`/`stable` pointers, anti-rollback and rollback.
+> `.github/workflows/promote.yml` is retired. The historical decision below is
+> retained to explain legacy tags; none of those tags is moved by current CI.
+
 > **Ring set superseded (2026-07-11)**: the three-ring `alpha|beta|prod` set decided below
 > is reduced to **two rings: `beta|stable`**, unified with the appliance-bundle channels —
 > see ICE-Fabric **ADR-0028**. `beta` = validation ring (every push to `main`, runs on the
@@ -15,11 +23,12 @@
 > at their next re-seed or `bootc switch` (no tag aliases are maintained — accepted, no
 > customer fleet at switch time). The rest of this ADR is kept as decided for the record.
 
-> **Amendment (2026-07-10, ICE-Fabric ADR-0023)**: the alpha/beta/prod channel *model*
+> **Historical amendment (2026-07-10, ICE-Fabric ADR-0023)**: the alpha/beta/prod channel *model*
 > below is unchanged, but for the **appliance fleet** the channel tags now also live on
 > **`registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>`** (the sovereign OTA
 > target), and `promote.yml` moves the channel pointer on **both** GHCR and the sovereign
-> registry by the same digest. The GHCR channel tags remain for community/open-core pulls.
+> registry by the same digest. This mechanism was retired by the 2026-07-15
+> supersession above; the tags remain only for rollback/forensics and do not move.
 
 ## Context
 

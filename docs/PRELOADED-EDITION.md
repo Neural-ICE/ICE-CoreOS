@@ -49,7 +49,7 @@ The raw→archive compression is the build bottleneck (a ~110 GiB raw).
 ```sh
 SEED_IMAGES=$HOME/ice-seed/images \
 SEED_MODELS=$HOME/ice-seed/models \
-BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:beta-debug \
+BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<train-digest> \
 VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
 ```
 

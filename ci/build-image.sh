@@ -6,20 +6,13 @@
 # Env:
 #   REGISTRY            registry/namespace      (default ghcr.io/neural-ice)
 #   IMAGE               package name            (default neural-ice-coreos)
-#   CHANNEL             beta | stable            (default beta; two-ring set,
-#                                                 ADR-0005 top note + ICE-Fabric ADR-0028)
 #   VARIANT             prod | debug             (default prod; debug => -debug tags,
 #                                                 sshd on, serial console, permissive)
-#   BUILD_ID            build counter suffix     (e.g. CI run number; optional)
+#   BUILD_ID            unique build identity    (required when PUSH=1)
+#   SOURCE_REVISION     source commit SHA         (required when PUSH=1; defaults to GITHUB_SHA)
 #   SSH_AUTHORIZED_KEY  bake an admin key        (empty => VANILLA, no key)
 #   PUSH                "1" to push after build  (default 0)
 #   PLATFORM            OCI platform             (default linux/arm64)
-#   OTA_REGISTRY        registry/ns the FLEET OTAs from (default = REGISTRY). CI sets this to
-#                       registry.neural-ice.ch/neural-ice so bootc upgrade follows the sovereign
-#                       registry (ADR-0023); it is baked into the image as the OTA imgref.
-#   MIRROR              "1" to ALSO push to OTA_REGISTRY (the fleet OTA target). Requires a prior
-#                       `podman login` to that registry. Default 0. Must be 1 whenever OTA_REGISTRY
-#                       != REGISTRY, else the baked OTA imgref would point at a place we never pushed.
 #   SOURCE_URL          org.opencontainers.image.source label (default the ICE-CoreOS repo) — WITHOUT
 #                       it GitHub cannot link the package to its repo (orphan package, ADR-0023 §0).
 #
@@ -34,41 +27,38 @@ cd "$REPO_ROOT"
 
 REGISTRY="${REGISTRY:-ghcr.io/neural-ice}"
 IMAGE="${IMAGE:-neural-ice-coreos}"
-CHANNEL="${CHANNEL:-beta}"
 VARIANT="${VARIANT:-prod}"
+BUILD_ID="${BUILD_ID:-}"
+SOURCE_REVISION="${SOURCE_REVISION:-${GITHUB_SHA:-}}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 SSH_AUTHORIZED_KEY="${SSH_AUTHORIZED_KEY:-}"
 PUSH="${PUSH:-0}"
-# Default OTA_REGISTRY = REGISTRY so LOCAL/community builds keep bootc following GHCR (no surprise,
-# no dependency on a registry the dev cannot push to). CI overrides it to the sovereign registry
-# and sets MIRROR=1 (ADR-0023 — the appliance fleet OTAs from registry.neural-ice.ch).
-OTA_REGISTRY="${OTA_REGISTRY:-$REGISTRY}"
-MIRROR="${MIRROR:-0}"
 SOURCE_URL="${SOURCE_URL:-https://github.com/Neural-ICE/ICE-CoreOS}"
 
-case "$CHANNEL" in beta|stable) ;; *) echo "ERROR: invalid CHANNEL '$CHANNEL' (beta|stable)" >&2; exit 2 ;; esac
 case "$VARIANT" in prod) SUFFIX="" ;; debug) SUFFIX="-debug" ;; *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|debug)" >&2; exit 2 ;; esac
+case "$PUSH" in 0|1) ;; *) echo "ERROR: PUSH must be 0 or 1" >&2; exit 2 ;; esac
 
-VERSION="$(tr -d '[:space:]' < VERSION)"
-SEMVER="${VERSION}-${CHANNEL}${BUILD_ID:+.${BUILD_ID}}${SUFFIX}"
-REF="${REGISTRY}/${IMAGE}"            # GHCR push target (upstream + community pull)
-OTA_REF="${OTA_REGISTRY}/${IMAGE}"    # what the fleet OTAs from (baked as the OTA imgref)
-
-# Ring transition (2026-07-11): the channel set moved from alpha|beta|prod to the two-ring
-# beta|stable set (ADR-0005 top note; unified with the bundle channels — ICE-Fabric ADR-0028).
-# Devices built before the switch may carry a baked OTA imgref of :alpha or :prod: those tags
-# stay on the registries but NO LONGER MOVE. Such a device keeps working and re-bakes onto
-# :beta / :stable at its next re-seed or `bootc switch`. No tag aliases are maintained
-# (explicitly accepted — no customer fleet at switch time).
-# Version-counter note: BUILD_ID is the CI run number of build-image.yml, monotonic across the
-# rename — the immutable tags continue (…-alpha.28 → …-beta.29+), no reset, no collision.
-
-# Guard: baking a sovereign OTA imgref we never mirror to would brick fleet OTA.
-if [ "$OTA_REF" != "$REF" ] && [ "$MIRROR" != "1" ]; then
-  echo "ERROR: OTA_REGISTRY ($OTA_REGISTRY) differs from REGISTRY ($REGISTRY) but MIRROR!=1 —" >&2
-  echo "       the baked OTA imgref would point at a registry we never push to. Set MIRROR=1." >&2
+if [ -n "$BUILD_ID" ] && [[ ! "$BUILD_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: BUILD_ID contains characters that are unsafe in an OCI tag" >&2
   exit 2
 fi
+if [ -n "$SOURCE_REVISION" ] && [[ ! "$SOURCE_REVISION" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+  echo "ERROR: SOURCE_REVISION must be a hexadecimal commit identifier" >&2
+  exit 2
+fi
+if [ "$PUSH" = "1" ] && { [ -z "$BUILD_ID" ] || [ -z "$SOURCE_REVISION" ]; }; then
+  echo "ERROR: PUSH=1 requires BUILD_ID and SOURCE_REVISION so the published tag is immutable" >&2
+  exit 2
+fi
+
+VERSION="$(tr -d '[:space:]' < VERSION)"
+if [ -n "$SOURCE_REVISION" ]; then
+  BUILD_LABEL="git.${SOURCE_REVISION:0:12}${BUILD_ID:+.${BUILD_ID}}"
+else
+  BUILD_LABEL="local${BUILD_ID:+.${BUILD_ID}}"
+fi
+SEMVER="${VERSION}-${BUILD_LABEL}${SUFFIX}"
+REF="${REGISTRY}/${IMAGE}"
 
 # Fail early with a clear message if the heavy artifacts are not staged.
 for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boot; do
@@ -88,55 +78,36 @@ done
 # PODMAN_SUDO=1 (CI); rootless otherwise (local dev).
 if [ "${PODMAN_SUDO:-0}" = "1" ]; then PODMAN=(sudo podman); else PODMAN=(podman); fi
 
-echo "==> Building ${REF}:${SEMVER}  (channel ${REF}:${CHANNEL}${SUFFIX})  OTA imgref ${OTA_REF}:${CHANNEL}${SUFFIX}  variant=${VARIANT}  key=$([ -n "$SSH_AUTHORIZED_KEY" ] && echo baked || echo vanilla)"
-"${PODMAN[@]}" build \
-  --platform "$PLATFORM" \
-  --build-arg "SSH_AUTHORIZED_KEY=${SSH_AUTHORIZED_KEY}" \
-  --build-arg "VARIANT=${VARIANT}" \
-  --build-arg "OTA_IMGREF=${OTA_REF}:${CHANNEL}${SUFFIX}" \
-  --build-arg "OS_VERSION=${SEMVER}" \
-  --label "org.opencontainers.image.source=${SOURCE_URL}" \
-  --label "org.opencontainers.image.version=${SEMVER}" \
-  ${GITHUB_SHA:+--label "org.opencontainers.image.revision=${GITHUB_SHA}"} \
+echo "==> Building ${REF}:${SEMVER}  variant=${VARIANT}  key=$([ -n "$SSH_AUTHORIZED_KEY" ] && echo baked || echo vanilla)"
+BUILD_ARGS=(
+  --platform "$PLATFORM"
+  --build-arg "SSH_AUTHORIZED_KEY=${SSH_AUTHORIZED_KEY}"
+  --build-arg "VARIANT=${VARIANT}"
+  --build-arg "OTA_IMGREF=${REF}:${SEMVER}"
+  --build-arg "OS_VERSION=${SEMVER}"
+  --label "org.opencontainers.image.source=${SOURCE_URL}"
+  --label "org.opencontainers.image.version=${SEMVER}"
+)
+if [ -n "$SOURCE_REVISION" ]; then
+  BUILD_ARGS+=(--label "org.opencontainers.image.revision=${SOURCE_REVISION}")
+fi
+"${PODMAN[@]}" build "${BUILD_ARGS[@]}" \
   -f image/Containerfile.bootc \
   -t "${REF}:${SEMVER}" \
-  -t "${REF}:${CHANNEL}${SUFFIX}" \
   .
 
 echo "SEMVER=${SEMVER}"
 echo "REF=${REF}"
 
 if [ "$PUSH" = "1" ]; then
-  # ORDER MATTERS (Codex #8 P2): advance the *moving* channel tags LAST, and the GHCR community
-  # channel only AFTER the sovereign channel exists. Otherwise a mirror failure would leave the
-  # GHCR channel pointing at an image whose baked OTA origin is the sovereign registry, while the
-  # sovereign channel was never updated — a fresh community install would then track a stale/missing
-  # sovereign tag. Sequence: GHCR :SEMVER (immutable) → sovereign :SEMVER + :CHANNEL → GHCR :CHANNEL.
-  echo "==> Pushing ${REF}:${SEMVER} (GHCR immutable)"
-  "${PODMAN[@]}" push "${REF}:${SEMVER}"
-  DIGEST="$("${PODMAN[@]}" image inspect "${REF}:${SEMVER}" --format '{{.Digest}}' 2>/dev/null || true)"
+  # Producers publish one run-unique immutable GHCR tag. Mirroring and product
+  # channel movement belong to ICE-Fabric's centralized, signed release train.
+  digest_file="$(mktemp "${TMPDIR:-/tmp}/ice-coreos-digest.XXXXXX")"
+  trap 'rm -f "$digest_file"' EXIT
+  echo "==> Pushing immutable source ${REF}:${SEMVER}"
+  "${PODMAN[@]}" push --digestfile "$digest_file" "${REF}:${SEMVER}"
+  DIGEST="$(tr -d '[:space:]' < "$digest_file")"
+  [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { echo "ERROR: push returned invalid digest '$DIGEST'" >&2; exit 4; }
   echo "DIGEST=${DIGEST}"
-
-  # Mirror the SAME local image (same digest) to the sovereign registry — the fleet OTA target
-  # (ADR-0023). OS is PUBLIC (no PI), so a direct dual-push from the self-hosted build is fine and
-  # keeps build+mirror atomic (the OS uses channel tags, not quadlet digest pins, so Fabric's
-  # quadlet mirror does not cover it). Requires a prior `podman login "$OTA_REGISTRY host"`.
-  if [ "$MIRROR" = "1" ]; then
-    echo "==> Mirroring to ${OTA_REF}:${SEMVER} and ${OTA_REF}:${CHANNEL}${SUFFIX} (fleet OTA target)"
-    "${PODMAN[@]}" push "${REF}:${SEMVER}"           "docker://${OTA_REF}:${SEMVER}"
-    "${PODMAN[@]}" push "${REF}:${CHANNEL}${SUFFIX}" "docker://${OTA_REF}:${CHANNEL}${SUFFIX}"
-    echo "OTA_REF=${OTA_REF}"
-  fi
-
-  # GHCR moving channel LAST — only now that the immutable + sovereign channel are in place.
-  echo "==> Pushing ${REF}:${CHANNEL}${SUFFIX} (GHCR community channel)"
-  "${PODMAN[@]}" push "${REF}:${CHANNEL}${SUFFIX}"
-
-  # ⚠ Channel-promotion caveat (Codex #8 P1): this build bakes OTA_IMGREF = the BUILD channel
-  # (${OTA_REF}:${CHANNEL}${SUFFIX}). promote.yml re-tags a validated digest across channels by COPY
-  # (ADR-0005: no rebuild), so a promoted :stable image still carries the *build* channel (:beta) in
-  # /usr/lib/neural-ice/ota-imgref. Installers close this gap (Codex #13 P1): build-installer-usb.sh
-  # injects `neuralice.imgref=<packaged channel>` (TARGET_IMGREF, default = BASE_IMAGE) into the
-  # install entry, and the autoinstall honours that karg over the baked default — never rely on the
-  # baked imgref on the installer path. See ota/neural-ice-autoinstall.sh and the README.
 fi
