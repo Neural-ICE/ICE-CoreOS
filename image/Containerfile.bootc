@@ -293,19 +293,17 @@ RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh \
                /usr/local/bin/neural-ice-hostname-init.sh \
                /usr/local/bin/neural-ice-payload-apply.sh; \
-    systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true; \
+    systemctl mask bootc-fetch-apply-updates.timer; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
                      neural-ice-hostname-init.service \
                      neural-ice-payload-apply.service \
-                     avahi-daemon.service \
-                     bootc-fetch-apply-updates.timer; \
+                     avahi-daemon.service; \
     systemctl set-default multi-user.target
 
-# Unattended OS OTA (ADR-0003): native `bootc upgrade` on a timer, from the public
-# GHCR image (no license gate on the OS, no custom wrapper, no Zincati). The timer is
-# shipped-but-masked in the base — we unmask+enable it above. Reboot policy can later be
-# constrained to a maintenance window via a bootc-fetch-apply-updates.service drop-in.
+# Immutable source artifacts do not follow themselves: CI publishes a run-unique tag,
+# so the native bootc timer is masked above. The branded Fabric layer keeps updates under
+# the signed train controller, which stages exact digests with bootc switch --retain.
 
 # Client DATA volume (2nd LUKS domain) auto-unlock — config-in-image (bootc way),
 # not post-install /etc surgery. crypttab references the partition by its stable
@@ -346,9 +344,9 @@ RUN set -euxo pipefail; \
         systemctl mask getty@.service autovt@.service; \
     fi
 
-# OTA source self-description. The producer passes its own immutable tag; the
-# branded Fabric derivation replaces it with the product reference and the signed
-# OTA controller ultimately stages the BOM's digest with bootc switch --retain.
+# OTA source self-description only. The producer passes its own immutable tag while
+# the native timer remains masked; the branded Fabric derivation replaces this with
+# the product reference and its signed controller stages the BOM digest.
 ARG OTA_IMGREF=""
 # OS version self-description (run-unique immutable version from CI).
 # The console TUI displays this file — never the TUI crate version.

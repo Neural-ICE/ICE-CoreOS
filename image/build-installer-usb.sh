@@ -16,15 +16,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Channel base the installer is built on (vanilla, no baked key for community).
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/neural-ice/neural-ice-coreos:stable}"
-# OTA imgref the INSTALLED system will follow — injected as a `neuralice.imgref=` karg on
-# the install entry, which ota/neural-ice-autoinstall.sh honours OVER the image's baked
-# default. Installers must NEVER rely on the baked imgref: a promoted :stable image is a
-# re-tagged beta build (ADR-0005: promotion = copy by digest, no rebuild), so its baked
-# /usr/lib/neural-ice/ota-imgref still names the BUILD channel (:beta) — without this karg
-# a stable installer would ship devices that follow the validation ring (Codex P1, PR #13).
-# Default = BASE_IMAGE (the packaged channel+variant tag). Override for pinned/local bases.
+# Exact base the installer is built on. No mutable or legacy default is allowed.
+BASE_IMAGE="${BASE_IMAGE:-}"
+# Exact imgref installed by the autoinstaller. The source artifact's native timer is
+# masked; later movement is owned by the signed Fabric train controller via bootc switch.
+# Defaulting to the exact BASE_IMAGE preserves byte identity through installation.
 TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
@@ -33,18 +29,19 @@ OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
 OUT_NAME="${OUT_NAME:-}"            # if set, copy the final raw to <REPO>/<OUT_NAME>.img
 BG_SRC="${BG_SRC:-${REPO_ROOT}/image/branding/grub-bg.png}"
 CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer.toml}"
-BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest}"
+BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
+[[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: BASE_IMAGE is required as a digest-pinned OCI reference" >&2; exit 1; }
+[[ "$TARGET_IMGREF" =~ @sha256:[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: TARGET_IMGREF must be a digest-pinned OCI reference" >&2; exit 1; }
 
-# Build the dual-mode installer image FROM the chosen channel base.
-# LOCAL-FIRST (lesson 2026-07-04): a freshly built local tag MUST NOT be clobbered
-# by a stale registry pull — the parity flash installed an old GHCR alpha-debug
-# because the unconditional pull replaced the just-built local image. Refresh
-# explicitly (podman pull) when a newer remote is wanted.
+# Build the dual-mode installer image FROM the chosen immutable base. Reusing a
+# locally present digest is safe because the content address cannot drift.
 echo "==> build installer image  FROM ${BASE_IMAGE}"
 if sudo podman image exists "$BASE_IMAGE"; then
-  echo "    (using LOCAL ${BASE_IMAGE} — pull explicitly to refresh from the registry)"
+  echo "    (using local content-addressed ${BASE_IMAGE})"
 else
   sudo podman pull "$BASE_IMAGE"
 fi

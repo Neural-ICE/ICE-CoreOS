@@ -37,6 +37,15 @@
 >    value only matters until the next re-bake; the digest-pinned `bootc switch` flow
 >    (ICE-Fabric ADR-0026 P2) supersedes tag-following entirely.
 
+> **Amendment (2026-07-15, ICE-Fabric ADR-0029/0034 — signed product trains):**
+> producers now publish only run-unique immutable GHCR artifacts and never move a
+> native bootc channel. Consequently the CoreOS source artifact keeps
+> `bootc-fetch-apply-updates.timer` masked. The branded appliance is installed by
+> exact sovereign digest and the signed OTA controller owns check/install,
+> `bootc switch --retain`, pending reboot, health validation, and rollback. This
+> amendment supersedes the autonomous native-timer implementation below for the
+> Neural ICE appliance; it does not weaken local bootc rollback.
+
 ## Context (the path taken)
 
 The real need, as formulated by the decider: *"an immutable read-only OS with

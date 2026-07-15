@@ -61,12 +61,12 @@ and pass that exact reference when building a local installer:
 BASE_IMAGE='ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest>' ./image/build-installer-usb.sh
 ```
 
-Then:
+The local build writes `${OUT:-/var/tmp/ice-coreos-bib}/image/disk.raw`. Then:
 
-1. Take the installer `.img` (from a Release, or the local build above).
+1. Take that exact `disk.raw` (or set `OUT` explicitly before building).
 2. Flash it to a USB stick:
    ```sh
-   xz -dc ice-coreos-installer-*.img.xz | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress
+   sudo dd if=/var/tmp/ice-coreos-bib/image/disk.raw of=/dev/sdX bs=64M oflag=direct conv=fsync status=progress
    ```
 3. **Inject your SSH key** (the vanilla image has none) — either:
    - drop your public key onto the USB's EFI partition at `ice-coreos/authorized_keys`
@@ -122,6 +122,11 @@ repository dispatch, which always executes the workflow from the default branch:
 gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
   -f event_type=build-coreos -F 'client_payload[variant]=debug'
 ```
+
+Run-unique CoreOS source artifacts keep the native `bootc-fetch-apply-updates.timer`
+masked: an immutable tag cannot be an update channel. Fabric composes the branded
+appliance from this digest and its signed OTA controller performs
+`bootc switch --retain` to later train digests.
 
 ### CI runner
 
