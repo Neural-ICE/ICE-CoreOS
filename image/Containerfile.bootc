@@ -345,18 +345,16 @@ RUN set -euxo pipefail; \
         systemctl mask getty@.service autovt@.service; \
     fi
 
-# OTA imgref self-description: the CI bakes the exact channel+variant tag this image
-# should follow (build-image.sh passes OTA_IMGREF). The installer reads it so a debug
-# install pins :<channel>-debug (not :stable). Overridable at install via neuralice.imgref=.
-# Channels are the two-ring beta|stable set (ADR-0005 top note + ICE-Fabric ADR-0028);
-# images baked before 2026-07-11 may still carry :alpha/:prod here — those tags remain
-# on the registries but no longer move, and the device re-bakes at its next re-seed.
-ARG OTA_IMGREF="ghcr.io/neural-ice/neural-ice-coreos:stable"
-# OS version self-description (SEMVER from the CI, e.g. 0.9.0-beta.42-debug).
+# OTA source self-description. The producer passes its own immutable tag; the
+# branded Fabric derivation replaces it with the product reference and the signed
+# OTA controller ultimately stages the BOM's digest with bootc switch --retain.
+ARG OTA_IMGREF=""
+# OS version self-description (run-unique immutable version from CI).
 # The console TUI displays this file — never the TUI crate version.
 ARG OS_VERSION=""
 RUN set -euxo pipefail; \
     install -d -m 0755 /usr/lib/neural-ice; \
+    test -n "${OTA_IMGREF}"; \
     printf '%s\n' "${OTA_IMGREF}" > /usr/lib/neural-ice/ota-imgref; \
     if [ -n "${OS_VERSION}" ]; then printf '%s\n' "${OS_VERSION}" > /usr/lib/neural-ice/version; fi
 

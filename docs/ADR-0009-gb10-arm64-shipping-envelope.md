@@ -30,18 +30,18 @@ subject to the ARM64+AMD64 publication requirement in ICE-Fabric ADR-0018.
 
 1. The current ICE-CoreOS product image, installer, and release-train
    `appliance.os_base` are explicitly **hardware-bound to linux/arm64 GB10**.
-2. The immutable version tag and the `beta` channel may therefore resolve to a
-   single ARM64 image. This is an intentional support envelope, not a partially
-   successful multi-arch build.
+2. The immutable source artifact and the signed appliance `beta` train may
+   therefore resolve to a single ARM64 image. This is an intentional support
+   envelope, not a partially successful multi-arch build.
 3. CI must assert that the published OS image reports `linux/arm64`. It must not
    create a `linux/amd64` descriptor by copying, relabelling, emulation, or manifest
    surgery.
 4. Signed BOMs identify the GB10 hardware target in their compatibility data. The
    OTA controller must continue to reject an incompatible train before pulling or
    staging the OS.
-5. `beta` remains the only validation ring for the current appliance. `stable` is
-   promoted only from the exact, previously validated digest; this ADR does not
-   authorize a promotion.
+5. `beta` remains the only validation ring for the current appliance. ICE-CoreOS
+   CI does not move channels; the signed Fabric train may promote only the exact,
+   previously validated digest. This ADR does not authorize a promotion.
 6. The exception stops at the bootc OS and hardware-specific installer payloads.
    ICE-AC1, gateways, connectors, CPU/glue images, the thin client, and other
    architecture-neutral deliverables still build and test natively for ARM64 and
@@ -64,7 +64,7 @@ Only then may CI assemble one ARM64+AMD64 bootc index and move a shared channel.
 
 - The two-week client demonstration uses the image that is actually qualified on
   the only appliance, without fabricating platform coverage.
-- OS channel and rollback semantics remain unchanged: immutable digest, signed
+- Product ring and rollback semantics remain unchanged: immutable digest, signed
   train, `bootc switch --retain`, explicit `pending_reboot`, and retained rollback.
 - A future x86 appliance is visible as a hardware-enablement project instead of a
   misleading CI checkbox.

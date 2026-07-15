@@ -29,47 +29,36 @@ install it on a DGX Spark and inject their own SSH key.
   boot with an enrolled lab key; a **Microsoft-signed shim** (boot on factory
   Secure Boot, no enrollment) is in preparation — see
   [ADR-0002](docs/ADR-0002-secure-boot-zero-touch.md) and [secureboot/](secureboot/).
-- **OTA from GHCR** — `ghcr.io/neural-ice/neural-ice-coreos`, free pull egress, atomic,
-  rollback. See [ADR-0003](docs/ADR-0003-base-and-update-model.md).
-- **Release channels** — two rings, `beta` / `stable`, with promotion-by-digest (no rebuild).
+- **Immutable OCI source** — CI publishes digest-addressable GB10 artifacts to
+  `ghcr.io/neural-ice/neural-ice-coreos`; Fabric mirrors approved digests and
+  signed product trains drive atomic OTA + rollback. See
+  [ADR-0003](docs/ADR-0003-base-and-update-model.md).
 - **Flashable USB installer** — dual-mode (Live / Install), light or preloaded
   edition (see [docs/PRELOADED-EDITION.md](docs/PRELOADED-EDITION.md)).
 
 ---
 
-## Release channels & promotion (staging)
+## Artifact publication and product release trains
 
-Two moving channel tags on the package, plus immutable `:<version>-<channel>.<n>` tags
-(ring set unified with the appliance-bundle channels — see ICE-Fabric ADR-0028):
+This repository is a producer, not a release-channel authority. A trusted `main`
+build publishes one run-unique immutable GHCR tag and reports its digest. It never
+logs in to the sovereign registry and never moves `beta`, `stable`, `latest`, or
+any other alias.
 
-| Channel | Tag | Cadence | Use |
-| --- | --- | --- | --- |
-| **beta** | `…:beta` | every push to `main` (CI) | validation ring |
-| **stable** | `…:stable` | promoted, when validated | production / community |
-
-The flow is a **staging pipeline** — the exact bits validated in `beta` are what reach
-`stable`, because promotion only **re-tags the digest** (no rebuild, no drift):
-
-```
-push → CI builds    → :beta           (.github/workflows/build-image.yml)
-promote beta→stable → :stable         (.github/workflows/promote.yml, manual)
-```
-
-A device or installer subscribes to a channel via its OTA origin
-(`--target-imgref …:stable`), so `bootc upgrade` follows that channel.
+ICE-Fabric centrally mirrors an approved digest to `registry.neural-ice.ch`, binds
+it into a signed BOM, and moves only the signed product-train `beta`/`stable`
+pointers. Appliances install the BOM's digest with `bootc switch --retain`; the
+current `.72` validation uses `beta`, while `stable` remains untouched.
 
 ---
 
 ## Install on a DGX Spark
 
-The OS image is **public** on GHCR (`ghcr.io/neural-ice/neural-ice-coreos:<channel>`).
-
-The flashable USB **installer** is produced by the `release-installer` workflow and
-attached to [Releases](https://github.com/Neural-ICE/ICE-CoreOS/releases) when
-published; you can always build one locally for any channel:
+The vanilla OS source image is public on GHCR. Resolve an immutable tag to a digest
+and pass that exact reference when building a local installer:
 
 ```sh
-BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:stable ./image/build-installer-usb.sh
+BASE_IMAGE='ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest>' ./image/build-installer-usb.sh
 ```
 
 Then:
@@ -118,18 +107,20 @@ Produce/stage them with `build/build-kernel.sh` + `ci/stage-artifacts.sh` (run r
 then build:
 
 ```sh
-# Vanilla public image (no SSH key):
-CHANNEL=beta ./ci/build-image.sh
+# Vanilla public image (local, no push and no SSH key):
+VARIANT=prod ./ci/build-image.sh
 
 # Dev image with a baked SSH key (lab only — keys in the image do not survive
 # a `bootc switch` to a keyless image; prefer the persistent authorized_keys):
-SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" CHANNEL=beta PUSH=1 ./ci/build-image.sh
+SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" VARIANT=debug ./ci/build-image.sh
 ```
 
-Build a flashable USB installer for a channel:
+CI publishes only from trusted `main`. A keyless debug build is requested with a
+repository dispatch, which always executes the workflow from the default branch:
 
 ```sh
-BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos:stable ./image/build-installer-usb.sh
+gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
+  -f event_type=build-coreos -F 'client_payload[variant]=debug'
 ```
 
 ### CI runner
@@ -138,7 +129,8 @@ The build/installer workflows run on a **self-hosted ARM64 runner** (a DGX Spark
 ARM64 build host) because they need native aarch64, `podman` + `bootc-image-builder`, and
 the staged GB10 artifacts. Register one with the
 [GitHub Actions runner](https://docs.github.com/actions/hosting-your-own-runners) and the
-labels `self-hosted, linux, ARM64`. Promotion runs on hosted runners (skopeo only).
+labels `self-hosted, Linux, ARM64, spark`. Mirroring and signed train promotion run
+only in ICE-Fabric on the designated self-hosted infrastructure.
 
 GHCR auth: workflows use `GITHUB_TOKEN` (`packages: write`); set a `GHCR_PAT` repo secret
 to override. Keep the `neural-ice-coreos` package **public** for free community pulls.
@@ -155,8 +147,8 @@ build/          GB10 kernel (4k) + driver build (heavy, rare)
 ci/             build/stage/version helper scripts used by CI and locally
 secureboot/     Microsoft-signed shim preparation (runbook, key ceremony, shim build)
 docs/           Architecture Decision Records + guides
-.github/        CI workflows (build-image, promote, release-installer, build-kernel)
-VERSION         semantic version base for channel tags
+.github/        CI workflows (immutable build, installer tooling, kernel build)
+VERSION         semantic version base for immutable source tags
 ```
 
 ## Architecture decisions
