@@ -12,6 +12,7 @@
 #
 # Build (root storage, required by bootc-image-builder --local):
 #   sudo podman build --platform linux/arm64 -f image/Containerfile.bootc \
+#        --build-arg OTA_IMGREF=ghcr.io/neural-ice/neural-ice-coreos:stream10-bootc \
 #        -t ghcr.io/neural-ice/neural-ice-coreos:stream10-bootc .
 
 # --------------------------------------------------------------------------- #
