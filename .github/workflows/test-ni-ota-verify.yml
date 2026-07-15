@@ -39,12 +39,15 @@ jobs:
       - name: Verify, lint and test in pinned Rust toolchain
         run: |
           set -euo pipefail
-          podman run --rm --userns=keep-id \
+          # Root inside rootless Podman maps to the runner user, so rustup may add
+          # components to the image toolchain while generated files stay user-owned.
+          podman run --rm \
             -v "$PWD:/src:Z" \
             -w /src/tools/ni-ota-verify \
             -e CARGO_HOME=/src/.cargo-ci \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
+              rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --all-targets --locked -- -D warnings
               cargo test --locked
