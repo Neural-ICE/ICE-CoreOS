@@ -32,6 +32,9 @@ Read the applicable ADR before editing. In particular:
   must never become a production default.
 - AI services are containers and examples use Quadlets, not compose or ad hoc
   production podman commands.
+- The bootc and installer release set must support linux/arm64 and linux/amd64.
+  ARM64/sm_121 is the priority platform, not an ARM64-only release exception.
+  OCI publication must expose one verified multi-arch manifest list.
 - Builds consume staged, verified artifacts. Never commit RPMs, driver blobs,
   signing keys, recovery keys, or generated work/ output.
 
