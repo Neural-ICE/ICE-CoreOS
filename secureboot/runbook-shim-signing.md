@@ -23,9 +23,9 @@ legal entity for this process.
   (**TKRI**, SIREN 789 990 298 — brand: Neural ICE). shim-review only needs a
   verifiable link — do **not** post the Kbis PDF in the public issue (it
   carries the manager's personal details).
-- [ ] Keep a **Kbis extract < 3 months** at hand for the EV CA's org
-  validation (free for the gérant via <https://monidenum.fr>).
-- [ ] The **Organization (O=)** name must be **`TKRI`** (dénomination sociale)
+- [x] Kbis extract < 3 months at hand for the EV CA's org validation
+  (free for the gérant via <https://monidenum.fr>) — used 2026-07.
+- [x] The **Organization (O=)** name must be **`TKRI`** (dénomination sociale)
   across: the EV certificate, the Partner Center account, and the certificates
   generated in the key ceremony. "Neural ICE" stays the product/brand name —
   the questionnaire's organization field takes the legal name, with the brand
@@ -38,20 +38,24 @@ Required by Microsoft for **UEFI firmware signing** submissions (it signs the
 shim). CA/Browser Forum rules require the EV private key on certified hardware:
 the **YubiKey 5C NFC FIPS** (FIPS 140-2 overall L2, physical L3) qualifies.
 
-- [ ] Pick a CA that can issue **onto a customer-provided YubiKey** via PIV
-  attestation (SSL.com documents this flow; DigiCert/Sectigo/GlobalSign
-  typically ship their own token or cloud HSM — also acceptable, then the
-  YubiKey is free for the Secure Boot keys).
-- [ ] Complete EV org validation (uses the commercial register entry;
-  typically 3–10 business days).
-- [ ] Record Issuer/Subject of the EV cert — the questionnaire asks for both.
+- [x] CA chosen: **SSL.com** (own-YubiKey PIV attestation flow), EV Code
+  Signing, key born ECCP384 in PIV slot 9a, touch-protected.
+- [x] EV org validation completed; certificate **issued 2026-07-14**
+  (valid → 2027-07-14).
+- [x] Issuer/Subject recorded in the questionnaire
+  ([shim-review-answers.draft.md](shim-review-answers.draft.md)).
 
 ### 1.3 Microsoft Partner Center (Windows Hardware Developer Program)
 
-- [ ] Create a Microsoft Entra ID tenant for the org (if none).
-- [ ] Register at <https://partner.microsoft.com/dashboard/registration/hardware>
-  (identity verification is done with the EV certificate).
-- [ ] Review the current [Microsoft UEFI signing requirements](https://techcommunity.microsoft.com/blog/hardware-dev-center/updated-microsoft-uefi-signing-requirements/1062916)
+- [x] Entra ID tenant created (2026-07-16). Note for future registrations:
+  the business-account wizard requires adding a payment card to finish
+  provisioning (no charge; removable afterwards), and privacy-hardened
+  browsers break the signup/SSO flows — use a clean browser profile.
+- [x] Hardware program registered (2026-07-16): company matched via its
+  existing D-U-N-S record, agreements accepted, EV certificate validated
+  **Active** (proof-of-possession: their signable file signed on Linux with
+  `osslsigncode` + OpenSC PKCS#11 against the YubiKey).
+- [x] Reviewed the current [Microsoft UEFI signing requirements](https://techcommunity.microsoft.com/blog/hardware-dev-center/updated-microsoft-uefi-signing-requirements/1062916)
   — notably: signing keys protected on **≥ FIPS 140-2 L2** hardware, backed up
   and recoverable only by trusted-role personnel under dual control.
 - Note: passing shim-review **exempts from the yearly independent security
@@ -89,6 +93,11 @@ Follow [shim/README.md](shim/README.md). Outputs: `shimaa64.efi`, `build.log`,
 SHA256 — all committed to the shim-review fork. `docker build .` must reproduce
 the exact binary (reviewers re-run it; a non-reproducible binary is rejected).
 
+**Done 2026-07-16** with the production CA: two `--no-cache` builds
+byte-identical; `shimaa64.efi` sha256 `d55327f1…e46c` (full sums in the
+[questionnaire](shim-review-answers.draft.md)). §2.1 ceremony done the same
+day (CA sha256 `44d0de0c…7803`, leaf in PIV 9c, backups restore-tested).
+
 ### 2.3 Boot-chain conformance (reviewed even though only shim gets signed)
 
 - [ ] **GRUB2**: rebuild the **CentOS Stream 10 `grub2` SRPM** (carries all
@@ -96,10 +105,10 @@ the exact binary (reviewers re-run it; a non-reproducible binary is rejected).
   `grub.neuralice` SBAT entry (never replace distro/upstream entries), sign
   `grubaa64.efi` with the Neural ICE leaf key. Record the exact NVR and the
   built-in module list (`grub2-mkimage` invocation) for the questionnaire.
-- [ ] **Kernel**: 6.12 el10 (`nvidia-gb10` tree) already includes the three
+- [x] **Kernel conformance**: 6.12 el10 (`nvidia-gb10` tree) includes the three
   lockdown commits the questionnaire asks about (upstream since v5.4/v5.8/v5.19)
-  and enforces `lockdown=integrity` under Secure Boot (verified on hardware).
-  Sign `vmlinuz` with the Neural ICE leaf key (`sbsign`).
+  and enforces `lockdown=integrity` under Secure Boot — verified on hardware.
+  *(Still to wire: sign `vmlinuz` with the leaf key in the pipeline.)*
 - [ ] **Module signing — make the build key ephemeral.** Current flow keeps
   `certs/signing_key.pem` around to sign the NVIDIA kmods after the kernel
   build. Reviewers explicitly ask about this: sign the NVIDIA modules **in the

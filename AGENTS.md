@@ -18,7 +18,10 @@ Read the applicable ADR before editing. In particular:
 - ADR-0004 governs TPM/LUKS.
 - ADR-0006 fixes the GB10 kernel to 4 KiB pages.
 - ADR-0008 governs multi-architecture support.
-- secureboot/ documents the signing boundary and ceremonies.
+- secureboot/ documents the signing boundary and ceremonies. Its contents
+  (questionnaire, binary hashes, certificates) mirror the state of the live
+  shim-review/Microsoft submission — do not edit without coordinating with
+  the Owner: a drifted hash or DN can invalidate the signing application.
 
 ## Host invariants
 

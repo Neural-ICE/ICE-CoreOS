@@ -1,7 +1,9 @@
 # ADR-0002 — Zero-touch Secure Boot (Neural ICE shim signed by Microsoft)
 
-- **Status**: Accepted (Option A) — implementation **in progress** (see
-  [`secureboot/`](../secureboot/); external dependency ~2–4 months)
+- **Status**: Accepted (Option A) — technical prerequisites **complete**
+  (2026-07-16: vendor CA created, final shim built reproducibly, EV identity
+  and Microsoft account in place — see [`secureboot/`](../secureboot/));
+  awaiting shim-review submission (external review ~2–3 months)
 - **Date**: 2026-06-28
 - **Decider**: Business/Security Owner (human)
 - **Guiding principle**: *installation must happen WITHOUT human action.*
@@ -70,17 +72,24 @@ Public submission on **`github.com/rhboot/shim-review`** (issue + questionnaire)
 
 **Legal/operational prerequisites** (legal entity, EV certificate, Microsoft
 Partner Center account, security contacts): see the
-[runbook](../secureboot/runbook-shim-signing.md).
+[runbook](../secureboot/runbook-shim-signing.md). Done 2026-07-16 — EV code
+signing certificate issued and validated on the Microsoft hardware account;
+**security contacts (two, PGP-verified) still open**.
 
 **TECHNICAL prerequisites** (implementation package: [`secureboot/`](../secureboot/)):
-- [ ] **shim 16.1** from the official tarball, **reproducible build** (`Dockerfile`,
-      pinned toolchain → `docker build .` regenerates the exact binary).
-- [ ] Neural ICE certificate (CA) in **DER**, embedded as `vendor_cert`.
-- [ ] Neural ICE **SBAT** entry (append, do not replace the upstream ones).
+- [x] **shim 16.1** from the official tarball, **reproducible build** — two
+      independent `--no-cache` builds byte-identical;
+      `shimaa64.efi` sha256 `d55327f1…e46c` (2026-07-16).
+- [x] Neural ICE certificate (CA) in **DER**, embedded as `vendor_cert`
+      (`Neural ICE UEFI Secure Boot CA 2026`, sha256 `44d0de0c…7803`,
+      created at the 2026-07-16 key ceremony).
+- [x] Neural ICE **SBAT** entry (appended; verified in the final binary:
+      `shim.neuralice,1`).
 - [ ] If GRUB2: up-to-date **CVE** patches (21 CVEs listed Feb 2025) + SBAT generation = 5.
       *(A **UKI/systemd-boot** greatly lightens this part → prefer the UKI.)*
-- [ ] **Kernel** with **lockdown** enforcement under Secure Boot (upstream commits).
-- [ ] Build logs, SHA256 of the binary, description of the patches.
+- [x] **Kernel** with **lockdown** enforcement under Secure Boot — verified on
+      GB10 hardware (`integrity` mode, 6.12 el10).
+- [x] Build logs, SHA256 of the binaries, no patches (vanilla 16.1).
 
 **MS signature**: after the `accepted` label, the shim is sent to Microsoft and signed
 with the **2011 + 2023** keys → we receive **2 signed copies**.

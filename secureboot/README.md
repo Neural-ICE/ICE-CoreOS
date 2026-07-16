@@ -36,9 +36,17 @@ Facts verified on GB10 hardware (2026-07-08):
 
 ## Status
 
-- [ ] P0 admin prerequisites (legal entity, EV certificate, Microsoft Partner Center, 2 security contacts + PGP) — see runbook §1
-- [ ] Key ceremony executed (CA + leaf on YubiKey FIPS, backups in safe)
-- [ ] Reproducible shim build produced (`shim/`) with final SHA256
+- [x] Legal entity verified + **EV code signing certificate** issued
+      (2026-07-14, key attested in a YubiKey 5 FIPS) — runbook §1.1–1.2
+- [x] **Microsoft Partner Center** hardware account registered, EV certificate
+      validated `Active` (2026-07-16) — runbook §1.3
+- [ ] **Two security contacts + PGP keys** published — runbook §1.4 (last open
+      admin item)
+- [x] **Key ceremony executed** (2026-07-16): offline CA
+      `Neural ICE UEFI Secure Boot CA 2026` (sha256 `44d0de0c…7803`, valid to
+      2046) + leaf in YubiKey PIV 9c; encrypted backups verified by restore test
+- [x] **Reproducible shim build** with the production CA: two `--no-cache`
+      builds byte-identical, `shimaa64.efi` sha256 `d55327f1…e46c` (2026-07-16)
 - [ ] GRUB2 rebuild with appended Neural ICE SBAT (separate pipeline work)
 - [ ] Ephemeral kernel-module signing key in the kernel/kmod pipeline (reviewers probe this)
 - [ ] Fork of `rhboot/shim-review` populated + tagged `neuralice-shim-aarch64-YYYYMMDD`
