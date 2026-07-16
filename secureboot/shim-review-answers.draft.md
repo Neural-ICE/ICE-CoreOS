@@ -10,7 +10,7 @@ Copy into the fork's `README.md` once every TODO is resolved.
 
 Organization name and website:
 **TKRI** (SARL, France), operating under the product brand **Neural ICE** —
-website: `[TODO: https://…]`
+website: <https://neural-ice.ch>
 
 ### What's the legal data that proves the organization's genuineness?
 
@@ -22,10 +22,14 @@ French commercial register (RCS) entry:
 The public details of both your organization and the issuer in the EV
 certificate used for signing .cab files at Microsoft Hardware Dev Center:
 ```
-[TODO after EV issuance, e.g.:
-Issuer: O=SSL.com, CN=SSL.com EV Code Signing Intermediate CA RSA R3
-Subject: C=FR, O=TKRI, CN=TKRI]
+Issuer: C=US, ST=Texas, L=Houston, O=SSL Corp, CN=SSL.com EV Code Signing Intermediate CA ECC R2
+Subject: C=FR, ST=Île-de-France, L=Paris, O=TKRI, serialNumber=789990298, CN=TKRI, businessCategory=Private Organization, jurisdictionL=Paris, jurisdictionST=Île-de-France, jurisdictionC=FR
 ```
+
+(EV Code Signing certificate serial `1EBE4EFD89D56D6DEAB0508C9930468F`, valid
+2026-07-14 → 2027-07-14; the private key was generated on-device in a YubiKey
+5 FIPS PIV slot and attested at issuance — see the key-protection answer
+below.)
 
 ### What product or service is this for?
 
@@ -94,10 +98,11 @@ None. Vanilla shim 16.1; the only build inputs are `VENDOR_CERT_FILE`
 
 ### Do you have the NX bit set in your shim? If so, is your entire boot stack NX-compatible and what testing have you done to ensure such compatibility?
 
-No, the NX bit is not set. Our boot stack (GRUB2 from CentOS Stream 10,
-kernel 6.12 aarch64) follows current Fedora/CentOS practice, which has not yet
-declared full NX compatibility. `[TODO: confirm against the final build —
-`objdump -x shimaa64.efi | grep DllCharacteristics`.]`
+No, the NX bit is not set (confirmed on the final build: `post-process-pe`
+reports "NX Compatibility flag is not set" for shim, MokManager and fallback).
+Our boot stack (GRUB2 from CentOS Stream 10, kernel 6.12 aarch64) follows
+current Fedora/CentOS practice, which has not yet declared full NX
+compatibility.
 
 ### What exact implementation of Secure Boot in GRUB2 do you have?
 
@@ -181,7 +186,14 @@ First application — N/A.
 
 ### What is the SHA256 hash of your final shim binary?
 
-`[TODO: from out/SHA256SUMS after the final build]`
+```
+d55327f1810150de037910878c1c8f6d43db9057f4591d25e4bcede38ac9e46c  shimaa64.efi
+d03b4a4319daf5d3eb30d6e7b498ba2641a7f4bf48ec805692242aacfcd22f76  mmaa64.efi
+f7ffbfca88d49f9043ef98405b9dce9047d2e507a5640358eaeade2668c16bfa  fbaa64.efi
+```
+
+(shim 16.1, vendor CA sha256 `44d0de0c…7803` embedded; two independent
+`--no-cache` container builds produced byte-identical binaries.)
 
 ### How do you manage and protect the keys used in your shim?
 
@@ -224,8 +236,10 @@ grub,5,Free Software Foundation,grub,2.12,https://www.gnu.org/software/grub/
 grub.rh,4,Red Hat,grub2,[TODO: NVR],mailto:secalert@redhat.com
 grub.neuralice,1,Neural ICE,grub2,[TODO: our NVR],https://github.com/Neural-ICE/shim-review
 ```
-`[TODO: paste the real dumps from the final binaries — shim's shim,N generation
-and grub entries must match what 16.1 and the c10s grub2 build actually emit.]`
+The shim entries above are the **real dump from the final binary**
+(`shimaa64.efi` sha256 `d55327f1…e46c`, build 2026-07-16).
+`[TODO: the GRUB2 entries are the intended layout — paste the real dump once
+the c10s grub2 rebuild exists, with its exact NVR.]`
 
 No other binaries are booted through shim (no fwupd EFI binary is shipped).
 
