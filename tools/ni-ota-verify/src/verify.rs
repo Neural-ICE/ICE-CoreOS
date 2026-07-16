@@ -372,7 +372,10 @@ fn anti_rollback_check(
             } else {
                 Check::fail(
                     "anti_rollback",
-                    format!("ROLLBACK: bundle_seq {bom_seq} < applied {} — recovery is forward-only", applied.bundle_seq),
+                    format!(
+                        "ROLLBACK: bundle_seq {bom_seq} < applied {} — recovery is forward-only",
+                        applied.bundle_seq
+                    ),
                 )
             }
         }
