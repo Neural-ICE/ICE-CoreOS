@@ -125,6 +125,7 @@ RUN curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-co
  && install -d -m 0755 /etc/cdi
 
 COPY image/bootc-overlay/            /
+RUN test "$(cat /usr/lib/neural-ice/hardware-target)" = nvidia-gb10-arm64
 
 RUN set -euxo pipefail; \
     chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \

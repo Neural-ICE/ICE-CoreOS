@@ -49,8 +49,10 @@ jobs:
             bash -euo pipefail -c '
               rustup component add rustfmt clippy
               cargo fmt --check
-              cargo clippy --all-targets --locked -- -D warnings
-              cargo test --locked
+              cargo clippy --all-targets --all-features --locked -- -D warnings
+              cargo test --locked --features test-path-overrides
+              cargo build --release --locked
+              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
             '
 
       - name: Cleanup build tree

@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{immutable_hardware_target, Config};
 use crate::state::{AppliedState, AppliedStateStore, FileStateStore, StateRead};
 use crate::verify::{applied_state_path, BomCore};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
@@ -31,12 +31,19 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         .map_err(|e| InternalError(format!("cannot read BOM {}: {e}", bom_path.display())))?;
     let bom: BomCore = serde_json::from_slice(&bytes)
         .map_err(|e| InternalError(format!("malformed BOM {}: {e}", bom_path.display())))?;
+    let hardware_target = immutable_hardware_target()?;
     let bom_sha = runner::sha256_file(&bom_path)?;
 
     let refuse = |why: String| -> Result<u8, InternalError> {
         eprintln!("ni-ota-verify: commit REFUSED: {why}");
         Ok(EXIT_REFUSE)
     };
+    if bom.hardware_target != hardware_target {
+        return refuse(format!(
+            "BOM hardware_target '{}' does not match immutable host target '{hardware_target}'",
+            bom.hardware_target
+        ));
+    }
     match store.read() {
         // First commit seeds the record (P2 shadow burn-in; P3's NV seeding
         // reads exactly this record — plan P3).
@@ -73,6 +80,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let receipt = serde_json::json!({
         "committed": true,
         "bundle_seq": state.bundle_seq,
+        "hardware_target": hardware_target,
         "bom_sha256": state.bom_sha256,
     });
     println!("{receipt}");

@@ -9,6 +9,45 @@ use std::path::{Path, PathBuf};
 
 use crate::InternalError;
 
+const DEFAULT_HARDWARE_TARGET_FILE: &str = "/usr/lib/neural-ice/hardware-target";
+
+pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let path = std::env::var_os("NI_OTA_HARDWARE_TARGET_FILE").map_or_else(
+        || PathBuf::from(DEFAULT_HARDWARE_TARGET_FILE),
+        PathBuf::from,
+    );
+    #[cfg(not(feature = "test-path-overrides"))]
+    let path = PathBuf::from(DEFAULT_HARDWARE_TARGET_FILE);
+    let target = std::fs::read_to_string(&path).map_err(|e| {
+        InternalError(format!(
+            "unreadable immutable hardware target {}: {e}",
+            path.display()
+        ))
+    })?;
+    let target = target.trim();
+    let valid = !target.is_empty()
+        && target.len() <= 64
+        && target
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+        && target
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && target
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !valid {
+        return Err(InternalError(format!(
+            "invalid immutable hardware target in {}",
+            path.display()
+        )));
+    }
+    Ok(target.to_string())
+}
+
 pub(crate) struct Config {
     /// false = shadow (verdicts are logged, refuse still exits 0);
     /// true = enforce (refuse exits nonzero). A missing/stripped `enforce`

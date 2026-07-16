@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{parse_compat_flag, Config};
+use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
 use crate::state::{AppliedStateStore, FileStateStore, StateRead};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
@@ -19,6 +19,7 @@ use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_
 #[derive(Deserialize)]
 pub(crate) struct BomCore {
     pub train: String,
+    pub hardware_target: String,
     pub bundle_seq: u64,
     // Optional so that an incomplete BOM fails the compat CHECK (a verdict)
     // instead of the parse step — the failure code must say "compat", not
@@ -31,6 +32,7 @@ pub(crate) struct BomCore {
 #[derive(Deserialize)]
 struct ChannelRecord {
     train: String,
+    hardware_target: String,
     channel: String,
     bundle_seq: u64,
 }
@@ -110,6 +112,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
 
     let config_path = flags.get("config").map_or(DEFAULT_CONFIG, String::as_str);
     let cfg = Config::load(Path::new(config_path))?;
+    let hardware_target = immutable_hardware_target()?;
     // Resolve the whole toolchain BEFORE any check runs: a missing cosign is
     // an internal error in every mode, never a "refuse" a caller could route.
     let cosign = runner::cosign_path()?;
@@ -217,6 +220,23 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
                 ),
             )
         });
+        checks.push(if rec.hardware_target == bom.hardware_target {
+            Check::pass(
+                "target_binding",
+                format!(
+                    "record and BOM both bind hardware_target '{}'",
+                    bom.hardware_target
+                ),
+            )
+        } else {
+            Check::fail(
+                "target_binding",
+                format!(
+                    "record targets '{}' but BOM targets '{}'",
+                    rec.hardware_target, bom.hardware_target
+                ),
+            )
+        });
     }
 
     // --- §0 step 5: the record must be for THIS device's channel -------------
@@ -238,6 +258,20 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
                 "device channel (--device-channel / device_channel=)",
                 cfg.enforce,
             ),
+        });
+        checks.push(if rec.hardware_target == hardware_target {
+            Check::pass(
+                "hardware_target",
+                format!("record targets this host '{hardware_target}'"),
+            )
+        } else {
+            Check::fail(
+                "hardware_target",
+                format!(
+                    "record targets '{}' but immutable host target is '{hardware_target}'",
+                    rec.hardware_target
+                ),
+            )
         });
     }
 
@@ -490,6 +524,7 @@ mod tests {
     fn compat_overlap_matrix() {
         let bom = |lo, hi| BomCore {
             train: "t".into(),
+            hardware_target: "nvidia-gb10-arm64".into(),
             bundle_seq: 1,
             compat_min: lo,
             compat_version: hi,
