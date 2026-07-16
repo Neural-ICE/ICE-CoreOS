@@ -12,10 +12,13 @@ use crate::InternalError;
 const DEFAULT_HARDWARE_TARGET_FILE: &str = "/usr/lib/neural-ice/hardware-target";
 
 pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
     let path = std::env::var_os("NI_OTA_HARDWARE_TARGET_FILE").map_or_else(
         || PathBuf::from(DEFAULT_HARDWARE_TARGET_FILE),
         PathBuf::from,
     );
+    #[cfg(not(feature = "test-path-overrides"))]
+    let path = PathBuf::from(DEFAULT_HARDWARE_TARGET_FILE);
     let target = std::fs::read_to_string(&path).map_err(|e| {
         InternalError(format!(
             "unreadable immutable hardware target {}: {e}",

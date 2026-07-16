@@ -28,6 +28,11 @@ The signed channel record and signed BOM both carry `hardware_target`.
 `ni-ota-verify` refuses unless they agree with each other and with the immutable
 host marker. `commit` repeats the host/BOM comparison before advancing the
 anti-rollback state, so invoking it directly cannot commit another SKU's bundle.
+The production binary always reads that marker from
+`/usr/lib/neural-ice/hardware-target`; its environment-selectable path exists
+only behind the non-default `test-path-overrides` Cargo feature used by
+integration tests. The bootc build uses default features and therefore cannot
+inherit a path override from a service environment.
 
 Channels are target-scoped OCI records such as
 `channels:nvidia-gb10-arm64-beta`; `latest` aliases are forbidden. A future x86
