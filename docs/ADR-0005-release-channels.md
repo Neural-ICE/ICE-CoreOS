@@ -3,7 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-06-30
 - **Decider**: Business/Security Owner (human)
-- **Related**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc OS, native OTA, open-core); ICE-Fabric **ADR-0023** (uniform packaging & OTA)
+- **Related**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc OS, native OTA, open-core); ICE-Fabric (uniform packaging & OTA)
 
 > **Superseded for product delivery (Owner GO, 2026-07-15):** ICE-CoreOS no
 > longer owns or mutates release channels. Its CI publishes one immutable,
@@ -15,7 +15,7 @@
 
 > **Ring set superseded (2026-07-11)**: the three-ring `alpha|beta|prod` set decided below
 > is reduced to **two rings: `beta|stable`**, unified with the appliance-bundle channels —
-> see ICE-Fabric **ADR-0028**. `beta` = validation ring (every push to `main`, runs on the
+> see ICE-Fabric. `beta` = validation ring (every push to `main`, runs on the
 > lab validation appliance); `stable` = customers/community (promoted). The promotion
 > mechanics (re-tag by digest, never rebuild) are unchanged; the flow is now simply
 > `beta → stable`. The old `:alpha`/`:prod` tags remain on the registries for rollback and
@@ -23,7 +23,7 @@
 > at their next re-seed or `bootc switch` (no tag aliases are maintained — accepted, no
 > customer fleet at switch time). The rest of this ADR is kept as decided for the record.
 
-> **Historical amendment (2026-07-10, ICE-Fabric ADR-0023)**: the alpha/beta/prod channel *model*
+> **Historical amendment (2026-07-10, ICE-Fabric)**: the alpha/beta/prod channel *model*
 > below is unchanged, but for the **appliance fleet** the channel tags now also live on
 > **`registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>`** (the sovereign OTA
 > target), and `promote.yml` moves the channel pointer on **both** GHCR and the sovereign

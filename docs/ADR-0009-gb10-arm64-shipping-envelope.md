@@ -6,8 +6,8 @@
 - **Supersedes for current trains**: ADR-0008's requirement to publish one
   ARM64+AMD64 bootc manifest before an x86 SKU is hardware-qualified
 - **Related**: ADR-0002 (Secure Boot), ADR-0004 (TPM/LUKS), ADR-0005 (release
-  channels), ADR-0006 (GB10 kernel), ICE-Fabric ADR-0018 (multi-arch payloads),
-  ADR-0026/ADR-0034 (signed, entitlement-scoped release trains)
+  channels), ADR-0006 (GB10 kernel), ICE-Fabric (multi-arch payloads),
+  ICE-Fabric (signed, entitlement-scoped release trains)
 
 ## Context
 
@@ -24,7 +24,7 @@ manifest entry from the ARM64 image, or from an unqualified generic CentOS image
 would claim support that does not exist and could deliver an unbootable OS.
 
 Architecture-neutral product containers are a separate concern. They remain
-subject to the ARM64+AMD64 publication requirement in ICE-Fabric ADR-0018.
+subject to the ARM64+AMD64 publication requirement in ICE-Fabric.
 
 ## Decision
 

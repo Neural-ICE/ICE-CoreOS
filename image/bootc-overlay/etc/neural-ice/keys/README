@@ -1,4 +1,4 @@
-Neural ICE OTA trust anchors (ICE-Fabric ADR-0026 / PLAN-ADR-0026-SIGNING — P0)
+Neural ICE OTA trust anchors (ICE-Fabric OTA signing plan — P0)
 ===============================================================================
 
 This directory holds the PUBLIC keys the appliance uses to verify signed OTA

@@ -61,7 +61,7 @@ pub(crate) struct Config {
     /// `--device-channel` flag overrides.
     pub device_channel: Option<String>,
     /// Optional `device_compat_min=`/`device_compat_max=` pair — the
-    /// appliance⇄thin-client compat range this device supports (ADR-0020).
+    /// appliance⇄thin-client compat range this device supports.
     /// Both or neither: a half-configured range aborts (fail-closed).
     pub device_compat: Option<(i64, i64)>,
 }

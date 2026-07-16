@@ -1,4 +1,4 @@
-//! The §0 verification contract (ICE-Fabric PLAN-ADR-0026-SIGNING), evaluated
+//! The §0 verification contract (ICE-Fabric OTA signing plan), evaluated
 //! over local files in plan order. Every §0 check emits a distinct
 //! machine-readable entry; checks keep running after a failure wherever their
 //! inputs allow it (shadow-mode burn-in wants the FULL diagnostic picture,
@@ -286,7 +286,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         ));
     }
 
-    // --- §0 step 7: compat ranges must OVERLAP (the full ADR-0020 test) ------
+    // --- §0 step 7: compat ranges must OVERLAP (the full compat-range test) ------
     if let Ok(bom) = &bom {
         checks.push(compat_check(bom, device_compat, cfg.enforce));
     }
@@ -372,7 +372,7 @@ fn anti_rollback_check(
             } else {
                 Check::fail(
                     "anti_rollback",
-                    format!("ROLLBACK: bundle_seq {bom_seq} < applied {} — recovery is forward-only (ADR-0026)", applied.bundle_seq),
+                    format!("ROLLBACK: bundle_seq {bom_seq} < applied {} — recovery is forward-only", applied.bundle_seq),
                 )
             }
         }

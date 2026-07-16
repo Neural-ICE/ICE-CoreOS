@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-16
 - **Decider:** Business/Security Owner
-- **Extends:** ADR-0005, ADR-0008 and ADR-0009; companion to ICE-Fabric ADR-0035
+- **Extends:** ADR-0005, ADR-0008 and ADR-0009; companion to ICE-Fabric
 
 ## Context
 

@@ -1,6 +1,6 @@
 # Keep the `podman build .` context lean. Exclude heavy build products and outputs that the
 # Containerfile never COPYs. All image/**, ota/**, ignition/** inputs are NOT excluded — the
-# build consumes them. (The console TUI is product code, composed by ICE-Fabric — ADR-0032.)
+# build consumes them. (The console TUI is product code, composed by ICE-Fabric.)
 .git
 *.img
 *.img.zst

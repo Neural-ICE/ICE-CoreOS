@@ -14,7 +14,7 @@
 #   PUSH                "1" to push after build  (default 0)
 #   PLATFORM            OCI platform             (default linux/arm64)
 #   SOURCE_URL          org.opencontainers.image.source label (default the ICE-CoreOS repo) — WITHOUT
-#                       it GitHub cannot link the package to its repo (orphan package, ADR-0023 §0).
+#                       it GitHub cannot link the package to its repo (orphan package).
 #
 # The build context must contain the staged GB10 artifacts (gitignored):
 #   image/rpms/  image/driver-modules/  image/nvidia-userspace/  image/signed-boot/
@@ -72,7 +72,7 @@ done
 
 # Console TUI: PRODUCT code — its source lives out of this vanilla OS repo.
 # The console TUI is product code (ICE-Console) composed onto this vanilla base by
-# ICE-Fabric (ADR-0032) — it is deliberately NOT staged or COPYd here.
+# ICE-Fabric — it is deliberately NOT staged or COPYd here.
 
 # Use the root container store (matches bib --local and caches the base) when
 # PODMAN_SUDO=1 (CI); rootless otherwise (local dev).

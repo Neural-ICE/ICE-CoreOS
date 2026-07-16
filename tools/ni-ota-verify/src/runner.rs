@@ -28,7 +28,7 @@ pub(crate) fn cosign_path() -> Result<PathBuf, InternalError> {
 }
 
 /// `cosign verify-blob --key <pub> --insecure-ignore-tlog=true --signature <sig> <file>`.
-/// --insecure-ignore-tlog=true is private-infrastructure mode (ADR-0026 D1):
+/// --insecure-ignore-tlog=true is private-infrastructure mode:
 /// there is deliberately no public Rekor entry to check.
 /// Ok(Ok(())) = signature valid; Ok(Err(detail)) = cosign rejected it (a
 /// verification failure, i.e. a check result); Err = could not run cosign.

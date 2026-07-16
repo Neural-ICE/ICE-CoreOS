@@ -16,7 +16,7 @@
 #        -t ghcr.io/neural-ice/neural-ice-coreos:stream10-bootc .
 
 # --------------------------------------------------------------------------- #
-# 0) Builder stage: ni-ota-verify (ICE-Fabric ADR-0026 / PLAN-ADR-0026-SIGNING
+# 0) Builder stage: ni-ota-verify (ICE-Fabric OTA signing plan
 #    — P2). The on-device OTA bundle verifier is compiled from tools/
 #    ni-ota-verify and baked into the OS image in §2b below. Native-arch build
 #    (same strategy as the uname-m switches below); STATIC (crt-static) so the
@@ -24,7 +24,7 @@
 #    builder image is pinned by MANIFEST-LIST digest (covers arm64 + amd64) and
 #    the crate graph by the committed Cargo.lock (--locked) — same interim
 #    supply-chain gate as the cosign/oras fetches below. TODO: vendor the
-#    builder image + crates through the sovereign asset mirror (ADR-0023) and
+#    builder image + crates through the sovereign asset mirror and
 #    drop the Docker-Hub/crates.io fetch.
 # BUMP: retag + re-pin together:  skopeo inspect --format '{{.Digest}}' \
 #   docker://docker.io/library/rust:<ver>-bookworm
@@ -132,7 +132,7 @@ RUN set -euxo pipefail; \
     chmod 0700 /etc/neural-ice/pki
 
 # --------------------------------------------------------------------------- #
-# 2b) OTA trust tooling (ICE-Fabric ADR-0026 / PLAN-ADR-0026-SIGNING — P0+P2).
+# 2b) OTA trust tooling (ICE-Fabric OTA signing plan — P0+P2).
 #     The appliance verifies signed update bundles ITSELF before applying them:
 #     cosign checks the bundle-manifest + channel-record signatures, oras
 #     fetches those signed artifacts from the sovereign registry, ni-ota-verify
@@ -151,7 +151,7 @@ RUN dnf -y install tpm2-tools && dnf clean all
 # bundle manifests, channel records and first-party images. Version-PINNED and
 # sha256-VERIFIED at build — the hardcoded checksums (taken from the release's
 # cosign_checksums.txt) are the interim supply-chain gate. TODO: vendor the
-# binary through the sovereign asset mirror (ADR-0023 vendoring doctrine) and
+# binary through the sovereign asset mirror (vendoring doctrine) and
 # drop the network fetch.
 # BUMP: update COSIGN_VERSION *and* BOTH checksums together, from
 #   https://github.com/sigstore/cosign/releases/download/v<ver>/cosign_checksums.txt
@@ -173,10 +173,10 @@ RUN set -euxo pipefail; \
 # oras (static, official release binary): OCI-artifact FETCH for the signed OTA
 # metadata — the update path pulls the channel record from
 # …/neural-ice/channels:<ch> and the BOM pair from …/neural-ice/bundles:<train>
-# (the ADR-0026 distribution refs in ota.conf), then hands the files to
+# (the distribution refs in ota.conf), then hands the files to
 # ni-ota-verify. Fetch side only: signature verification stays cosign's job.
 # Version-PINNED and sha256-VERIFIED at build, same interim supply-chain gate
-# as cosign above. TODO: vendor through the sovereign asset mirror (ADR-0023)
+# as cosign above. TODO: vendor through the sovereign asset mirror
 # and drop the network fetch.
 # BUMP: update ORAS_VERSION *and* BOTH checksums together, from
 #   https://github.com/oras-project/oras/releases/download/v<ver>/oras_<ver>_checksums.txt
@@ -197,7 +197,7 @@ RUN set -euxo pipefail; \
     chmod 0755 /usr/bin/oras; \
     oras version
 
-# ni-ota-verify (P2, ADR-0026 D3): the on-device OTA bundle verifier — signed
+# ni-ota-verify (P2): the on-device OTA bundle verifier — signed
 # channel record + BOM checks (via the pinned cosign above) and the
 # anti-rollback gate, run BEFORE any update is applied. Static binary from the
 # stage-0 builder; contract + exit codes: tools/ni-ota-verify/README.md.
@@ -249,7 +249,7 @@ COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system
 # payload CONTENT is product-side — the OS ships only the mechanism.
 COPY image/payload/neural-ice-payload-apply.sh      /usr/local/bin/neural-ice-payload-apply.sh
 COPY image/payload/neural-ice-payload-apply.service /usr/lib/systemd/system/neural-ice-payload-apply.service
-# NOTE (ADR-0032): the branded console dashboard (TUI) is PRODUCT code and lives
+# NOTE (ICE-Fabric): the branded console dashboard (TUI) is PRODUCT code and lives
 # in ICE-Console. It is NOT part of this open-core OS — ICE-Fabric composes it
 # onto this vanilla base (derivation FROM this image + the TUI layer). This repo
 # builds a generic OS: a normal login getty owns tty1 (see below).
@@ -289,7 +289,7 @@ RUN set -euxo pipefail; \
 # Headless appliance: target multi-user (no GUI). Otherwise graphical.target reserves tty1 for
 # a non-existent display manager. This vanilla OS keeps the normal login getty on tty1; the
 # BRANDED appliance masks getty@tty1 and puts the console dashboard there in the Fabric
-# derivation (ADR-0032) — that product concern is NOT baked here.
+# derivation (ICE-Fabric) — that product concern is NOT baked here.
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh \
                /usr/local/bin/neural-ice-hostname-init.sh \

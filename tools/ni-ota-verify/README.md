@@ -1,6 +1,6 @@
 # ni-ota-verify
 
-On-device OTA bundle verifier for Neural ICE appliances (ICE-Fabric ADR-0026,
+On-device OTA bundle verifier for Neural ICE appliances (ICE-Fabric,
 decision D3: the verifier lives in this open-core OS repo — generic
 "verify signed bundle manifest + anti-rollback" logic, zero product IP; only
 the keys are secret).
@@ -12,7 +12,7 @@ files only**; fetching them is the OTA caller's job (see *Caller integration*).
 
 ## The verification contract
 
-Checks run in the order of the ICE-Fabric plan (`PLAN-ADR-0026-SIGNING` §0,
+Checks run in the order of the ICE-Fabric plan (§0,
 private repo). Each check emits a distinct machine-readable entry; checks keep
 running after a failure wherever their inputs allow, so a shadow-mode burn-in
 log shows the full diagnostic picture:
@@ -46,7 +46,7 @@ cosign verify-blob --key <root_pubkey> --insecure-ignore-tlog=true \
     --signature <sig> <file>
 ```
 
-(`--insecure-ignore-tlog=true` is private-infrastructure mode, ADR-0026 D1:
+(`--insecure-ignore-tlog=true` is private-infrastructure mode:
 there is deliberately no public Rekor entry to check.)
 
 ## Output and exit codes

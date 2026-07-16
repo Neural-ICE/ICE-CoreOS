@@ -1,5 +1,5 @@
-//! ni-ota-verify — on-device OTA bundle verifier (ICE-Fabric ADR-0026 D3,
-//! PLAN-ADR-0026-SIGNING §0 / P2).
+//! ni-ota-verify — on-device OTA bundle verifier (ICE-Fabric OTA verifier,
+//! the ICE-Fabric OTA signing plan §0 / P2).
 //!
 //! Verifies LOCAL FILES only. The OTA caller fetches the signed channel record
 //! and BOM pair (oras, from the sovereign registry), hands the four files to

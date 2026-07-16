@@ -1,4 +1,4 @@
-# ni-ota-verify — on-device OTA bundle verifier (ICE-Fabric ADR-0026 D3 / plan P2).
+# ni-ota-verify — on-device OTA bundle verifier (ICE-Fabric OTA signing plan, P2).
 # Deliberately minimal: serde for the JSON artifacts, std for everything else.
 # No async runtime, no network crates — fetching is the OTA caller's job (oras),
 # signature crypto is the image's pinned /usr/bin/cosign (one verification stack).
@@ -7,7 +7,7 @@ name = "ni-ota-verify"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Neural ICE on-device OTA bundle verifier: signed BOM + channel record + anti-rollback (ADR-0026)"
+description = "Neural ICE on-device OTA bundle verifier: signed BOM + channel record + anti-rollback"
 
 [features]
 default = []

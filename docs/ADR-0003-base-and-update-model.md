@@ -10,7 +10,7 @@
 > `kernel` (not `kernel-64k`) — for compatibility with the container AI stack.
 > The "64k tested/QA" rationale below is superseded on the page-size point only.
 
-> **Amendment (2026-07-10, ICE-Fabric ADR-0023 — uniform packaging & OTA)**: for the
+> **Amendment (2026-07-10, ICE-Fabric — uniform packaging & OTA)**: for the
 > **appliance fleet**, `bootc upgrade` now follows **`registry.neural-ice.ch`** (the
 > sovereign R2-backed registry), not GHCR directly. The OS image is still built and
 > published to `ghcr.io/neural-ice/neural-ice-coreos` (upstream + **public community
@@ -28,16 +28,16 @@
 > 2. **Promoted channels carry the build channel's baked imgref** — `promote.yml` re-tags a
 >    validated digest across channels by *copy* (ADR-0005: no rebuild), so a promoted `:stable`
 >    image still says `…:beta` in `/usr/lib/neural-ice/ota-imgref` (channels are the two-ring
->    `beta|stable` set since 2026-07-11 — ADR-0005 top note + ICE-Fabric ADR-0028). Fleet
+>    `beta|stable` set since 2026-07-11 — ADR-0005 top note + ICE-Fabric). Fleet
 >    `:stable` appliances must therefore be **installed with the channel set explicitly**.
 >    The installer path enforces this (2026-07-11): `image/build-installer-usb.sh` injects
 >    `neuralice.imgref=<packaged channel>` into the install menu entry (`TARGET_IMGREF`,
 >    wired from `release-installer.yml`), and the autoinstall honours that karg over the
 >    baked default — the baked imgref is never trusted for installs. On-device, the baked
 >    value only matters until the next re-bake; the digest-pinned `bootc switch` flow
->    (ICE-Fabric ADR-0026 P2) supersedes tag-following entirely.
+>    (ICE-Fabric P2) supersedes tag-following entirely.
 
-> **Amendment (2026-07-15, ICE-Fabric ADR-0029/0034 — signed product trains):**
+> **Amendment (2026-07-15, ICE-Fabric — signed product trains):**
 > producers now publish only run-unique immutable GHCR artifacts and never move a
 > native bootc channel. Consequently the CoreOS source artifact keeps
 > `bootc-fetch-apply-updates.timer` masked. The branded appliance is installed by
