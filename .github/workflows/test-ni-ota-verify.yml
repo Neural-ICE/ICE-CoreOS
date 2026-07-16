@@ -1,0 +1,60 @@
+name: test-ni-ota-verify
+
+# PR gate for the on-device OTA verifier (tools/ni-ota-verify — ICE-Fabric
+# OTA signing plan P2): fmt + clippy + tests on the
+# organization-owned x86_64 desktop pool. The toolchain runs inside the same
+# digest-pinned Rust image used by the bootc build, so runners stay toolchain-free.
+# The tests stub cosign via NI_OTA_COSIGN, so no signing infrastructure is needed
+# here. The ARM64 OS build (build-image.yml) is
+# deliberately untouched — it picks the verifier up via its normal image/**
+# trigger when the Containerfile lands on main.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/ni-ota-verify/**'
+      - '.github/workflows/test-ni-ota-verify.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/ni-ota-verify/**'
+      - '.github/workflows/test-ni-ota-verify.yml'
+
+concurrency:
+  group: test-ni-ota-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+    env:
+      RUST_IMAGE: docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify, lint and test in pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          # Root inside rootless Podman maps to the runner user, so rustup may add
+          # components to the image toolchain while generated files stay user-owned.
+          podman run --rm \
+            -v "$PWD:/src:Z" \
+            -w /src/tools/ni-ota-verify \
+            -e CARGO_HOME=/src/.cargo-ci \
+            "$RUST_IMAGE" \
+            bash -euo pipefail -c '
+              rustup component add rustfmt clippy
+              cargo fmt --check
+              cargo clippy --all-targets --all-features --locked -- -D warnings
+              cargo test --locked --features test-path-overrides
+              cargo build --release --locked
+              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
+            '
+
+      - name: Cleanup build tree
+        if: always()
+        run: rm -rf tools/ni-ota-verify/target .cargo-ci

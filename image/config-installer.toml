@@ -1,0 +1,10 @@
+# bootc-image-builder config for the Neural ICE installer USB (--type raw).
+#
+# Size the LIVE root filesystem. The auto-install runs `bootc image copy-to-storage`
+# (duplicates the OS image, ~10 GiB) on the live USB before deploying it to the internal
+# disk. bib's default (~8 GiB) is too small → runs out. 16 GiB fits the copy + headroom,
+# while shedding ~24 GiB of zeros vs the old 40 GiB → the raw (and thus the USB write) is
+# that much smaller. The PRELOADED seed lives in a SEPARATE ni-seed partition, not here.
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "16 GiB"

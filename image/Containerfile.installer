@@ -1,0 +1,26 @@
+# ICE-CoreOS — dual-mode INSTALLER image (DGX Spark)
+# = Secure Boot SIGNED (validated) base image + auto-install service.
+# At boot the media (raw GPT) offers, via GRUB: "Live" and "Auto install".
+#
+# The base image is a build-arg so the installer can be built for any channel:
+#   sudo podman build --platform linux/arm64 -f image/Containerfile.installer \
+#     --build-arg BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest> \
+#     -t localhost/ice-coreos-installer:local .
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# All the partitioning/encryption tools required by the auto-install are
+# already in the CentOS Stream 10 bootc base: sfdisk/partx/wipefs/blkid/lsblk
+# (util-linux), cryptsetup, systemd-cryptenroll, mkfs.fat/ext4/xfs. Nothing to add
+# -> the installer stays free of any extra package.
+
+# Auto-install service (gated by the neuralice.autoinstall kernel argument).
+COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
+COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
+RUN set -euxo pipefail; \
+    chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh; \
+    systemctl enable neural-ice-autoinstall.service
+
+# Branding (os-release, Plymouth, kargs) is inherited from the canonical image.
+LABEL org.opencontainers.image.title="Neural ICE CoreOS (DGX Spark installer)" \
+      neural-ice.role="installer-dualmode"

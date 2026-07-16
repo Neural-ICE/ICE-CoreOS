@@ -1,0 +1,20 @@
+# Neural ICE — apply an installer-staged payload (one-shot, generic).
+# Runs once when the PRELOADED installer staged a payload/ dir on the data
+# volume; skipped forever after (stamp) and on LIGHT installs (no payload).
+# Ordered before multi-user so freshly staged Quadlets start on the SAME boot
+# (apply.sh runs daemon-reload + an explicit start list).
+[Unit]
+Description=Neural ICE — apply installer-staged payload (one-shot)
+ConditionPathExists=/var/lib/neural-ice/data/payload/apply.sh
+ConditionPathExists=!/var/lib/neural-ice/.payload-applied
+RequiresMountsFor=/var/lib/neural-ice/data
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/neural-ice-payload-apply.sh
+
+[Install]
+WantedBy=multi-user.target

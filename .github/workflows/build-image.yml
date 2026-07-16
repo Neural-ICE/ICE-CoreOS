@@ -1,0 +1,93 @@
+name: build-image
+
+# The hardware-bound GB10 bootc producer publishes one immutable GHCR artifact.
+# ICE-Fabric alone mirrors its approved digest to the sovereign registry, and
+# only a signed release train moves beta/stable product pointers.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "image/**"
+      - "ota/**"
+      - "ignition/**"
+      - "ci/build-image.sh"
+      - "VERSION"
+      - "tools/ni-ota-verify/**"
+  # Unlike workflow_dispatch, repository_dispatch always executes the workflow
+  # from the default branch. It provides a safe way to request the debug variant
+  # without allowing a selected branch to replace commands on the org runner.
+  repository_dispatch:
+    types: [build-coreos]
+
+concurrency:
+  group: build-image-gb10
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, Linux, ARM64, spark]
+    timeout-minutes: 120
+    env:
+      REGISTRY: ghcr.io/neural-ice
+      IMAGE: neural-ice-coreos
+      VARIANT: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.variant || 'prod' }}
+      BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
+      SOURCE_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Stage GB10 artifacts
+        env:
+          ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
+        run: |
+          set -euo pipefail
+          for d in rpms driver-modules nvidia-userspace signed-boot; do
+            if [ ! -d "$ARTIFACTS_DIR/$d" ]; then
+              echo "::error::missing artifacts dir $ARTIFACTS_DIR/$d on the runner"
+              exit 1
+            fi
+            rm -rf "image/$d"
+            cp -a "$ARTIFACTS_DIR/$d" "image/$d"
+          done
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
+            | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish immutable source artifact
+        env:
+          PUSH: "1"
+          PODMAN_SUDO: "1"
+          SOURCE_URL: https://github.com/${{ github.repository }}
+          # Debug remains keyless. The installer injects the operator key from
+          # EFI:/ice-coreos/authorized_keys; no CI signing/key secret is baked.
+          SSH_AUTHORIZED_KEY: ""
+        run: |
+          set -o pipefail
+          ./ci/build-image.sh | tee build.out
+
+      - name: Assert the shipping platform and summarize the handoff
+        run: |
+          set -euo pipefail
+          semver="$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)"
+          ref="$(grep -m1 '^REF=' build.out | cut -d= -f2)"
+          digest="$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)"
+          sudo podman image inspect "$ref:$semver" --format '{{.Os}}/{{.Architecture}}' \
+            | grep -qx linux/arm64
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::invalid published digest '$digest'"; exit 1; }
+          {
+            echo "### Immutable ICE-CoreOS source artifact"
+            echo ""
+            echo "- source: \`$ref@$digest\`"
+            echo "- immutable tag: \`$ref:$semver\`"
+            echo "- variant: \`$VARIANT\`"
+            echo "- platform: \`linux/arm64\` (GB10 ADR-0009)"
+            echo "- next gate: ICE-Fabric central mirror + signed beta train"
+            echo "- channel/alias mutation: none"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,49 @@
+# Neural ICE CoreOS — deterministic hostname + mDNS name from the management NIC.
+#
+# Runs on EVERY boot (ordered before avahi-daemon): sets the runtime + static
+# hostname `ni-coreos-<mac4>` and repopulates /run/neural-ice/mdns-hostname
+# (tmpfs). Idempotent. NO dbus/hostnamed involved: the script writes
+# /proc/sys/kernel/hostname + /etc/hostname directly (deterministic on a
+# degraded boot and under SELinux enforcing — see the .72 2026-07-13 incident).
+
+[Unit]
+Description=Neural ICE — set hostname + mDNS name from management NIC MAC
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+# Needs /etc writable and /sys/class/net populated (udev); reads the management
+# NM profile off disk (NM need not be up). Must set the hostname BEFORE avahi
+# publishes it and before NetworkManager could push a DHCP hostname.
+After=local-fs.target systemd-udevd.service
+Before=avahi-daemon.service NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neural-ice-hostname-init.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+# === Security hardening ===
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+# NOT ProtectKernelTunables: the script SETS the runtime hostname by writing
+# /proc/sys/kernel/hostname (its core purpose) — the dbus/hostnamed path was
+# dropped after it failed on a degraded boot and under enforcing (2026-07-13).
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# NOT PrivateNetwork/PrivateDevices: the script reads /sys/class/net/<iface>/address
+# to derive the MAC — network-namespace or device isolation hides real NICs.
+# NOT ProtectSystem=strict: /etc/hosts is edited in place on first configuration.
+
+[Install]
+WantedBy=multi-user.target

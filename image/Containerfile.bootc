@@ -1,0 +1,377 @@
+# Neural ICE CoreOS — Deliverable 2 (bootc / image mode variant, ARM64 GB10)
+# CentOS Stream 10 bootc base: SAME el10 lineage as the GB10 kernel
+# (6.12.0-*.el10) -> clean kernel swap. Self-contained image, deposited offline
+# by bootc-image-builder.
+#
+# Kernel: the GB10 SoC (Grace-Blackwell) is NOT in the stock el10 kernel, so we
+# ship the Red Hat `nvidia-gb10` kernel — but built as the STANDARD 4k-page
+# flavor (`kernel`, not `kernel-64k`). 4k restores compatibility with the
+# container workloads run on top (qdrant/jemalloc, vLLM, prebuilt aarch64 wheels)
+# that break under 64k pages; NVIDIA recommends the regular kernel too. Secure
+# Boot signing is unchanged by the page size (see ADR-0002). See ADR-0006.
+#
+# Build (root storage, required by bootc-image-builder --local):
+#   sudo podman build --platform linux/arm64 -f image/Containerfile.bootc \
+#        --build-arg OTA_IMGREF=ghcr.io/neural-ice/neural-ice-coreos:stream10-bootc \
+#        -t ghcr.io/neural-ice/neural-ice-coreos:stream10-bootc .
+
+# --------------------------------------------------------------------------- #
+# 0) Builder stage: ni-ota-verify (ICE-Fabric OTA signing plan
+#    — P2). The on-device OTA bundle verifier is compiled from tools/
+#    ni-ota-verify and baked into the OS image in §2b below. Native-arch build
+#    (same strategy as the uname-m switches below); STATIC (crt-static) so the
+#    binary carries no runtime library dependency into the bootc image. The
+#    builder image is pinned by MANIFEST-LIST digest (covers arm64 + amd64) and
+#    the crate graph by the committed Cargo.lock (--locked) — same interim
+#    supply-chain gate as the cosign/oras fetches below. TODO: vendor the
+#    builder image + crates through the sovereign asset mirror and
+#    drop the Docker-Hub/crates.io fetch.
+# BUMP: retag + re-pin together:  skopeo inspect --format '{{.Digest}}' \
+#   docker://docker.io/library/rust:<ver>-bookworm
+# --------------------------------------------------------------------------- #
+FROM docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS ni-ota-verify-build
+WORKDIR /build
+COPY tools/ni-ota-verify/ /build/
+# Explicit --target (even though it equals the host triple) so RUSTFLAGS only
+# applies to the final binary, not to build scripts/proc-macros — the reliable
+# way to get crt-static without breaking the derive crates. No pipefail: the
+# Debian builder's /bin/sh is dash; every pipeline below is failure-guarded.
+RUN set -eux; \
+    target="$(rustc -vV | sed -n 's/^host: //p')"; \
+    test -n "$target"; \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+        cargo build --release --locked --target "$target"; \
+    install -D -m 0755 "target/${target}/release/ni-ota-verify" /out/ni-ota-verify; \
+    ( ldd /out/ni-ota-verify 2>&1 || true ) \
+        | grep -Eq 'statically linked|not a dynamic executable'; \
+    /out/ni-ota-verify --version
+
+FROM quay.io/centos-bootc/centos-bootc:stream10
+
+ARG NVIDIA_DRIVER_VERSION=595.58.03
+
+# Appliance variant (A4): controls the security/console posture, NOT the release
+# channel (that's the image tag). Default = prod (secure, sealed).
+#   prod  : sshd MASKED (sealed appliance, ADR-0003), kargs=["quiet"], SELinux enforcing.
+#   debug : sshd enabled (core key), serial console (ttyS0) + tty1, verbose boot,
+#           SELinux permissive (enforcing=0) — for lab/field troubleshooting only.
+# Build both: --build-arg VARIANT=prod  ->  :prod ; --build-arg VARIANT=debug -> :debug
+ARG VARIANT=prod
+
+# --------------------------------------------------------------------------- #
+# 1) Swap the stock el10 kernel -> GB10 `nvidia-gb10` kernel, STANDARD 4k flavor
+#    (identical 6.12.0-*.el10 lineage => clean swap). The stock kernel lacks GB10
+#    enablement; the custom tree adds it. We install the 4k `kernel*` RPMs (NOT
+#    `kernel-64k*`) so userspace runs on 4 KiB pages. The build now emits only the
+#    4k flavor (build/build-kernel.sh flips the tree's `-arm64_4k` BUILDOPTS), but
+#    the globs stay anchored on `-6.12` so they select the 4k non-debug RPMs even
+#    if debug/64k variants are ever present. See ADR-0006.
+# --------------------------------------------------------------------------- #
+COPY image/rpms/ /tmp/rpms/
+RUN set -euxo pipefail; \
+    dnf -y remove --noautoremove kernel kernel-core kernel-modules kernel-modules-core; \
+    dnf -y install --setopt=install_weak_deps=False \
+        /tmp/rpms/kernel-core-6.12*.rpm \
+        /tmp/rpms/kernel-modules-core-6.12*.rpm \
+        /tmp/rpms/kernel-modules-6.12*.rpm \
+        /tmp/rpms/kernel-6.12*.rpm; \
+    rm -rf /tmp/rpms
+
+# Open NVIDIA r595 driver PRE-COMPILED against the GB10 4k kernel (identical vermagic),
+# baked into /usr/lib/modules/<kver>/extra/nvidia + depmod. ATOMIC kernel<->driver
+# coupling: no privileged injector container, no GHCR pull.
+COPY image/driver-modules/*.ko /tmp/nvidia/
+RUN set -euxo pipefail; \
+    KVER="$(ls /usr/lib/modules | head -1)"; \
+    install -d "/usr/lib/modules/${KVER}/extra/nvidia"; \
+    cp /tmp/nvidia/*.ko "/usr/lib/modules/${KVER}/extra/nvidia/"; \
+    depmod -a "${KVER}"; \
+    modinfo "/usr/lib/modules/${KVER}/extra/nvidia/nvidia.ko" | grep -E '^(version|vermagic):'; \
+    rm -rf /tmp/nvidia
+
+# GSP firmware + r595 userspace driver (extracted from the official .run bundle):
+#  - firmware -> /usr/lib/firmware/nvidia/595.58.03 (REQUIRED to initialize the GPU)
+#  - libs -> /usr/lib64 (+ SONAME symlinks); binaries -> /usr/bin
+#  - nvidia-modprobe setuid (creation of the /dev/nvidia* nodes)
+COPY image/nvidia-userspace/ /
+RUN set -euxo pipefail; \
+    V=595.58.03; cd /usr/lib64; \
+    for lib in libnvidia-ml libcuda libnvidia-cfg libnvidia-ptxjitcompiler; do \
+        ln -sf "${lib}.so.${V}" "${lib}.so.1"; \
+        ln -sf "${lib}.so.1"     "${lib}.so"; \
+    done; \
+    chmod 4755 /usr/bin/nvidia-modprobe; \
+    chmod 0755 /usr/bin/nvidia-smi /usr/bin/nvidia-persistenced; \
+    ldconfig; \
+    ldconfig -p | grep -E 'libcuda|libnvidia-ml'
+
+# --------------------------------------------------------------------------- #
+# 2) Base tooling + /etc overlay (CX-7 network)
+# --------------------------------------------------------------------------- #
+# jq: first-boot/CDI helpers.
+# avahi + avahi-tools: mDNS responder that publishes this host's <hostname>.local
+# (the hostname is derived from the management NIC MAC by neural-ice-hostname-init).
+# This is HOST publication only — any SERVICE advertisement is an application
+# concern (a workload Quadlet), not part of this community OS image, which stays
+# free of product-service config.
+RUN dnf -y install jq avahi avahi-tools && dnf clean all
+
+# nvidia-container-toolkit (CDI): GPU access inside Podman containers.
+# The CDI spec is generated AT BOOT (on the hardware) by nvidia-cdi-generate.service.
+RUN curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+        -o /etc/yum.repos.d/nvidia-container-toolkit.repo \
+ && dnf -y install nvidia-container-toolkit \
+ && dnf clean all \
+ && install -d -m 0755 /etc/cdi
+
+COPY image/bootc-overlay/            /
+RUN test "$(cat /usr/lib/neural-ice/hardware-target)" = nvidia-gb10-arm64
+
+RUN set -euxo pipefail; \
+    chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \
+    chmod 0700 /etc/neural-ice/pki
+
+# --------------------------------------------------------------------------- #
+# 2b) OTA trust tooling (ICE-Fabric OTA signing plan — P0+P2).
+#     The appliance verifies signed update bundles ITSELF before applying them:
+#     cosign checks the bundle-manifest + channel-record signatures, oras
+#     fetches those signed artifacts from the sovereign registry, ni-ota-verify
+#     (P2, built in stage 0 above) runs the verification contract, tpm2-tools
+#     reads/writes the TPM NV anti-rollback counter (P3). The public keys land
+#     at the Owner key ceremony (see the overlay's /etc/neural-ice/keys/README);
+#     the NV-index provisioning is P3. /etc/neural-ice/ota.conf (overlay, above)
+#     carries the verifier config — shadow mode (enforce=0) by default.
+# --------------------------------------------------------------------------- #
+# tpm2-tools: TPM2 NV read/write for the monotonic `applied_seq` counter.
+# Already shipped by the centos-bootc:stream10 base (tpm2-tools-5.7*.el10), so
+# this is a no-op today — kept EXPLICIT so the dependency survives a base change.
+RUN dnf -y install tpm2-tools && dnf clean all
+
+# cosign (static, official sigstore release binary): signature verification for
+# bundle manifests, channel records and first-party images. Version-PINNED and
+# sha256-VERIFIED at build — the hardcoded checksums (taken from the release's
+# cosign_checksums.txt) are the interim supply-chain gate. TODO: vendor the
+# binary through the sovereign asset mirror (vendoring doctrine) and
+# drop the network fetch.
+# BUMP: update COSIGN_VERSION *and* BOTH checksums together, from
+#   https://github.com/sigstore/cosign/releases/download/v<ver>/cosign_checksums.txt
+ARG COSIGN_VERSION=2.6.3
+ARG COSIGN_SHA256_ARM64=b7c23659a50a59fd8eec44b87188e9062157d0c87796cac7b38727e5390c4917
+ARG COSIGN_SHA256_AMD64=7c78a7f2efc00088bd788a758db6e0928e79f3e0eb83eb5d3c499ed98da4c4f4
+RUN set -euxo pipefail; \
+    case "$(uname -m)" in \
+        aarch64) arch=arm64; sha="${COSIGN_SHA256_ARM64}" ;; \
+        x86_64)  arch=amd64; sha="${COSIGN_SHA256_AMD64}" ;; \
+        *) echo "unsupported architecture: $(uname -m)"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/bin/cosign \
+        "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-${arch}"; \
+    echo "${sha}  /usr/bin/cosign" | sha256sum -c -; \
+    chmod 0755 /usr/bin/cosign; \
+    cosign version
+
+# oras (static, official release binary): OCI-artifact FETCH for the signed OTA
+# metadata — the update path pulls the channel record from
+# …/neural-ice/channels:<ch> and the BOM pair from …/neural-ice/bundles:<train>
+# (the distribution refs in ota.conf), then hands the files to
+# ni-ota-verify. Fetch side only: signature verification stays cosign's job.
+# Version-PINNED and sha256-VERIFIED at build, same interim supply-chain gate
+# as cosign above. TODO: vendor through the sovereign asset mirror
+# and drop the network fetch.
+# BUMP: update ORAS_VERSION *and* BOTH checksums together, from
+#   https://github.com/oras-project/oras/releases/download/v<ver>/oras_<ver>_checksums.txt
+ARG ORAS_VERSION=1.3.3
+ARG ORAS_SHA256_ARM64=ac7156f93a21e903f7ad606c792f3560f17e0cd0e36365634701b1e7cc4e4eca
+ARG ORAS_SHA256_AMD64=9ce999f8d2de03fc03968b29d743077a58783e545e5eaa53917ca177352d0e59
+RUN set -euxo pipefail; \
+    case "$(uname -m)" in \
+        aarch64) arch=arm64; sha="${ORAS_SHA256_ARM64}" ;; \
+        x86_64)  arch=amd64; sha="${ORAS_SHA256_AMD64}" ;; \
+        *) echo "unsupported architecture: $(uname -m)"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/oras.tar.gz \
+        "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${arch}.tar.gz"; \
+    echo "${sha}  /tmp/oras.tar.gz" | sha256sum -c -; \
+    tar -C /usr/bin -xzf /tmp/oras.tar.gz oras; \
+    rm -f /tmp/oras.tar.gz; \
+    chmod 0755 /usr/bin/oras; \
+    oras version
+
+# ni-ota-verify (P2): the on-device OTA bundle verifier — signed
+# channel record + BOM checks (via the pinned cosign above) and the
+# anti-rollback gate, run BEFORE any update is applied. Static binary from the
+# stage-0 builder; contract + exit codes: tools/ni-ota-verify/README.md.
+COPY --from=ni-ota-verify-build /out/ni-ota-verify /usr/bin/ni-ota-verify
+RUN /usr/bin/ni-ota-verify --version
+
+# OTA verifier runtime state (last verdict, applied-bundle record) lives under
+# /var (runtime state, not image — bootc hygiene); tmpfiles.d recreates it on
+# every boot, same pattern as neural-ice-data.conf below.
+RUN printf 'd /var/lib/neural-ice/ota 0700 root root -\n' \
+        > /usr/lib/tmpfiles.d/neural-ice-ota.conf
+
+# Admin user 'core' — key-only SSH (key lives in /usr = immutable, independent
+# of /home). No baked password -> safe even when the image is public.
+#
+# The authorized key is a BUILD-ARG:
+#   - empty (default) => VANILLA public image: NO baked key. Anyone reusing the
+#     distro injects their own key at install time via Ignition (see ignition/),
+#     which lands in ~core/.ssh/authorized_keys (also honored by the sshd config
+#     below). The base image stays a clean, reusable, key-less distro.
+#   - set (appliance / dev builds) => bake the operator key, e.g.:
+#       podman build --build-arg SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" ...
+ARG SSH_AUTHORIZED_KEY=""
+RUN set -euxo pipefail; \
+    useradd -m -G wheel -s /bin/bash core; \
+    install -d -m 0755 /usr/ssh; \
+    printf '%s\n' "${SSH_AUTHORIZED_KEY}" > /usr/ssh/core.keys; \
+    chmod 0644 /usr/ssh/core.keys; \
+    printf 'AuthorizedKeysFile .ssh/authorized_keys /usr/ssh/%%u.keys\n' > /etc/ssh/sshd_config.d/10-neural-ice-keys.conf; \
+    echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/10-wheel-nopasswd; \
+    chmod 0440 /etc/sudoers.d/10-wheel-nopasswd
+
+# [LAB] Boot binaries SIGNED with the lab key (vmlinuz + shim) that replace the
+# unsigned ones, + the DER cert for firmware/MOK enrollment.
+# The NVIDIA modules in driver-modules/ are already signed (sign-file).
+# PROD: replaced by a Neural ICE shim signed by Microsoft (see docs/ADR-0002).
+COPY image/signed-boot/ /
+
+# --------------------------------------------------------------------------- #
+# 3) OS update = native bootc (public, free image) — no gate on the OS
+#    (ADR-0003: gating lives in the private container layer, not in the OS).
+# --------------------------------------------------------------------------- #
+# First-boot SSH-key provisioning: lets a VANILLA install receive an operator
+# key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
+COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
+COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
+# Generic installer-payload apply (one-shot): the PRELOADED installer may stage a
+# payload/ dir on the data volume; this runs its apply.sh once on first boot. The
+# payload CONTENT is product-side — the OS ships only the mechanism.
+COPY image/payload/neural-ice-payload-apply.sh      /usr/local/bin/neural-ice-payload-apply.sh
+COPY image/payload/neural-ice-payload-apply.service /usr/lib/systemd/system/neural-ice-payload-apply.service
+# NOTE (ICE-Fabric): the branded console dashboard (TUI) is PRODUCT code and lives
+# in ICE-Console. It is NOT part of this open-core OS — ICE-Fabric composes it
+# onto this vanilla base (derivation FROM this image + the TUI layer). This repo
+# builds a generic OS: a normal login getty owns tty1 (see below).
+# Deterministic hostname/mDNS name from the management NIC MAC (ni-coreos-<mac4>).
+# The unit ships in the /etc overlay; avahi (installed above) publishes the name.
+COPY image/mdns/neural-ice-hostname-init.sh /usr/local/bin/neural-ice-hostname-init.sh
+# PRELOADED edition: the installer stages a ready-built podman overlay store onto the encrypted
+# data volume; we register it as a READ-ONLY additional image store so the appliance's images are
+# visible INSTANTLY at first boot — no `podman load`, no CPU re-hash/untar of ~20 GB.
+# IMPORTANT (field-learned 2026-07-03): containers-storage HARD-FAILS if an additionalimagestores
+# path does not exist (no silent skip) — so the directory must exist EVERYWHERE podman runs:
+#   - baked into the image (covers the LIVE installer, where the data volume isn't mounted),
+#   - tmpfiles.d recreates it under the mounted data volume on every boot (covers LIGHT installs),
+#   - the autoinstall also mkdirs it on the data volume at install time (belt and braces).
+# containers-storage has NO storage.conf.d drop-in mechanism (verified: containers-storage.conf(5)),
+# so we edit /etc/containers/storage.conf directly, APPEND-SAFE — preserving any
+# additionalimagestores the base already sets (bound images).
+RUN set -euxo pipefail; \
+    src=/etc/containers/storage.conf; \
+    store=/var/lib/neural-ice/data/seed-store; \
+    install -d -m 0700 "$store"; \
+    printf 'd /var/lib/neural-ice/data/seed-store 0700 root root -\n' \
+        > /usr/lib/tmpfiles.d/neural-ice-seed-store.conf; \
+    install -d /etc/containers; \
+    if [ ! -f "$src" ]; then \
+        if [ -f /usr/share/containers/storage.conf ]; then cp /usr/share/containers/storage.conf "$src"; \
+        else printf '[storage]\ndriver = "overlay"\n\n[storage.options]\n' > "$src"; fi; \
+    fi; \
+    if grep -Eq '^[[:space:]]*additionalimagestores[[:space:]]*=[[:space:]]*\[' "$src"; then \
+        sed -i "s#^\([[:space:]]*additionalimagestores[[:space:]]*=[[:space:]]*\[\)#\1 \"$store\",#" "$src"; \
+    else \
+        grep -q '^\[storage.options\]' "$src" || printf '\n[storage.options]\n' >> "$src"; \
+        sed -i "/^\[storage.options\]/a additionalimagestores = [\"$store\"]" "$src"; \
+    fi; \
+    grep -n 'additionalimagestores' "$src"
+
+# Headless appliance: target multi-user (no GUI). Otherwise graphical.target reserves tty1 for
+# a non-existent display manager. This vanilla OS keeps the normal login getty on tty1; the
+# BRANDED appliance masks getty@tty1 and puts the console dashboard there in the Fabric
+# derivation (ICE-Fabric) — that product concern is NOT baked here.
+RUN set -euxo pipefail; \
+    chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh \
+               /usr/local/bin/neural-ice-hostname-init.sh \
+               /usr/local/bin/neural-ice-payload-apply.sh; \
+    systemctl mask bootc-fetch-apply-updates.timer; \
+    systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
+                     neural-ice-firstboot-sshkey.service \
+                     neural-ice-hostname-init.service \
+                     neural-ice-payload-apply.service \
+                     avahi-daemon.service; \
+    systemctl set-default multi-user.target
+
+# Immutable source artifacts do not follow themselves: CI publishes a run-unique tag,
+# so the native bootc timer is masked above. The branded Fabric layer keeps updates under
+# the signed train controller, which stages exact digests with bootc switch --retain.
+
+# Client DATA volume (2nd LUKS domain) auto-unlock — config-in-image (bootc way),
+# not post-install /etc surgery. crypttab references the partition by its stable
+# GPT label "data-luks" (set by the installer), opens it via the TPM2 token
+# enrolled at install. `none` + `nofail` => never hangs boot if absent (e.g. live
+# USB). The mount itself is injected per-install via a `systemd.mount-extra` karg.
+RUN set -euxo pipefail; \
+    printf 'data /dev/disk/by-partlabel/data-luks none tpm2-device=auto,nofail\n' > /etc/crypttab; \
+    chmod 0600 /etc/crypttab; \
+    printf 'd /var/lib/neural-ice 0755 root root -\nd /var/lib/neural-ice/data 0700 root root -\n' \
+        > /usr/lib/tmpfiles.d/neural-ice-data.conf
+
+# --------------------------------------------------------------------------- #
+# 3b) Neural ICE branding: OS name (GRUB title + firmware label) + kargs.
+#     NO Plymouth and NO dracut regeneration: the splash renders black on the
+#     GB10 DRM (abandoned), and the GB10 kernel's initramfs already contains
+#     crypt + tpm2 (LUKS/TPM unlock). Not regenerating the initramfs =
+#     faster builds + tiny OTA deltas (a config change no longer rewrites the
+#     ~180 MB initramfs image).
+# --------------------------------------------------------------------------- #
+RUN set -euxo pipefail; \
+    sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
+    install -d -m 0755 /usr/lib/bootc/kargs.d; \
+    if [ "${VARIANT}" = "debug" ]; then \
+        printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0"]\n' \
+            > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
+        sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS (debug)"/' /usr/lib/os-release; \
+        install -d /etc/systemd/system/serial-getty@ttyS0.service.d; \
+        printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %%I $TERM\n' \
+            > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf; \
+        systemctl enable serial-getty@ttyS0.service; \
+    else \
+        printf 'kargs = ["quiet"]\n' > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
+        systemctl mask sshd.service; \
+        # Sealed console: no shell anywhere. tty1 is the TUI (getty@tty1 already masked); mask the
+        # getty@/autovt@ templates too so no login prompt can autospawn on any secondary VT
+        # (Ctrl+Alt+F2..F6). Debug keeps its VT gettys + serial + ssh; prod does not.
+        systemctl mask getty@.service autovt@.service; \
+    fi
+
+# OTA source self-description only. The producer passes its own immutable tag while
+# the native timer remains masked; the branded Fabric derivation replaces this with
+# the product reference and its signed controller stages the BOM digest.
+ARG OTA_IMGREF=""
+# OS version self-description (run-unique immutable version from CI).
+# The console TUI displays this file — never the TUI crate version.
+ARG OS_VERSION=""
+RUN set -euxo pipefail; \
+    install -d -m 0755 /usr/lib/neural-ice; \
+    test -n "${OTA_IMGREF}"; \
+    printf '%s\n' "${OTA_IMGREF}" > /usr/lib/neural-ice/ota-imgref; \
+    if [ -n "${OS_VERSION}" ]; then printf '%s\n' "${OS_VERSION}" > /usr/lib/neural-ice/version; fi
+
+# --------------------------------------------------------------------------- #
+# 4) bootc hygiene: /var must stay empty (runtime state, not image)
+# --------------------------------------------------------------------------- #
+RUN rm -rf /var/cache/* /var/lib/dnf /var/log/* /tmp/* 2>/dev/null || true
+
+# --------------------------------------------------------------------------- #
+# 5) bootc validation of the image
+# --------------------------------------------------------------------------- #
+RUN bootc container lint
+
+LABEL org.opencontainers.image.title="ICE-CoreOS" \
+      org.opencontainers.image.description="Immutable bootc GPU appliance OS for NVIDIA DGX Spark (GB10) — CentOS Stream 10 (el10), GB10 kernel (4k pages), NVIDIA r595, Secure Boot signed, TPM2/LUKS. OTA source." \
+      org.opencontainers.image.vendor="Neural ICE" \
+      org.opencontainers.image.source="https://github.com/Neural-ICE/ICE-CoreOS" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      neural-ice.nvidia.driver="r${NVIDIA_DRIVER_VERSION}" \
+      neural-ice.base="centos-bootc:stream10"
