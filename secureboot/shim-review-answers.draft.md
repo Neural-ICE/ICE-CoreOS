@@ -22,10 +22,14 @@ French commercial register (RCS) entry:
 The public details of both your organization and the issuer in the EV
 certificate used for signing .cab files at Microsoft Hardware Dev Center:
 ```
-[TODO after EV issuance, e.g.:
-Issuer: O=SSL.com, CN=SSL.com EV Code Signing Intermediate CA RSA R3
-Subject: C=FR, O=TKRI, CN=TKRI]
+Issuer: C=US, ST=Texas, L=Houston, O=SSL Corp, CN=SSL.com EV Code Signing Intermediate CA ECC R2
+Subject: C=FR, ST=Île-de-France, L=Paris, O=TKRI, serialNumber=789990298, CN=TKRI, businessCategory=Private Organization, jurisdictionL=Paris, jurisdictionST=Île-de-France, jurisdictionC=FR
 ```
+
+(EV Code Signing certificate serial `1EBE4EFD89D56D6DEAB0508C9930468F`, valid
+2026-07-14 → 2027-07-14; the private key was generated on-device in a YubiKey
+5 FIPS PIV slot and attested at issuance — see the key-protection answer
+below.)
 
 ### What product or service is this for?
 
