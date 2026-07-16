@@ -39,6 +39,9 @@ subject to the ARM64+AMD64 publication requirement in ICE-Fabric ADR-0018.
 4. Signed BOMs identify the GB10 hardware target in their compatibility data. The
    OTA controller must continue to reject an incompatible train before pulling or
    staging the OS.
+   The image bakes `nvidia-gb10-arm64` under
+   `/usr/lib/neural-ice/hardware-target`; the verifier and anti-rollback commit
+   compare the signed record/BOM to that immutable marker (ADR-0010).
 5. `beta` remains the only validation ring for the current appliance. ICE-CoreOS
    CI does not move channels; the signed Fabric train may promote only the exact,
    previously validated digest. This ADR does not authorize a promotion.
@@ -58,7 +61,9 @@ ADR-0008 becomes actionable only after all of the following exist:
 - signed beta train with install, reboot, health and rollback evidence;
 - an Owner decision to add that SKU to the supported release envelope.
 
-Only then may CI assemble one ARM64+AMD64 bootc index and move a shared channel.
+Only then may CI publish the target's native bootc artifact and enable its
+target-scoped signed beta channel. No shared cross-hardware channel or synthetic
+ARM64+AMD64 bootc index is created (ADR-0010).
 
 ## Consequences
 

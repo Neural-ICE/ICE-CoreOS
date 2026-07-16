@@ -17,6 +17,11 @@
 > must not be represented by a synthetic `linux/amd64` manifest entry before that
 > hardware, Secure Boot, installer, TPM and rollback path exist and are validated.
 
+> **2026-07-16 distribution amendment:** ADR-0010 replaces the future shared
+> cross-SKU bootc manifest with explicit hardware targets and target-scoped signed
+> channels. Architecture-neutral containers remain multiarch; hardware-bound bootc
+> images do not pretend that architecture alone expresses GPU/driver compatibility.
+
 ## Context
 
 ICE-CoreOS today positions itself as an OS **for NVIDIA DGX Spark (GB10, ARM64)**.

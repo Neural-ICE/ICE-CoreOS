@@ -45,6 +45,7 @@ impl Fixture {
             "-----BEGIN TEST PUBLIC KEY-----\n",
         )
         .unwrap();
+        fs::write(dir.join("hardware-target"), "nvidia-gb10-arm64\n").unwrap();
         Fixture { dir }
     }
 
@@ -74,7 +75,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"raw_sha256":"bb","version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","key_version":1,"train":"{train}"}}"#
+                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"raw_sha256":"bb","version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -86,7 +87,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":{seq},"channel":"{channel}","key_version":1,"train":"{train}"}}"#
+                r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":{seq},"channel":"{channel}","hardware_target":"nvidia-gb10-arm64","key_version":1,"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -119,6 +120,7 @@ impl Fixture {
     fn verify_cmd_bare(&self, config: &Path) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.env("NI_OTA_COSIGN", self.path("cosign-stub.sh"))
+            .env("NI_OTA_HARDWARE_TARGET_FILE", self.path("hardware-target"))
             .arg("verify")
             .args(["--bom".as_ref(), self.path("bom.json").as_os_str()])
             .args(["--bom-sig".as_ref(), self.path("bom.sig").as_os_str()])
@@ -199,7 +201,9 @@ fn happy_path_passes_in_both_modes() {
             "bom_parse",
             "train_match",
             "seq_match",
+            "target_binding",
             "channel_match",
+            "hardware_target",
             "anti_rollback",
             "compat_overlap",
         ] {
@@ -275,6 +279,22 @@ fn channel_mismatch_refuses() {
     let c = check(&verdict, "channel_match");
     assert_eq!(c["ok"], false);
     assert!(c["detail"].as_str().unwrap().contains("edge"));
+}
+
+#[test]
+fn hardware_target_mismatch_refuses() {
+    let fx = Fixture::new("hardware-target");
+    fx.arrange_happy();
+    fs::write(
+        fx.path("record.json"),
+        r#"{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":7,"channel":"stable","hardware_target":"nvidia-cuda-x86_64","key_version":1,"train":"0.44.7"}"#,
+    )
+    .unwrap();
+    let cfg = fx.write_config(1, "");
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 1);
+    assert_eq!(check(&verdict, "target_binding")["ok"], false);
+    assert_eq!(check(&verdict, "hardware_target")["ok"], false);
 }
 
 #[test]
@@ -464,6 +484,18 @@ fn unreadable_config_is_an_internal_error() {
     assert!(stderr.contains("unreadable config"));
 }
 
+#[test]
+fn missing_immutable_hardware_target_is_an_internal_error() {
+    let fx = Fixture::new("no-hardware-target");
+    fx.arrange_happy();
+    fs::remove_file(fx.path("hardware-target")).unwrap();
+    let cfg = fx.write_config(1, "");
+    let (code, verdict, stderr) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 2);
+    assert_eq!(verdict, Value::Null);
+    assert!(stderr.contains("unreadable immutable hardware target"));
+}
+
 // --- commit ---------------------------------------------------------------------
 
 #[test]
@@ -473,6 +505,7 @@ fn commit_seeds_advances_and_guards() {
     let cfg = fx.write_config(0, "");
     let commit = |bom: &Path| -> (i32, Value, String) {
         run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
             .arg("commit")
             .args(["--bom".as_ref(), bom.as_os_str()])
             .args(["--config".as_ref(), cfg.as_os_str()]))
@@ -496,7 +529,7 @@ fn commit_seeds_advances_and_guards() {
     let forged = fx.path("bom-forged.json");
     fs::write(
         &forged,
-        r#"{"train":"0.44.7-evil","bundle_seq":7,"compat_min":1,"compat_version":3}"#,
+        r#"{"train":"0.44.7-evil","hardware_target":"nvidia-gb10-arm64","bundle_seq":7,"compat_min":1,"compat_version":3}"#,
     )
     .unwrap();
     let (code, _, stderr) = commit(&forged);
@@ -507,7 +540,7 @@ fn commit_seeds_advances_and_guards() {
     let older = fx.path("bom-old.json");
     fs::write(
         &older,
-        r#"{"train":"0.44.5","bundle_seq":5,"compat_min":1,"compat_version":3}"#,
+        r#"{"train":"0.44.5","hardware_target":"nvidia-gb10-arm64","bundle_seq":5,"compat_min":1,"compat_version":3}"#,
     )
     .unwrap();
     let (code, _, stderr) = commit(&older);
@@ -524,12 +557,30 @@ fn commit_seeds_advances_and_guards() {
     let newer = fx.path("bom-new.json");
     fs::write(
         &newer,
-        r#"{"train":"0.44.8","bundle_seq":8,"compat_min":1,"compat_version":3}"#,
+        r#"{"train":"0.44.8","hardware_target":"nvidia-gb10-arm64","bundle_seq":8,"compat_min":1,"compat_version":3}"#,
     )
     .unwrap();
     let (code, receipt, _) = commit(&newer);
     assert_eq!(code, 0);
     assert_eq!(receipt["bundle_seq"], 8);
+}
+
+#[test]
+fn commit_refuses_a_different_hardware_target() {
+    let fx = Fixture::new("commit-hardware-target");
+    let bom = fx.write_bom("0.44.7", 7);
+    let value: Value = serde_json::from_str(&fs::read_to_string(&bom).unwrap()).unwrap();
+    let mut value = value;
+    value["hardware_target"] = Value::String("nvidia-cuda-x86_64".to_string());
+    fs::write(&bom, serde_json::to_vec(&value).unwrap()).unwrap();
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 1);
+    assert!(stderr.contains("does not match immutable host target"));
 }
 
 #[test]

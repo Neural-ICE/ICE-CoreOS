@@ -25,7 +25,9 @@ log shows the full diagnostic picture:
 | — | `bom_parse`     | BOM unreadable / malformed JSON                                          |
 | 3 | `train_match`   | `record.train != bom.train`                                              |
 | 4 | `seq_match`     | `record.bundle_seq != bom.bundle_seq` (signed channel↔bundle binding)    |
+| 4b | `target_binding` | `record.hardware_target != bom.hardware_target`                         |
 | 5 | `channel_match` | `record.channel !=` this device's channel                                |
+| 5b | `hardware_target` | signed target differs from `/usr/lib/neural-ice/hardware-target`       |
 | 6 | `anti_rollback` | `bom.bundle_seq < applied.bundle_seq`; **or** equal seq with a DIFFERENT BOM hash (two bundles claiming one seq = forgery signal). Equal seq with the **identical** BOM hash passes — the repair carve-out (re-apply of the exact current bundle). |
 | — | `unseeded`      | replaces `anti_rollback` when no applied state exists yet: **shadow** = pass WITH warning (the first `commit` seeds it), **enforce** = refuse (enforcement is invalid on an unseeded device — the P3 seeding rule) |
 | 7 | `compat_overlap`| `[bom.compat_min, bom.compat_version]` does not overlap the device's supported range |
@@ -79,7 +81,8 @@ ni-ota-verify commit --bom <path> [--config …] [--applied-state <path>]
 Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 `state_dir` and optionally `device_channel` / `device_compat_min` /
 `device_compat_max`; flags override. A missing `enforce` key defaults to
-**enforce** (an incomplete config leans strict, never silently log-only).
+**enforce** (an incomplete config leans strict, never silently log-only). The
+hardware target comes from the immutable image marker, not a CLI override.
 
 `commit` records `{bundle_seq, bom_sha256}` in `state_dir/applied.json`
 **after** the caller's health gate passes. It refuses (exit 1) any BOM that
@@ -89,7 +92,7 @@ seq with the identical hash re-commits idempotently (repair).
 ## Caller integration (the OTA path, ICE-Fabric side)
 
 ```
-oras pull <registry>/<channel_ref>:<device-channel>       # signed channel record + .sig
+oras pull <registry>/<channel_ref>:<hardware-target>-<device-channel> # signed channel record + .sig
 oras pull <registry>/<bundle_ref>:<record.train>          # signed BOM + .sig
 ni-ota-verify verify --bom … --bom-sig … --record … --record-sig …   # THE GATE
     → apply strictly by the digests in the verified BOM (never by tag)
