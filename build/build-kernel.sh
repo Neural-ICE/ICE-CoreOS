@@ -158,19 +158,21 @@ if ! ls "\${RPMDIR}"/kernel-core-*.rpm >/dev/null 2>&1; then
 fi
 cp -v "\${RPMDIR}"/*.rpm /output/
 
-# 6) NVIDIA r595 driver (open GPU kernel modules) via kmod spec
+# 6) NVIDIA r595 driver (open GPU kernel modules), signed with THIS kernel
+#    build's EPHEMERAL module-signing key (certs/signing_key.pem, whose public
+#    half was just built into the kernel and whose private half dies with the
+#    build). This binds the modules to exactly this kernel and leaves no
+#    persistent module key. See secureboot/signing-pipeline.md and build-driver.sh.
 if [[ "\${BUILD_DRIVER}" == "true" ]]; then
-  echo "==> Build NVIDIA open driver r\${NVIDIA_DRIVER_VERSION} (kmod-nvidia-open)"
-  SPEC="/workspace/kmod-nvidia-open.spec"
-  if [[ -f "\${SPEC}" ]]; then
-    rpmbuild -bb --define "_disable_source_fetch 0" \
-             --define "kver \$(rpm -qp --qf '%{VERSION}-%{RELEASE}.%{ARCH}' \\
-                        \$(ls /output/kernel-core-*.rpm | head -1))" \
-             "\${SPEC}" || echo "    (driver build failed — check the .spec and network access)"
-    cp -v "\${HOME}"/rpmbuild/RPMS/\${ARCH}/kmod-nvidia-open-*.rpm /output/ 2>/dev/null || true
+  echo "==> Build + sign NVIDIA open driver r\${NVIDIA_DRIVER_VERSION} (ephemeral key)"
+  KTREE="\$(find /workspace -type d -name certs -path '*nvidia-gb10*' 2>/dev/null | head -1 | xargs -r dirname)"
+  if [[ -n "\${KTREE}" && -n "\${NVIDIA_OPEN_SRC:-}" ]]; then
+    KTREE="\${KTREE}" NVSRC="\${NVIDIA_OPEN_SRC}" OUT=/output/driver-modules \
+      bash /workspace/build/build-driver.sh \
+      || echo "    (driver build/sign failed — see secureboot/signing-pipeline.md)"
   else
-    echo "    kmod-nvidia-open.spec missing from /workspace: driver step skipped."
-    echo "    Drop the .spec (r\${NVIDIA_DRIVER_VERSION}) into /workspace to enable it."
+    echo "    driver step skipped: set NVIDIA_OPEN_SRC and ensure the kernel build"
+    echo "    tree (with certs/signing_key.pem) is present — see build-driver.sh."
   fi
 fi
 
