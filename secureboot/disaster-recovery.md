@@ -79,13 +79,16 @@ CA — and there is **no boot-time CRL** to revoke a single leaf. Response:
 
 1. **Rotate the leaf immediately** (steps above); freeze releases under the old
    leaf so all new releases use the new one.
-2. **Contain bad binaries, since the CA cannot un-trust one leaf:** any
-   unauthorized binary is revoked by **SBAT-generation bump + submitting its hash
-   to the UEFI `dbx`** (the CA-compromise mechanism below) — the same tool used
-   for a bad GRUB/kernel.
-3. **If the PIN may also be exposed,** escalate to the **CA-compromise** playbook:
-   a leaf driven at will under the CA is, for deployed units, close to a CA-trust
-   bypass.
+2. **Per-binary `dbx` is only a stopgap.** Deny-listing the hashes you have already
+   found (SBAT-generation bump + submitting them to the UEFI `dbx`, the
+   CA-compromise mechanism below) stops *those* binaries — but a usable token can
+   mint **fresh** binaries with new hashes that the old shim still accepts, because
+   they chain to the unchanged CA and there is **no boot-time leaf revocation**.
+3. **A usable token is therefore a CA/shim-rotation event.** Unless you are certain
+   the PIN was never exposed (so the token cannot actually be driven), go to the
+   **CA-compromise** playbook below: rotating the CA + new shim + revoking the old
+   shim is the *only* way to un-trust everything the old leaf can still produce.
+   Per-binary `dbx` merely buys time until that lands.
 4. Rotate any operator/CI credentials the holder may also have had.
 
 > ⚠️ **Owner risk call:** how hard to escalate a *lost* (vs proven stolen-with-PIN)
@@ -140,10 +143,16 @@ Microsoft-signed shim still embeds and trusts the compromised CA**. Full respons
      revocation) — until that lands, the old shim + compromised CA remain a bypass
      on any unit that has not updated `dbx`;
    - `vendor_dbx` the previously-signed GRUB/kernel as a stopgap.
-3. **Re-enroll TPM PCR 7 across the fleet:** the new shim/CA changes PCR 7, which
-   breaks the TPM-sealed LUKS auto-unlock. The idempotent re-enrollment service
-   (ADR-0004; runbook "TPM PCR 7 changes …") **must** run as each unit takes the
-   new shim, or it demands a LUKS recovery key on the next reboot.
+3. **TPM PCR 7 — expect a recovery/re-seal step (see [ADR-0011](../docs/ADR-0011-tpm-unlock-rotation-robustness.md)):**
+   the new shim/CA changes PCR 7, so the TPM-sealed LUKS auto-unlock breaks on both
+   volumes. With today's current-PCR sealing (`--tpm2-pcrs=7`, ADR-0004) a unit can
+   only re-seal to the new value *after* it has booted the new shim — so each first
+   falls back to its **LUKS recovery key**, then re-seals. ⚠️ For the **system**
+   volume that is the `SYS_RECOVERY` escrow, which is **not yet implemented**: if it
+   was not captured at install, the root volume is **reprovisioned from GHCR**
+   (stateless OS; client `data` recovered via its own operator key). ADR-0011
+   (UKI + PCR 11 signed policy) removes this window — the TPM accepts any boot state
+   you have signed, so a rotation needs no recovery key.
 4. Roll the fleet onto the new shim + updated `dbx`/`SBAT`. This is the worst case,
    and it is exactly why the CA key is generated offline and never exists
    unencrypted at rest.
@@ -156,7 +165,8 @@ backup:
 - [ ] Both CA-key media restore and decrypt cleanly (`age -d` succeeds on each).
 - [ ] **The decrypted private key really is the CA key** — not just that *a* key
       decrypts. Derive its public key and match the CA certificate's: compare
-      `openssl pkey -in ca.key -pubout` against `openssl x509 -in ca.crt -pubkey`,
+      `openssl pkey -in ca.key -pubout` against `openssl x509 -in ca.crt -pubkey -noout`
+      (without `-noout`, `x509` also prints the cert and the compare falsely fails),
       or sign a throwaway CSR and verify it against the CA cert. A substituted
       medium can carry the correct public cert beside a wrong (but decryptable)
       key and pass a fingerprint-only check.
