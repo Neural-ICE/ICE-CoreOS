@@ -41,7 +41,7 @@ Two distinct trust mechanisms are at work, and they must not be confused:
 | grubaa64.efi | **leaf** (YubiKey 9c) | shim (against the embedded CA) | each grub build |
 | vmlinuz | **leaf** (YubiKey 9c) | shim/grub protocol | each kernel build |
 | in-tree `.ko` | kernel **ephemeral** key | the kernel itself | during the kernel build |
-| NVIDIA out-of-tree `.ko` | the **same** ephemeral key | the kernel itself | in the same build run |
+| NVIDIA out-of-tree `.ko` | the **same** ephemeral key | the kernel itself | in the same kernel `rpmbuild` (built in-tree) |
 
 ## Module signing — the ephemeral key (the correct design)
 
@@ -56,19 +56,33 @@ own build.** Modules signed for kernel A cannot load into kernel B — the keys
 differ. This is stronger than relying on `vermagic` alone.
 
 For that to hold, the **out-of-tree NVIDIA modules must be signed with the same
-per-build key**, inside the same build run, *before* the key is destroyed:
+per-build key**. That key is generated *inside* the kernel's `rpmbuild` and
+discarded when the build tree is torn down — there is no reliable window to grab
+it afterwards. So instead of capturing the key, the NVIDIA modules are built
+**inside the same `rpmbuild`** and signed by the kernel spec itself, with no key
+ever touching our own scripts:
 
-1. Build the kernel → `certs/signing_key.pem` exists in the build tree, its
-   public half is embedded in the kernel.
-2. Build the NVIDIA open modules against that kernel's `kernel-devel`.
-3. Sign each `.ko` with `scripts/sign-file sha512 certs/signing_key.pem
-   certs/signing_key.x509 <ko>`.
-4. **Destroy** `certs/signing_key.pem` (it is never shipped, never persisted).
+1. A patch to the RHEL kernel `kernel.spec.template`
+   (`build/patches/nvidia-open-inline-sign.patch`) adds the NVIDIA open source
+   as a spec `Source`, builds the modules in `%build` against the freshly built
+   kernel tree, and stages the unsigned `.ko` under
+   `/lib/modules/<kver>/extra/nvidia-open/`.
+2. The kernel's own `__modsign_install_post` step then signs **every** `.ko`
+   under the module tree — in-tree and NVIDIA alike — with the build's ephemeral
+   key, as its last install action.
+3. The private half is never handled by us and is discarded with the build tree.
+   The NVIDIA `.ko` ship in a `kernel-modules-nvidia-open` subpackage.
+
+This is verifiable on the built RPMs: the NVIDIA `.ko` and the in-tree `.ko`
+report the **same** `modinfo -F signer` (the per-build key), and no
+`signing_key.pem` remains on disk. Because that key's public half is the one
+built into the kernel (`.builtin_trusted_keys`), the modules load under
+`lockdown=integrity` with **nothing** enrolled in the firmware `db`.
 
 > **Anti-pattern to avoid (was the lab setup):** signing the NVIDIA modules with
 > a *persistent* key (e.g. a fixed `lab.key`) that is reused across builds. Then
 > one build's modules can load into another kernel, and the private key must be
-> guarded forever. The ephemeral approach removes both problems.
+> guarded forever. The ephemeral in-build approach removes both problems.
 
 ## EFI signing — leaf via the YubiKey
 
@@ -96,8 +110,11 @@ signer rejects the malformed PE.
 |---|---|---|
 | shim | MS-signed | reproducible, awaiting shim-review |
 | grub | leaf-signed | ✅ leaf-signed + `sbverify` OK |
-| vmlinuz | leaf-signed | ⚠️ still RHEL **test**-cert-signed — must be leaf-signed |
-| modules | ephemeral key | ⚠️ still **persistent lab key** — must switch to the ephemeral key |
+| modules | ephemeral key | ✅ NVIDIA + in-tree `.ko` signed by the per-build ephemeral key (same `modinfo -F signer`; no persistent key) |
+| vmlinuz | leaf-signed | ⚠️ built test-cert-signed; test sig stripped, staged for the manual leaf-sign |
 
-The last two rows are the remaining work before the boot chain is production and
-before the shim-review answers about kernel/module signing are literally true.
+Only `vmlinuz` remains: the kernel build emits it signed with the RHEL **test**
+certificate, so a post-build step strips that signature and re-signs it with the
+leaf (the one manual YubiKey action). Once that lands, the boot chain is
+production and the shim-review answers about kernel/module signing are literally
+true.

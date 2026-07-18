@@ -67,6 +67,11 @@ ARG VARIANT=prod
 #    the globs stay anchored on `-6.12` so they select the 4k non-debug RPMs even
 #    if debug/64k variants are ever present. See ADR-0006.
 # --------------------------------------------------------------------------- #
+# The NVIDIA open r595 modules ship in kernel-modules-nvidia-open: built in-tree
+# against THIS kernel and signed by its EPHEMERAL module key (same signer as the
+# in-tree modules), so they load under lockdown with nothing enrolled in db. The
+# RPM lands them in /usr/lib/modules/<kver>/extra/nvidia-open/ and runs depmod.
+# ATOMIC kernel<->driver coupling: no loose .ko, no privileged injector, no GHCR pull.
 COPY image/rpms/ /tmp/rpms/
 RUN set -euxo pipefail; \
     dnf -y remove --noautoremove kernel kernel-core kernel-modules kernel-modules-core; \
@@ -74,20 +79,12 @@ RUN set -euxo pipefail; \
         /tmp/rpms/kernel-core-6.12*.rpm \
         /tmp/rpms/kernel-modules-core-6.12*.rpm \
         /tmp/rpms/kernel-modules-6.12*.rpm \
+        /tmp/rpms/kernel-modules-nvidia-open-6.12*.rpm \
         /tmp/rpms/kernel-6.12*.rpm; \
     rm -rf /tmp/rpms
-
-# Open NVIDIA r595 driver PRE-COMPILED against the GB10 4k kernel (identical vermagic),
-# baked into /usr/lib/modules/<kver>/extra/nvidia + depmod. ATOMIC kernel<->driver
-# coupling: no privileged injector container, no GHCR pull.
-COPY image/driver-modules/*.ko /tmp/nvidia/
 RUN set -euxo pipefail; \
     KVER="$(ls /usr/lib/modules | head -1)"; \
-    install -d "/usr/lib/modules/${KVER}/extra/nvidia"; \
-    cp /tmp/nvidia/*.ko "/usr/lib/modules/${KVER}/extra/nvidia/"; \
-    depmod -a "${KVER}"; \
-    modinfo "/usr/lib/modules/${KVER}/extra/nvidia/nvidia.ko" | grep -E '^(version|vermagic):'; \
-    rm -rf /tmp/nvidia
+    modinfo /usr/lib/modules/${KVER}/extra/nvidia-open/nvidia.ko* | grep -E '^(version|vermagic|signer):'
 
 # GSP firmware + r595 userspace driver (extracted from the official .run bundle):
 #  - firmware -> /usr/lib/firmware/nvidia/595.58.03 (REQUIRED to initialize the GPU)
