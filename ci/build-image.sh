@@ -61,10 +61,10 @@ SEMVER="${VERSION}-${BUILD_LABEL}${SUFFIX}"
 REF="${REGISTRY}/${IMAGE}"
 
 # Fail early with a clear message if the heavy artifacts are not staged.
-for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boot; do
+for d in image/rpms image/nvidia-userspace image/signed-boot; do
   if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
     echo "ERROR: missing staged GB10 artifacts in '$d'." >&2
-    echo "       Build/stage them first (GB10 kernel (4k) RPMs, signed driver modules," >&2
+    echo "       Build/stage them first (GB10 kernel (4k) RPMs incl. kernel-modules-nvidia-open," >&2
     echo "       nvidia userspace, signed boot binaries). See README + ci/build-kernel.sh." >&2
     exit 3
   fi

@@ -161,7 +161,15 @@ if [[ "\${BUILD_DRIVER}" == "true" ]]; then
   echo "==> Option D: stage NVIDIA open source + apply inline-signing patch"
   tar -C /nvsrc-parent --transform "s,^kernel-open,nvidia-open-gpu-\${NVIDIA_DRIVER_VERSION}," -cf - kernel-open \
     | xz -T0 -6 > rhel_files/nvidia-open-gpu-\${NVIDIA_DRIVER_VERSION}.tar.xz
-  git -C /workspace/nvidia-gb10 apply --verbose /patches/nvidia-open-inline-sign.patch
+  # Idempotent: the reused checkout carries local mods across 'git checkout -B',
+  # so on a second run the template is already patched — skip re-applying.
+  if git -C /workspace/nvidia-gb10 apply --reverse --check /patches/nvidia-open-inline-sign.patch 2>/dev/null; then
+    echo "    kernel.spec.template already patched — skipping git apply"
+  else
+    git -C /workspace/nvidia-gb10 apply --verbose /patches/nvidia-open-inline-sign.patch
+  fi
+  # Keep the spec Source version in lock-step with the tarball we just staged.
+  sed -i "s/^%global nvidia_open_ver .*/%global nvidia_open_ver \${NVIDIA_DRIVER_VERSION}/" kernel.spec.template
   echo "    staged rhel_files/nvidia-open-gpu-\${NVIDIA_DRIVER_VERSION}.tar.xz + patched kernel.spec.template"
 fi
 
@@ -211,8 +219,8 @@ PODMAN_RUN=(podman run --rm
 # Option D mounts: NVIDIA open source (its parent, read-only) + the template patch.
 if [[ "$BUILD_DRIVER" == "true" ]]; then
   PODMAN_RUN+=(
-    -v "$(dirname "$NVIDIA_OPEN_SRC"):/nvsrc-parent:ro"
-    -v "${SCRIPT_DIR}/patches:/patches:ro"
+    -v "$(dirname "$NVIDIA_OPEN_SRC"):/nvsrc-parent:ro,Z"
+    -v "${SCRIPT_DIR}/patches:/patches:ro,Z"
   )
 fi
 

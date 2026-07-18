@@ -1,5 +1,5 @@
 diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
-index 883634d6a..ae62a775f 100644
+index 883634d6a..9b51b2f94 100644
 --- a/redhat/kernel.spec.template
 +++ b/redhat/kernel.spec.template
 @@ -1042,6 +1042,12 @@ Source106: fedoraimaca.x509
@@ -15,7 +15,7 @@ index 883634d6a..ae62a775f 100644
  %if 0%{?fedora}%{?eln}
  %define ima_ca_cert %{SOURCE106}
  %endif
-@@ -1886,6 +1892,22 @@ of the operating system: memory allocation, process allocation, device
+@@ -1886,6 +1892,28 @@ of the operating system: memory allocation, process allocation, device
  input and output, etc.
  %endif
  
@@ -33,12 +33,18 @@ index 883634d6a..ae62a775f 100644
 +The private half of that key is discarded at the end of the build, so these
 +modules load only in this kernel and the key cannot be re-used to sign anything
 +else.
++
++%post modules-nvidia-open
++depmod -a %{KVERREL} >/dev/null 2>&1 || :
++
++%postun modules-nvidia-open
++depmod -a %{KVERREL} >/dev/null 2>&1 || :
 +%endif
 +
  %if %{with_up} && %{with_debug} && %{with_efiuki}
  %description debug-uki-virt
  Prebuilt debug unified kernel image for virtual machines.
-@@ -2029,6 +2051,12 @@ ApplyOptionalPatch linux-kernel-test.patch
+@@ -2029,6 +2057,12 @@ ApplyOptionalPatch linux-kernel-test.patch
  %{log_msg "End of patch applications"}
  # END OF PATCH APPLICATIONS
  
@@ -51,7 +57,7 @@ index 883634d6a..ae62a775f 100644
  # Any further pre-build tree manipulations happen here.
  %{log_msg "Pre-build tree manipulations"}
  chmod +x scripts/checkpatch.pl
-@@ -3144,6 +3172,18 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
+@@ -3144,6 +3178,22 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
  
  %if %{with_up_base}
  BuildKernel %make_target %kernel_image %{_use_vdso}
@@ -60,9 +66,13 @@ index 883634d6a..ae62a775f 100644
 +# base kernel and stage them UNSIGNED under the module tree. __modsign_install_post
 +# signs them together with the in-tree modules using this build's ephemeral key.
 +%{log_msg "Building NVIDIA open GPU modules against %{KVERREL}"}
-+make -C %{_builddir}/nvidia-open-gpu-%{nvidia_open_ver} %{?_smp_mflags} modules \
-+     SYSSRC="%{_builddir}/kernel-%{tarfile_release}/linux-%{KVERREL}" \
-+     IGNORE_CC_MISMATCH=1
++# Build in a subshell with RPM LDFLAGS cleared: those linker flags can interfere
++# with the out-of-tree module build (the standalone NVIDIA driver spec clears
++# them the same way before `make modules`).
++( unset LDFLAGS LDFLAGS_MODULE || : ; \
++  make -C %{_builddir}/nvidia-open-gpu-%{nvidia_open_ver} %{?_smp_mflags} modules \
++       SYSSRC="%{_builddir}/kernel-%{tarfile_release}/linux-%{KVERREL}" \
++       IGNORE_CC_MISMATCH=1 )
 +mkdir -p $RPM_BUILD_ROOT/lib/modules/%{KVERREL}/extra/nvidia-open
 +find %{_builddir}/nvidia-open-gpu-%{nvidia_open_ver} -name '*.ko' -exec \
 +     install -m 0644 {} $RPM_BUILD_ROOT/lib/modules/%{KVERREL}/extra/nvidia-open/ \;
@@ -70,7 +80,7 @@ index 883634d6a..ae62a775f 100644
  %endif
  
  %ifnarch noarch i686 %{nobuildarches}
-@@ -4392,6 +4432,14 @@ fi\
+@@ -4392,6 +4442,14 @@ fi\
  %{_libexecdir}/kselftests
  %endif
  
