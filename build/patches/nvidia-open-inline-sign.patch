@@ -1,0 +1,87 @@
+diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
+index 883634d6a..ae62a775f 100644
+--- a/redhat/kernel.spec.template
++++ b/redhat/kernel.spec.template
+@@ -1042,6 +1042,12 @@ Source106: fedoraimaca.x509
+ Source107: nvidiajetsonsoc.x509
+ Source108: nvidiabfdpu.x509
+ 
++# Neural ICE: NVIDIA open GPU (r595) out-of-tree module source. Built in-tree
++# (see %build) and signed by this build's ephemeral module-signing key together
++# with the in-tree modules, so no persistent module-signing key exists.
++%global nvidia_open_ver 595.58.03
++Source9000: nvidia-open-gpu-%{nvidia_open_ver}.tar.xz
++
+ %if 0%{?fedora}%{?eln}
+ %define ima_ca_cert %{SOURCE106}
+ %endif
+@@ -1886,6 +1892,22 @@ of the operating system: memory allocation, process allocation, device
+ input and output, etc.
+ %endif
+ 
++# Neural ICE: NVIDIA open GPU out-of-tree modules, signed by the base kernel's
++# ephemeral module-signing key. Only built for the base (up) variant we ship.
++%if %{with_up_base}
++%package modules-nvidia-open
++Summary: NVIDIA open GPU (r595) kernel modules for kernel %{KVERREL}
++Requires: %{name}-modules-core-uname-r = %{KVERREL}
++Provides: %{name}-modules-nvidia-open-uname-r = %{KVERREL}
++Provides: installonlypkg(kernel-module)
++%description modules-nvidia-open
++The NVIDIA open GPU (r595) out-of-tree kernel modules, built against and signed
++by the ephemeral per-build module-signing key of this exact %{KVERREL} kernel.
++The private half of that key is discarded at the end of the build, so these
++modules load only in this kernel and the key cannot be re-used to sign anything
++else.
++%endif
++
+ %if %{with_up} && %{with_debug} && %{with_efiuki}
+ %description debug-uki-virt
+ Prebuilt debug unified kernel image for virtual machines.
+@@ -2029,6 +2051,12 @@ ApplyOptionalPatch linux-kernel-test.patch
+ %{log_msg "End of patch applications"}
+ # END OF PATCH APPLICATIONS
+ 
++# Neural ICE: unpack the NVIDIA open GPU module source next to the kernel tree.
++# Absolute paths only; cwd here is the kernel source dir.
++%{log_msg "Untar NVIDIA open GPU module source"}
++rm -rf %{_builddir}/nvidia-open-gpu-%{nvidia_open_ver}
++tar -xf %{SOURCE9000} -C %{_builddir}
++
+ # Any further pre-build tree manipulations happen here.
+ %{log_msg "Pre-build tree manipulations"}
+ chmod +x scripts/checkpatch.pl
+@@ -3144,6 +3172,18 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
+ 
+ %if %{with_up_base}
+ BuildKernel %make_target %kernel_image %{_use_vdso}
++
++# Neural ICE: build the NVIDIA open GPU (r595) modules against the freshly built
++# base kernel and stage them UNSIGNED under the module tree. __modsign_install_post
++# signs them together with the in-tree modules using this build's ephemeral key.
++%{log_msg "Building NVIDIA open GPU modules against %{KVERREL}"}
++make -C %{_builddir}/nvidia-open-gpu-%{nvidia_open_ver} %{?_smp_mflags} modules \
++     SYSSRC="%{_builddir}/kernel-%{tarfile_release}/linux-%{KVERREL}" \
++     IGNORE_CC_MISMATCH=1
++mkdir -p $RPM_BUILD_ROOT/lib/modules/%{KVERREL}/extra/nvidia-open
++find %{_builddir}/nvidia-open-gpu-%{nvidia_open_ver} -name '*.ko' -exec \
++     install -m 0644 {} $RPM_BUILD_ROOT/lib/modules/%{KVERREL}/extra/nvidia-open/ \;
++echo "kernel.spec: staged NVIDIA .ko: $(find $RPM_BUILD_ROOT/lib/modules/%{KVERREL}/extra/nvidia-open -name '*.ko' 2>/dev/null | wc -l)"
+ %endif
+ 
+ %ifnarch noarch i686 %{nobuildarches}
+@@ -4392,6 +4432,14 @@ fi\
+ %{_libexecdir}/kselftests
+ %endif
+ 
++# Neural ICE: NVIDIA open GPU modules (signed by the ephemeral module key).
++%if %{with_up_base}
++%files modules-nvidia-open
++%defattr(-,root,root)
++%dir /lib/modules/%{KVERREL}/extra/nvidia-open
++/lib/modules/%{KVERREL}/extra/nvidia-open/*.ko*
++%endif
++
+ # empty meta-package
+ %if %{with_up_base}
+ %ifnarch %nobuildarches noarch
