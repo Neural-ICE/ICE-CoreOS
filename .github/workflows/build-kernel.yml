@@ -31,7 +31,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build GB10 kernel (4k) + NVIDIA driver artifacts
-        run: ./build/build-kernel.sh aarch64
+        run: |
+          # Option D builds the NVIDIA open modules in-tree (ephemeral-signed);
+          # point at the kernel-open source. Overridable; default derives from the
+          # driver version on the self-hosted runner.
+          export NVIDIA_OPEN_SRC="${NVIDIA_OPEN_SRC:-$HOME/nvidia-userspace-build/NVIDIA-Linux-aarch64-${NVIDIA_DRIVER_VERSION}/kernel-open}"
+          ./build/build-kernel.sh aarch64
 
       - name: Stage artifacts into image/ tree
         run: ./ci/stage-artifacts.sh

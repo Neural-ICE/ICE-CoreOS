@@ -11,8 +11,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-RPM_SRC="${RPM_SRC:-$HOME/neural-ice-build/output}"   # kernel-*.rpm (4k flavor), kmod-nvidia-open-*.rpm
-DRIVER_SRC="${DRIVER_SRC:-$HOME/neural-ice-build/driver-modules}"  # signed *.ko
+RPM_SRC="${RPM_SRC:-$HOME/neural-ice-build/output}"   # kernel-*.rpm (4k flavor) incl. kernel-modules-nvidia-open-*.rpm (ephemeral-signed)
 USERSPACE_SRC="${USERSPACE_SRC:-$HOME/neural-ice-build/nvidia-userspace}"  # usr/ tree
 SIGNEDBOOT_SRC="${SIGNEDBOOT_SRC:-$HOME/neural-ice-build/signed-boot}"     # signed vmlinuz/shim/grub + DER
 
@@ -31,10 +30,11 @@ stage() {  # $1=label  $2=src  $3=dest  $4=glob
   echo "staged ${#files[@]} $label file(s) -> $dest"
 }
 
-rm -rf image/rpms image/driver-modules image/nvidia-userspace image/signed-boot
+rm -rf image/rpms image/nvidia-userspace image/signed-boot
 
-stage "kernel/kmod RPM" "$RPM_SRC"       image/rpms            '*.rpm'
-stage "signed driver .ko" "$DRIVER_SRC"  image/driver-modules  '*.ko'
+# The NVIDIA modules now ship inside kernel-modules-nvidia-open-*.rpm (ephemeral-
+# signed by the kernel build), caught by the *.rpm glob — no loose .ko to stage.
+stage "kernel RPM" "$RPM_SRC"       image/rpms            '*.rpm'
 # userspace + signed-boot are directory trees (usr/...), copy recursively
 if [ -d "$USERSPACE_SRC" ]; then install -d image/nvidia-userspace; cp -a "$USERSPACE_SRC/." image/nvidia-userspace/; echo "staged nvidia-userspace tree"; else echo "WARN: no nvidia-userspace at $USERSPACE_SRC" >&2; fi
 if [ -d "$SIGNEDBOOT_SRC" ]; then install -d image/signed-boot;     cp -a "$SIGNEDBOOT_SRC/." image/signed-boot/;     echo "staged signed-boot tree"; else echo "WARN: no signed-boot at $SIGNEDBOOT_SRC" >&2; fi

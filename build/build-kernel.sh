@@ -40,6 +40,7 @@ done
 KERNEL_REPO="${KERNEL_REPO:-https://gitlab.com/redhat/edge/kernel/nvidia-gb10.git}"
 KERNEL_BRANCH="${KERNEL_BRANCH:-latest}"               # nvidia-gb10 default branch (has redhat/); 'main' is a mainline mirror WITHOUT redhat/
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-595.58.03}"
+NVIDIA_OPEN_SRC="${NVIDIA_OPEN_SRC:-}"                 # path to NVIDIA .../kernel-open (Option D: modules built in-tree & ephemeral-signed)
 BUILDER_IMAGE="${BUILDER_IMAGE:-neural-ice/kernel-builder:stream10}"
 WORKSPACE="${WORKSPACE:-${HOME}/neural-ice-build}"     # persistent across runs (git cache)
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE}/output}"        # final RPMs collected here
@@ -67,6 +68,15 @@ if [[ "$HOST_ARCH" != "$ARCH" ]]; then
 fi
 
 command -v podman >/dev/null || { echo "podman not found" >&2; exit 4; }
+
+# Option D prerequisites: the NVIDIA open source (built in-tree) and the template
+# patch that wires it into the kernel spec. Skipped with --no-driver.
+if [[ "$BUILD_DRIVER" == "true" ]]; then
+  [[ -d "$NVIDIA_OPEN_SRC" && "$(basename "$NVIDIA_OPEN_SRC")" == "kernel-open" ]] || {
+    echo "ERROR: set NVIDIA_OPEN_SRC to the NVIDIA .../kernel-open dir (Option D), or pass --no-driver." >&2; exit 6; }
+  [[ -f "${SCRIPT_DIR}/patches/nvidia-open-inline-sign.patch" ]] || {
+    echo "ERROR: missing build/patches/nvidia-open-inline-sign.patch" >&2; exit 6; }
+fi
 
 echo "==> Neural ICE | kernel build"
 echo "    arch=$ARCH flavor=$KERNEL_FLAVOR driver=r${NVIDIA_DRIVER_VERSION%%.*} ($NVIDIA_DRIVER_VERSION)"
@@ -142,7 +152,29 @@ else
   echo "      selection changed; verify the 4k kernel is actually built below." >&2
 fi
 
-# 4) Compilation + RPM packaging
+# 3c) Option D — build the NVIDIA open modules INSIDE this kernel rpmbuild, so the
+#     kernel's own __modsign_install_post signs them with the per-build EPHEMERAL
+#     module key (no key ever handled by us; see secureboot/signing-pipeline.md).
+#     We stage the NVIDIA source as a spec Source and apply the template patch
+#     AFTER the reset, exactly like the BUILDOPTS flip in 3b.
+if [[ "\${BUILD_DRIVER}" == "true" ]]; then
+  echo "==> Option D: stage NVIDIA open source + apply inline-signing patch"
+  tar -C /nvsrc-parent --transform "s,^kernel-open,nvidia-open-gpu-\${NVIDIA_DRIVER_VERSION}," -cf - kernel-open \
+    | xz -T0 -6 > rhel_files/nvidia-open-gpu-\${NVIDIA_DRIVER_VERSION}.tar.xz
+  # Idempotent: the reused checkout carries local mods across 'git checkout -B',
+  # so on a second run the template is already patched — skip re-applying.
+  if git -C /workspace/nvidia-gb10 apply --reverse --check /patches/nvidia-open-inline-sign.patch 2>/dev/null; then
+    echo "    kernel.spec.template already patched — skipping git apply"
+  else
+    git -C /workspace/nvidia-gb10 apply --verbose /patches/nvidia-open-inline-sign.patch
+  fi
+  # Keep the spec Source version in lock-step with the tarball we just staged.
+  sed -i "s/^%global nvidia_open_ver .*/%global nvidia_open_ver \${NVIDIA_DRIVER_VERSION}/" kernel.spec.template
+  echo "    staged rhel_files/nvidia-open-gpu-\${NVIDIA_DRIVER_VERSION}.tar.xz + patched kernel.spec.template"
+fi
+
+# 4) Compilation + RPM packaging (with Option D, the same run also builds and
+#    ephemeral-signs the NVIDIA modules into kernel-modules-nvidia-open)
 echo "==> Compiling the kernel (make dist-rpms) — may take a while"
 make dist-rpms
 
@@ -156,23 +188,13 @@ if ! ls "\${RPMDIR}"/kernel-core-*.rpm >/dev/null 2>&1; then
   echo "ERROR: no 4k kernel-core-*.rpm produced — 4k flavor not built (see ADR-0006)." >&2
   exit 5
 fi
-cp -v "\${RPMDIR}"/*.rpm /output/
-
-# 6) NVIDIA r595 driver (open GPU kernel modules) via kmod spec
-if [[ "\${BUILD_DRIVER}" == "true" ]]; then
-  echo "==> Build NVIDIA open driver r\${NVIDIA_DRIVER_VERSION} (kmod-nvidia-open)"
-  SPEC="/workspace/kmod-nvidia-open.spec"
-  if [[ -f "\${SPEC}" ]]; then
-    rpmbuild -bb --define "_disable_source_fetch 0" \
-             --define "kver \$(rpm -qp --qf '%{VERSION}-%{RELEASE}.%{ARCH}' \\
-                        \$(ls /output/kernel-core-*.rpm | head -1))" \
-             "\${SPEC}" || echo "    (driver build failed — check the .spec and network access)"
-    cp -v "\${HOME}"/rpmbuild/RPMS/\${ARCH}/kmod-nvidia-open-*.rpm /output/ 2>/dev/null || true
-  else
-    echo "    kmod-nvidia-open.spec missing from /workspace: driver step skipped."
-    echo "    Drop the .spec (r\${NVIDIA_DRIVER_VERSION}) into /workspace to enable it."
-  fi
+# With Option D the NVIDIA modules are produced by the same rpmbuild; require the
+# subpackage so a silently-dropped inline-signing step fails the build loudly.
+if [[ "\${BUILD_DRIVER}" == "true" ]] && ! ls "\${RPMDIR}"/kernel-modules-nvidia-open-*.rpm >/dev/null 2>&1; then
+  echo "ERROR: kernel-modules-nvidia-open-*.rpm missing — Option D inline signing failed." >&2
+  exit 7
 fi
+cp -v "\${RPMDIR}"/*.rpm /output/
 
 echo "==> Done. Contents of /output:"
 ls -1 /output | sed 's/^/      /'
@@ -194,6 +216,14 @@ PODMAN_RUN=(podman run --rm
   -e "TERM=${TERM:-xterm}"
 )
 
+# Option D mounts: NVIDIA open source (its parent, read-only) + the template patch.
+if [[ "$BUILD_DRIVER" == "true" ]]; then
+  PODMAN_RUN+=(
+    -v "$(dirname "$NVIDIA_OPEN_SRC"):/nvsrc-parent:ro,Z"
+    -v "${SCRIPT_DIR}/patches:/patches:ro,Z"
+  )
+fi
+
 if [[ "$OPEN_SHELL" == "true" ]]; then
   echo "==> Interactive shell in the build container"
   exec "${PODMAN_RUN[@]}" -it "$BUILDER_IMAGE"
@@ -205,6 +235,6 @@ echo "==> Launching the isolated compilation"
 echo ""
 echo "============================================================"
 echo " Final RPMs available in: $OUTPUT_DIR"
-echo "   (expected pattern: $RPM_GLOB + kmod-nvidia-open-*.rpm)"
+echo "   (expected pattern: $RPM_GLOB + kernel-modules-nvidia-open-*.rpm)"
 echo " Next step: ./image/build-and-push.sh $ARCH"
 echo "============================================================"

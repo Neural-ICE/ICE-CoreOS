@@ -31,6 +31,7 @@ Facts verified on GB10 hardware (2026-07-08):
 |---|---|
 | [runbook-shim-signing.md](runbook-shim-signing.md) | End-to-end runbook: admin prerequisites, key ceremony, build, shim-review submission, Microsoft signing, integration |
 | [key-ceremony.md](key-ceremony.md) | Key generation ceremony (YubiKey 5 FIPS): Neural ICE UEFI CA + leaf signing cert + EV cert slots |
+| [signing-pipeline.md](signing-pipeline.md) | Production signing chain: what signs shim/grub/kernel/modules, the ephemeral module key, leaf EFI signing via the YubiKey |
 | [shim-review-answers.draft.md](shim-review-answers.draft.md) | Pre-filled draft of the official shim-review questionnaire (`rhboot/shim-review` README template) |
 | [shim/](shim/) | Reproducible shim 16.1 aarch64 build: `Dockerfile`, vendor SBAT entry, build wrapper |
 
