@@ -1,5 +1,5 @@
 diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
-index 883634d6a..9b51b2f94 100644
+index 883634d6a..9cc164509 100644
 --- a/redhat/kernel.spec.template
 +++ b/redhat/kernel.spec.template
 @@ -1042,6 +1042,12 @@ Source106: fedoraimaca.x509
@@ -15,7 +15,7 @@ index 883634d6a..9b51b2f94 100644
  %if 0%{?fedora}%{?eln}
  %define ima_ca_cert %{SOURCE106}
  %endif
-@@ -1886,6 +1892,28 @@ of the operating system: memory allocation, process allocation, device
+@@ -1886,6 +1892,22 @@ of the operating system: memory allocation, process allocation, device
  input and output, etc.
  %endif
  
@@ -33,18 +33,12 @@ index 883634d6a..9b51b2f94 100644
 +The private half of that key is discarded at the end of the build, so these
 +modules load only in this kernel and the key cannot be re-used to sign anything
 +else.
-+
-+%post modules-nvidia-open
-+depmod -a %{KVERREL} >/dev/null 2>&1 || :
-+
-+%postun modules-nvidia-open
-+depmod -a %{KVERREL} >/dev/null 2>&1 || :
 +%endif
 +
  %if %{with_up} && %{with_debug} && %{with_efiuki}
  %description debug-uki-virt
  Prebuilt debug unified kernel image for virtual machines.
-@@ -2029,6 +2057,12 @@ ApplyOptionalPatch linux-kernel-test.patch
+@@ -2029,6 +2051,12 @@ ApplyOptionalPatch linux-kernel-test.patch
  %{log_msg "End of patch applications"}
  # END OF PATCH APPLICATIONS
  
@@ -57,7 +51,7 @@ index 883634d6a..9b51b2f94 100644
  # Any further pre-build tree manipulations happen here.
  %{log_msg "Pre-build tree manipulations"}
  chmod +x scripts/checkpatch.pl
-@@ -3144,6 +3178,22 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
+@@ -3144,6 +3172,22 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
  
  %if %{with_up_base}
  BuildKernel %make_target %kernel_image %{_use_vdso}
@@ -80,11 +74,15 @@ index 883634d6a..9b51b2f94 100644
  %endif
  
  %ifnarch noarch i686 %{nobuildarches}
-@@ -4392,6 +4442,14 @@ fi\
+@@ -4392,6 +4436,18 @@ fi\
  %{_libexecdir}/kselftests
  %endif
  
 +# Neural ICE: NVIDIA open GPU modules (signed by the ephemeral module key).
++# No depmod scriptlet: this subpackage installs in the SAME transaction as the
++# kernel, whose %posttrans runs `depmod -a <kver>` over the whole module tree
++# (incl. extra/nvidia-open). The atomic bootc image never updates it on its own,
++# so a per-subpackage depmod would be redundant.
 +%if %{with_up_base}
 +%files modules-nvidia-open
 +%defattr(-,root,root)
