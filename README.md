@@ -100,9 +100,9 @@ The OS image needs **staged GB10 artifacts** that are produced rarely and live o
 (GB10 kernel (4k) RPMs with signed NVIDIA modules, NVIDIA userspace, signed boot payload):
 
 ```
-/opt/ice-coreos/artifacts/generations/<run-id>/
+$HOME/neural-ice/artifacts/generations/<run-id>/
   rpms/  nvidia-userspace/  signed-boot/  generation.env  manifest.sha256
-/opt/ice-coreos/artifacts/current -> generations/<run-id>
+$HOME/neural-ice/artifacts/current -> generations/<run-id>
 ```
 
 `ci/stage-artifacts.sh` verifies the five exact, coherent aarch64 RPMs (including
@@ -127,14 +127,14 @@ For operator recovery on the Spark, reactivation of a retained generation is exp
 checksummed and atomic:
 
 ```sh
-ARTIFACTS_ROOT=/opt/ice-coreos/artifacts \
+ARTIFACTS_ROOT="$HOME/neural-ice/artifacts" \
   ./ci/artifact-generation.sh activate <previous-generation-id>
 ```
 
 Finalization is an Owner-controlled signing gate, not part of `build-kernel`:
 
 ```sh
-ARTIFACTS_ROOT=/opt/ice-coreos/artifacts \
+ARTIFACTS_ROOT="$HOME/neural-ice/artifacts" \
 SIGNEDBOOT_SRC=/path/to/signed-boot-for-this-candidate \
 SIGNED_BOOT_TRUST_POLICY_BIN=/path/to/owner-approved-trust-policy \
 SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-v1 \
@@ -152,7 +152,7 @@ attestation without depending on an external process environment.
 For local builds, first materialize the verified finalized generation, then build:
 
 ```sh
-ARTIFACTS_ROOT=/opt/ice-coreos/artifacts STAGING_DEST=image \
+ARTIFACTS_ROOT="$HOME/neural-ice/artifacts" STAGING_DEST=image \
   ./ci/artifact-generation.sh materialize
 
 # Vanilla public image (local, no push and no SSH key):

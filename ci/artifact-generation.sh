@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Crash-safe producer/consumer contract for GB10 build-artifact generations.
 set -euo pipefail
-ROOT="${ARTIFACTS_ROOT:-/opt/ice-coreos/artifacts}"
+ROOT="${ARTIFACTS_ROOT:-${HOME}/neural-ice/artifacts}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SBVERIFY_BIN="${SBVERIFY_BIN:-sbverify}"
 VMLINUX_CANONICALIZE_BIN="${VMLINUX_CANONICALIZE_BIN:-$SCRIPT_DIR/canonicalize-vmlinuz.sh}"

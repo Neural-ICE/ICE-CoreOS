@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-/opt/ice-coreos/artifacts}"
+export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-${HOME}/neural-ice/artifacts}"
 export RPM_SRC="${RPM_SRC:-$HOME/neural-ice-build/output}"
 export USERSPACE_SRC="${USERSPACE_SRC:-$HOME/neural-ice/image/nvidia-userspace}"
 exec "$REPO_ROOT/ci/artifact-generation.sh" candidate
