@@ -77,12 +77,14 @@ atomically moves `current`. Any failure leaves the previous `current` untouched.
 The policy executable must hash-bind any external public trust anchors that it reads. The consumer
 does not accept a hash from a GitHub variable: it hashes the reviewed executable in the default-
 branch checkout, matches that exact ID/hash against `trust-policy.env`, and re-runs the policy.
-Both finalization and consumption bootstrap through a non-interactive POSIX shell, remove `BASH_ENV`
-and `ENV`, then re-exec an absolute privileged Bash with deterministic tool paths. They invoke the
-policy with an empty, allowlisted process environment (`PATH` and `LC_ALL` only); inherited startup
-hooks and caller `PATH` entries cannot change manifest verification or the policy decision. Explicit
-operator inputs such as source and destination paths remain supported. Execute these entrypoints
-directly as shown (`./ci/...`), never by forcing an interpreter such as `bash ci/...`.
+Finalization, consumption and the final build wrapper bootstrap through a non-interactive POSIX
+shell, remove `BASH_ENV` and `ENV`, then re-exec an absolute privileged Bash with deterministic tool
+paths. They invoke the policy with an empty, allowlisted process environment (`PATH` and `LC_ALL`
+only); inherited startup hooks and caller `PATH` entries cannot skip manifest verification or the
+policy decision. Explicit operator inputs such as source and destination paths remain supported.
+Execute these entrypoints directly as shown (`./ci/...`), never by forcing an interpreter such as
+`bash ci/...`. The final wrapper may resolve Podman from the caller path only for a local `PUSH=0`
+build and only after the gate passes; every publishing path uses `/usr/bin/podman`.
 
 ## 4. Consume and recover
 

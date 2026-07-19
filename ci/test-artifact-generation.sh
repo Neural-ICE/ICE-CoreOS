@@ -181,14 +181,17 @@ rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
 [[ ! -e "$TMP/podman-rehashed.out" ]] || fail "self-rehashing policy reached podman"
 rm -rf "$TEST_REPO/image"
 cp -a "$DEST" "$TEST_REPO/image"
-PODMAN_LOG="$TMP/podman-debug.out" PATH="$TMP/fake-bin:$PATH" VARIANT=debug \
+env PODMAN_LOG="$TMP/podman-debug.out" PATH="$EVIL_BIN:$TMP/fake-bin:$PATH" \
+  BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct VARIANT=debug \
   "$TEST_REPO/ci/build-image.sh" > "$TMP/build-debug.out"
+[[ ! -e "$BASH_ENV_MARKER" ]] || fail "build wrapper sourced inherited BASH_ENV"
+[[ ! -e "$ENV_MARKER" ]] || fail "build wrapper sourced inherited ENV"
 grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-id=neural-ice-secureboot-lab-v1" \
   "$TMP/podman-debug.out" >/dev/null
 grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-sha256=$FAKE_TRUST_POLICY_SHA256" \
   "$TMP/podman-debug.out" >/dev/null
 rm -f "$TMP/podman-prod.out"
-expect_failure env PODMAN_LOG="$TMP/podman-prod.out" PATH="$TMP/fake-bin:$PATH" VARIANT=prod \
+expect_failure env PODMAN_LOG="$TMP/podman-prod.out" PATH="$EVIL_BIN:$PATH" VARIANT=prod \
   "$TEST_REPO/ci/build-image.sh"
 [[ ! -e "$TMP/podman-prod.out" ]] || fail "prod policy failure reached podman"
 

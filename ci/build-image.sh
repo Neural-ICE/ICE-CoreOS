@@ -1,4 +1,13 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# shellcheck shell=bash
+# Keep inherited shell hooks and PATH from running before the final trust gate.
+case $- in
+  *p*) ;;
+  *) _neural_ice_caller_path=${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+     exec /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+       _NEURAL_ICE_CALLER_PATH="$_neural_ice_caller_path" \
+       /bin/bash --noprofile --norc -p "$0" "$@" ;;
+esac
 #
 # Build (and optionally push) the ICE-CoreOS bootc OS image.
 # Shared by the GitHub Actions workflow and local builds.
@@ -21,7 +30,11 @@
 #   image/rpms/  image/nvidia-userspace/  image/signed-boot/
 # These are materialized from a finalized generation by ci/artifact-generation.sh.
 #
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'; export PATH
+LC_ALL=C; export LC_ALL
 set -euo pipefail
+CALLER_PATH="${_NEURAL_ICE_CALLER_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
+unset _NEURAL_ICE_CALLER_PATH
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -43,6 +56,7 @@ output_value() {
 
 case "$VARIANT" in prod) SUFFIX="" ;; debug) SUFFIX="-debug" ;; *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|debug)" >&2; exit 2 ;; esac
 case "$PUSH" in 0|1) ;; *) echo "ERROR: PUSH must be 0 or 1" >&2; exit 2 ;; esac
+case "${PODMAN_SUDO:-0}" in 0|1) ;; *) echo "ERROR: PODMAN_SUDO must be 0 or 1" >&2; exit 2 ;; esac
 
 if [ -n "$BUILD_ID" ] && [[ ! "$BUILD_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "ERROR: BUILD_ID contains characters that are unsafe in an OCI tag" >&2
@@ -119,9 +133,23 @@ ARTIFACT_GENERATION="$VERIFIED_ARTIFACT_GENERATION"
 # The console TUI is product code (ICE-Console) composed onto this vanilla base by
 # ICE-Fabric — it is deliberately NOT staged or COPYd here.
 
-# Use the root container store (matches bib --local and caches the base) when
-# PODMAN_SUDO=1 (CI); rootless otherwise (local dev).
-if [ "${PODMAN_SUDO:-0}" = "1" ]; then PODMAN=(sudo podman); else PODMAN=(podman); fi
+# A publishing job never trusts the caller PATH for its registry writer. Local
+# PUSH=0 builds retain rootless/Homebrew compatibility, but only after the full
+# provenance and trust-policy gate above has succeeded.
+if [ "$PUSH" = "1" ]; then
+  PODMAN_BIN=/usr/bin/podman
+else
+  PODMAN_BIN="$(PATH="$CALLER_PATH" command -v podman 2>/dev/null || true)"
+fi
+[[ "$PODMAN_BIN" == /* && -f "$PODMAN_BIN" && -x "$PODMAN_BIN" ]] \
+  || { echo "ERROR: an executable absolute podman path is required" >&2; exit 2; }
+if [ "${PODMAN_SUDO:-0}" = "1" ]; then
+  [[ -f /usr/bin/sudo && -x /usr/bin/sudo ]] \
+    || { echo "ERROR: /usr/bin/sudo is required when PODMAN_SUDO=1" >&2; exit 2; }
+  PODMAN=(/usr/bin/sudo "$PODMAN_BIN")
+else
+  PODMAN=("$PODMAN_BIN")
+fi
 
 echo "==> Building ${REF}:${SEMVER}  variant=${VARIANT}  key=$([ -n "$SSH_AUTHORIZED_KEY" ] && echo baked || echo vanilla)"
 BUILD_ARGS=(
