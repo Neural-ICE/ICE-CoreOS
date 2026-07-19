@@ -1,8 +1,8 @@
 //! End-to-end CLI tests against the built binary. No real cosign and no
 //! signing infrastructure needed: `NI_OTA_COSIGN` injects a stub script whose
-//! verdict is driven by the CONTENT of the signature file (contains "GOOD" →
-//! valid, anything else → rejected), so every §0 check is exercised through
-//! the real subprocess plumbing.
+//! verdict is driven by the CONTENT of the signature file (`GOOD` accepts a
+//! fixture; `SHA256:<digest>` binds it to the exact blob), so every §0 check is
+//! exercised through the real subprocess plumbing.
 #![cfg(unix)]
 
 use std::fs;
@@ -13,18 +13,31 @@ use std::process::Command;
 use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ni-ota-verify");
+const TEST_OS_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TEST_OS_REF: &str = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TEST_SEED_REF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 const COSIGN_STUB: &str = r#"#!/bin/sh
 # Test stub for `cosign verify-blob` (see tests/cli.rs): a signature file
-# containing the string GOOD verifies; anything else is rejected like a bad
-# signature (exit 1), which is exactly how the real cosign reports one.
+# starting with GOOD verifies. SHA256:<digest> verifies only if the blob hash
+# matches, allowing the bootstrap tests to exercise post-signature tampering.
 sig=""
+blob=""
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--signature" ]; then sig="$2"; shift 2; else shift 1; fi
+  case "$1" in
+    --signature) sig="$2"; shift 2 ;;
+    --key) shift 2 ;;
+    --*) shift 1 ;;
+    verify-blob) shift 1 ;;
+    *) blob="$1"; shift 1 ;;
+  esac
 done
 [ -n "$sig" ] || { echo "stub: no --signature flag" >&2; exit 2; }
-grep -q GOOD "$sig" 2>/dev/null || { echo "stub: signature rejected" >&2; exit 1; }
-exit 0
+grep -q '^GOOD' "$sig" 2>/dev/null && exit 0
+expected="$(sed -n 's/^SHA256://p' "$sig")"
+[ -n "$expected" ] && [ -n "$blob" ] || { echo "stub: signature rejected" >&2; exit 1; }
+actual="$(sha256sum "$blob" | awk '{print $1}')" || exit 2
+[ "$actual" = "$expected" ] || { echo "stub: signature rejected" >&2; exit 1; }
 "#;
 
 struct Fixture {
@@ -37,6 +50,7 @@ impl Fixture {
             std::env::temp_dir().join(format!("ni-ota-verify-cli-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("state")).unwrap();
+        fs::set_permissions(dir.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
         let stub = dir.join("cosign-stub.sh");
         fs::write(&stub, COSIGN_STUB).unwrap();
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
@@ -75,7 +89,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"raw_sha256":"bb","version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"train":"{train}"}}"#
+                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},"raw_sha256":"bb","version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -108,12 +122,20 @@ impl Fixture {
         path
     }
 
+    fn write_bound_sig(&self, name: &str, blob: &Path) -> PathBuf {
+        let path = self.path(name);
+        fs::write(&path, format!("SHA256:{}\n", sha256_of(blob))).unwrap();
+        path
+    }
+
     fn seed_applied(&self, seq: u64, sha: &str) {
+        let path = self.path("state/applied.json");
         fs::write(
-            self.path("state/applied.json"),
+            &path,
             format!(r#"{{"bundle_seq":{seq},"bom_sha256":"{sha}"}}"#),
         )
         .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     /// 4-file verify invocation WITHOUT device identity flags.
@@ -134,6 +156,21 @@ impl Fixture {
     fn verify_cmd(&self, config: &Path) -> Command {
         let mut cmd = self.verify_cmd_bare(config);
         cmd.args(["--device-channel", "stable"])
+            .args(["--device-compat", "1,3"]);
+        cmd
+    }
+
+    fn bootstrap_cmd(&self, config: &Path, bom: &Path, signature: &Path) -> Command {
+        let mut cmd = Command::new(BIN);
+        cmd.env("NI_OTA_COSIGN", self.path("cosign-stub.sh"))
+            .env("NI_OTA_HARDWARE_TARGET_FILE", self.path("hardware-target"))
+            .arg("bootstrap")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--bom-sig".as_ref(), signature.as_os_str()])
+            .args(["--expected-train", "0.44.18"])
+            .args(["--current-os-ref", TEST_OS_REF])
+            .args(["--current-seed-ref", TEST_SEED_REF])
+            .args(["--config".as_ref(), config.as_os_str()])
             .args(["--device-compat", "1,3"]);
         cmd
     }
@@ -494,6 +531,228 @@ fn missing_immutable_hardware_target_is_an_internal_error() {
     assert_eq!(code, 2);
     assert_eq!(verdict, Value::Null);
     assert!(stderr.contains("unreadable immutable hardware target"));
+}
+
+// --- bootstrap ---------------------------------------------------------------
+
+#[test]
+fn bootstrap_creates_absent_baseline_and_exact_retry_is_idempotent() {
+    let fx = Fixture::new("bootstrap-idempotent");
+    let bom = fx.write_bom("0.44.18", 4);
+    let sig = fx.write_bound_sig("bom.sig", &bom);
+    let cfg = fx.write_config(0, "");
+
+    let (code, receipt, stderr) = run(&mut fx.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bootstrapped"], true);
+    assert_eq!(receipt["idempotent"], false);
+    assert_eq!(receipt["train"], "0.44.18");
+    assert_eq!(receipt["bundle_seq"], 4);
+    assert_eq!(receipt["hardware_target"], "nvidia-gb10-arm64");
+    assert_eq!(receipt["os_ref"], TEST_OS_REF);
+    assert_eq!(receipt["seed_ref"], TEST_SEED_REF);
+    assert_eq!(receipt["bom_sha256"], sha256_of(&bom));
+
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bundle_seq"], 4);
+    assert_eq!(applied["bom_sha256"], sha256_of(&bom));
+    assert_eq!(
+        fs::metadata(fx.path("state/applied.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+
+    // Models a retry after the atomic state create succeeded but the original
+    // caller crashed before observing the receipt.
+    let (code, receipt, stderr) = run(&mut fx.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["idempotent"], true);
+}
+
+#[test]
+fn bootstrap_rejects_bad_or_post_signature_tampered_bom_even_in_shadow_config() {
+    let bad_sig = Fixture::new("bootstrap-bad-signature");
+    let bom = bad_sig.write_bom("0.44.18", 4);
+    let sig = bad_sig.write_sig("bom.sig", false);
+    let cfg = bad_sig.write_config(0, "");
+    let (code, _, stderr) = run(&mut bad_sig.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("BOM signature rejected"));
+    assert!(!bad_sig.path("state/applied.json").exists());
+
+    let tampered = Fixture::new("bootstrap-tampered-bom");
+    let bom = tampered.write_bom("0.44.18", 4);
+    let sig = tampered.write_bound_sig("bom.sig", &bom);
+    fs::write(&bom, fs::read_to_string(&bom).unwrap() + "\n").unwrap();
+    let cfg = tampered.write_config(0, "");
+    let (code, _, stderr) = run(&mut tampered.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("BOM signature rejected"));
+    assert!(!tampered.path("state/applied.json").exists());
+}
+
+#[test]
+fn bootstrap_rejects_wrong_hardware_target_and_incompatible_bom() {
+    let target = Fixture::new("bootstrap-target");
+    let bom = target.write_bom("0.44.18", 4);
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&bom).unwrap()).unwrap();
+    value["hardware_target"] = Value::String("nvidia-cuda-x86_64".to_string());
+    fs::write(&bom, serde_json::to_vec(&value).unwrap()).unwrap();
+    let sig = target.write_sig("bom.sig", true);
+    let cfg = target.write_config(1, "");
+    let (code, _, stderr) = run(&mut target.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("does not match immutable host target"));
+    assert!(!target.path("state/applied.json").exists());
+
+    let compat = Fixture::new("bootstrap-compat");
+    let bom = compat.write_bom("0.44.18", 4);
+    let sig = compat.write_sig("bom.sig", true);
+    let cfg = compat.write_config(1, "");
+    let mut cmd = Command::new(BIN);
+    cmd.env("NI_OTA_COSIGN", compat.path("cosign-stub.sh"))
+        .env(
+            "NI_OTA_HARDWARE_TARGET_FILE",
+            compat.path("hardware-target"),
+        )
+        .arg("bootstrap")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--bom-sig".as_ref(), sig.as_os_str()])
+        .args(["--expected-train", "0.44.18"])
+        .args(["--current-os-ref", TEST_OS_REF])
+        .args(["--current-seed-ref", TEST_SEED_REF])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .args(["--device-compat", "4,5"]);
+    let (code, _, stderr) = run(&mut cmd);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("does not overlap device"));
+    assert!(!compat.path("state/applied.json").exists());
+}
+
+#[test]
+fn bootstrap_binds_expected_train_booted_os_and_installed_seed() {
+    let train = Fixture::new("bootstrap-train-binding");
+    let bom = train.write_bom("0.44.19", 4);
+    let sig = train.write_sig("bom.sig", true);
+    let cfg = train.write_config(1, "");
+    let (code, _, stderr) = run(&mut train.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("does not match expected train"));
+    assert!(!train.path("state/applied.json").exists());
+
+    let os = Fixture::new("bootstrap-os-binding");
+    let bom = os.write_bom("0.44.18", 4);
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&bom).unwrap()).unwrap();
+    value["appliance"]["os_base"]["digest"] = Value::String(format!("sha256:{}", "c".repeat(64)));
+    fs::write(&bom, serde_json::to_vec(&value).unwrap()).unwrap();
+    let sig = os.write_sig("bom.sig", true);
+    let cfg = os.write_config(1, "");
+    let (code, _, stderr) = run(&mut os.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("does not match booted OS ref"));
+    assert!(!os.path("state/applied.json").exists());
+
+    let seed = Fixture::new("bootstrap-seed-binding");
+    let bom = seed.write_bom("0.44.18", 4);
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&bom).unwrap()).unwrap();
+    value["sources"]["seed"]["ref"] = Value::String("c".repeat(40));
+    fs::write(&bom, serde_json::to_vec(&value).unwrap()).unwrap();
+    let sig = seed.write_sig("bom.sig", true);
+    let cfg = seed.write_config(1, "");
+    let (code, _, stderr) = run(&mut seed.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("does not match installed payload"));
+    assert!(!seed.path("state/applied.json").exists());
+}
+
+#[test]
+fn bootstrap_refuses_different_or_corrupt_existing_state_without_overwrite() {
+    let different = Fixture::new("bootstrap-state-different");
+    let bom = different.write_bom("0.44.18", 4);
+    let sig = different.write_sig("bom.sig", true);
+    let cfg = different.write_config(1, "");
+    different.seed_applied(3, &"c".repeat(64));
+    let before = fs::read(different.path("state/applied.json")).unwrap();
+    let (code, _, stderr) = run(&mut different.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("different baseline"));
+    assert_eq!(
+        fs::read(different.path("state/applied.json")).unwrap(),
+        before
+    );
+
+    let corrupt = Fixture::new("bootstrap-state-corrupt");
+    let bom = corrupt.write_bom("0.44.18", 4);
+    let sig = corrupt.write_sig("bom.sig", true);
+    let cfg = corrupt.write_config(1, "");
+    fs::write(corrupt.path("state/applied.json"), "{not json").unwrap();
+    fs::set_permissions(
+        corrupt.path("state/applied.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let before = fs::read(corrupt.path("state/applied.json")).unwrap();
+    let (code, _, stderr) = run(&mut corrupt.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("refusing to overwrite"));
+    assert_eq!(
+        fs::read(corrupt.path("state/applied.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn bootstrap_refuses_symlink_and_insecure_mode_state() {
+    let symlinked = Fixture::new("bootstrap-state-symlink");
+    let bom = symlinked.write_bom("0.44.18", 4);
+    let sig = symlinked.write_sig("bom.sig", true);
+    let cfg = symlinked.write_config(1, "");
+    let target = symlinked.path("outside-state.json");
+    fs::write(
+        &target,
+        format!(r#"{{"bundle_seq":4,"bom_sha256":"{}"}}"#, sha256_of(&bom)),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&target, symlinked.path("state/applied.json")).unwrap();
+    let before = fs::read(&target).unwrap();
+    let (code, _, stderr) = run(&mut symlinked.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("symlink or non-regular"));
+    assert_eq!(fs::read(&target).unwrap(), before);
+
+    let permissive = Fixture::new("bootstrap-state-mode");
+    let bom = permissive.write_bom("0.44.18", 4);
+    let sig = permissive.write_sig("bom.sig", true);
+    let cfg = permissive.write_config(1, "");
+    permissive.seed_applied(4, &sha256_of(&bom));
+    fs::set_permissions(
+        permissive.path("state/applied.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&mut permissive.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("must be mode 0600"));
+}
+
+#[test]
+fn bootstrap_ignores_harmless_crash_debris_before_atomic_publication() {
+    let fx = Fixture::new("bootstrap-crash-debris");
+    let bom = fx.write_bom("0.44.18", 4);
+    let sig = fx.write_sig("bom.sig", true);
+    let cfg = fx.write_config(1, "");
+    let debris = fx.path("state/.applied.json.bootstrap.999999.0.tmp");
+    fs::write(&debris, "partial").unwrap();
+
+    let (code, receipt, stderr) = run(&mut fx.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["idempotent"], false);
+    assert!(fx.path("state/applied.json").exists());
+    assert!(debris.exists(), "unowned crash debris is never overwritten");
 }
 
 // --- commit ---------------------------------------------------------------------

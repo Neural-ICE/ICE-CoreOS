@@ -63,7 +63,7 @@ there is deliberately no public Rekor entry to check.)
 | exit | meaning |
 |------|---------|
 | `0`  | verdict `pass` — **or** verdict `refuse` in **shadow** mode (`enforce=0`): shadow is log-only, the caller decides nothing on the exit code |
-| `1`  | verdict `refuse` in **enforce** mode (`enforce=1`) — do not apply. `commit` refusals also exit 1 (commit mutates state, so it is always enforced) |
+| `1`  | verdict `refuse` in **enforce** mode (`enforce=1`) — do not apply. `bootstrap` and `commit` refusals also exit 1 (state mutation is always enforced) |
 | `2`  | internal error (missing cosign, unreadable config, …) — **always**, in every mode: broken tooling never passes, and never masquerades as a clean refusal |
 
 The shadow/enforce distinction affects **only** the exit code of a clean
@@ -75,6 +75,11 @@ The shadow/enforce distinction affects **only** the exit code of a clean
 ni-ota-verify verify --bom <path> --bom-sig <path> --record <path> --record-sig <path>
                      [--config /etc/neural-ice/ota.conf] [--device-channel <ch>]
                      [--device-compat <min,max>] [--applied-state <path>]
+ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>
+                        --current-os-ref <image@sha256:digest>
+                        --current-seed-ref <40-hex-commit>
+                        [--config …] [--device-compat <min,max>]
+                        [--applied-state <path>]
 ni-ota-verify commit --bom <path> [--config …] [--applied-state <path>]
 ```
 
@@ -83,6 +88,47 @@ Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 `device_compat_max`; flags override. A missing `enforce` key defaults to
 **enforce** (an incomplete config leans strict, never silently log-only). The
 hardware target comes from the immutable image marker, not a CLI override.
+
+### Signed LAB USB baseline bootstrap
+
+`bootstrap` is the one-time bridge from a physically delivered, signed LAB USB
+image to the normal anti-rollback state. It consumes only the signed BOM and
+its detached signature: it neither accepts nor creates a channel record and
+cannot move a `beta`, `stable`, or product alias.
+
+The command always fails closed, including when `ota.conf` has `enforce=0`. It
+verifies the BOM against `root_pubkey`, then binds all of the following before
+creating any state:
+
+- `train == --expected-train`;
+- BOM `hardware_target` equals the immutable host marker;
+- the BOM/device compatibility ranges overlap;
+- BOM `appliance.os_base.image@digest == --current-os-ref` (the digest-pinned
+  image reported as booted by `bootc status`);
+- BOM `sources.seed.ref == --current-seed-ref` (the installed immutable
+  `PAYLOAD_ID`).
+
+On a genuinely absent `applied.json`, it durably publishes
+`{bundle_seq,bom_sha256}` as mode `0600` with create-if-absent semantics. The
+state parent must already be a real directory; for the production root caller,
+it must be root-owned mode `0700`. Symlink and non-regular state paths are
+refused. A retry for the exact same signed BOM succeeds idempotently after
+metadata and content readback, covering a caller crash after publication.
+Existing different state, corrupt state, malformed identity inputs, signature
+failure, or any binding mismatch is refused without overwriting the state.
+
+Example for a factory/LAB service that has independently read the local booted
+identity and installed payload identity:
+
+```sh
+ni-ota-verify bootstrap \
+  --bom /run/neural-ice/bootstrap/0.44.18.bom.json \
+  --bom-sig /run/neural-ice/bootstrap/0.44.18.bom.sig \
+  --expected-train 0.44.18 \
+  --current-os-ref registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<64hex> \
+  --current-seed-ref <40hex> \
+  --device-compat 5,5
+```
 
 `commit` records `{bundle_seq, bom_sha256}` in `state_dir/applied.json`
 **after** the caller's health gate passes. It refuses (exit 1) any BOM that

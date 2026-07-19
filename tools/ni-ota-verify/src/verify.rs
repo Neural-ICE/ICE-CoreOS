@@ -26,6 +26,33 @@ pub(crate) struct BomCore {
     // "malformed JSON", when only the range is missing.
     pub compat_min: Option<i64>,
     pub compat_version: Option<i64>,
+    // Installation identity is enforced by `bootstrap`. Keep these optional
+    // at deserialization so a missing field is reported as a precise refusal,
+    // not hidden inside a generic JSON parse error.
+    pub appliance: Option<BomAppliance>,
+    pub sources: Option<BomSources>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomAppliance {
+    pub os_base: Option<BomOsBase>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomOsBase {
+    pub image: String,
+    pub digest: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomSources {
+    pub seed: Option<BomSource>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomSource {
+    #[serde(rename = "ref")]
+    pub reference: String,
 }
 
 /// The signed channel record (`releases/channels/<ch>.json` — plan §2).
@@ -531,6 +558,8 @@ mod tests {
             bundle_seq: 1,
             compat_min: lo,
             compat_version: hi,
+            appliance: None,
+            sources: None,
         };
         assert!(compat_check(&bom(Some(1), Some(3)), Some((2, 4)), true).ok);
         assert!(compat_check(&bom(Some(1), Some(3)), Some((3, 3)), true).ok);
