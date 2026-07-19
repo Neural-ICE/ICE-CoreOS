@@ -1,4 +1,12 @@
-#!/bin/bash
+#!/bin/sh
+# shellcheck shell=bash
+# A non-interactive POSIX shell does not source BASH_ENV. Re-exec once through a
+# clean privileged Bash before parsing any of the Bash implementation below.
+case $- in
+  *p*) ;;
+  *) exec /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+       /bin/bash --noprofile --norc -p "$0" "$@" ;;
+esac
 # Bind a finalized GB10 artifact generation to the exact Secure Boot policy
 # approved for the requested image variant. This gate is deliberately backed by
 # version-controlled policy executables, never repository variables or secrets.

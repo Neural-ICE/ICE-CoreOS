@@ -32,7 +32,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'cp "$1" "$2"' > "$FAKE_CANONICALIZE"
 printf '%s\n' '#!/usr/bin/env bash' \
   '[[ "${PATH:-}" == /usr/sbin:/usr/bin:/sbin:/bin ]] || exit 91' \
   '[[ "${LC_ALL:-}" == C ]] || exit 92' \
-  '[[ -z "${BASH_ENV:-}" && -z "${POLICY_ENV_POISON:-}" ]] || exit 93' \
+  '[[ -z "${BASH_ENV:-}" && -z "${ENV:-}" && -z "${POLICY_ENV_POISON:-}" ]] || exit 93' \
   'self_dir="$(cd "$(dirname "$0")" && pwd)"' \
   'if [[ -e "$self_dir/.mutate-policy" ]]; then' \
   '  printf "mutated\n" >> "$1/signed-boot-provenance.env"' \
@@ -54,7 +54,13 @@ chmod +x "$FAKE_SBVERIFY" "$FAKE_CANONICALIZE" "$FAKE_TRUST_POLICY"
 EVIL_BIN="$TMP/evil-bin"; install -d "$EVIL_BIN"
 printf '%s\n' '#!/usr/bin/bash' 'exit 0' > "$EVIL_BIN/bash"; chmod +x "$EVIL_BIN/bash"
 BASH_ENV_FILE="$TMP/bash-env"
-printf '%s\n' 'export POLICY_ENV_POISON=from-bash-env' > "$BASH_ENV_FILE"
+BASH_ENV_MARKER="$TMP/bash-env-was-sourced"
+printf '%s\n' 'export POLICY_ENV_POISON=from-bash-env' \
+  ": > \"$BASH_ENV_MARKER\"" > "$BASH_ENV_FILE"
+ENV_FILE="$TMP/posix-env"
+ENV_MARKER="$TMP/posix-env-was-sourced"
+printf '%s\n' 'export POLICY_ENV_POISON=from-posix-env' \
+  ": > \"$ENV_MARKER\"" > "$ENV_FILE"
 export SBVERIFY_BIN="$FAKE_SBVERIFY" VMLINUX_CANONICALIZE_BIN="$FAKE_CANONICALIZE" \
   SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" \
   SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1
@@ -106,11 +112,13 @@ SRC1="$TMP/src1"; SIGNED1="$TMP/signed1"; make_sources "$SRC1"; make_signed_boot
 candidate gen-1 "$SRC1" >/dev/null
 [[ ! -e "$TMP/store/current" ]] || fail "candidate moved current"
 ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-candidate gen-1
-env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" POLICY_ENV_POISON=direct \
+env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct \
   ARTIFACTS_ROOT="$TMP/store" SIGNEDBOOT_SRC="$SIGNED1" \
   SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" \
   SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1 \
   "$SCRIPT" finalize gen-1 >/dev/null
+[[ ! -e "$BASH_ENV_MARKER" ]] || fail "artifact finalizer sourced inherited BASH_ENV"
+[[ ! -e "$ENV_MARKER" ]] || fail "artifact finalizer sourced inherited ENV"
 [[ "$(readlink "$TMP/store/current")" == generations/gen-1 ]] || fail "gen-1 not activated"
 
 DEST="$TMP/image"
@@ -135,10 +143,12 @@ cp "$SCRIPT" "$BUILD_CONTEXT_SCRIPT" "$BUILD_IMAGE_SCRIPT" "$TEST_REPO/ci/"
 cp "$FAKE_TRUST_POLICY" \
   "$TEST_REPO/secureboot/trust-policies/neural-ice-secureboot-lab-v1"
 BUILD_GATE="$TEST_REPO/ci/verify-build-context.sh"
-gate_output="$(env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" POLICY_ENV_POISON=direct \
+gate_output="$(env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct \
   "$BUILD_GATE" "$DEST" debug)"
 grep -q '^CURRENT_GENERATION=gen-1$' <<< "$gate_output" \
   || fail "hardened build gate did not execute"
+[[ ! -e "$BASH_ENV_MARKER" ]] || fail "build gate sourced inherited BASH_ENV"
+[[ ! -e "$ENV_MARKER" ]] || fail "build gate sourced inherited ENV"
 expect_failure "$BUILD_GATE" "$DEST" prod
 expect_failure "$BUILD_GATE" "$DEST" ""
 printf '\n# changed after finalization\n' >> \

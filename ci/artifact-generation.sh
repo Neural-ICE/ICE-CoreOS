@@ -1,4 +1,12 @@
-#!/bin/bash
+#!/bin/sh
+# shellcheck shell=bash
+# A non-interactive POSIX shell does not source BASH_ENV. Re-exec once through a
+# clean privileged Bash before parsing any of the Bash implementation below.
+case $- in
+  *p*) ;;
+  *) exec /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+       /bin/bash --noprofile --norc -p "$0" "$@" ;;
+esac
 # Crash-safe producer/consumer contract for GB10 build-artifact generations.
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'; export PATH
 LC_ALL=C; export LC_ALL
