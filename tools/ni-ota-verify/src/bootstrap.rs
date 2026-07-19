@@ -69,6 +69,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     if let Err(why) = store.validate_bootstrap_state() {
         return refuse(why);
     }
+    let bom_snapshot = store.snapshot(&bom_path)?;
 
     // Resolve and run the pinned verifier before parsing or trusting any BOM
     // field. Bootstrap has no shadow semantics: a missing trust anchor or bad
@@ -83,17 +84,14 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             pubkey.display()
         ));
     }
-    if let Err(why) = runner::verify_blob(&cosign, pubkey, &bom_sig_path, &bom_path)? {
+    if let Err(why) = runner::verify_blob(&cosign, pubkey, &bom_sig_path, bom_snapshot.path())? {
         return refuse(format!(
             "BOM signature rejected for {}: {why}",
             bom_path.display()
         ));
     }
 
-    let bytes = match std::fs::read(&bom_path) {
-        Ok(bytes) => bytes,
-        Err(e) => return refuse(format!("cannot read BOM {}: {e}", bom_path.display())),
-    };
+    let bytes = bom_snapshot.read()?;
     let bom: BomCore = match serde_json::from_slice(&bytes) {
         Ok(bom) => bom,
         Err(e) => return refuse(format!("malformed BOM {}: {e}", bom_path.display())),
@@ -181,9 +179,13 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         ));
     }
 
+    let bom_sha256 = runner::sha256_file(bom_snapshot.path())?;
+    if bom_snapshot.read()? != bytes {
+        return refuse("protected BOM snapshot changed during verification".to_string());
+    }
     let expected = AppliedState {
         bundle_seq: bom.bundle_seq,
-        bom_sha256: runner::sha256_file(&bom_path)?,
+        bom_sha256,
     };
     match store.read() {
         Ok(StateRead::Applied(applied)) => {

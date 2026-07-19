@@ -8,7 +8,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
@@ -33,11 +33,17 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$sig" ] || { echo "stub: no --signature flag" >&2; exit 2; }
-grep -q '^GOOD' "$sig" 2>/dev/null && exit 0
-expected="$(sed -n 's/^SHA256://p' "$sig")"
-[ -n "$expected" ] && [ -n "$blob" ] || { echo "stub: signature rejected" >&2; exit 1; }
-actual="$(sha256sum "$blob" | awk '{print $1}')" || exit 2
-[ "$actual" = "$expected" ] || { echo "stub: signature rejected" >&2; exit 1; }
+if ! grep -q '^GOOD' "$sig" 2>/dev/null; then
+  expected="$(sed -n 's/^SHA256://p' "$sig")"
+  [ -n "$expected" ] && [ -n "$blob" ] || { echo "stub: signature rejected" >&2; exit 1; }
+  actual="$(sha256sum "$blob" | awk '{print $1}')" || exit 2
+  [ "$actual" = "$expected" ] || { echo "stub: signature rejected" >&2; exit 1; }
+fi
+if [ -n "${NI_OTA_TEST_MUTATE_SOURCE:-}" ]; then
+  cp "$NI_OTA_TEST_MUTATION" "$NI_OTA_TEST_MUTATE_SOURCE" || exit 2
+fi
+[ -z "${NI_OTA_TEST_COSIGN_DELAY:-}" ] || sleep "$NI_OTA_TEST_COSIGN_DELAY"
+exit 0
 "#;
 
 struct Fixture {
@@ -596,6 +602,39 @@ fn bootstrap_rejects_bad_or_post_signature_tampered_bom_even_in_shadow_config() 
 }
 
 #[test]
+fn bootstrap_uses_one_protected_snapshot_when_source_mutates_during_cosign() {
+    let fx = Fixture::new("bootstrap-source-race");
+    let bom = fx.write_bom("0.44.18", 4);
+    let signed_hash = sha256_of(&bom);
+    let sig = fx.write_bound_sig("bom.sig", &bom);
+    let mutation = fx.path("unsigned-mutation.json");
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&bom).unwrap()).unwrap();
+    value["bundle_seq"] = Value::from(999_u64);
+    fs::write(&mutation, serde_json::to_vec(&value).unwrap()).unwrap();
+    let cfg = fx.write_config(0, "");
+    let mut cmd = fx.bootstrap_cmd(&cfg, &bom, &sig);
+    cmd.env("NI_OTA_TEST_MUTATE_SOURCE", &bom)
+        .env("NI_OTA_TEST_MUTATION", &mutation);
+
+    let (code, receipt, stderr) = run(&mut cmd);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 4);
+    assert_eq!(receipt["bom_sha256"], signed_hash);
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bundle_seq"], 4);
+    assert_eq!(applied["bom_sha256"], signed_hash);
+    let source: Value = serde_json::from_str(&fs::read_to_string(&bom).unwrap()).unwrap();
+    assert_eq!(source["bundle_seq"], 999, "source mutation did run");
+    let mut entries: Vec<_> = fs::read_dir(fx.path("state"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["applied.json"], "snapshot cleanup");
+}
+
+#[test]
 fn bootstrap_rejects_wrong_hardware_target_and_incompatible_bom() {
     let target = Fixture::new("bootstrap-target");
     let bom = target.write_bom("0.44.18", 4);
@@ -740,6 +779,33 @@ fn bootstrap_refuses_symlink_and_insecure_mode_state() {
 }
 
 #[test]
+fn bootstrap_refuses_symlink_and_non_directory_state_parent() {
+    let symlinked = Fixture::new("bootstrap-parent-symlink");
+    let bom = symlinked.write_bom("0.44.18", 4);
+    let sig = symlinked.write_sig("bom.sig", true);
+    let cfg = symlinked.write_config(1, "");
+    fs::remove_dir(symlinked.path("state")).unwrap();
+    let real = symlinked.path("real-state");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&real, symlinked.path("state")).unwrap();
+    let (code, _, stderr) = run(&mut symlinked.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("not a real directory"));
+    assert!(!real.join("applied.json").exists());
+
+    let regular = Fixture::new("bootstrap-parent-file");
+    let bom = regular.write_bom("0.44.18", 4);
+    let sig = regular.write_sig("bom.sig", true);
+    let cfg = regular.write_config(1, "");
+    fs::remove_dir(regular.path("state")).unwrap();
+    fs::write(regular.path("state"), "not a directory").unwrap();
+    let (code, _, stderr) = run(&mut regular.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("not a real directory"));
+}
+
+#[test]
 fn bootstrap_ignores_harmless_crash_debris_before_atomic_publication() {
     let fx = Fixture::new("bootstrap-crash-debris");
     let bom = fx.write_bom("0.44.18", 4);
@@ -753,6 +819,80 @@ fn bootstrap_ignores_harmless_crash_debris_before_atomic_publication() {
     assert_eq!(receipt["idempotent"], false);
     assert!(fx.path("state/applied.json").exists());
     assert!(debris.exists(), "unowned crash debris is never overwritten");
+}
+
+#[test]
+fn concurrent_bootstraps_are_idempotent_or_refuse_a_different_baseline() {
+    let same = Fixture::new("bootstrap-concurrent-same");
+    let bom = same.write_bom("0.44.18", 4);
+    let sig = same.write_sig("bom.sig", true);
+    let cfg = same.write_config(1, "");
+    let mut first = same.bootstrap_cmd(&cfg, &bom, &sig);
+    let mut second = same.bootstrap_cmd(&cfg, &bom, &sig);
+    for command in [&mut first, &mut second] {
+        command
+            .env("NI_OTA_TEST_COSIGN_DELAY", "0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+    let first = first.spawn().unwrap();
+    let second = second.spawn().unwrap();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let different = Fixture::new("bootstrap-concurrent-different");
+    let base = different.write_bom("0.44.18", 4);
+    let bom_a = different.path("bom-a.json");
+    fs::copy(&base, &bom_a).unwrap();
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&base).unwrap()).unwrap();
+    value["bundle_seq"] = Value::from(5_u64);
+    let bom_b = different.path("bom-b.json");
+    fs::write(&bom_b, serde_json::to_vec(&value).unwrap()).unwrap();
+    let sig = different.write_sig("bom.sig", true);
+    let cfg = different.write_config(1, "");
+    let mut first = different.bootstrap_cmd(&cfg, &bom_a, &sig);
+    let mut second = different.bootstrap_cmd(&cfg, &bom_b, &sig);
+    for command in [&mut first, &mut second] {
+        command
+            .env("NI_OTA_TEST_COSIGN_DELAY", "0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+    let first = first.spawn().unwrap();
+    let second = second.spawn().unwrap();
+    let outputs = [
+        first.wait_with_output().unwrap(),
+        second.wait_with_output().unwrap(),
+    ];
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1,
+        "one different baseline must win exactly"
+    );
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(different.path("state/applied.json")).unwrap())
+            .unwrap();
+    let seq = applied["bundle_seq"].as_u64().unwrap();
+    assert!(matches!(seq, 4 | 5));
+    let expected_hash = if seq == 4 {
+        sha256_of(&bom_a)
+    } else {
+        sha256_of(&bom_b)
+    };
+    assert_eq!(applied["bom_sha256"], expected_hash);
 }
 
 // --- commit ---------------------------------------------------------------------
@@ -779,6 +919,14 @@ fn commit_seeds_advances_and_guards() {
         serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
     assert_eq!(applied["bundle_seq"], 7);
     assert_eq!(applied["bom_sha256"], sha256_of(&bom).as_str());
+    assert_eq!(
+        fs::metadata(fx.path("state/applied.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
 
     // 2) idempotent repair re-commit (same seq, same bytes) is allowed
     let (code, _, _) = commit(&bom);
@@ -822,6 +970,17 @@ fn commit_seeds_advances_and_guards() {
     let (code, receipt, _) = commit(&newer);
     assert_eq!(code, 0);
     assert_eq!(receipt["bundle_seq"], 8);
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bundle_seq"], 8, "durable writer readback");
+    assert_eq!(
+        fs::metadata(fx.path("state/applied.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
 }
 
 #[test]

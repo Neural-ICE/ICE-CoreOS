@@ -7,7 +7,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,15 +45,36 @@ pub(crate) struct FileStateStore {
     pub path: PathBuf,
 }
 
+/// Root-only temporary inode removed on every return path. It is created in
+/// the state directory, so publication and directory fsync stay on one
+/// filesystem and no untrusted temporary namespace is involved.
+pub(crate) struct SecureTempFile {
+    path: PathBuf,
+}
+
+impl SecureTempFile {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn read(&self) -> Result<Vec<u8>, InternalError> {
+        std::fs::read(&self.path)
+            .map_err(|e| InternalError(format!("cannot read {}: {e}", self.path.display())))
+    }
+}
+
+impl Drop for SecureTempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl FileStateStore {
     /// Bootstrap runs as root on the appliance. Its state parent is a trust
     /// boundary, not scratch space: require an existing real directory and,
     /// for a privileged caller, exact root ownership and mode 0700.
     pub(crate) fn validate_bootstrap_parent(&self) -> Result<(), String> {
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| format!("applied-state path has no parent: {}", self.path.display()))?;
+        let dir = self.parent().map_err(|error| error.0)?;
         let metadata = std::fs::symlink_metadata(dir)
             .map_err(|e| format!("cannot inspect state dir {}: {e}", dir.display()))?;
         if !metadata.file_type().is_dir() {
@@ -62,17 +83,13 @@ impl FileStateStore {
                 dir.display()
             ));
         }
-        if effective_uid() == 0 {
-            let mode = metadata.mode() & 0o7777;
-            if metadata.uid() != 0 || mode != 0o700 {
-                return Err(format!(
-                    "state dir {} must be root-owned mode 0700 (uid={}, mode={mode:04o})",
-                    dir.display(),
-                    metadata.uid()
-                ));
-            }
-        }
-        Ok(())
+        validate_owner_mode(
+            &format!("state dir {}", dir.display()),
+            metadata.uid(),
+            metadata.mode(),
+            effective_uid() == 0,
+            (effective_uid() == 0).then_some(0o700),
+        )
     }
 
     /// Validate the published bootstrap inode without following symlinks.
@@ -94,21 +111,23 @@ impl FileStateStore {
                 self.path.display()
             ));
         }
-        let mode = metadata.mode() & 0o7777;
-        if mode != 0o600 {
-            return Err(format!(
-                "applied state {} must be mode 0600 (mode={mode:04o})",
-                self.path.display()
-            ));
-        }
-        if effective_uid() == 0 && metadata.uid() != 0 {
-            return Err(format!(
-                "applied state {} must be root-owned (uid={})",
-                self.path.display(),
-                metadata.uid()
-            ));
-        }
+        validate_owner_mode(
+            &format!("applied state {}", self.path.display()),
+            metadata.uid(),
+            metadata.mode(),
+            effective_uid() == 0,
+            Some(0o600),
+        )?;
         Ok(true)
+    }
+
+    /// Freeze a caller-supplied artifact into a protected inode. Callers must
+    /// verify, parse, and hash this snapshot rather than reopening the source.
+    pub(crate) fn snapshot(&self, source: &Path) -> Result<SecureTempFile, InternalError> {
+        self.validate_bootstrap_parent().map_err(InternalError)?;
+        let bytes = std::fs::read(source)
+            .map_err(|e| InternalError(format!("cannot read {}: {e}", source.display())))?;
+        self.create_secure_temp("bom-snapshot", &bytes)
     }
 
     /// Atomically publish a new baseline without ever replacing an existing
@@ -116,89 +135,135 @@ impl FileStateStore {
     /// place; `AlreadyExists` means a concurrent or prior bootstrap won and the
     /// caller must compare it before accepting idempotence.
     pub(crate) fn write_if_absent(&self, state: &AppliedState) -> Result<bool, InternalError> {
-        let dir = self.path.parent().ok_or_else(|| {
-            InternalError(format!(
-                "applied-state path has no parent: {}",
-                self.path.display()
-            ))
-        })?;
+        let dir = self.parent()?;
         self.validate_bootstrap_parent().map_err(InternalError)?;
-        let file_name = self.path.file_name().ok_or_else(|| {
-            InternalError(format!(
-                "applied-state path has no file name: {}",
-                self.path.display()
-            ))
-        })?;
-        let json = serde_json::to_string(state)
-            .map_err(|e| InternalError(format!("cannot serialize applied state: {e}")))?;
-
-        let (tmp, mut file) = (0_u16..128)
-            .find_map(|attempt| {
-                let tmp = self.path.with_file_name(format!(
-                    ".{}.bootstrap.{}.{}.tmp",
-                    file_name.to_string_lossy(),
-                    std::process::id(),
-                    attempt
-                ));
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                match options.open(&tmp) {
-                    Ok(file) => Some(Ok((tmp, file))),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-                    Err(e) => Some(Err(InternalError(format!(
-                        "cannot create bootstrap temp file {}: {e}",
-                        tmp.display()
-                    )))),
-                }
-            })
-            .transpose()?
-            .ok_or_else(|| {
-                InternalError(format!(
-                    "cannot allocate bootstrap temp file beside {}",
-                    self.path.display()
-                ))
-            })?;
-
-        let stage = (|| -> Result<(), InternalError> {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| {
-                    InternalError(format!(
-                        "cannot secure permissions on {}: {e}",
-                        tmp.display()
-                    ))
-                })?;
-            file.write_all(format!("{json}\n").as_bytes())
-                .map_err(|e| InternalError(format!("cannot write {}: {e}", tmp.display())))?;
-            file.sync_all()
-                .map_err(|e| InternalError(format!("cannot sync {}: {e}", tmp.display())))?;
-            Ok(())
-        })();
-        drop(file);
-        if let Err(error) = stage {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
-
-        let created = match std::fs::hard_link(&tmp, &self.path) {
+        let staged = self.stage_state(state)?;
+        let created = match std::fs::hard_link(staged.path(), &self.path) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
                 return Err(InternalError(format!(
                     "cannot atomically create {}: {e}",
                     self.path.display()
                 )));
             }
         };
-        let _ = std::fs::remove_file(&tmp);
         if created {
-            std::fs::File::open(dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| {
-                    InternalError(format!("cannot sync state dir {}: {e}", dir.display()))
-                })?;
+            drop(staged);
+            sync_directory(dir)?;
+            self.readback(state)?;
         }
         Ok(created)
+    }
+
+    fn parent(&self) -> Result<&Path, InternalError> {
+        self.path.parent().ok_or_else(|| {
+            InternalError(format!(
+                "applied-state path has no parent: {}",
+                self.path.display()
+            ))
+        })
+    }
+
+    fn stage_state(&self, state: &AppliedState) -> Result<SecureTempFile, InternalError> {
+        let json = serde_json::to_string(state)
+            .map_err(|e| InternalError(format!("cannot serialize applied state: {e}")))?;
+        self.create_secure_temp("state", format!("{json}\n").as_bytes())
+    }
+
+    fn create_secure_temp(
+        &self,
+        label: &str,
+        contents: &[u8],
+    ) -> Result<SecureTempFile, InternalError> {
+        let file_name = self.path.file_name().ok_or_else(|| {
+            InternalError(format!(
+                "applied-state path has no file name: {}",
+                self.path.display()
+            ))
+        })?;
+        let (path, mut file) = (0_u16..128)
+            .find_map(|attempt| {
+                let path = self.path.with_file_name(format!(
+                    ".{}.{}.{}.{}.tmp",
+                    file_name.to_string_lossy(),
+                    label,
+                    std::process::id(),
+                    attempt
+                ));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true).mode(0o600);
+                match options.open(&path) {
+                    Ok(file) => Some(Ok((path, file))),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(InternalError(format!(
+                        "cannot create secure temp file {}: {e}",
+                        path.display()
+                    )))),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                InternalError(format!(
+                    "cannot allocate secure temp file beside {}",
+                    self.path.display()
+                ))
+            })?;
+        let result = (|| -> Result<(), InternalError> {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    InternalError(format!(
+                        "cannot secure permissions on {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            file.write_all(contents)
+                .map_err(|e| InternalError(format!("cannot write {}: {e}", path.display())))?;
+            file.sync_all()
+                .map_err(|e| InternalError(format!("cannot sync {}: {e}", path.display())))?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        let temp = SecureTempFile { path };
+        validate_secure_regular(temp.path()).map_err(InternalError)?;
+        if temp.read()? != contents {
+            return Err(InternalError(format!(
+                "secure temp readback differs: {}",
+                temp.path().display()
+            )));
+        }
+        Ok(temp)
+    }
+
+    fn readback(&self, expected: &AppliedState) -> Result<(), InternalError> {
+        match self.validate_bootstrap_state() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(InternalError(format!(
+                    "applied state disappeared after publication: {}",
+                    self.path.display()
+                )))
+            }
+            Err(why) => return Err(InternalError(why)),
+        }
+        match self.read() {
+            Ok(StateRead::Applied(actual)) if actual == *expected => Ok(()),
+            Ok(StateRead::Applied(_)) => Err(InternalError(format!(
+                "applied state readback differs after publication: {}",
+                self.path.display()
+            ))),
+            Ok(StateRead::Unseeded) => Err(InternalError(format!(
+                "applied state absent after publication: {}",
+                self.path.display()
+            ))),
+            Err(why) => Err(InternalError(format!(
+                "applied state readback failed: {why}"
+            ))),
+        }
     }
 }
 
@@ -225,38 +290,68 @@ impl AppliedStateStore for FileStateStore {
     }
 
     fn write(&self, state: &AppliedState) -> Result<(), InternalError> {
-        let dir = self.path.parent().ok_or_else(|| {
+        let dir = self.parent()?;
+        self.validate_bootstrap_parent().map_err(InternalError)?;
+        let staged = self.stage_state(state)?;
+        std::fs::rename(staged.path(), &self.path).map_err(|e| {
             InternalError(format!(
-                "applied-state path has no parent: {}",
-                self.path.display()
+                "cannot move {} into place: {e}",
+                staged.path().display()
             ))
         })?;
-        std::fs::create_dir_all(dir).map_err(|e| {
-            InternalError(format!("cannot create state dir {}: {e}", dir.display()))
-        })?;
-        // atomic write: temp sibling + rename, so a crash mid-write can never
-        // leave a half-written (= corrupt = fail-closed-refusing) record.
-        let file_name = self.path.file_name().ok_or_else(|| {
-            InternalError(format!(
-                "applied-state path has no file name: {}",
-                self.path.display()
-            ))
-        })?;
-        let tmp = self
-            .path
-            .with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
-        let json = serde_json::to_string(state)
-            .map_err(|e| InternalError(format!("cannot serialize applied state: {e}")))?;
-        std::fs::write(&tmp, format!("{json}\n"))
-            .map_err(|e| InternalError(format!("cannot write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| InternalError(format!("cannot move {} into place: {e}", tmp.display())))?;
-        Ok(())
+        drop(staged);
+        sync_directory(dir)?;
+        self.readback(state)
     }
 
     fn describe(&self) -> String {
         self.path.display().to_string()
     }
+}
+
+fn validate_secure_regular(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect secure file {}: {e}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "secure file is a symlink or non-regular file: {}",
+            path.display()
+        ));
+    }
+    validate_owner_mode(
+        &format!("secure file {}", path.display()),
+        metadata.uid(),
+        metadata.mode(),
+        effective_uid() == 0,
+        Some(0o600),
+    )
+}
+
+fn validate_owner_mode(
+    label: &str,
+    uid: u32,
+    mode: u32,
+    require_root: bool,
+    required_mode: Option<u32>,
+) -> Result<(), String> {
+    let mode = mode & 0o7777;
+    if let Some(required) = required_mode {
+        if mode != required {
+            return Err(format!(
+                "{label} must be mode {required:04o} (mode={mode:04o})"
+            ));
+        }
+    }
+    if require_root && uid != 0 {
+        return Err(format!("{label} must be root-owned (uid={uid})"));
+    }
+    Ok(())
+}
+
+fn sync_directory(dir: &Path) -> Result<(), InternalError> {
+    std::fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| InternalError(format!("cannot sync state dir {}: {e}", dir.display())))
 }
 
 #[cfg(unix)]
@@ -277,6 +372,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("ni-ota-verify-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         FileStateStore {
             path: dir.join("applied.json"),
         }
@@ -299,6 +396,7 @@ mod tests {
             StateRead::Applied(got) => assert_eq!(got, state),
             StateRead::Unseeded => panic!("expected applied state"),
         }
+        assert_eq!(std::fs::metadata(&s.path).unwrap().mode() & 0o7777, 0o600);
         std::fs::write(&s.path, "{not json").unwrap();
         assert!(s.read().is_err());
     }
@@ -319,5 +417,15 @@ mod tests {
             panic!("symlink state must be refused");
         };
         assert!(error.contains("symlink or non-regular"));
+    }
+
+    #[test]
+    fn owner_mode_predicate_is_hermetic() {
+        assert!(validate_owner_mode("parent", 0, 0o40700, true, Some(0o700)).is_ok());
+        assert!(validate_owner_mode("state", 0, 0o100600, true, Some(0o600)).is_ok());
+        assert!(validate_owner_mode("parent", 1000, 0o40700, true, Some(0o700)).is_err());
+        assert!(validate_owner_mode("parent", 0, 0o40750, true, Some(0o700)).is_err());
+        assert!(validate_owner_mode("state", 0, 0o100640, true, Some(0o600)).is_err());
+        assert!(validate_owner_mode("dev", 1000, 0o40777, false, None).is_ok());
     }
 }

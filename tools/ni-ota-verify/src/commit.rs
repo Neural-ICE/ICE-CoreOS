@@ -23,16 +23,21 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let store = FileStateStore {
         path: applied_state_path(&flags, &cfg)?,
     };
+    let bom_snapshot = store.snapshot(&bom_path)?;
 
     // A BOM that cannot be parsed cannot be committed — internal error, not a
     // policy refusal: the caller must only ever commit a BOM that already
     // passed `verify`.
-    let bytes = std::fs::read(&bom_path)
-        .map_err(|e| InternalError(format!("cannot read BOM {}: {e}", bom_path.display())))?;
+    let bytes = bom_snapshot.read()?;
     let bom: BomCore = serde_json::from_slice(&bytes)
         .map_err(|e| InternalError(format!("malformed BOM {}: {e}", bom_path.display())))?;
     let hardware_target = immutable_hardware_target()?;
-    let bom_sha = runner::sha256_file(&bom_path)?;
+    let bom_sha = runner::sha256_file(bom_snapshot.path())?;
+    if bom_snapshot.read()? != bytes {
+        return Err(InternalError(
+            "protected BOM snapshot changed during commit".to_string(),
+        ));
+    }
 
     let refuse = |why: String| -> Result<u8, InternalError> {
         eprintln!("ni-ota-verify: commit REFUSED: {why}");

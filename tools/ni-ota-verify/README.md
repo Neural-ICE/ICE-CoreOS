@@ -97,8 +97,9 @@ its detached signature: it neither accepts nor creates a channel record and
 cannot move a `beta`, `stable`, or product alias.
 
 The command always fails closed, including when `ota.conf` has `enforce=0`. It
-verifies the BOM against `root_pubkey`, then binds all of the following before
-creating any state:
+copies the BOM once to a protected mode-`0600` snapshot, verifies that snapshot
+against `root_pubkey`, and parses and hashes the same protected inode. It then
+binds all of the following before creating any state:
 
 - `train == --expected-train`;
 - BOM `hardware_target` equals the immutable host marker;
@@ -133,7 +134,10 @@ ni-ota-verify bootstrap \
 `commit` records `{bundle_seq, bom_sha256}` in `state_dir/applied.json`
 **after** the caller's health gate passes. It refuses (exit 1) any BOM that
 would lower the recorded seq, and an equal seq with a different hash; an equal
-seq with the identical hash re-commits idempotently (repair).
+seq with the identical hash re-commits idempotently (repair). Bootstrap and
+commit both consume protected BOM snapshots and share the same durable writer:
+unique mode-`0600` temporary inode, file sync, atomic publication, directory
+sync, then metadata and content readback before success is reported.
 
 ## Caller integration (the OTA path, ICE-Fabric side)
 
