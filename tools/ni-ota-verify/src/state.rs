@@ -5,7 +5,9 @@
 //! the SAME trait: the verify/commit logic never learns which backend it talks
 //! to, so the swap is a new `AppliedStateStore` impl, not a logic change.
 
+use std::fs::File;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -45,6 +47,20 @@ pub(crate) struct FileStateStore {
     pub path: PathBuf,
 }
 
+/// Process-scoped exclusive lock for one applied-state path. The lock inode is
+/// persistent, but ownership lives in the kernel and is released when this
+/// descriptor closes (including process crash), so no stale owner file can
+/// block recovery.
+pub(crate) struct StateLock {
+    file: File,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = flock(&self.file, LOCK_UN);
+    }
+}
+
 /// Root-only temporary inode removed on every return path. It is created in
 /// the state directory, so publication and directory fsync stay on one
 /// filesystem and no untrusted temporary namespace is involved.
@@ -70,6 +86,21 @@ impl Drop for SecureTempFile {
 }
 
 impl FileStateStore {
+    /// Lock the complete bootstrap read/check/write transaction. Bootstrap is
+    /// deliberately unable to create its trust-boundary directory.
+    pub(crate) fn lock_bootstrap(&self) -> Result<StateLock, String> {
+        self.validate_bootstrap_parent()?;
+        self.acquire_lock()
+    }
+
+    /// Lock the complete post-health commit transaction. Unlike bootstrap,
+    /// commit historically supports a custom state path whose parent is not
+    /// present yet; create that parent mode 0700, then attest it before use.
+    pub(crate) fn lock_commit(&self) -> Result<StateLock, InternalError> {
+        self.ensure_commit_parent()?;
+        self.acquire_lock().map_err(InternalError)
+    }
+
     /// Bootstrap runs as root on the appliance. Its state parent is a trust
     /// boundary, not scratch space: require an existing real directory and,
     /// for a privileged caller, exact root ownership and mode 0700.
@@ -163,6 +194,114 @@ impl FileStateStore {
                 self.path.display()
             ))
         })
+    }
+
+    fn ensure_commit_parent(&self) -> Result<(), InternalError> {
+        let dir = self.parent()?;
+        let created = match std::fs::symlink_metadata(dir) {
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    InternalError(format!(
+                        "cannot create state dir {} mode 0700: {e}",
+                        dir.display()
+                    ))
+                })?;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |e| {
+                        InternalError(format!(
+                            "cannot secure state dir {} mode 0700: {e}",
+                            dir.display()
+                        ))
+                    },
+                )?;
+                true
+            }
+            Err(e) => {
+                return Err(InternalError(format!(
+                    "cannot inspect state dir {}: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        self.validate_commit_parent().map_err(InternalError)?;
+        if created {
+            sync_directory(dir)?;
+            if let Some(parent) = dir.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_commit_parent(&self) -> Result<(), String> {
+        let dir = self.parent().map_err(|error| error.0)?;
+        let metadata = std::fs::symlink_metadata(dir)
+            .map_err(|e| format!("cannot inspect state dir {}: {e}", dir.display()))?;
+        if !metadata.file_type().is_dir() {
+            return Err(format!(
+                "state parent is not a real directory: {}",
+                dir.display()
+            ));
+        }
+        validate_owner_mode(
+            &format!("state dir {}", dir.display()),
+            metadata.uid(),
+            metadata.mode(),
+            effective_uid() == 0,
+            Some(0o700),
+        )
+    }
+
+    fn acquire_lock(&self) -> Result<StateLock, String> {
+        let path = self.lock_path()?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(format!(
+                    "state lock is a symlink or non-regular file: {}",
+                    path.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect state lock {}: {e}", path.display())),
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).mode(0o600);
+        let file = options
+            .open(&path)
+            .map_err(|e| format!("cannot open state lock {}: {e}", path.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot secure state lock {}: {e}", path.display()))?;
+        validate_open_regular(&path, &file, "state lock")?;
+        flock(&file, LOCK_EX)
+            .map_err(|e| format!("cannot lock applied state {}: {e}", self.path.display()))?;
+
+        // Re-attest after acquisition. A root-owned 0700 parent prevents an
+        // unprivileged replacement; the identity comparison also detects an
+        // inode swap between pathname inspection and open.
+        if let Err(error) = self.validate_bootstrap_parent() {
+            let _ = flock(&file, LOCK_UN);
+            return Err(error);
+        }
+        if let Err(error) = validate_open_regular(&path, &file, "state lock") {
+            let _ = flock(&file, LOCK_UN);
+            return Err(error);
+        }
+        Ok(StateLock { file })
+    }
+
+    fn lock_path(&self) -> Result<PathBuf, String> {
+        let file_name = self.path.file_name().ok_or_else(|| {
+            format!(
+                "applied-state path has no file name: {}",
+                self.path.display()
+            )
+        })?;
+        Ok(self
+            .path
+            .with_file_name(format!(".{}.lock", file_name.to_string_lossy())))
     }
 
     fn stage_state(&self, state: &AppliedState) -> Result<SecureTempFile, InternalError> {
@@ -327,6 +466,31 @@ fn validate_secure_regular(path: &Path) -> Result<(), String> {
     )
 }
 
+fn validate_open_regular(path: &Path, file: &File, label: &str) -> Result<(), String> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect {label} {}: {e}", path.display()))?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect open {label} {}: {e}", path.display()))?;
+    if !path_metadata.file_type().is_file()
+        || !file_metadata.file_type().is_file()
+        || path_metadata.dev() != file_metadata.dev()
+        || path_metadata.ino() != file_metadata.ino()
+    {
+        return Err(format!(
+            "{label} pathname is a symlink, non-regular file, or replaced inode: {}",
+            path.display()
+        ));
+    }
+    validate_owner_mode(
+        &format!("{label} {}", path.display()),
+        file_metadata.uid(),
+        file_metadata.mode(),
+        effective_uid() == 0,
+        Some(0o600),
+    )
+}
+
 fn validate_owner_mode(
     label: &str,
     uid: u32,
@@ -352,6 +516,26 @@ fn sync_directory(dir: &Path) -> Result<(), InternalError> {
     std::fs::File::open(dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|e| InternalError(format!("cannot sync state dir {}: {e}", dir.display())))
+}
+
+const LOCK_EX: i32 = 2;
+const LOCK_UN: i32 = 8;
+
+fn flock(file: &File, operation: i32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    loop {
+        // SAFETY: `file` owns a live descriptor for the duration of the call;
+        // flock neither retains the pointer nor accesses Rust memory.
+        if unsafe { flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(unix)]

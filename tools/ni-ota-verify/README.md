@@ -118,6 +118,16 @@ metadata and content readback, covering a caller crash after publication.
 Existing different state, corrupt state, malformed identity inputs, signature
 failure, or any binding mismatch is refused without overwriting the state.
 
+Bootstrap and commit serialize the complete state transaction (snapshot,
+read/check, publication, and readback) with one exclusive `flock` on a
+mode-`0600` inode beside `applied.json`. The inode can remain after a run, but
+the lock owner exists only in the kernel and is released on descriptor close or
+process crash; there is no stale PID/lock-directory recovery path. `bootstrap`
+still requires its secure parent to exist. For compatibility, `commit` may
+create an absent custom parent, but it creates it mode `0700` and attests that
+it is a real directory (and root-owned for the production root caller) before
+opening the lock or state.
+
 Example for a factory/LAB service that has independently read the local booted
 identity and installed payload identity:
 
@@ -138,6 +148,34 @@ seq with the identical hash re-commits idempotently (repair). Bootstrap and
 commit both consume protected BOM snapshots and share the same durable writer:
 unique mode-`0600` temporary inode, file sync, atomic publication, directory
 sync, then metadata and content readback before success is reported.
+
+### Owner authorization, recovery, and one-version rollback
+
+This LAB-only change is covered by the Owner approvals recorded on
+2026-07-19: **`GO signed-boot LAB debug sur .72 + policy
+neural-ice-secureboot-lab-v1 + gate LAB/PROD #37 — aucun déplacement de canal`**
+and **`GO correction staging CoreOS`**. It does not publish, promote, or move a
+`beta`, `stable`, or product alias.
+
+Recovery is fail-closed and forward-only:
+
+- a failure before the atomic state publication leaves the device unseeded and
+  the exact signed bootstrap can be retried;
+- a crash after publication but before the receipt leaves the exact durable
+  state, so the same signed bootstrap completes idempotently;
+- a process crash while holding the transaction lock releases the kernel lock;
+  the persistent mode-`0600` lock inode is harmless on the next invocation;
+- corrupt, insecure, or different existing state is never deleted or silently
+  reseeded. Boot recovery media, preserve evidence, diagnose the state, then
+  repair with a newly signed train whose sequence is strictly higher.
+
+For one-version rollback, the health gate remains before `commit`. If install
+or health fails, the caller rolls the bootc deployment back one version while
+the prior applied-state sequence remains unchanged. Once `commit` succeeds,
+booting an older payload does not lower that sequence and verification refuses
+the older BOM; recovery is a forward repair with a higher signed sequence (or
+the existing equal-sequence, byte-identical BOM repair carve-out). Thus neither
+bootstrap nor concurrent commits can regress the anti-rollback state.
 
 ## Caller integration (the OTA path, ICE-Fabric side)
 

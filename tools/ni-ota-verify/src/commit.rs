@@ -23,6 +23,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let store = FileStateStore {
         path: applied_state_path(&flags, &cfg)?,
     };
+    let _state_lock = store.lock_commit()?;
     let bom_snapshot = store.snapshot(&bom_path)?;
 
     // A BOM that cannot be parsed cannot be committed — internal error, not a
@@ -77,6 +78,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         }
     }
 
+    // Integration-test-only race seam. The production image builds without
+    // `test-path-overrides`, so no delay or environment-controlled behavior is
+    // present in the shipped verifier.
+    #[cfg(feature = "test-path-overrides")]
+    test_delay_after_read()?;
+
     let state = AppliedState {
         bundle_seq: bom.bundle_seq,
         bom_sha256: bom_sha,
@@ -95,4 +102,23 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         store.describe()
     );
     Ok(EXIT_PASS)
+}
+
+#[cfg(feature = "test-path-overrides")]
+fn test_delay_after_read() -> Result<(), InternalError> {
+    if let Some(path) = std::env::var_os("NI_OTA_TEST_COMMIT_READY") {
+        std::fs::write(PathBuf::from(path), b"ready\n")
+            .map_err(|e| InternalError(format!("cannot publish commit test barrier: {e}")))?;
+    }
+    let Some(raw) = std::env::var_os("NI_OTA_TEST_COMMIT_DELAY_MS") else {
+        return Ok(());
+    };
+    let millis = raw.to_string_lossy().parse::<u64>().map_err(|e| {
+        InternalError(format!(
+            "invalid NI_OTA_TEST_COMMIT_DELAY_MS '{}': {e}",
+            raw.to_string_lossy()
+        ))
+    })?;
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+    Ok(())
 }

@@ -9,6 +9,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -42,6 +44,7 @@ fi
 if [ -n "${NI_OTA_TEST_MUTATE_SOURCE:-}" ]; then
   cp "$NI_OTA_TEST_MUTATION" "$NI_OTA_TEST_MUTATE_SOURCE" || exit 2
 fi
+[ -z "${NI_OTA_TEST_COSIGN_READY:-}" ] || printf 'ready\n' > "$NI_OTA_TEST_COSIGN_READY"
 [ -z "${NI_OTA_TEST_COSIGN_DELAY:-}" ] || sleep "$NI_OTA_TEST_COSIGN_DELAY"
 exit 0
 "#;
@@ -223,6 +226,16 @@ fn sha256_of(path: &Path) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+fn wait_for_path(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for test barrier {}", path.display());
 }
 
 // --- verify: happy paths -----------------------------------------------------
@@ -631,7 +644,11 @@ fn bootstrap_uses_one_protected_snapshot_when_source_mutates_during_cosign() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     entries.sort();
-    assert_eq!(entries, ["applied.json"], "snapshot cleanup");
+    assert_eq!(
+        entries,
+        [".applied.json.lock", "applied.json"],
+        "snapshot cleanup leaves only durable state and its kernel-lock inode"
+    );
 }
 
 #[test]
@@ -803,6 +820,21 @@ fn bootstrap_refuses_symlink_and_non_directory_state_parent() {
     let (code, _, stderr) = run(&mut regular.bootstrap_cmd(&cfg, &bom, &sig));
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("not a real directory"));
+
+    let missing = Fixture::new("bootstrap-parent-missing");
+    let bom = missing.write_bom("0.44.18", 4);
+    let sig = missing.write_sig("bom.sig", true);
+    let cfg = missing.write_config(1, "");
+    let custom_state = missing.path("missing/custom/applied.json");
+    let mut command = missing.bootstrap_cmd(&cfg, &bom, &sig);
+    command.args(["--applied-state".as_ref(), custom_state.as_os_str()]);
+    let (code, _, stderr) = run(&mut command);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("cannot inspect state dir"));
+    assert!(
+        !custom_state.parent().unwrap().exists(),
+        "bootstrap must not create its trust-boundary parent"
+    );
 }
 
 #[test]
@@ -895,6 +927,54 @@ fn concurrent_bootstraps_are_idempotent_or_refuse_a_different_baseline() {
     assert_eq!(applied["bom_sha256"], expected_hash);
 }
 
+#[test]
+fn concurrent_bootstrap_and_commit_never_regress_the_baseline() {
+    let fx = Fixture::new("bootstrap-vs-commit");
+    let bootstrap_source = fx.write_bom("0.44.18", 5);
+    let bootstrap_bom = fx.path("bootstrap-bom.json");
+    fs::copy(&bootstrap_source, &bootstrap_bom).unwrap();
+    let bootstrap_sig = fx.write_bound_sig("bootstrap-bom.sig", &bootstrap_bom);
+    let commit_source = fx.write_bom("0.44.17", 4);
+    let commit_bom = fx.path("commit-bom.json");
+    fs::copy(&commit_source, &commit_bom).unwrap();
+    let cfg = fx.write_config(1, "");
+    let ready = fx.path("bootstrap-cosign-ready");
+
+    let mut bootstrap = fx.bootstrap_cmd(&cfg, &bootstrap_bom, &bootstrap_sig);
+    bootstrap
+        .env("NI_OTA_TEST_COSIGN_READY", &ready)
+        .env("NI_OTA_TEST_COSIGN_DELAY", "0.3")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let bootstrap = bootstrap.spawn().unwrap();
+    wait_for_path(&ready);
+
+    // Bootstrap owns the common state lock while its signature is checked.
+    // Commit must not observe Unseeded and later overwrite seq 5 with seq 4.
+    let mut commit = Command::new(BIN);
+    commit
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), commit_bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let commit = commit.spawn().unwrap();
+
+    let bootstrap = bootstrap.wait_with_output().unwrap();
+    let commit = commit.wait_with_output().unwrap();
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+    assert_eq!(commit.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&commit.stderr).contains("LOWER"));
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bundle_seq"], 5, "state must never regress");
+}
+
 // --- commit ---------------------------------------------------------------------
 
 #[test]
@@ -980,6 +1060,100 @@ fn commit_seeds_advances_and_guards() {
             .mode()
             & 0o7777,
         0o600
+    );
+}
+
+#[test]
+fn commit_creates_and_attests_an_absent_custom_parent() {
+    let fx = Fixture::new("commit-custom-parent");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let state = fx.path("custom/nested/applied.json");
+    assert!(!state.parent().unwrap().exists());
+
+    let (code, receipt, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .args(["--applied-state".as_ref(), state.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 7);
+    assert_eq!(
+        fs::metadata(state.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(state.parent().unwrap().join(".applied.json.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+}
+
+#[test]
+fn concurrent_commits_can_never_publish_a_lower_sequence_last() {
+    let fx = Fixture::new("commit-concurrent-forward-only");
+    fx.seed_applied(3, &"c".repeat(64));
+    let low_source = fx.write_bom("0.44.4", 4);
+    let low = fx.path("low.json");
+    fs::copy(&low_source, &low).unwrap();
+    let high_source = fx.write_bom("0.44.5", 5);
+    let high = fx.path("high.json");
+    fs::copy(&high_source, &high).unwrap();
+    let cfg = fx.write_config(1, "");
+    let ready = fx.path("low-commit-read-ready");
+
+    let mut low_command = Command::new(BIN);
+    low_command
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NI_OTA_TEST_COMMIT_READY", &ready)
+        .env("NI_OTA_TEST_COMMIT_DELAY_MS", "300")
+        .arg("commit")
+        .args(["--bom".as_ref(), low.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let low_command = low_command.spawn().unwrap();
+    wait_for_path(&ready);
+
+    let mut high_command = Command::new(BIN);
+    high_command
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), high.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let high_command = high_command.spawn().unwrap();
+
+    let low_output = low_command.wait_with_output().unwrap();
+    let high_output = high_command.wait_with_output().unwrap();
+    assert!(
+        low_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&low_output.stderr)
+    );
+    assert!(
+        high_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&high_output.stderr)
+    );
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(
+        applied["bundle_seq"], 5,
+        "a delayed lower commit must never overwrite a completed higher commit"
     );
 }
 

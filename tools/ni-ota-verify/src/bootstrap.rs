@@ -63,9 +63,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         Ok(EXIT_REFUSE)
     };
 
-    if let Err(why) = store.validate_bootstrap_parent() {
-        return refuse(why);
-    }
+    let _state_lock = match store.lock_bootstrap() {
+        Ok(lock) => lock,
+        Err(why) => return refuse(why),
+    };
     if let Err(why) = store.validate_bootstrap_state() {
         return refuse(why);
     }
