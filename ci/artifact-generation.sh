@@ -1,5 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Crash-safe producer/consumer contract for GB10 build-artifact generations.
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'; export PATH
+LC_ALL=C; export LC_ALL
 set -euo pipefail
 ROOT="${ARTIFACTS_ROOT:-${HOME}/neural-ice/artifacts}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,6 +9,9 @@ SBVERIFY_BIN="${SBVERIFY_BIN:-sbverify}"
 VMLINUX_CANONICALIZE_BIN="${VMLINUX_CANONICALIZE_BIN:-$SCRIPT_DIR/canonicalize-vmlinuz.sh}"
 REQUIRED_RPMS=(kernel kernel-core kernel-modules-core kernel-modules kernel-modules-nvidia-open)
 die() { echo "ERROR: $*" >&2; exit 1; }
+run_trust_policy() {
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$@"
+}
 safe_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "unsafe generation id '$1'"; }
 hash_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
@@ -282,7 +287,7 @@ finalize_candidate() {
   trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
   rm "$tmp/manifest.sha256"; rm -rf "$tmp/unsigned-boot"; install -d -m 0755 "$tmp/signed-boot"; cp -a "$signedboot_src/." "$tmp/signed-boot/"
   sed 's/^state=candidate$/state=final/' "$tmp/generation.env" > "$tmp/generation.env.new"; mv "$tmp/generation.env.new" "$tmp/generation.env"
-  "$policy_bin" "$tmp/signed-boot" "$(metadata_value kernel_uname_r "$tmp/generation.env")" \
+  run_trust_policy "$policy_bin" "$tmp/signed-boot" "$(metadata_value kernel_uname_r "$tmp/generation.env")" \
     || die "signed-boot trust policy rejected candidate '$id'"
   verified="${VERIFIED_UTC:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
   cat > "$tmp/signed-boot/trust-policy.env" <<EOF

@@ -30,10 +30,14 @@ printf '%s\n' '#!/usr/bin/env bash' \
 printf '%s\n' '#!/usr/bin/env bash' 'cp "$1" "$2"' > "$FAKE_CANONICALIZE"
 # shellcheck disable=SC2016 # literal script body expands its own environment/arguments
 printf '%s\n' '#!/usr/bin/env bash' \
-  'if [[ "${MUTATE_POLICY:-0}" == 1 ]]; then' \
+  '[[ "${PATH:-}" == /usr/sbin:/usr/bin:/sbin:/bin ]] || exit 91' \
+  '[[ "${LC_ALL:-}" == C ]] || exit 92' \
+  '[[ -z "${BASH_ENV:-}" && -z "${POLICY_ENV_POISON:-}" ]] || exit 93' \
+  'self_dir="$(cd "$(dirname "$0")" && pwd)"' \
+  'if [[ -e "$self_dir/.mutate-policy" ]]; then' \
   '  printf "mutated\n" >> "$1/signed-boot-provenance.env"' \
   'fi' \
-  'if [[ "${MUTATE_POLICY_REHASH:-0}" == 1 ]]; then' \
+  'if [[ -e "$self_dir/.mutate-policy-rehash" ]]; then' \
   '  file="$1/signed-boot-provenance.env"' \
   '  manifest="$(dirname "$1")/manifest.sha256"' \
   '  printf "mutated-and-rehashed\n" >> "$file"' \
@@ -47,6 +51,10 @@ printf '%s\n' '#!/usr/bin/env bash' \
   'fi' \
   'exit 0' > "$FAKE_TRUST_POLICY"
 chmod +x "$FAKE_SBVERIFY" "$FAKE_CANONICALIZE" "$FAKE_TRUST_POLICY"
+EVIL_BIN="$TMP/evil-bin"; install -d "$EVIL_BIN"
+printf '%s\n' '#!/usr/bin/bash' 'exit 0' > "$EVIL_BIN/bash"; chmod +x "$EVIL_BIN/bash"
+BASH_ENV_FILE="$TMP/bash-env"
+printf '%s\n' 'export POLICY_ENV_POISON=from-bash-env' > "$BASH_ENV_FILE"
 export SBVERIFY_BIN="$FAKE_SBVERIFY" VMLINUX_CANONICALIZE_BIN="$FAKE_CANONICALIZE" \
   SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" \
   SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1
@@ -98,7 +106,11 @@ SRC1="$TMP/src1"; SIGNED1="$TMP/signed1"; make_sources "$SRC1"; make_signed_boot
 candidate gen-1 "$SRC1" >/dev/null
 [[ ! -e "$TMP/store/current" ]] || fail "candidate moved current"
 ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-candidate gen-1
-finalize gen-1 "$SIGNED1" >/dev/null
+env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" POLICY_ENV_POISON=direct \
+  ARTIFACTS_ROOT="$TMP/store" SIGNEDBOOT_SRC="$SIGNED1" \
+  SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" \
+  SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1 \
+  "$SCRIPT" finalize gen-1 >/dev/null
 [[ "$(readlink "$TMP/store/current")" == generations/gen-1 ]] || fail "gen-1 not activated"
 
 DEST="$TMP/image"
@@ -123,7 +135,10 @@ cp "$SCRIPT" "$BUILD_CONTEXT_SCRIPT" "$BUILD_IMAGE_SCRIPT" "$TEST_REPO/ci/"
 cp "$FAKE_TRUST_POLICY" \
   "$TEST_REPO/secureboot/trust-policies/neural-ice-secureboot-lab-v1"
 BUILD_GATE="$TEST_REPO/ci/verify-build-context.sh"
-"$BUILD_GATE" "$DEST" debug >/dev/null
+gate_output="$(env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" POLICY_ENV_POISON=direct \
+  "$BUILD_GATE" "$DEST" debug)"
+grep -q '^CURRENT_GENERATION=gen-1$' <<< "$gate_output" \
+  || fail "hardened build gate did not execute"
 expect_failure "$BUILD_GATE" "$DEST" prod
 expect_failure "$BUILD_GATE" "$DEST" ""
 printf '\n# changed after finalization\n' >> \
@@ -141,14 +156,18 @@ install -d "$TMP/fake-bin"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$PODMAN_LOG"' > "$TMP/fake-bin/podman"
 chmod +x "$TMP/fake-bin/podman"
 rm -f "$TMP/podman-mutating.out"
-expect_failure env MUTATE_POLICY=1 PODMAN_LOG="$TMP/podman-mutating.out" \
+touch "$TEST_REPO/secureboot/trust-policies/.mutate-policy"
+expect_failure env PODMAN_LOG="$TMP/podman-mutating.out" \
   PATH="$TMP/fake-bin:$PATH" VARIANT=debug "$TEST_REPO/ci/build-image.sh"
+rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy"
 [[ ! -e "$TMP/podman-mutating.out" ]] || fail "mutating policy reached podman"
 rm -rf "$TEST_REPO/image"
 cp -a "$DEST" "$TEST_REPO/image"
 rm -f "$TMP/podman-rehashed.out"
-expect_failure env MUTATE_POLICY_REHASH=1 PODMAN_LOG="$TMP/podman-rehashed.out" \
+touch "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
+expect_failure env PODMAN_LOG="$TMP/podman-rehashed.out" \
   PATH="$TMP/fake-bin:$PATH" VARIANT=debug "$TEST_REPO/ci/build-image.sh"
+rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
 [[ ! -e "$TMP/podman-rehashed.out" ]] || fail "self-rehashing policy reached podman"
 rm -rf "$TEST_REPO/image"
 cp -a "$DEST" "$TEST_REPO/image"

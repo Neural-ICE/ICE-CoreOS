@@ -1,13 +1,18 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Bind a finalized GB10 artifact generation to the exact Secure Boot policy
 # approved for the requested image variant. This gate is deliberately backed by
 # version-controlled policy executables, never repository variables or secrets.
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'; export PATH
+LC_ALL=C; export LC_ALL
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 POLICY_ROOT="$REPO_ROOT/secureboot/trust-policies"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+run_trust_policy() {
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$@"
+}
 hash_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   else shasum -a 256 "$1" | awk '{print $1}'
@@ -60,7 +65,7 @@ manifest_hash="$(hash_file "$context/manifest.sha256")"
 # still accepted by the source revision that is about to build the image.
 kernel_uname="$(metadata_value kernel_uname_r "$context/generation.env")" \
   || die "invalid kernel uname in build context"
-"$policy_bin" "$context/signed-boot" "$kernel_uname" >/dev/null \
+run_trust_policy "$policy_bin" "$context/signed-boot" "$kernel_uname" >/dev/null \
   || die "approved $variant trust policy rejected the staged signed-boot tree"
 
 # Treat the policy executable as an untrusted parser: it must not be able to
