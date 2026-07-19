@@ -217,6 +217,51 @@ if [[ "\${BUILD_DRIVER}" == "true" ]] && ! ls "\${RPMDIR}"/kernel-modules-nvidia
   echo "ERROR: kernel-modules-nvidia-open-*.rpm missing — Option D inline signing failed." >&2
   exit 7
 fi
+
+# Kernel subpackages deliberately disable automatic Requires while preserving
+# automatic Provides. Otherwise RPM turns every imported kernel symbol in the
+# NVIDIA modules into an unsatisfiable ksym(...) dependency: RHEL kernel RPMs
+# do not publish those capabilities. Enforce the exact uname-r coupling before
+# any RPM can leave the builder or become an immutable candidate.
+if [[ "\${BUILD_DRIVER}" == "true" ]]; then
+  kernel_core_rpms=()
+  nvidia_rpms=()
+  for rpm_file in "\${RPMDIR}"/*.rpm; do
+    case "\$(rpm -qp --qf '%{NAME}' "\${rpm_file}")" in
+      kernel-core) kernel_core_rpms+=("\${rpm_file}") ;;
+      kernel-modules-nvidia-open) nvidia_rpms+=("\${rpm_file}") ;;
+    esac
+  done
+  ((\${#kernel_core_rpms[@]} == 1)) || {
+    echo "ERROR: expected exactly one kernel-core RPM, found \${#kernel_core_rpms[@]}." >&2
+    exit 7
+  }
+  ((\${#nvidia_rpms[@]} == 1)) || {
+    echo "ERROR: expected exactly one kernel-modules-nvidia-open RPM, found \${#nvidia_rpms[@]}." >&2
+    exit 7
+  }
+  kernel_uname="\$(rpm -qp --qf '%{VERSION}-%{RELEASE}.%{ARCH}' "\${kernel_core_rpms[0]}")"
+  nvidia_requires="\$(rpm -qp \
+    --qf '[%{REQUIRENAME}\t%{REQUIREFLAGS:depflags}\t%{REQUIREVERSION}\n]' \
+    "\${nvidia_rpms[0]}")"
+  nvidia_provides="\$(rpm -qp --provides "\${nvidia_rpms[0]}")"
+  if grep -q '^ksym(' <<< "\${nvidia_requires}"; then
+    echo "ERROR: kernel-modules-nvidia-open contains forbidden automatic ksym Requires." >&2
+    exit 7
+  fi
+  expected_uname_req="\$(printf 'kernel-modules-core-uname-r\t=\t%s' "\${kernel_uname}")"
+  actual_uname_reqs="\$(awk -F '\t' \
+    '\$1 == "kernel-modules-core-uname-r" {print}' <<< "\${nvidia_requires}")"
+  [[ "\${actual_uname_reqs}" == "\${expected_uname_req}" ]] || {
+    echo "ERROR: NVIDIA RPM uname-r dependency is not exactly '\${expected_uname_req}'." >&2
+    exit 7
+  }
+  grep -q '^ksym(' <<< "\${nvidia_provides}" || {
+    echo "ERROR: kernel-modules-nvidia-open lost its automatic ksym Provides." >&2
+    exit 7
+  }
+  echo "==> NVIDIA RPM dependency contract: PASS (\${kernel_uname})"
+fi
 cp -v "\${RPMDIR}"/*.rpm /output/
 
 # Emit a content-bound metadata inventory while rpm is available inside the

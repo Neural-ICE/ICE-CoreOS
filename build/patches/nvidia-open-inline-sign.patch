@@ -15,7 +15,7 @@ index 883634d6a..9cc164509 100644
  %if 0%{?fedora}%{?eln}
  %define ima_ca_cert %{SOURCE106}
  %endif
-@@ -1886,6 +1892,22 @@ of the operating system: memory allocation, process allocation, device
+@@ -1886,6 +1892,24 @@ of the operating system: memory allocation, process allocation, device
  input and output, etc.
  %endif
  
@@ -27,6 +27,8 @@ index 883634d6a..9cc164509 100644
 +Requires: %{name}-modules-core-uname-r = %{KVERREL}
 +Provides: %{name}-modules-nvidia-open-uname-r = %{KVERREL}
 +Provides: installonlypkg(kernel-module)
++AutoReq: no
++AutoProv: yes
 +%description modules-nvidia-open
 +The NVIDIA open GPU (r595) out-of-tree kernel modules, built against and signed
 +by the ephemeral per-build module-signing key of this exact %{KVERREL} kernel.
@@ -38,7 +40,7 @@ index 883634d6a..9cc164509 100644
  %if %{with_up} && %{with_debug} && %{with_efiuki}
  %description debug-uki-virt
  Prebuilt debug unified kernel image for virtual machines.
-@@ -2029,6 +2051,12 @@ ApplyOptionalPatch linux-kernel-test.patch
+@@ -2029,6 +2053,12 @@ ApplyOptionalPatch linux-kernel-test.patch
  %{log_msg "End of patch applications"}
  # END OF PATCH APPLICATIONS
  
@@ -51,7 +53,7 @@ index 883634d6a..9cc164509 100644
  # Any further pre-build tree manipulations happen here.
  %{log_msg "Pre-build tree manipulations"}
  chmod +x scripts/checkpatch.pl
-@@ -3144,6 +3172,22 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
+@@ -3144,6 +3174,22 @@ BuildKernel %make_target %kernel_image %{_use_vdso} automotive
  
  %if %{with_up_base}
  BuildKernel %make_target %kernel_image %{_use_vdso}
@@ -74,7 +76,7 @@ index 883634d6a..9cc164509 100644
  %endif
  
  %ifnarch noarch i686 %{nobuildarches}
-@@ -4392,6 +4436,18 @@ fi\
+@@ -4392,6 +4438,18 @@ fi\
  %{_libexecdir}/kselftests
  %endif
  

@@ -11,6 +11,8 @@ on:
       - "ci/verify-build-context.sh"
       - "secureboot/trust-policies/**"
       - "build/build-kernel.sh"
+      - "build/patches/nvidia-open-inline-sign.patch"
+      - "ci/test-kernel-packaging-patch.sh"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
       - ".github/workflows/test-artifact-generation.yml"
@@ -25,6 +27,8 @@ on:
       - "ci/verify-build-context.sh"
       - "secureboot/trust-policies/**"
       - "build/build-kernel.sh"
+      - "build/patches/nvidia-open-inline-sign.patch"
+      - "ci/test-kernel-packaging-patch.sh"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
       - ".github/workflows/test-artifact-generation.yml"
@@ -45,7 +49,9 @@ jobs:
         run: |
           shellcheck ci/artifact-generation.sh ci/canonicalize-vmlinuz.sh \
             ci/stage-artifacts.sh ci/test-artifact-generation.sh ci/build-image.sh \
-            ci/verify-build-context.sh \
+            ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
             build/build-kernel.sh
-      - name: Test crash-safe artifact generations
-        run: ./ci/test-artifact-generation.sh
+      - name: Test artifact generation and kernel packaging contract
+        run: |
+          ./ci/test-artifact-generation.sh
+          ./ci/test-kernel-packaging-patch.sh

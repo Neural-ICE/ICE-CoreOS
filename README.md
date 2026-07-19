@@ -113,6 +113,12 @@ that provenance before checking the signed shim, GRUB, MokManager and vmlinuz. O
 can atomically move `current`. An incomplete, mismatched, stale or interrupted candidate leaves the
 previous buildable generation untouched.
 
+Before publishing a candidate, the kernel builder also checks the NVIDIA RPM dependency contract:
+automatic `ksym(...)` Provides remain available for diagnostics, automatic `ksym(...)` Requires are
+forbidden, and the package must require exactly the matching `kernel-modules-core-uname-r`. This
+keeps the driver tied to its build kernel without creating dependencies the RHEL kernel RPMs do not
+publish.
+
 The heavy kernel workflow is requested from the default branch only. Both values are immutable
 inputs; update them deliberately when the upstream kernel or driver is approved:
 
