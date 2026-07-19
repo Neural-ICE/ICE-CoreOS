@@ -1080,6 +1080,14 @@ fn commit_creates_and_attests_an_absent_custom_parent() {
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(receipt["bundle_seq"], 7);
     assert_eq!(
+        fs::metadata(fx.path("custom"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
+    assert_eq!(
         fs::metadata(state.parent().unwrap())
             .unwrap()
             .permissions()
@@ -1099,6 +1107,146 @@ fn commit_creates_and_attests_an_absent_custom_parent() {
             & 0o7777,
         0o600
     );
+}
+
+#[test]
+fn relative_applied_state_uses_current_directory_without_chmod() {
+    let fx = Fixture::new("commit-relative-parent");
+    fs::set_permissions(&fx.dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let bom = fx.write_bom("0.44.7", 7);
+    let sig = fx.write_bound_sig("bom.sig", &bom);
+    let cfg = fx.write_config(0, "");
+
+    let commit = || {
+        run(Command::new(BIN)
+            .current_dir(&fx.dir)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()])
+            .args(["--applied-state", "applied.json"]))
+    };
+    let (code, receipt, stderr) = commit();
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 7);
+    let (code, _, stderr) = commit();
+    assert_eq!(code, 0, "idempotent retry: {stderr}");
+    assert_eq!(
+        fs::metadata(&fx.dir).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(fx.path("applied.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(fx.path(".applied.json.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+
+    let mut bootstrap = fx.bootstrap_cmd(&cfg, &bom, &sig);
+    bootstrap
+        .current_dir(&fx.dir)
+        .args(["--applied-state", "bootstrap-applied.json"]);
+    let (code, _, stderr) = run(&mut bootstrap);
+    assert_eq!(code, 1, "bootstrap must keep its strict 0700 parent policy");
+    assert!(stderr.contains("must be mode 0700"), "{stderr}");
+    assert_eq!(
+        fs::metadata(&fx.dir).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    assert!(!fx.path("bootstrap-applied.json").exists());
+}
+
+#[test]
+fn verify_creates_commit_compatible_secure_state_dir() {
+    let fx = Fixture::new("verify-creates-state-dir");
+    let bom = fx.write_bom("0.44.7", 7);
+    fx.write_record("0.44.7", "stable", 7);
+    fx.write_sig("bom.sig", true);
+    fx.write_sig("record.sig", true);
+    let cfg = fx.write_config(0, "");
+    fs::remove_dir_all(fx.path("state")).unwrap();
+
+    let (code, _, stderr) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        fs::metadata(fx.path("state")).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    assert!(fx.path("state/last-verdict.json").is_file());
+
+    let (code, receipt, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 7);
+    assert_eq!(
+        fs::metadata(fx.path("state/applied.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+}
+
+#[test]
+fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
+    let permissive = Fixture::new("verify-permissive-state-dir");
+    permissive.write_bom("0.44.7", 7);
+    permissive.write_record("0.44.7", "stable", 7);
+    permissive.write_sig("bom.sig", true);
+    permissive.write_sig("record.sig", true);
+    let cfg = permissive.write_config(0, "");
+    fs::set_permissions(permissive.path("state"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, _, stderr) = run(&mut permissive.verify_cmd(&cfg));
+    assert_eq!(code, 0);
+    assert!(stderr.contains("could not record last verdict"), "{stderr}");
+    assert_eq!(
+        fs::metadata(permissive.path("state"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert!(!permissive.path("state/last-verdict.json").exists());
+
+    let symlinked = Fixture::new("verify-symlink-state-dir");
+    symlinked.write_bom("0.44.7", 7);
+    symlinked.write_record("0.44.7", "stable", 7);
+    symlinked.write_sig("bom.sig", true);
+    symlinked.write_sig("record.sig", true);
+    let cfg = symlinked.write_config(0, "");
+    fs::remove_dir_all(symlinked.path("state")).unwrap();
+    fs::create_dir(symlinked.path("outside-state")).unwrap();
+    fs::set_permissions(
+        symlinked.path("outside-state"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(symlinked.path("outside-state"), symlinked.path("state")).unwrap();
+
+    let (code, _, stderr) = run(&mut symlinked.verify_cmd(&cfg));
+    assert_eq!(code, 0);
+    assert!(stderr.contains("could not record last verdict"), "{stderr}");
+    assert!(fs::symlink_metadata(symlinked.path("state"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!symlinked.path("outside-state/last-verdict.json").exists());
 }
 
 #[test]

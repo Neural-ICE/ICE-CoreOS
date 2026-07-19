@@ -89,6 +89,15 @@ Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 **enforce** (an incomplete config leans strict, never silently log-only). The
 hardware target comes from the immutable image marker, not a CLI override.
 
+An absent configured `state_dir` is created component by component as mode
+`0700`, with every new directory and parent entry synced before use. An
+existing directory must already be a real mode-`0700` directory; `verify`
+warns and skips its best-effort verdict mirror rather than chmod-repairing an
+insecure directory or following a directory symlink. For an explicit relative
+`--applied-state applied.json`, `commit` may use an existing current directory
+that is not group/world-writable and never changes its mode. `bootstrap`
+always requires its state parent to be exactly mode `0700`.
+
 ### Signed LAB USB baseline bootstrap
 
 `bootstrap` is the one-time bridge from a physically delivered, signed LAB USB

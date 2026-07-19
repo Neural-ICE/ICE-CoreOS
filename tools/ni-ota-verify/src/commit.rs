@@ -24,7 +24,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         path: applied_state_path(&flags, &cfg)?,
     };
     let _state_lock = store.lock_commit()?;
-    let bom_snapshot = store.snapshot(&bom_path)?;
+    let bom_snapshot = store.snapshot_commit(&bom_path)?;
 
     // A BOM that cannot be parsed cannot be committed — internal error, not a
     // policy refusal: the caller must only ever commit a BOM that already

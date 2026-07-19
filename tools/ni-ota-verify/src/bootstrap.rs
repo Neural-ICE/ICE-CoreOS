@@ -70,7 +70,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     if let Err(why) = store.validate_bootstrap_state() {
         return refuse(why);
     }
-    let bom_snapshot = store.snapshot(&bom_path)?;
+    let bom_snapshot = store.snapshot_bootstrap(&bom_path)?;
 
     // Resolve and run the pinned verifier before parsing or trusting any BOM
     // field. Bootstrap has no shadow semantics: a missing trust anchor or bad

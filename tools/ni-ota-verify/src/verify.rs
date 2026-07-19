@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
-use crate::state::{AppliedStateStore, FileStateStore, StateRead};
+use crate::state::{ensure_secure_state_directory, AppliedStateStore, FileStateStore, StateRead};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
 /// The signed IMMUTABLE core of the release-train lockfile (ICE-Fabric
@@ -482,13 +482,18 @@ fn human_summary(verdict: &Verdict) {
 /// Never fatal — observability must not block (or fake) a verdict.
 fn record_last_verdict(cfg: &Config, json: &str) {
     let Some(dir) = &cfg.state_dir else { return };
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("last-verdict.json"), format!("{json}\n"))
+    let write = || -> Result<(), InternalError> {
+        ensure_secure_state_directory(dir)?;
+        std::fs::write(dir.join("last-verdict.json"), format!("{json}\n")).map_err(|error| {
+            InternalError(format!(
+                "cannot write {}: {error}",
+                dir.join("last-verdict.json").display()
+            ))
+        })
     };
-    if let Err(e) = write() {
+    if let Err(InternalError(error)) = write() {
         eprintln!(
-            "ni-ota-verify: WARN: could not record last verdict in {}: {e}",
+            "ni-ota-verify: WARN: could not record last verdict in {}: {error}",
             dir.display()
         );
     }
