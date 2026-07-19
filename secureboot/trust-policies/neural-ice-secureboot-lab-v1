@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# neural-ice-secureboot-lab-v1 — LAB Secure Boot trust policy (fail-closed).
+#
+# Contract (ICE-CoreOS ci/artifact-generation.sh finalize):
+#   neural-ice-secureboot-lab-v1 SIGNEDBOOT_DIR KERNEL_UNAME_R
+#
+# Exit 0 IFF every boot component in SIGNEDBOOT_DIR is Secure-Boot-signed by its
+# approved LAB anchor:
+#   - vmlinuz + grub (both bootupd paths)  -> Neural ICE UEFI Secure Boot CA
+#                                             (the leaf chains to it)
+#   - shim / MokManager / fallback         -> Neural ICE Lab Secure Boot
+#                                             (the LAB key enrolled in the .72 db)
+#
+# Self-contained trust identity: the two PUBLIC anchors ship next to this script
+# and their SHA-256 are pinned below. The script refuses to run if an anchor's
+# SHA-256 does not match, so THIS executable's own SHA-256 transitively binds the
+# anchor set AND the component->signer mapping. No mutable/external state decides
+# trust. This is the LAB policy only — it never approves a Microsoft/PROD chain.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ANCHORS="$SELF_DIR/neural-ice-secureboot-lab-v1.d"
+SBVERIFY="${SBVERIFY_BIN:-sbverify}"
+
+CA_CRT="$ANCHORS/neural-ice-ca.crt"
+CA_SHA256="f8455b8cda5e6bcb60614eb1f2c7f3eec4ddbc873b968efc580231d55582ec87"
+LAB_CRT="$ANCHORS/neural-ice-lab.crt"
+LAB_SHA256="580360d8652628e6bb27c5b7b07cc74b9cc8de7cf98405ac3ede9c9e539d4231"
+
+die() { echo "neural-ice-secureboot-lab-v1: REJECT: $*" >&2; exit 1; }
+
+[[ $# -eq 2 ]] || die "usage: neural-ice-secureboot-lab-v1 SIGNEDBOOT_DIR KERNEL_UNAME_R"
+DIR="$1"; UNAME_R="$2"
+[[ -d "$DIR" && ! -L "$DIR" ]] || die "signed-boot dir missing or symlink"
+command -v "$SBVERIFY" >/dev/null 2>&1 || die "sbverify is required"
+
+pin() {  # $1=cert  $2=expected sha256
+  [[ -f "$1" && ! -L "$1" ]] || die "pinned anchor missing: ${1##*/}"
+  local h; h="$(sha256sum "$1" | cut -d' ' -f1)"
+  [[ "$h" == "$2" ]] || die "anchor SHA-256 mismatch for ${1##*/} (got $h)"
+}
+pin "$CA_CRT" "$CA_SHA256"
+pin "$LAB_CRT" "$LAB_SHA256"
+
+verify() {  # $1=relpath  $2=anchor
+  local f="$DIR/$1"
+  [[ -f "$f" && ! -L "$f" ]] || die "missing component: $1"
+  "$SBVERIFY" --cert "$2" "$f" >/dev/null 2>&1 || die "unapproved/absent signer for $1"
+}
+
+# Leaf-signed, chains to the Neural ICE UEFI CA:
+verify "usr/lib/modules/$UNAME_R/vmlinuz"                "$CA_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/grubaa64.efi"   "$CA_CRT"
+verify "usr/lib/bootupd/updates/EFI/centos/grubaa64.efi" "$CA_CRT"
+# LAB-signed, Neural ICE Lab Secure Boot (db-enrolled on .72):
+verify "usr/lib/bootupd/updates/EFI/BOOT/BOOTAA64.EFI"   "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/centos/shimaa64.efi" "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/mmaa64.efi"     "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/centos/mmaa64.efi"   "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/fbaa64.efi"     "$LAB_CRT"
+
+# Exactly one kernel image.
+n="$(find "$DIR/usr/lib/modules" -type f -name vmlinuz | wc -l | tr -d '[:space:]')"
+[[ "$n" -eq 1 ]] || die "expected exactly one vmlinuz, found $n"
+
+echo "neural-ice-secureboot-lab-v1: OK ($UNAME_R)"
