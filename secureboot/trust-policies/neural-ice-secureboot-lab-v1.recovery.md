@@ -1,10 +1,10 @@
 # neural-ice-secureboot-lab-v1 — recovery & rollback (LAB / debug)
 
 Operational recovery for the **LAB** signed-boot trust policy. Companion to
-[../disaster-recovery.md](../disaster-recovery.md) and
-[../signing-pipeline.md](../signing-pipeline.md); this file is specific to the
-`neural-ice-secureboot-lab-v1` chain and to bringing a candidate up on the `.72`
-test appliance.
+[../signing-pipeline.md](../signing-pipeline.md) and
+[../../docs/ADR-0004-disk-encryption-tpm-luks.md](../../docs/ADR-0004-disk-encryption-tpm-luks.md);
+this file is specific to the `neural-ice-secureboot-lab-v1` chain and to bringing
+a candidate up on the `.72` test appliance.
 
 ## Scope (hard boundary)
 
@@ -20,10 +20,17 @@ test appliance.
 
 1. `neural-ice-secureboot-lab-v1 <signed-boot> <uname_r>` returns 0 (closed-world,
    signers, no writable root/files).
-2. The policy's pinned anchors match the certificates **enrolled in the `.72`
-   firmware `db`**: the Lab cert (`580360d8…`) must be in `db` (so shim boots) and
-   the boot chain must validate under it. If the firmware `db` and the policy
-   anchors disagree → **stop, do not activate**.
+2. **Firmware `db` vs shim's embedded CA — two separate checks** (never require
+   all anchors in `db`):
+   - only the **LAB shim-signing cert** (`580360d8…`) is enrolled in the `.72`
+     firmware `db` — that is what lets the firmware boot the shim;
+   - the **Neural ICE CA** (`f8455b8c…`) is the `VENDOR_CERT` **embedded in shim**
+     and validates grub/vmlinuz *inside* shim, separately. It must **not** be
+     enrolled directly in the firmware `db` — that would widen the trust boundary
+     and bypass shim.
+   - Confirm both: the Lab cert is present in `db`, and the CA is present as
+     shim's vendor cert. A disagreement on **either** check is **fail-closed** —
+     do not activate.
 3. `current` and the previous finalized generation are untouched (a candidate is
    immutable; finalize is a separate, later step).
 
@@ -52,10 +59,11 @@ Secure Boot** to work around it.
 
 ### PCR 7 / TPM auto-unlock broken by the `db` change
 Changing the firmware `db` (or the shim/CA) changes **PCR 7**, so the TPM-sealed
-LUKS auto-unlock stops (see [../disaster-recovery.md](../disaster-recovery.md) and
-ADR-0011). Use the **already-escrowed recovery key** to unlock, and **re-enroll
-the TPM only after** an approved Secure Boot state has been restored — never
-re-seal against an unverified state.
+LUKS auto-unlock stops (see
+[../../docs/ADR-0004-disk-encryption-tpm-luks.md](../../docs/ADR-0004-disk-encryption-tpm-luks.md)).
+Use the **already-escrowed recovery key** to unlock, and **re-enroll the TPM only
+after** an approved Secure Boot state has been restored — never re-seal against an
+unverified state.
 
 ## Exit criteria (a LAB run is "good")
 
