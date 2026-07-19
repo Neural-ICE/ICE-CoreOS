@@ -95,9 +95,11 @@ awk -F '\t' -v OFS='\t' -v hash="$(file_hash "$old")" '$3 == "kernel-modules" {$
   "$MISMATCH/rpms/rpm-metadata.tsv" > "$MISMATCH/rpms/rpm-metadata.tsv.new"
 mv "$MISMATCH/rpms/rpm-metadata.tsv.new" "$MISMATCH/rpms/rpm-metadata.tsv"
 expect_failure candidate gen-mismatch "$MISMATCH"
-PROVENANCE="$TMP/provenance"; make_sources "$PROVENANCE"; awk -F= -v OFS='=' '$1 == "nvidia_driver_version" {$2="999.0"} {print}' "$PROVENANCE/rpms/kernel-payload.env" > "$PROVENANCE/rpms/kernel-payload.env.new"
-mv "$PROVENANCE/rpms/kernel-payload.env.new" "$PROVENANCE/rpms/kernel-payload.env"
-expect_failure candidate gen-provenance "$PROVENANCE"
+for field in nvidia_driver_version kernel_source_revision; do
+  PROVENANCE="$TMP/provenance-$field"; make_sources "$PROVENANCE"; awk -F= -v OFS='=' -v field="$field" '$1 == field {$2="mismatch"} {print}' "$PROVENANCE/rpms/kernel-payload.env" > "$PROVENANCE/rpms/kernel-payload.env.new"
+  mv "$PROVENANCE/rpms/kernel-payload.env.new" "$PROVENANCE/rpms/kernel-payload.env"
+  expect_failure candidate "gen-provenance-$field" "$PROVENANCE"
+done
 # A stale signed boot set is rejected: the candidate remains, current stays old.
 SRC2="$TMP/src2"; SIGNED2="$TMP/signed2"; make_sources "$SRC2" 2.el10; make_signed_boot "$SRC2" "$SIGNED2" gen-2
 candidate gen-2 "$SRC2" >/dev/null
