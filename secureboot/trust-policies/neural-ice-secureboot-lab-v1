@@ -1,0 +1,123 @@
+#!/usr/bin/bash -p
+# neural-ice-secureboot-lab-v1 — LAB Secure Boot trust policy
+# (fail-closed, closed-world, environment-hardened).
+#
+# Contract (ICE-CoreOS ci/artifact-generation.sh finalize):
+#   neural-ice-secureboot-lab-v1 SIGNEDBOOT_DIR KERNEL_UNAME_R
+#
+# Exit 0 IFF the signed-boot tree contains EXACTLY the approved set, no writable
+# root/component, and every boot component is Secure-Boot-signed by its approved
+# LAB anchor:
+#   - vmlinuz + grub (both bootupd paths)  -> Neural ICE UEFI Secure Boot CA
+#   - shim / MokManager / fallback         -> Neural ICE Lab Secure Boot
+#
+# Trust is bound to THIS executable's SHA-256 and to the controlled builder TCB:
+#   * absolute privileged interpreter (/usr/bin/bash -p) — no PATH-hijacked bash,
+#     no BASH_ENV/ENV sourcing;
+#   * deterministic PATH + locale; critical tools are absolute /usr/bin paths,
+#     each asserted root-owned / regular / non-writable;
+#   * public anchors ship next to the script, their SHA-256 pinned below;
+#   * the tree is validated closed-world AND nothing (root, files, dirs) may be
+#     group/other-writable.
+# LAB only — never approves a Microsoft/PROD chain.
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'; export PATH
+LC_ALL=C; export LC_ALL
+set -euo pipefail
+
+SBVERIFY=/usr/bin/sbverify
+SHA256SUM=/usr/bin/sha256sum
+FIND=/usr/bin/find
+STAT=/usr/bin/stat
+READLINK=/usr/bin/readlink
+DIRNAME=/usr/bin/dirname
+
+die() { echo "neural-ice-secureboot-lab-v1: REJECT: $*" >&2; exit 1; }
+
+# The tree of trust for external tools: each must be an absolute, root-owned,
+# non-writable regular file. /usr/bin/stat is validated first (assert_tool uses it).
+[[ -f /usr/bin/stat && ! -L /usr/bin/stat && -x /usr/bin/stat ]] || die "stat missing"
+[[ "$(/usr/bin/stat -c '%U' /usr/bin/stat)" == root ]] || die "stat not root-owned"
+assert_tool() {  # $1=absolute path
+  [[ "$1" == /* && -f "$1" && ! -L "$1" && -x "$1" ]] || die "tool not a regular executable: $1"
+  [[ "$("$STAT" -c '%U' "$1")" == root ]] || die "tool not root-owned: $1"
+  [[ $(( 8#$("$STAT" -c '%a' "$1") & 8#022 )) -eq 0 ]] || die "tool group/other-writable: $1"
+}
+for t in "$SBVERIFY" "$SHA256SUM" "$FIND" "$STAT" "$READLINK" "$DIRNAME"; do assert_tool "$t"; done
+
+SELF_DIR="$(cd "$("$DIRNAME" "$("$READLINK" -f "$0")")" && pwd)"
+ANCHORS="$SELF_DIR/neural-ice-secureboot-lab-v1.d"
+CA_CRT="$ANCHORS/neural-ice-ca.crt"
+CA_SHA256="f8455b8cda5e6bcb60614eb1f2c7f3eec4ddbc873b968efc580231d55582ec87"
+LAB_CRT="$ANCHORS/neural-ice-lab.crt"
+LAB_SHA256="580360d8652628e6bb27c5b7b07cc74b9cc8de7cf98405ac3ede9c9e539d4231"
+
+[[ $# -eq 2 ]] || die "usage: neural-ice-secureboot-lab-v1 SIGNEDBOOT_DIR KERNEL_UNAME_R"
+DIR="$1"; UNAME_R="$2"
+[[ -d "$DIR" && ! -L "$DIR" ]] || die "signed-boot dir missing or is a symlink"
+case "$UNAME_R" in ''|*/*|*..*) die "invalid kernel uname_r";; esac
+
+writable_mode() { [[ $(( 8#$("$STAT" -c '%a' "$1") & 8#022 )) -ne 0 ]]; }
+
+# G1: the tree ROOT must not be group/other-writable (cp -a would carry its mode).
+! writable_mode "$DIR" || die "signed-boot root is group/other-writable"
+
+pin() {  # $1=cert  $2=expected sha256
+  [[ -f "$1" && ! -L "$1" ]] || die "pinned anchor missing: ${1##*/}"
+  local out; out="$("$SHA256SUM" "$1")"
+  [[ "${out%% *}" == "$2" ]] || die "anchor SHA-256 mismatch for ${1##*/}"
+}
+pin "$CA_CRT" "$CA_SHA256"
+pin "$LAB_CRT" "$LAB_SHA256"
+
+# F2 + G1: closed-world inventory; nothing writable.
+ALLOWED_FILES=(
+  "usr/lib/modules/$UNAME_R/vmlinuz"
+  "usr/lib/bootupd/updates/EFI/BOOT/BOOTAA64.EFI"
+  "usr/lib/bootupd/updates/EFI/BOOT/fbaa64.efi"
+  "usr/lib/bootupd/updates/EFI/BOOT/grubaa64.efi"
+  "usr/lib/bootupd/updates/EFI/BOOT/mmaa64.efi"
+  "usr/lib/bootupd/updates/EFI/centos/grubaa64.efi"
+  "usr/lib/bootupd/updates/EFI/centos/mmaa64.efi"
+  "usr/lib/bootupd/updates/EFI/centos/shimaa64.efi"
+  "signed-boot-provenance.env"
+  "trust-policy.env"
+)
+declare -A OKFILE OKDIR
+for p in "${ALLOWED_FILES[@]}"; do
+  OKFILE["$p"]=1
+  d="$p"; while [[ "$d" == */* ]]; do d="${d%/*}"; OKDIR["$d"]=1; done
+done
+
+[[ -z "$("$FIND" "$DIR" -mindepth 1 -type l -print -quit)" ]] || die "symlink present in tree"
+while IFS= read -r -d '' f; do die "special node in tree: ${f#"$DIR/"} ($("$STAT" -c '%F' "$f"))"
+done < <("$FIND" "$DIR" -mindepth 1 ! -type f ! -type d ! -type l -print0)
+
+while IFS= read -r -d '' f; do
+  rel="${f#"$DIR/"}"
+  [[ -n "${OKFILE[$rel]:-}" ]] || die "unexpected file in tree: $rel"
+  ! writable_mode "$f" || die "group/other-writable file: $rel"
+done < <("$FIND" "$DIR" -mindepth 1 -type f -print0)
+
+while IFS= read -r -d '' d; do
+  rel="${d#"$DIR/"}"
+  [[ -n "${OKDIR[$rel]:-}" ]] || die "unexpected directory in tree: $rel"
+  ! writable_mode "$d" || die "group/other-writable directory: $rel"
+done < <("$FIND" "$DIR" -mindepth 1 -type d -print0)
+
+[[ -f "$DIR/signed-boot-provenance.env" ]] || die "missing signed-boot-provenance.env"
+
+verify() {  # $1=relpath  $2=anchor
+  local f="$DIR/$1"
+  [[ -f "$f" && ! -L "$f" ]] || die "missing component: $1"
+  "$SBVERIFY" --cert "$2" "$f" >/dev/null 2>&1 || die "unapproved/absent signer for $1"
+}
+verify "usr/lib/modules/$UNAME_R/vmlinuz"                "$CA_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/grubaa64.efi"   "$CA_CRT"
+verify "usr/lib/bootupd/updates/EFI/centos/grubaa64.efi" "$CA_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/BOOTAA64.EFI"   "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/centos/shimaa64.efi" "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/mmaa64.efi"     "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/centos/mmaa64.efi"   "$LAB_CRT"
+verify "usr/lib/bootupd/updates/EFI/BOOT/fbaa64.efi"     "$LAB_CRT"
+
+echo "neural-ice-secureboot-lab-v1: OK ($UNAME_R)"
