@@ -136,8 +136,8 @@ Finalization is an Owner-controlled signing gate, not part of `build-kernel`:
 ```sh
 ARTIFACTS_ROOT="$HOME/neural-ice/artifacts" \
 SIGNEDBOOT_SRC=/path/to/signed-boot-for-this-candidate \
-SIGNED_BOOT_TRUST_POLICY_BIN=/path/to/owner-approved-trust-policy \
-SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-v1 \
+SIGNED_BOOT_TRUST_POLICY_BIN="$PWD/secureboot/trust-policies/neural-ice-secureboot-lab-v1" \
+SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1 \
   ./ci/artifact-generation.sh finalize <candidate-generation-id>
 ```
 
@@ -147,7 +147,19 @@ Its trust anchors and mapping remain an Owner/Secure-Boot decision; the staging 
 or accepts an implicit certificate.
 Successful finalization records the policy ID and executable SHA-256 inside the generation's
 checksummed `trust-policy.env`; later materialization and rollback revalidate that durable
-attestation without depending on an external process environment.
+attestation without depending on an external process environment. Any public trust-anchor files
+used by a policy must have their exact hashes enforced by that executable, so its recorded hash
+binds the complete signer mapping.
+
+The image consumer then applies a second, source-controlled gate and re-runs the exact policy:
+
+- `debug` accepts only `secureboot/trust-policies/neural-ice-secureboot-lab-v1`, its exact
+  executable SHA-256 and the matching attestation;
+- `prod` accepts only a future `neural-ice-secureboot-prod-v1` executable and matching
+  attestation. Until that reviewed policy exists, production builds fail closed.
+
+Repository variables and secrets cannot override this mapping. A policy edit changes its hash and
+therefore requires a new Owner-controlled finalization before another image can be built.
 
 For local builds, first materialize the verified finalized generation, then build:
 
@@ -155,16 +167,17 @@ For local builds, first materialize the verified finalized generation, then buil
 ARTIFACTS_ROOT="$HOME/neural-ice/artifacts" STAGING_DEST=image \
   ./ci/artifact-generation.sh materialize
 
-# Vanilla public image (local, no push and no SSH key):
-VARIANT=prod ./ci/build-image.sh
-
-# Dev image with a baked SSH key (lab only — keys in the image do not survive
+# Dev image with a baked SSH key (LAB only — keys in the image do not survive
 # a `bootc switch` to a keyless image; prefer the persistent authorized_keys):
 SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" VARIANT=debug ./ci/build-image.sh
+
+# VARIANT=prod remains unavailable until the reviewed production policy and a
+# generation finalized by that exact policy exist.
 ```
 
-CI publishes only from trusted `main`. A keyless debug build is requested with a
-repository dispatch, which always executes the workflow from the default branch:
+CI publishes only through an explicit repository dispatch, which always executes the workflow
+from the default branch. There is no push/merge default and the variant has no implicit value. A
+keyless LAB debug build is requested with:
 
 ```sh
 gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
@@ -185,8 +198,8 @@ the staged GB10 artifacts. Register one with the
 labels `self-hosted, Linux, ARM64, spark`. Mirroring and signed train promotion run
 only in ICE-Fabric on the designated self-hosted infrastructure.
 
-GHCR auth: workflows use `GITHUB_TOKEN` (`packages: write`); set a `GHCR_PAT` repo secret
-to override. Keep the `neural-ice-coreos` package **public** for free community pulls.
+GHCR auth: workflows use only the job-scoped `GITHUB_TOKEN` (`packages: write`); no PAT fallback
+is supported. Keep the `neural-ice-coreos` package **public** for free community pulls.
 
 ---
 

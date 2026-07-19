@@ -4,18 +4,9 @@ name: build-image
 # ICE-Fabric alone mirrors its approved digest to the sovereign registry, and
 # only a signed release train moves beta/stable product pointers.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "image/**"
-      - "ota/**"
-      - "ignition/**"
-      - "ci/build-image.sh"
-      - "VERSION"
-      - "tools/ni-ota-verify/**"
-  # Unlike workflow_dispatch, repository_dispatch always executes the workflow
-  # from the default branch. It provides a safe way to request the debug variant
-  # without allowing a selected branch to replace commands on the org runner.
+  # repository_dispatch executes the workflow from the default branch. Requiring
+  # an explicit variant prevents a merge from silently producing a prod artifact
+  # from a LAB-finalized runner-local generation.
   repository_dispatch:
     types: [build-coreos]
 
@@ -36,11 +27,18 @@ jobs:
     env:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
-      VARIANT: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.variant || 'prod' }}
+      VARIANT: ${{ github.event.client_payload.variant }}
       BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
       SOURCE_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Validate the explicit build request
+        run: |
+          case "$VARIANT" in
+            debug|prod) ;;
+            *) echo "::error::client_payload.variant must be exactly debug or prod"; exit 2 ;;
+          esac
 
       - name: Materialize verified GB10 artifact generation
         env:
@@ -52,9 +50,22 @@ jobs:
           generation="$(sed -n 's/^CURRENT_GENERATION=//p' artifact-generation.out)"
           echo "ARTIFACT_GENERATION=$generation" >> "$GITHUB_ENV"
 
+      - name: Bind the generation to the approved variant trust policy
+        run: |
+          set -euo pipefail
+          ./ci/verify-build-context.sh image "$VARIANT" | tee build-context.out
+          for key in CURRENT_GENERATION ARTIFACT_MANIFEST_SHA256 \
+            SIGNED_BOOT_TRUST_POLICY_ID SIGNED_BOOT_TRUST_POLICY_SHA256; do
+            value="$(awk -F= -v key="$key" \
+              '$1 == key {sub(/^[^=]*=/, ""); print; found++} END {exit found == 1 ? 0 : 1}' \
+              build-context.out)" \
+              || { echo "::error::preflight did not report exactly one $key"; exit 3; }
+            echo "$key=$value" >> "$GITHUB_ENV"
+          done
+
       - name: Log in to GHCR
         run: |
-          echo "${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}" \
+          echo "${{ github.token }}" \
             | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build and publish immutable source artifact
@@ -76,6 +87,8 @@ jobs:
           ref="$(grep -m1 '^REF=' build.out | cut -d= -f2)"
           digest="$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)"
           manifest_sha256="$(grep -m1 '^ARTIFACT_MANIFEST_SHA256=' build.out | cut -d= -f2)"
+          policy_id="$(grep -m1 '^SIGNED_BOOT_TRUST_POLICY_ID=' build.out | cut -d= -f2)"
+          policy_sha256="$(grep -m1 '^SIGNED_BOOT_TRUST_POLICY_SHA256=' build.out | cut -d= -f2)"
           sudo podman image inspect "$ref:$semver" --format '{{.Os}}/{{.Architecture}}' \
             | grep -qx linux/arm64
           sudo podman image inspect "$ref:$semver" \
@@ -86,6 +99,16 @@ jobs:
           sudo podman image inspect "$ref:$semver" \
             --format '{{index .Labels "ch.neural-ice.artifact-manifest-sha256"}}' \
             | grep -Fx "$manifest_sha256"
+          [[ "$policy_id" == "$SIGNED_BOOT_TRUST_POLICY_ID" \
+            && "$policy_sha256" == "$SIGNED_BOOT_TRUST_POLICY_SHA256" \
+            && "$policy_sha256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "::error::build trust-policy output differs from preflight"; exit 1; }
+          sudo podman image inspect "$ref:$semver" \
+            --format '{{index .Labels "ch.neural-ice.signed-boot-trust-policy-id"}}' \
+            | grep -Fx "$policy_id"
+          sudo podman image inspect "$ref:$semver" \
+            --format '{{index .Labels "ch.neural-ice.signed-boot-trust-policy-sha256"}}' \
+            | grep -Fx "$policy_sha256"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
             || { echo "::error::invalid published digest '$digest'"; exit 1; }
           {
@@ -97,6 +120,7 @@ jobs:
             echo "- platform: \`linux/arm64\` (GB10 ADR-0009)"
             echo "- artifact generation: \`$ARTIFACT_GENERATION\`"
             echo "- artifact manifest SHA-256: \`$manifest_sha256\`"
+            echo "- signed-boot trust policy: \`$policy_id@$policy_sha256\`"
             echo "- next gate: ICE-Fabric central mirror + signed beta train"
             echo "- channel/alias mutation: none"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -6,7 +6,7 @@
 # Env:
 #   REGISTRY            registry/namespace      (default ghcr.io/neural-ice)
 #   IMAGE               package name            (default neural-ice-coreos)
-#   VARIANT             prod | debug             (default prod; debug => -debug tags,
+#   VARIANT             prod | debug             (required; debug => -debug tags,
 #                                                 sshd on, serial console, permissive)
 #   BUILD_ID            unique build identity    (required when PUSH=1)
 #   SOURCE_REVISION     source commit SHA         (required when PUSH=1; defaults to GITHUB_SHA)
@@ -28,13 +28,18 @@ cd "$REPO_ROOT"
 
 REGISTRY="${REGISTRY:-ghcr.io/neural-ice}"
 IMAGE="${IMAGE:-neural-ice-coreos}"
-VARIANT="${VARIANT:-prod}"
+VARIANT="${VARIANT:-}"
 BUILD_ID="${BUILD_ID:-}"
 SOURCE_REVISION="${SOURCE_REVISION:-${GITHUB_SHA:-}}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 SSH_AUTHORIZED_KEY="${SSH_AUTHORIZED_KEY:-}"
 PUSH="${PUSH:-0}"
 SOURCE_URL="${SOURCE_URL:-https://github.com/Neural-ICE/ICE-CoreOS}"
+
+output_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; found++} END {exit found == 1 ? 0 : 1}'
+}
 
 case "$VARIANT" in prod) SUFFIX="" ;; debug) SUFFIX="-debug" ;; *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|debug)" >&2; exit 2 ;; esac
 case "$PUSH" in 0|1) ;; *) echo "ERROR: PUSH must be 0 or 1" >&2; exit 2 ;; esac
@@ -74,13 +79,34 @@ done
 # Directory presence is not provenance. Require the finalized generation
 # metadata, re-hash every byte and re-check the signed vmlinuz binding before
 # podman receives the build context.
-CONTEXT_VERIFICATION="$(./ci/artifact-generation.sh verify-context image)" || {
-  echo "ERROR: staged GB10 artifacts are not a verified finalized generation." >&2
+CONTEXT_VERIFICATION="$(./ci/verify-build-context.sh image "$VARIANT")" || {
+  echo "ERROR: staged GB10 artifacts are not approved for the requested image variant." >&2
   exit 3
 }
-VERIFIED_ARTIFACT_GENERATION="$(sed -n 's/^CURRENT_GENERATION=//p' <<< "$CONTEXT_VERIFICATION")"
+VERIFIED_ARTIFACT_GENERATION="$(output_value CURRENT_GENERATION <<< "$CONTEXT_VERIFICATION")" || {
+  echo "ERROR: verified GB10 artifacts did not report exactly one generation." >&2
+  exit 3
+}
+ARTIFACT_MANIFEST_SHA256="$(output_value ARTIFACT_MANIFEST_SHA256 <<< "$CONTEXT_VERIFICATION")" || {
+  echo "ERROR: verified GB10 artifacts did not report exactly one manifest hash." >&2
+  exit 3
+}
+SIGNED_BOOT_TRUST_POLICY_ID="$(output_value SIGNED_BOOT_TRUST_POLICY_ID <<< "$CONTEXT_VERIFICATION")" || {
+  echo "ERROR: verified GB10 artifacts did not report exactly one trust policy id." >&2
+  exit 3
+}
+SIGNED_BOOT_TRUST_POLICY_SHA256="$(output_value SIGNED_BOOT_TRUST_POLICY_SHA256 <<< "$CONTEXT_VERIFICATION")" || {
+  echo "ERROR: verified GB10 artifacts did not report exactly one trust policy hash." >&2
+  exit 3
+}
 [[ "$VERIFIED_ARTIFACT_GENERATION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
   echo "ERROR: verified GB10 artifacts did not report a safe generation ID." >&2
+  exit 3
+}
+[[ "$ARTIFACT_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ \
+  && "$SIGNED_BOOT_TRUST_POLICY_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ \
+  && "$SIGNED_BOOT_TRUST_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "ERROR: verified GB10 artifacts reported an invalid trust/provenance binding." >&2
   exit 3
 }
 if [ -n "${ARTIFACT_GENERATION:-}" ] && [ "$ARTIFACT_GENERATION" != "$VERIFIED_ARTIFACT_GENERATION" ]; then
@@ -88,11 +114,6 @@ if [ -n "${ARTIFACT_GENERATION:-}" ] && [ "$ARTIFACT_GENERATION" != "$VERIFIED_A
   exit 3
 fi
 ARTIFACT_GENERATION="$VERIFIED_ARTIFACT_GENERATION"
-if command -v sha256sum >/dev/null 2>&1; then
-  ARTIFACT_MANIFEST_SHA256="$(sha256sum image/manifest.sha256 | awk '{print $1}')"
-else
-  ARTIFACT_MANIFEST_SHA256="$(shasum -a 256 image/manifest.sha256 | awk '{print $1}')"
-fi
 
 # Console TUI: PRODUCT code — its source lives out of this vanilla OS repo.
 # The console TUI is product code (ICE-Console) composed onto this vanilla base by
@@ -113,6 +134,8 @@ BUILD_ARGS=(
   --label "org.opencontainers.image.version=${SEMVER}"
   --label "ch.neural-ice.artifact-generation=${ARTIFACT_GENERATION}"
   --label "ch.neural-ice.artifact-manifest-sha256=${ARTIFACT_MANIFEST_SHA256}"
+  --label "ch.neural-ice.signed-boot-trust-policy-id=${SIGNED_BOOT_TRUST_POLICY_ID}"
+  --label "ch.neural-ice.signed-boot-trust-policy-sha256=${SIGNED_BOOT_TRUST_POLICY_SHA256}"
 )
 if [ -n "$SOURCE_REVISION" ]; then
   BUILD_ARGS+=(--label "org.opencontainers.image.revision=${SOURCE_REVISION}")
@@ -126,6 +149,8 @@ echo "SEMVER=${SEMVER}"
 echo "REF=${REF}"
 echo "ARTIFACT_GENERATION=${ARTIFACT_GENERATION}"
 echo "ARTIFACT_MANIFEST_SHA256=${ARTIFACT_MANIFEST_SHA256}"
+echo "SIGNED_BOOT_TRUST_POLICY_ID=${SIGNED_BOOT_TRUST_POLICY_ID}"
+echo "SIGNED_BOOT_TRUST_POLICY_SHA256=${SIGNED_BOOT_TRUST_POLICY_SHA256}"
 
 if [ "$PUSH" = "1" ]; then
   # Producers publish one run-unique immutable GHCR tag. Mirroring and product

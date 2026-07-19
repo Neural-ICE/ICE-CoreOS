@@ -13,6 +13,14 @@
 > `.github/workflows/promote.yml` is retired. The historical decision below is
 > retained to explain legacy tags; none of those tags is moved by current CI.
 
+> **Signed-boot variant gate (Owner GO, 2026-07-19):** the immutable CoreOS producer no longer
+> runs automatically on a push to `main`. It requires an explicit default-branch
+> `repository_dispatch` with `variant=debug|prod`. The finalized artifact generation must attest
+> the exact source-controlled trust-policy executable approved for that variant: LAB v1 for
+> `debug`, future PROD v1 for `prod`. Missing or mismatched policy fails closed, and PROD remains
+> unavailable until its reviewed policy exists. The resulting OCI image records the policy ID/hash;
+> this producer still moves no release channel or product alias.
+
 > **Ring set superseded (2026-07-11)**: the three-ring `alpha|beta|prod` set decided below
 > is reduced to **two rings: `beta|stable`**, unified with the appliance-bundle channels —
 > see ICE-Fabric. `beta` = validation ring (every push to `main`, runs on the

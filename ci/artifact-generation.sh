@@ -311,6 +311,31 @@ materialize() {
   echo "materialized immutable generation '$id' into '$dest'"; echo "CURRENT_GENERATION=$id"
 }
 
+verify_context() {
+  local context="${1:-}" expected_policy_id="${2:-}" expected_policy_hash="${3:-}"
+  local context_id attestation policy_id policy_hash
+  [[ "$#" == 1 || "$#" == 3 ]] \
+    || die "verify-context requires DIR or DIR EXPECTED_POLICY_ID EXPECTED_POLICY_SHA256"
+  context_id="$(metadata_value generation_id "$context/generation.env")" \
+    || die "invalid context metadata"
+  verify_payload "$context" "$context_id" final 1
+  attestation="$context/signed-boot/trust-policy.env"
+  policy_id="$(metadata_value policy_id "$attestation")" || die "invalid trust-policy id"
+  policy_hash="$(metadata_value policy_sha256 "$attestation")" || die "invalid trust-policy hash"
+  if [[ "$#" == 3 ]]; then
+    [[ "$expected_policy_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ \
+      && "$expected_policy_hash" =~ ^[0-9a-f]{64}$ ]] \
+      || die "invalid expected trust policy binding"
+    [[ "$policy_id" == "$expected_policy_id" ]] \
+      || die "trust policy '$policy_id' is not approved for this build (expected '$expected_policy_id')"
+    [[ "$policy_hash" == "$expected_policy_hash" ]] \
+      || die "trust policy executable hash does not match the approved build policy"
+  fi
+  echo "CURRENT_GENERATION=$context_id"
+  echo "SIGNED_BOOT_TRUST_POLICY_ID=$policy_id"
+  echo "SIGNED_BOOT_TRUST_POLICY_SHA256=$policy_hash"
+}
+
 case "${1:-}" in
   candidate) create_candidate ;;
   finalize) [[ -n "${2:-}" ]] || die "finalize requires a candidate id"; finalize_candidate "$2" ;;
@@ -318,6 +343,6 @@ case "${1:-}" in
   materialize) materialize ;;
   verify-candidate) [[ -n "${2:-}" ]] || die "verify-candidate requires an id"; verify_payload "$ROOT/candidates/$2" "$2" candidate ;;
   verify-current) current_id="$(resolve_current)"; echo "CURRENT_GENERATION=$current_id" ;;
-  verify-context) [[ -n "${2:-}" ]] || die "verify-context requires a directory"; context_id="$(metadata_value generation_id "$2/generation.env")" || die "invalid context metadata"; verify_payload "$2" "$context_id" final 1; echo "CURRENT_GENERATION=$context_id" ;;
-  *) die "usage: $0 {candidate|finalize ID|activate ID|materialize|verify-candidate ID|verify-current|verify-context DIR}" ;;
+  verify-context) shift; verify_context "$@" ;;
+  *) die "usage: $0 {candidate|finalize ID|activate ID|materialize|verify-candidate ID|verify-current|verify-context DIR [EXPECTED_POLICY_ID EXPECTED_POLICY_SHA256]}" ;;
 esac

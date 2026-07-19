@@ -65,14 +65,18 @@ It returns zero only when every component maps to its approved signer/trust anch
 ```sh
 ARTIFACTS_ROOT=<configured-artifact-root> \
 SIGNEDBOOT_SRC=<clean-signed-boot-tree> \
-SIGNED_BOOT_TRUST_POLICY_BIN=<approved-policy-executable> \
-SIGNED_BOOT_TRUST_POLICY_ID=<approved-policy-id> \
+SIGNED_BOOT_TRUST_POLICY_BIN="$PWD/secureboot/trust-policies/neural-ice-secureboot-lab-v1" \
+SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1 \
   ./ci/artifact-generation.sh finalize <run-id>
 ```
 
 Finalization re-canonicalizes the signed vmlinuz and compares it with the candidate hash, runs the
 trust policy, records the policy ID and executable SHA-256, re-hashes the complete generation, then
 atomically moves `current`. Any failure leaves the previous `current` untouched.
+
+The policy executable must hash-bind any external public trust anchors that it reads. The consumer
+does not accept a hash from a GitHub variable: it hashes the reviewed executable in the default-
+branch checkout, matches that exact ID/hash against `trust-policy.env`, and re-runs the policy.
 
 ## 4. Consume and recover
 
@@ -81,21 +85,32 @@ Materialize only a finalized `current`:
 ```sh
 ARTIFACTS_ROOT=<configured-artifact-root> STAGING_DEST=image \
   ./ci/artifact-generation.sh materialize
-./ci/build-image.sh
+VARIANT=debug ./ci/build-image.sh
 ```
 
 Materialization independently revalidates the generation metadata and every hash immediately before
-the image build. The build records the generation ID and artifact-manifest SHA-256 as OCI labels.
-After finalization, request the default-branch CI producer rather than pushing an image manually:
+the image build. The consumer then binds the generation to its requested variant:
+
+| Variant | Exact approved policy | Current availability |
+| --- | --- | --- |
+| `debug` | `neural-ice-secureboot-lab-v1` | LAB validation only |
+| `prod` | `neural-ice-secureboot-prod-v1` | fail-closed until the reviewed PROD policy exists |
+
+The build records the generation ID, artifact-manifest SHA-256 and exact trust-policy ID/SHA-256 as
+OCI labels. After LAB finalization, request the default-branch CI producer rather than pushing an
+image manually:
 
 ```sh
 gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
   -f event_type=build-coreos \
-  -F 'client_payload[variant]=prod'
+  -F 'client_payload[variant]=debug'
 ```
 
-This publishes one immutable GHCR source artifact only. Central mirroring and signed release-train
-promotion remain ICE-Fabric responsibilities; this dispatch never moves a product channel.
+There is no push/merge trigger and no implicit variant. A production dispatch remains unavailable
+until both the reviewed production policy executable and a generation finalized by that exact policy
+exist. A successful dispatch publishes one immutable GHCR source artifact only. Central mirroring
+and signed release-train promotion remain ICE-Fabric responsibilities; this dispatch never moves a
+product channel.
 
 To roll the CI staging pointer back, reactivate a retained generation; it is fully revalidated before
 the atomic switch:
