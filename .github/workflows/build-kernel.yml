@@ -7,45 +7,69 @@ name: build-kernel
 # This is a long, hardware/source-specific build (the GB10 kernel, STANDARD 4k
 # flavor, from the Red Hat nvidia-gb10 tree — see ADR-0006). It runs on the
 # self-hosted ARM64 runner that holds the
-# upstream sources and signing keys. Output artifacts are gitignored and stay
-# on the runner (staged under image/rpms, image/driver-modules, ...).
+# upstream sources. Output stays on that runner as an immutable, checksummed
+# candidate. This workflow never moves `current`; signing/finalization is a
+# separate Owner-controlled gate.
 
+# repository_dispatch always executes the workflow from the default branch. A
+# selectable workflow_dispatch branch must never write persistent staging.
 on:
-  workflow_dispatch:
-    inputs:
-      kernel_ref:
-        description: 'nvidia-gb10 kernel source ref/branch'
-        default: latest
-      nvidia_driver_version:
-        description: 'NVIDIA open driver version'
-        default: 595.58.03
+  repository_dispatch:
+    types: [build-coreos-kernel]
+
+concurrency:
+  # Shared with build-image: an image can never observe a generation while the
+  # producer is still publishing it on the Spark runner.
+  group: coreos-gb10-artifacts-nvidia-gb10-arm64
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   kernel:
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: [self-hosted, Linux, ARM64, spark]
     timeout-minutes: 600
     env:
-      KERNEL_REF: ${{ github.event.inputs.kernel_ref }}
-      NVIDIA_DRIVER_VERSION: ${{ github.event.inputs.nvidia_driver_version }}
+      KERNEL_REF: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}
+      KERNEL_SOURCE_REVISION: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}
+      NVIDIA_DRIVER_VERSION: ${{ github.event.client_payload.nvidia_driver_version || '595.58.03' }}
+      ARTIFACTS_ROOT: ${{ vars.ARTIFACTS_DIR }}
+      GENERATION_ID: ${{ github.run_id }}.${{ github.run_attempt }}
+      SOURCE_REVISION: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Build GB10 kernel (4k) + NVIDIA driver artifacts
         run: |
+          export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-$HOME/neural-ice/artifacts}"
+          echo "ARTIFACTS_ROOT=$ARTIFACTS_ROOT" >> "$GITHUB_ENV"
           # Option D builds the NVIDIA open modules in-tree (ephemeral-signed);
           # point at the kernel-open source. Overridable; default derives from the
           # driver version on the self-hosted runner.
           export NVIDIA_OPEN_SRC="${NVIDIA_OPEN_SRC:-$HOME/nvidia-userspace-build/NVIDIA-Linux-aarch64-${NVIDIA_DRIVER_VERSION}/kernel-open}"
+          RPM_SRC="$RUNNER_TEMP/ice-coreos-kernel-${GENERATION_ID}/rpms"
+          rm -rf "$(dirname "$RPM_SRC")"
+          install -d -m 0755 "$RPM_SRC"
+          export RPM_SRC OUTPUT_DIR="$RPM_SRC"
+          echo "RPM_SRC=$RPM_SRC" >> "$GITHUB_ENV"
           ./build/build-kernel.sh aarch64
 
-      - name: Stage artifacts into image/ tree
-        run: ./ci/stage-artifacts.sh
+      - name: Publish kernel candidate
+        run: USERSPACE_SRC="$HOME/neural-ice/image/nvidia-userspace" ./ci/stage-artifacts.sh
 
-      - name: Report staged artifacts
+      - name: Report published candidate
         run: |
+          set -euo pipefail
+          ./ci/artifact-generation.sh verify-candidate "$GENERATION_ID"
           {
-            echo "### Staged GB10 artifacts"
-            for d in image/rpms image/driver-modules image/nvidia-userspace image/signed-boot; do
-              echo "- \`$d\`: $(ls -1 "$d" 2>/dev/null | wc -l) files"
+            echo "### Published GB10 kernel candidate"
+            echo ""
+            echo "- candidate: \`$GENERATION_ID\`"
+            echo "- target: \`nvidia-gb10-arm64\`"
+            for d in rpms nvidia-userspace; do
+              echo "- \`$d\`: $(find "$ARTIFACTS_ROOT/candidates/$GENERATION_ID/$d" -type f | wc -l) files"
             done
+            echo "- current pointer mutation: none"
+            echo "- next gate: sign this candidate's exact vmlinuz, then finalize"
           } >> "$GITHUB_STEP_SUMMARY"
