@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
 # Crash-safe producer/consumer contract for GB10 build-artifact generations.
 set -euo pipefail
-
 ROOT="${ARTIFACTS_ROOT:-/opt/ice-coreos/artifacts}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SBVERIFY_BIN="${SBVERIFY_BIN:-sbverify}"
 VMLINUX_CANONICALIZE_BIN="${VMLINUX_CANONICALIZE_BIN:-$SCRIPT_DIR/canonicalize-vmlinuz.sh}"
 REQUIRED_RPMS=(kernel kernel-core kernel-modules-core kernel-modules kernel-modules-nvidia-open)
-
 die() { echo "ERROR: $*" >&2; exit 1; }
 safe_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "unsafe generation id '$1'"; }
-
 hash_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   else shasum -a 256 "$1" | awk '{print $1}'
   fi
 }
-
 hash_text() {
   if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | awk '{print $1}'
   else printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
   fi
 }
-
 tree_has_payload() { [[ -d "$1" && ! -L "$1" ]] && [[ -n "$(find "$1" \( -type f -o -type l \) -print -quit)" ]]; }
 
 validate_tree() {

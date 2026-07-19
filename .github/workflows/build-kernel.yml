@@ -34,7 +34,7 @@ jobs:
       KERNEL_REF: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}
       KERNEL_SOURCE_REVISION: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}
       NVIDIA_DRIVER_VERSION: ${{ github.event.client_payload.nvidia_driver_version || '595.58.03' }}
-      ARTIFACTS_ROOT: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
+      ARTIFACTS_ROOT: ${{ vars.ARTIFACTS_DIR }}
       GENERATION_ID: ${{ github.run_id }}.${{ github.run_attempt }}
       SOURCE_REVISION: ${{ github.sha }}
     steps:
@@ -42,6 +42,8 @@ jobs:
 
       - name: Build GB10 kernel (4k) + NVIDIA driver artifacts
         run: |
+          export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-$HOME/neural-ice/artifacts}"
+          echo "ARTIFACTS_ROOT=$ARTIFACTS_ROOT" >> "$GITHUB_ENV"
           # Option D builds the NVIDIA open modules in-tree (ephemeral-signed);
           # point at the kernel-open source. Overridable; default derives from the
           # driver version on the self-hosted runner.
@@ -54,7 +56,7 @@ jobs:
           ./build/build-kernel.sh aarch64
 
       - name: Publish kernel candidate
-        run: ./ci/stage-artifacts.sh
+        run: USERSPACE_SRC="$HOME/neural-ice/image/nvidia-userspace" ./ci/stage-artifacts.sh
 
       - name: Report published candidate
         run: |
