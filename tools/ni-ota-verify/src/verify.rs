@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
-use crate::state::{AppliedStateStore, FileStateStore, StateRead};
+use crate::state::{ensure_secure_state_directory, AppliedStateStore, FileStateStore, StateRead};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
 /// The signed IMMUTABLE core of the release-train lockfile (ICE-Fabric
@@ -26,6 +26,33 @@ pub(crate) struct BomCore {
     // "malformed JSON", when only the range is missing.
     pub compat_min: Option<i64>,
     pub compat_version: Option<i64>,
+    // Installation identity is enforced by `bootstrap`. Keep these optional
+    // at deserialization so a missing field is reported as a precise refusal,
+    // not hidden inside a generic JSON parse error.
+    pub appliance: Option<BomAppliance>,
+    pub sources: Option<BomSources>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomAppliance {
+    pub os_base: Option<BomOsBase>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomOsBase {
+    pub image: String,
+    pub digest: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomSources {
+    pub seed: Option<BomSource>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BomSource {
+    #[serde(rename = "ref")]
+    pub reference: String,
 }
 
 /// The signed channel record (`releases/channels/<ch>.json` — plan §2).
@@ -455,13 +482,18 @@ fn human_summary(verdict: &Verdict) {
 /// Never fatal — observability must not block (or fake) a verdict.
 fn record_last_verdict(cfg: &Config, json: &str) {
     let Some(dir) = &cfg.state_dir else { return };
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("last-verdict.json"), format!("{json}\n"))
+    let write = || -> Result<(), InternalError> {
+        ensure_secure_state_directory(dir)?;
+        std::fs::write(dir.join("last-verdict.json"), format!("{json}\n")).map_err(|error| {
+            InternalError(format!(
+                "cannot write {}: {error}",
+                dir.join("last-verdict.json").display()
+            ))
+        })
     };
-    if let Err(e) = write() {
+    if let Err(InternalError(error)) = write() {
         eprintln!(
-            "ni-ota-verify: WARN: could not record last verdict in {}: {e}",
+            "ni-ota-verify: WARN: could not record last verdict in {}: {error}",
             dir.display()
         );
     }
@@ -531,6 +563,8 @@ mod tests {
             bundle_seq: 1,
             compat_min: lo,
             compat_version: hi,
+            appliance: None,
+            sources: None,
         };
         assert!(compat_check(&bom(Some(1), Some(3)), Some((2, 4)), true).ok);
         assert!(compat_check(&bom(Some(1), Some(3)), Some((3, 3)), true).ok);

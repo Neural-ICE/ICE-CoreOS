@@ -1,23 +1,26 @@
 //! ni-ota-verify — on-device OTA bundle verifier (ICE-Fabric OTA verifier,
 //! the ICE-Fabric OTA signing plan §0 / P2).
 //!
-//! Verifies LOCAL FILES only. The OTA caller fetches the signed channel record
-//! and BOM pair (oras, from the sovereign registry), hands the four files to
-//! `verify`, applies the update strictly by the digests in the verified BOM,
-//! runs its health gate, then calls `commit` to advance the applied-state
-//! record. Signature verification is delegated to the image's pinned
-//! /usr/bin/cosign — one verification stack, no crypto re-implemented here.
+//! Verifies LOCAL FILES only. `bootstrap` binds a physically delivered LAB
+//! image to its signed BOM without trusting a channel record. The OTA caller
+//! fetches the signed channel record and BOM pair (oras, from the sovereign
+//! registry), hands the four files to `verify`, applies the update strictly by
+//! the digests in the verified BOM, runs its health gate, then calls `commit`
+//! to advance the applied-state record. Signature verification is delegated to
+//! the image's pinned /usr/bin/cosign — one verification stack, no crypto
+//! re-implemented here.
 //!
 //! Exit codes (the caller's contract — see README.md):
 //!   0  verdict "pass" — or verdict "refuse" in SHADOW mode (enforce=0):
 //!      shadow is log-only; the verdict is emitted, the caller decides nothing
 //!      on the exit code.
 //!   1  verdict "refuse" in ENFORCE mode (enforce=1) — do not apply.
-//!      `commit` refusals also exit 1 (commit has no shadow semantics: it
-//!      mutates state, so it is always enforced).
+//!      `bootstrap` and `commit` refusals also exit 1 (state mutation has no
+//!      shadow semantics and is always enforced).
 //!   2  internal error (missing cosign, unreadable config, …) — ALWAYS,
 //!      regardless of mode: broken tooling never passes (fail-closed).
 
+mod bootstrap;
 mod commit;
 mod config;
 mod runner;
@@ -36,6 +39,11 @@ const USAGE: &str = "usage:
   ni-ota-verify verify --bom <path> --bom-sig <path> --record <path> --record-sig <path>
                        [--config /etc/neural-ice/ota.conf] [--device-channel <ch>]
                        [--device-compat <min,max>] [--applied-state <path>]
+  ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>
+                          --current-os-ref <image@sha256:digest>
+                          --current-seed-ref <40-hex-commit>
+                          [--config /etc/neural-ice/ota.conf]
+                          [--device-compat <min,max>] [--applied-state <path>]
   ni-ota-verify commit --bom <path> [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
   ni-ota-verify --version";
 
@@ -53,6 +61,7 @@ fn run() -> u8 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("verify") => verify::run(&args[1..]),
+        Some("bootstrap") => bootstrap::run(&args[1..]),
         Some("commit") => commit::run(&args[1..]),
         Some("--version" | "version") => {
             println!("ni-ota-verify {}", env!("CARGO_PKG_VERSION"));

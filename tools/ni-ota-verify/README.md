@@ -63,7 +63,7 @@ there is deliberately no public Rekor entry to check.)
 | exit | meaning |
 |------|---------|
 | `0`  | verdict `pass` — **or** verdict `refuse` in **shadow** mode (`enforce=0`): shadow is log-only, the caller decides nothing on the exit code |
-| `1`  | verdict `refuse` in **enforce** mode (`enforce=1`) — do not apply. `commit` refusals also exit 1 (commit mutates state, so it is always enforced) |
+| `1`  | verdict `refuse` in **enforce** mode (`enforce=1`) — do not apply. `bootstrap` and `commit` refusals also exit 1 (state mutation is always enforced) |
 | `2`  | internal error (missing cosign, unreadable config, …) — **always**, in every mode: broken tooling never passes, and never masquerades as a clean refusal |
 
 The shadow/enforce distinction affects **only** the exit code of a clean
@@ -75,6 +75,11 @@ The shadow/enforce distinction affects **only** the exit code of a clean
 ni-ota-verify verify --bom <path> --bom-sig <path> --record <path> --record-sig <path>
                      [--config /etc/neural-ice/ota.conf] [--device-channel <ch>]
                      [--device-compat <min,max>] [--applied-state <path>]
+ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>
+                        --current-os-ref <image@sha256:digest>
+                        --current-seed-ref <40-hex-commit>
+                        [--config …] [--device-compat <min,max>]
+                        [--applied-state <path>]
 ni-ota-verify commit --bom <path> [--config …] [--applied-state <path>]
 ```
 
@@ -84,10 +89,119 @@ Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 **enforce** (an incomplete config leans strict, never silently log-only). The
 hardware target comes from the immutable image marker, not a CLI override.
 
+An absent configured `state_dir` is created component by component as mode
+`0700`, with every new directory and parent entry synced before use. An
+existing directory must already be a real mode-`0700` directory; `verify`
+warns and skips its best-effort verdict mirror rather than chmod-repairing an
+insecure directory. Every path component is resolved descriptor-relative with
+no symlink following; `..`, untrusted owners, and replaceable non-sticky
+ancestors are rejected. A root-owned sticky directory such as `/tmp` is only
+accepted when the next entry belongs to root or the verifier's EUID. For an
+explicit relative `--applied-state applied.json`, `commit` may use an existing
+current directory that is not group/world-writable and never changes its mode.
+`bootstrap` always requires its state parent to be exactly mode `0700`.
+
+The sole compatibility exception is evaluated by `commit`: the exact legacy
+production directory `/var/lib/neural-ice/ota`, if it already exists as a
+real root-owned directory with exact mode `0755`, is migrated once to `0700`
+through its no-follow directory descriptor and synced before the lock is
+opened. No custom path or other mode/owner is repaired. `verify` and
+`bootstrap` never perform this migration. The previous root-run verifier can
+continue using the more restrictive `0700` directory, so a one-version bootc
+rollback does not require reversing the permission migration.
+
+### Signed LAB USB baseline bootstrap
+
+`bootstrap` is the one-time bridge from a physically delivered, signed LAB USB
+image to the normal anti-rollback state. It consumes only the signed BOM and
+its detached signature: it neither accepts nor creates a channel record and
+cannot move a `beta`, `stable`, or product alias.
+
+The command always fails closed, including when `ota.conf` has `enforce=0`. It
+copies the BOM once to a protected mode-`0600` snapshot, verifies that snapshot
+against `root_pubkey`, and parses and hashes the same protected inode. It then
+binds all of the following before creating any state:
+
+- `train == --expected-train`;
+- BOM `hardware_target` equals the immutable host marker;
+- the BOM/device compatibility ranges overlap;
+- BOM `appliance.os_base.image@digest == --current-os-ref` (the digest-pinned
+  image reported as booted by `bootc status`);
+- BOM `sources.seed.ref == --current-seed-ref` (the installed immutable
+  `PAYLOAD_ID`).
+
+On a genuinely absent `applied.json`, it durably publishes
+`{bundle_seq,bom_sha256}` as mode `0600` with create-if-absent semantics. The
+state parent must already be a real directory; for the production root caller,
+it must be root-owned mode `0700`. Symlink and non-regular state paths are
+refused. A retry for the exact same signed BOM succeeds idempotently after
+metadata and content readback, covering a caller crash after publication.
+Existing different state, corrupt state, malformed identity inputs, signature
+failure, or any binding mismatch is refused without overwriting the state.
+
+Bootstrap and commit serialize the complete state transaction (snapshot,
+read/check, publication, and readback) with one exclusive `flock` on a
+mode-`0600` inode beside `applied.json`. The inode can remain after a run, but
+the lock owner exists only in the kernel and is released on descriptor close or
+process crash; there is no stale PID/lock-directory recovery path. `bootstrap`
+still requires its secure parent to exist. For compatibility, `commit` may
+create an absent custom parent, but it creates it mode `0700` and attests that
+it is a real directory (and root-owned for the production root caller) before
+opening the lock or state.
+
+Example for a factory/LAB service that has independently read the local booted
+identity and installed payload identity:
+
+```sh
+ni-ota-verify bootstrap \
+  --bom /run/neural-ice/bootstrap/0.44.18.bom.json \
+  --bom-sig /run/neural-ice/bootstrap/0.44.18.bom.sig \
+  --expected-train 0.44.18 \
+  --current-os-ref registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<64hex> \
+  --current-seed-ref <40hex> \
+  --device-compat 5,5
+```
+
 `commit` records `{bundle_seq, bom_sha256}` in `state_dir/applied.json`
 **after** the caller's health gate passes. It refuses (exit 1) any BOM that
 would lower the recorded seq, and an equal seq with a different hash; an equal
-seq with the identical hash re-commits idempotently (repair).
+seq with the identical hash re-commits idempotently (repair). Bootstrap and
+commit both consume protected BOM snapshots and share the same durable writer:
+unique mode-`0600` temporary inode, file sync, atomic publication, directory
+sync, then metadata and content readback before success is reported.
+
+### Owner authorization, recovery, and one-version rollback
+
+This LAB-only change is covered by the Owner approvals recorded on
+2026-07-19: **`GO signed-boot LAB debug sur .72 + policy
+neural-ice-secureboot-lab-v1 + gate LAB/PROD #37 — aucun déplacement de canal`**
+and **`GO correction staging CoreOS`**. It does not publish, promote, or move a
+`beta`, `stable`, or product alias.
+
+Recovery is fail-closed and forward-only:
+
+- a failure before the atomic state publication leaves the device unseeded and
+  the exact signed bootstrap can be retried;
+- a crash after publication but before the receipt leaves the exact durable
+  state, so the same signed bootstrap completes idempotently;
+- a process crash while holding the transaction lock releases the kernel lock;
+  the persistent mode-`0600` lock inode is harmless on the next invocation;
+- the one-time legacy `0755` directory migration is idempotent: interruption
+  before the descriptor-relative chmod leaves `0755` for a retry; interruption
+  after it leaves the already-secure `0700` directory, which is synced and
+  re-attested on the next `commit`. It never modifies state file contents;
+- outside that exact legacy directory-mode carve-out, corrupt, insecure, or
+  different existing state is never deleted or silently reseeded. Boot
+  recovery media, preserve evidence, diagnose the state, then repair with a
+  newly signed train whose sequence is strictly higher.
+
+For one-version rollback, the health gate remains before `commit`. If install
+or health fails, the caller rolls the bootc deployment back one version while
+the prior applied-state sequence remains unchanged. Once `commit` succeeds,
+booting an older payload does not lower that sequence and verification refuses
+the older BOM; recovery is a forward repair with a higher signed sequence (or
+the existing equal-sequence, byte-identical BOM repair carve-out). Thus neither
+bootstrap nor concurrent commits can regress the anti-rollback state.
 
 ## Caller integration (the OTA path, ICE-Fabric side)
 
@@ -114,7 +228,8 @@ ota.conf), seeded from the P2 record — a new store impl, not a logic change.
 ## Development
 
 ```
-cargo test                                  # unit + CLI tests; cosign is stubbed via NI_OTA_COSIGN
+cargo test --locked --all-targets           # default-feature unit tests
+cargo test --locked --features test-path-overrides  # unit + CLI tests; cosign is stubbed
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 
