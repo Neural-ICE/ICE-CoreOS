@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::InternalError;
 
+const LEGACY_STATE_DIR: &str = "/var/lib/neural-ice/ota";
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppliedState {
     /// bundle_seq of the last successfully applied bundle (post health gate).
@@ -210,7 +212,66 @@ impl FileStateStore {
         if self.uses_current_directory_parent() {
             return self.validate_commit_parent().map_err(InternalError);
         }
+        self.migrate_legacy_commit_parent(dir)?;
         ensure_secure_state_directory(dir)
+    }
+
+    /// One-time compatibility bridge for the old verifier, which created the
+    /// canonical state directory under root's 0022 umask. Nothing except the
+    /// exact legacy root-owned 0755 directory is ever chmod-repaired.
+    fn migrate_legacy_commit_parent(&self, dir: &Path) -> Result<(), InternalError> {
+        let (allowed_dir, expected_owner) = legacy_migration_policy();
+        if dir != allowed_dir {
+            return Ok(());
+        }
+
+        let Some(directory) = walk_directory_chain(dir, false, &mut |_, _| Ok(()))? else {
+            return Ok(());
+        };
+        let metadata = directory.metadata().map_err(|error| {
+            InternalError(format!(
+                "cannot inspect legacy state dir {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let mode = metadata.mode() & 0o7777;
+        let migrate = legacy_migration_required(
+            dir,
+            &allowed_dir,
+            effective_uid(),
+            expected_owner,
+            metadata.uid(),
+            mode,
+        )?;
+        if migrate {
+            directory
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| {
+                    InternalError(format!(
+                        "cannot migrate legacy state dir {} from 0755 to 0700: {error}",
+                        dir.display()
+                    ))
+                })?;
+        }
+
+        directory.sync_all().map_err(|error| {
+            InternalError(format!(
+                "cannot sync legacy state dir {} after migration: {error}",
+                dir.display()
+            ))
+        })?;
+        let parent = normalized_parent(dir).ok_or_else(|| {
+            InternalError(format!("legacy state dir has no parent: {}", dir.display()))
+        })?;
+        sync_directory(parent)?;
+        validate_secure_state_directory(dir).map_err(InternalError)?;
+        if migrate {
+            eprintln!(
+                "ni-ota-verify: migrated legacy state directory {} from root-owned 0755 to 0700",
+                dir.display()
+            );
+        }
+        Ok(())
     }
 
     fn validate_commit_parent(&self) -> Result<(), String> {
@@ -484,6 +545,43 @@ fn normalized_parent(path: &Path) -> Option<&Path> {
         Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
         parent => parent,
     }
+}
+
+fn legacy_migration_policy() -> (PathBuf, u32) {
+    #[cfg(feature = "test-path-overrides")]
+    if let Some(path) = std::env::var_os("NI_OTA_TEST_LEGACY_STATE_DIR") {
+        return (PathBuf::from(path), effective_uid());
+    }
+    (PathBuf::from(LEGACY_STATE_DIR), 0)
+}
+
+fn legacy_migration_required(
+    dir: &Path,
+    allowed_dir: &Path,
+    euid: u32,
+    expected_owner: u32,
+    actual_owner: u32,
+    mode: u32,
+) -> Result<bool, InternalError> {
+    if dir != allowed_dir {
+        return Ok(false);
+    }
+    if mode == 0o700 {
+        if actual_owner != expected_owner {
+            return Err(InternalError(format!(
+                "refusing legacy state-dir handling for {}: secure directory owner uid {actual_owner} differs from expected uid {expected_owner}",
+                dir.display()
+            )));
+        }
+        return Ok(false);
+    }
+    if euid != expected_owner || actual_owner != expected_owner || mode != 0o755 {
+        return Err(InternalError(format!(
+            "refusing legacy state-dir migration for {}: require caller uid {expected_owner}, owner uid {expected_owner}, and exact mode 0755 (caller={euid}, owner={actual_owner}, mode={mode:04o})",
+            dir.display()
+        )));
+    }
+    Ok(true)
 }
 
 fn validate_secure_state_directory(dir: &Path) -> Result<(), String> {
@@ -961,6 +1059,30 @@ mod tests {
             1000,
         )
         .is_err());
+    }
+
+    #[test]
+    fn legacy_migration_is_exactly_bounded_to_owner_mode_and_path() {
+        let allowed = Path::new("/var/lib/neural-ice/ota");
+        assert!(legacy_migration_required(allowed, allowed, 0, 0, 0, 0o755).unwrap());
+        assert!(!legacy_migration_required(allowed, allowed, 0, 0, 0, 0o700).unwrap());
+        assert!(!legacy_migration_required(
+            Path::new("/var/lib/neural-ice"),
+            allowed,
+            0,
+            0,
+            0,
+            0o755,
+        )
+        .unwrap());
+        for candidate in [
+            legacy_migration_required(allowed, allowed, 1000, 0, 0, 0o755),
+            legacy_migration_required(allowed, allowed, 0, 0, 1000, 0o755),
+            legacy_migration_required(allowed, allowed, 0, 0, 0, 0o750),
+            legacy_migration_required(allowed, allowed, 0, 0, 1000, 0o700),
+        ] {
+            assert!(candidate.unwrap_err().0.contains("refusing legacy"));
+        }
     }
 
     #[test]

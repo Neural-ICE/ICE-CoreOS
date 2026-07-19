@@ -101,6 +101,15 @@ explicit relative `--applied-state applied.json`, `commit` may use an existing
 current directory that is not group/world-writable and never changes its mode.
 `bootstrap` always requires its state parent to be exactly mode `0700`.
 
+The sole compatibility exception is evaluated by `commit`: the exact legacy
+production directory `/var/lib/neural-ice/ota`, if it already exists as a
+real root-owned directory with exact mode `0755`, is migrated once to `0700`
+through its no-follow directory descriptor and synced before the lock is
+opened. No custom path or other mode/owner is repaired. `verify` and
+`bootstrap` never perform this migration. The previous root-run verifier can
+continue using the more restrictive `0700` directory, so a one-version bootc
+rollback does not require reversing the permission migration.
+
 ### Signed LAB USB baseline bootstrap
 
 `bootstrap` is the one-time bridge from a physically delivered, signed LAB USB
@@ -177,9 +186,14 @@ Recovery is fail-closed and forward-only:
   state, so the same signed bootstrap completes idempotently;
 - a process crash while holding the transaction lock releases the kernel lock;
   the persistent mode-`0600` lock inode is harmless on the next invocation;
-- corrupt, insecure, or different existing state is never deleted or silently
-  reseeded. Boot recovery media, preserve evidence, diagnose the state, then
-  repair with a newly signed train whose sequence is strictly higher.
+- the one-time legacy `0755` directory migration is idempotent: interruption
+  before the descriptor-relative chmod leaves `0755` for a retry; interruption
+  after it leaves the already-secure `0700` directory, which is synced and
+  re-attested on the next `commit`. It never modifies state file contents;
+- outside that exact legacy directory-mode carve-out, corrupt, insecure, or
+  different existing state is never deleted or silently reseeded. Boot
+  recovery media, preserve evidence, diagnose the state, then repair with a
+  newly signed train whose sequence is strictly higher.
 
 For one-version rollback, the health gate remains before `commit`. If install
 or health fails, the caller rolls the bootc deployment back one version while

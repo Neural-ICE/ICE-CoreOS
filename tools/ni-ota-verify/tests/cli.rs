@@ -1309,10 +1309,12 @@ fn commit_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
     let bom = fx.write_bom("0.44.7", 7);
     let cfg = fx.write_config(1, "");
     let (state_dir, target) = intermediate_symlink_state_parent(&fx);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     let applied = state_dir.join("applied.json");
 
     let (code, _, stderr) = run(Command::new(BIN)
         .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NI_OTA_TEST_LEGACY_STATE_DIR", &state_dir)
         .arg("commit")
         .args(["--bom".as_ref(), bom.as_os_str()])
         .args(["--config".as_ref(), cfg.as_os_str()])
@@ -1320,6 +1322,11 @@ fn commit_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("without following symlinks"), "{stderr}");
     assert!(fs::read_dir(&target).unwrap().next().is_none());
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0o755,
+        "migration must not chmod through an intermediate symlink"
+    );
 }
 
 #[test]
@@ -1335,6 +1342,7 @@ fn commit_refuses_a_replaceable_intermediate_parent_without_target_writes() {
 
     let (code, _, stderr) = run(Command::new(BIN)
         .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NI_OTA_TEST_LEGACY_STATE_DIR", &target)
         .arg("commit")
         .args(["--bom".as_ref(), bom.as_os_str()])
         .args(["--config".as_ref(), cfg.as_os_str()])
@@ -1342,6 +1350,72 @@ fn commit_refuses_a_replaceable_intermediate_parent_without_target_writes() {
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("replaceable"), "{stderr}");
     assert!(!target.exists(), "commit must reject before mkdirat");
+}
+
+#[test]
+fn commit_migrates_only_the_bounded_legacy_0755_state_dir() {
+    let fx = Fixture::new("commit-legacy-state-dir-migration");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let state_dir = fx.path("state");
+    let legacy_marker = state_dir.join("legacy-marker");
+    fs::write(&legacy_marker, b"preserve-me\n").unwrap();
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let commit = || {
+        run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .env("NI_OTA_TEST_LEGACY_STATE_DIR", &state_dir)
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()]))
+    };
+    let (code, receipt, stderr) = commit();
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 7);
+    assert!(
+        stderr.contains("migrated legacy state directory"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::metadata(&state_dir).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state_dir.join("applied.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert_eq!(fs::read(&legacy_marker).unwrap(), b"preserve-me\n");
+
+    let (code, _, stderr) = commit();
+    assert_eq!(code, 0, "idempotent post-migration retry: {stderr}");
+    assert!(!stderr.contains("migrated legacy state directory"));
+}
+
+#[test]
+fn commit_never_migrates_an_unbounded_0755_state_dir() {
+    let fx = Fixture::new("commit-unbounded-legacy-state-dir");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let state_dir = fx.path("state");
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("must be mode 0700"), "{stderr}");
+    assert_eq!(
+        fs::metadata(&state_dir).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    assert!(!state_dir.join("applied.json").exists());
 }
 
 #[test]
