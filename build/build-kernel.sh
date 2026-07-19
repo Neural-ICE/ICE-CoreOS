@@ -38,14 +38,17 @@ done
 
 # Configuration (overridable via the environment)
 KERNEL_REPO="${KERNEL_REPO:-https://gitlab.com/redhat/edge/kernel/nvidia-gb10.git}"
-KERNEL_BRANCH="${KERNEL_BRANCH:-latest}"               # nvidia-gb10 default branch (has redhat/); 'main' is a mainline mirror WITHOUT redhat/
+# Full upstream commit only. A branch such as `latest` is mutable and cannot
+# identify the source of a persistent artifact generation.
+KERNEL_REF="${KERNEL_REF:-fa4faa0227e00c2291e47b120e71c7aed0fe27b7}"
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-595.58.03}"
 NVIDIA_OPEN_SRC="${NVIDIA_OPEN_SRC:-}"                 # path to NVIDIA .../kernel-open (Option D: modules built in-tree & ephemeral-signed)
-BUILDER_IMAGE="${BUILDER_IMAGE:-neural-ice/kernel-builder:stream10}"
 WORKSPACE="${WORKSPACE:-${HOME}/neural-ice-build}"     # persistent across runs (git cache)
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE}/output}"        # final RPMs collected here
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILDER_DEFINITION_SHA256="$(sha256sum "${SCRIPT_DIR}/Containerfile.builder" | awk '{print $1}')"
+BUILDER_IMAGE="${BUILDER_IMAGE:-neural-ice/kernel-builder:stream10-${BUILDER_DEFINITION_SHA256:0:12}}"
 
 # --------------------------------------------------------------------------- #
 # Validation
@@ -67,7 +70,13 @@ if [[ "$HOST_ARCH" != "$ARCH" ]]; then
   exit 3
 fi
 
-command -v podman >/dev/null || { echo "podman not found" >&2; exit 4; }
+for required_command in podman sbverify sbattach sha256sum; do
+  command -v "$required_command" >/dev/null || { echo "$required_command not found" >&2; exit 4; }
+done
+[[ "$KERNEL_REF" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "ERROR: KERNEL_REF must be a full 40-character upstream commit SHA." >&2; exit 5; }
+[[ "$NVIDIA_DRIVER_VERSION" =~ ^[0-9]+([.][0-9]+)+$ ]] || {
+  echo "ERROR: NVIDIA_DRIVER_VERSION must be a dotted numeric version." >&2; exit 5; }
 
 # Option D prerequisites: the NVIDIA open source (built in-tree) and the template
 # patch that wires it into the kernel spec. Skipped with --no-driver.
@@ -76,6 +85,13 @@ if [[ "$BUILD_DRIVER" == "true" ]]; then
     echo "ERROR: set NVIDIA_OPEN_SRC to the NVIDIA .../kernel-open dir (Option D), or pass --no-driver." >&2; exit 6; }
   [[ -f "${SCRIPT_DIR}/patches/nvidia-open-inline-sign.patch" ]] || {
     echo "ERROR: missing build/patches/nvidia-open-inline-sign.patch" >&2; exit 6; }
+fi
+NVIDIA_OPEN_SOURCE_SHA256="none"
+if [[ "$BUILD_DRIVER" == "true" ]]; then
+  NVIDIA_OPEN_SOURCE_SHA256="$(
+    tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+      -C "$(dirname "$NVIDIA_OPEN_SRC")" -cf - "$(basename "$NVIDIA_OPEN_SRC")" | sha256sum | awk '{print $1}'
+  )"
 fi
 
 echo "==> Neural ICE | kernel build"
@@ -89,8 +105,14 @@ mkdir -p "$WORKSPACE" "$OUTPUT_DIR"
 # --------------------------------------------------------------------------- #
 if ! podman image exists "$BUILDER_IMAGE"; then
   echo "==> Building the build image $BUILDER_IMAGE"
-  podman build -t "$BUILDER_IMAGE" -f "${SCRIPT_DIR}/Containerfile.builder" "${SCRIPT_DIR}"
+  podman build --label "ch.neural-ice.builder-definition-sha256=$BUILDER_DEFINITION_SHA256" \
+    -t "$BUILDER_IMAGE" -f "${SCRIPT_DIR}/Containerfile.builder" "${SCRIPT_DIR}"
 fi
+BUILDER_LABEL="$(podman image inspect "$BUILDER_IMAGE" --format '{{index .Labels "ch.neural-ice.builder-definition-sha256"}}')"
+[[ "$BUILDER_LABEL" == "$BUILDER_DEFINITION_SHA256" ]] || {
+  echo "ERROR: cached builder image does not match Containerfile.builder" >&2; exit 4; }
+BUILDER_IMAGE_ID="$(podman image inspect "$BUILDER_IMAGE" --format '{{.Id}}')"
+[[ "$BUILDER_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] || { echo "ERROR: invalid builder image id" >&2; exit 4; }
 
 # --------------------------------------------------------------------------- #
 # Script executed INSIDE the isolated container
@@ -100,25 +122,26 @@ set -euo pipefail
 ARCH="$ARCH"
 KERNEL_FLAVOR="$KERNEL_FLAVOR"
 KERNEL_REPO="$KERNEL_REPO"
-KERNEL_BRANCH="$KERNEL_BRANCH"
+KERNEL_REF="$KERNEL_REF"
 NVIDIA_DRIVER_VERSION="$NVIDIA_DRIVER_VERSION"
 BUILD_DRIVER="$BUILD_DRIVER"
 
 cd /workspace
 
-# 1) Clone/update of the kernel source (persistent cache via the volume)
+# 1) Clone/update of the kernel source (persistent object cache via the volume)
 if [[ -d nvidia-gb10/.git ]]; then
-  echo "==> Source present: git fetch"
-  git -C nvidia-gb10 fetch --depth=1 origin "\${KERNEL_BRANCH}"
-  # Reset the local branch to exactly what we fetched. Robust even when the local
-  # clone has no 'main' branch and no origin/<branch> tracking ref (in which case
-  # 'checkout main' + 'reset --hard origin/main' both fail); FETCH_HEAD always
-  # points at the just-fetched tip.
-  git -C nvidia-gb10 checkout -B "\${KERNEL_BRANCH}" FETCH_HEAD
+  echo "==> Source present: fetch exact commit \${KERNEL_REF}"
+  git -C nvidia-gb10 remote set-url origin "\${KERNEL_REPO}"
 else
-  echo "==> Clone \${KERNEL_REPO} (\${KERNEL_BRANCH})"
-  git clone --depth=1 --branch "\${KERNEL_BRANCH}" "\${KERNEL_REPO}" nvidia-gb10
+  echo "==> Initialize \${KERNEL_REPO}"
+  git init nvidia-gb10
+  git -C nvidia-gb10 remote add origin "\${KERNEL_REPO}"
 fi
+git -C nvidia-gb10 fetch --depth=1 origin "\${KERNEL_REF}"
+git -C nvidia-gb10 checkout --detach --force FETCH_HEAD
+git -C nvidia-gb10 clean -ffdx
+[[ "\$(git -C nvidia-gb10 rev-parse HEAD)" == "\${KERNEL_REF}" ]] || {
+  echo "ERROR: fetched kernel revision does not match KERNEL_REF" >&2; exit 4; }
 
 cd nvidia-gb10/redhat
 
@@ -196,6 +219,39 @@ if [[ "\${BUILD_DRIVER}" == "true" ]] && ! ls "\${RPMDIR}"/kernel-modules-nvidia
 fi
 cp -v "\${RPMDIR}"/*.rpm /output/
 
+# Emit a content-bound metadata inventory while rpm is available inside the
+# CentOS builder. The Ubuntu Spark host never needs RPM tooling to validate or
+# consume a generation.
+: > /output/rpm-metadata.tsv
+for rpm_file in /output/*.rpm; do
+  checksum="\$(sha256sum "\${rpm_file}" | awk '{print \$1}')"
+  filename="\$(basename "\${rpm_file}")"
+  metadata="\$(rpm -qp --qf '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}' "\${rpm_file}")"
+  printf '%s\t%s\t%s\n' "\${checksum}" "\${filename}" "\${metadata}" >> /output/rpm-metadata.tsv
+done
+LC_ALL=C sort -o /output/rpm-metadata.tsv /output/rpm-metadata.tsv
+
+# Bind the later signed vmlinuz to this exact candidate. The signing pipeline
+# carries this hash into signed-boot-provenance.env; finalization requires that
+# provenance, so an older same-name boot payload cannot be paired accidentally.
+VERIFY_DIR="\$(mktemp -d)"
+trap 'rm -rf "\${VERIFY_DIR}"' EXIT
+kernel_core_rpm="\$(rpm -qp --qf '%{NAME}\t%{VERSION}-%{RELEASE}.%{ARCH}\n' /output/*.rpm \
+  | awk -F '\t' '\$1 == "kernel-core" {print \$2}')"
+[[ -n "\${kernel_core_rpm}" ]] || { echo "ERROR: cannot resolve kernel-core uname" >&2; exit 8; }
+(
+  cd "\${VERIFY_DIR}"
+  rpm2cpio /output/kernel-core-*.rpm | cpio -idm --quiet
+)
+VMLINUX="\${VERIFY_DIR}/lib/modules/\${kernel_core_rpm}/vmlinuz"
+[[ -f "\${VMLINUX}" ]] || { echo "ERROR: kernel-core lacks expected vmlinuz for \${kernel_core_rpm}" >&2; exit 8; }
+cp "\${VMLINUX}" /output/vmlinuz-to-sign
+cat > /output/kernel-payload.env <<EOF_PAYLOAD
+kernel_uname_r=\${kernel_core_rpm}
+EOF_PAYLOAD
+rm -rf "\${VERIFY_DIR}"
+trap - EXIT
+
 echo "==> Done. Contents of /output:"
 ls -1 /output | sed 's/^/      /'
 INNER
@@ -232,9 +288,26 @@ fi
 echo "==> Launching the isolated compilation"
 "${PODMAN_RUN[@]}" "$BUILDER_IMAGE" -lc "$INNER_SCRIPT"
 
+# Canonicalize the already distro-signed vmlinuz by removing every signature
+# table, then bind that stable PE hash to the candidate. The original file is
+# preserved as vmlinuz-to-sign for the Owner-controlled signing pipeline.
+VMLINUX_CANONICAL="$(mktemp "${TMPDIR:-/tmp}/ice-coreos-vmlinuz.XXXXXX")"
+trap 'rm -f "$VMLINUX_CANONICAL"' EXIT
+"${SCRIPT_DIR}/../ci/canonicalize-vmlinuz.sh" "$OUTPUT_DIR/vmlinuz-to-sign" "$VMLINUX_CANONICAL"
+printf 'vmlinuz_unsigned_sha256=%s\n' "$(sha256sum "$VMLINUX_CANONICAL" | awk '{print $1}')" \
+  >> "$OUTPUT_DIR/kernel-payload.env"
+cat >> "$OUTPUT_DIR/kernel-payload.env" <<EOF_PAYLOAD
+builder_definition_sha256=$BUILDER_DEFINITION_SHA256
+builder_image_id=$BUILDER_IMAGE_ID
+nvidia_open_source_sha256=$NVIDIA_OPEN_SOURCE_SHA256
+EOF_PAYLOAD
+rm -f "$VMLINUX_CANONICAL"
+trap - EXIT
+
 echo ""
 echo "============================================================"
 echo " Final RPMs available in: $OUTPUT_DIR"
 echo "   (expected pattern: $RPM_GLOB + kernel-modules-nvidia-open-*.rpm)"
-echo " Next step: ./image/build-and-push.sh $ARCH"
+echo " Kernel source revision: $KERNEL_REF"
+echo " Next step: publish a verified artifact generation with ci/stage-artifacts.sh"
 echo "============================================================"

@@ -97,16 +97,64 @@ the encrypted `/var/lib/neural-ice/data` volume.
 ## Build
 
 The OS image needs **staged GB10 artifacts** that are produced rarely and live outside git
-(GB10 kernel (4k) RPMs, signed NVIDIA modules, NVIDIA userspace, signed boot binaries):
+(GB10 kernel (4k) RPMs with signed NVIDIA modules, NVIDIA userspace, signed boot payload):
 
 ```
-image/rpms/  image/driver-modules/  image/nvidia-userspace/  image/signed-boot/
+/opt/ice-coreos/artifacts/generations/<run-id>/
+  rpms/  nvidia-userspace/  signed-boot/  generation.env  manifest.sha256
+/opt/ice-coreos/artifacts/current -> generations/<run-id>
 ```
 
-Produce/stage them with `build/build-kernel.sh` + `ci/stage-artifacts.sh` (run rarely),
-then build:
+`ci/stage-artifacts.sh` verifies the five exact, coherent aarch64 RPMs (including
+`kernel-modules-nvidia-open`) and snapshots them as an immutable **candidate**. It deliberately
+does not move `current`. The signing pipeline must sign that candidate's exact vmlinuz and emit its
+candidate ID, uname and unsigned-vmlinuz hash in `signed-boot-provenance.env`; finalization matches
+that provenance before checking the signed shim, GRUB, MokManager and vmlinuz. Only that complete, checksummed generation
+can atomically move `current`. An incomplete, mismatched, stale or interrupted candidate leaves the
+previous buildable generation untouched.
+
+The heavy kernel workflow is requested from the default branch only. Both values are immutable
+inputs; update them deliberately when the upstream kernel or driver is approved:
 
 ```sh
+gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
+  -f event_type=build-coreos-kernel \
+  -F 'client_payload[kernel_ref]=fa4faa0227e00c2291e47b120e71c7aed0fe27b7' \
+  -F 'client_payload[nvidia_driver_version]=595.58.03'
+```
+
+For operator recovery on the Spark, reactivation of a retained generation is explicit,
+checksummed and atomic:
+
+```sh
+ARTIFACTS_ROOT=/opt/ice-coreos/artifacts \
+  ./ci/artifact-generation.sh activate <previous-generation-id>
+```
+
+Finalization is an Owner-controlled signing gate, not part of `build-kernel`:
+
+```sh
+ARTIFACTS_ROOT=/opt/ice-coreos/artifacts \
+SIGNEDBOOT_SRC=/path/to/signed-boot-for-this-candidate \
+SIGNED_BOOT_TRUST_POLICY_BIN=/path/to/owner-approved-trust-policy \
+SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-v1 \
+  ./ci/artifact-generation.sh finalize <candidate-generation-id>
+```
+
+The trust-policy command is mandatory and fail-closed. It must verify the approved signer mapping
+(Microsoft UEFI signer for shim/boot fallback, Neural ICE signer for GRUB, MokManager and vmlinuz).
+Its trust anchors and mapping remain an Owner/Secure-Boot decision; the staging code never invents
+or accepts an implicit certificate.
+Successful finalization records the policy ID and executable SHA-256 inside the generation's
+checksummed `trust-policy.env`; later materialization and rollback revalidate that durable
+attestation without depending on an external process environment.
+
+For local builds, first materialize the verified finalized generation, then build:
+
+```sh
+ARTIFACTS_ROOT=/opt/ice-coreos/artifacts STAGING_DEST=image \
+  ./ci/artifact-generation.sh materialize
+
 # Vanilla public image (local, no push and no SSH key):
 VARIANT=prod ./ci/build-image.sh
 

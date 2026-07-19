@@ -7,7 +7,7 @@
 #
 # Build:
 #   podman build -t neural-ice/kernel-builder:stream10 -f build/Containerfile.builder build/
-FROM quay.io/centos/centos:stream10
+FROM quay.io/centos/centos:stream10@sha256:e465ba2bdfb7243192b9274c95d2cbac55363f944131776517fd9cfb9ff62731
 
 # CRB (codeready-builder) repo required by the kernel BuildRequires.
 RUN dnf -y install 'dnf-command(config-manager)' \

@@ -7,6 +7,8 @@ image/driver-modules/
 image/driver-modules-unsigned/
 image/nvidia-userspace/
 image/signed-boot/
+image/generation.env
+image/manifest.sha256
 image/labkey/
 image/bib-output/
 build/output/
