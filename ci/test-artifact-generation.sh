@@ -46,7 +46,7 @@ make_sources() {
   cp "$root/unsigned-vmlinuz" "$root/rpms/vmlinuz-to-sign"
   printf 'kernel_uname_r=%s\nvmlinuz_unsigned_sha256=%s\n' \
     "$uname_r" "$(file_hash "$root/unsigned-vmlinuz")" > "$root/rpms/kernel-payload.env"
-  printf 'builder_definition_sha256=%064d\nbuilder_image_id=%064d\nnvidia_open_source_sha256=%064d\n' \
+  printf 'builder_definition_sha256=%064d\nbuilder_image_id=%064d\nnvidia_open_source_sha256=%064d\nkernel_source_revision=fa4faa0227e00c2291e47b120e71c7aed0fe27b7\nnvidia_driver_version=595.58.03\n' \
     1 2 3 >> "$root/rpms/kernel-payload.env"
   printf 'userspace\n' > "$root/userspace/usr/lib64/libcuda.so.595.58.03"
   ln -s libcuda.so.595.58.03 "$root/userspace/usr/lib64/libcuda.so.1"
@@ -95,7 +95,9 @@ awk -F '\t' -v OFS='\t' -v hash="$(file_hash "$old")" '$3 == "kernel-modules" {$
   "$MISMATCH/rpms/rpm-metadata.tsv" > "$MISMATCH/rpms/rpm-metadata.tsv.new"
 mv "$MISMATCH/rpms/rpm-metadata.tsv.new" "$MISMATCH/rpms/rpm-metadata.tsv"
 expect_failure candidate gen-mismatch "$MISMATCH"
-
+PROVENANCE="$TMP/provenance"; make_sources "$PROVENANCE"; awk -F= -v OFS='=' '$1 == "nvidia_driver_version" {$2="999.0"} {print}' "$PROVENANCE/rpms/kernel-payload.env" > "$PROVENANCE/rpms/kernel-payload.env.new"
+mv "$PROVENANCE/rpms/kernel-payload.env.new" "$PROVENANCE/rpms/kernel-payload.env"
+expect_failure candidate gen-provenance "$PROVENANCE"
 # A stale signed boot set is rejected: the candidate remains, current stays old.
 SRC2="$TMP/src2"; SIGNED2="$TMP/signed2"; make_sources "$SRC2" 2.el10; make_signed_boot "$SRC2" "$SIGNED2" gen-2
 candidate gen-2 "$SRC2" >/dev/null

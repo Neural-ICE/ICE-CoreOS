@@ -300,6 +300,8 @@ cat >> "$OUTPUT_DIR/kernel-payload.env" <<EOF_PAYLOAD
 builder_definition_sha256=$BUILDER_DEFINITION_SHA256
 builder_image_id=$BUILDER_IMAGE_ID
 nvidia_open_source_sha256=$NVIDIA_OPEN_SOURCE_SHA256
+kernel_source_revision=$KERNEL_REF
+nvidia_driver_version=$NVIDIA_DRIVER_VERSION
 EOF_PAYLOAD
 rm -f "$VMLINUX_CANONICAL"
 trap - EXIT

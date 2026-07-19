@@ -218,7 +218,7 @@ create_candidate() {
   local id="${GENERATION_ID:-}" rpm_src="${RPM_SRC:-}" userspace_src="${USERSPACE_SRC:-}"
   local source_revision="${SOURCE_REVISION:-unknown}" kernel_source="${KERNEL_SOURCE_REVISION:-}"
   local nvidia_version="${NVIDIA_DRIVER_VERSION:-}" candidates tmp final kernel uname_r unsigned_hash created
-  local builder_definition builder_image nvidia_source
+  local builder_definition builder_image nvidia_source payload_kernel_source payload_nvidia_version
   [[ -n "$id" && -n "$rpm_src" && -n "$userspace_src" ]] || die "candidate requires GENERATION_ID, RPM_SRC and USERSPACE_SRC"
   safe_id "$id"; [[ ! -L "$ROOT" ]] || die "artifact store root must not be a symlink"
   [[ "$source_revision" =~ ^([0-9a-fA-F]{7,64}|unknown)$ && "$kernel_source" =~ ^[0-9a-f]{40}$ ]] || die "invalid source revision"
@@ -230,6 +230,10 @@ create_candidate() {
   builder_definition="$(metadata_value builder_definition_sha256 "$rpm_src/kernel-payload.env")" || die "invalid builder definition"
   builder_image="$(metadata_value builder_image_id "$rpm_src/kernel-payload.env")" || die "invalid builder image"
   nvidia_source="$(metadata_value nvidia_open_source_sha256 "$rpm_src/kernel-payload.env")" || die "invalid NVIDIA source hash"
+  payload_kernel_source="$(metadata_value kernel_source_revision "$rpm_src/kernel-payload.env")" || die "invalid payload kernel revision"
+  payload_nvidia_version="$(metadata_value nvidia_driver_version "$rpm_src/kernel-payload.env")" || die "invalid payload NVIDIA version"
+  [[ "$payload_kernel_source" == "$kernel_source" && "$payload_nvidia_version" == "$nvidia_version" ]] \
+    || die "staging provenance does not match the built kernel payload"
   candidates="$ROOT/candidates"; final="$candidates/$id"; tmp="$candidates/.${id}.preparing.$$"
   [[ ! -e "$final" && ! -e "$tmp" ]] || die "candidate '$id' already exists"
   install -d -m 0755 "$candidates" "$tmp/rpms" "$tmp/nvidia-userspace" "$tmp/unsigned-boot"
