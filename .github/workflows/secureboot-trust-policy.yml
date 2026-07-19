@@ -1,0 +1,33 @@
+name: secureboot-trust-policy
+
+on:
+  pull_request:
+    paths:
+      - "secureboot/trust-policies/**"
+      - ".github/workflows/secureboot-trust-policy.yml"
+  push:
+    branches: [main]
+    paths:
+      - "secureboot/trust-policies/**"
+      - ".github/workflows/secureboot-trust-policy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    # ICE-CoreOS is public: never execute code from an untrusted fork on an
+    # organization self-hosted runner.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, ARM64, spark]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - name: Validate shell syntax and lint
+        run: |
+          bash -n secureboot/trust-policies/neural-ice-secureboot-lab-v1
+          bash -n secureboot/trust-policies/test-neural-ice-secureboot-lab-v1.sh
+          shellcheck secureboot/trust-policies/neural-ice-secureboot-lab-v1 \
+            secureboot/trust-policies/test-neural-ice-secureboot-lab-v1.sh
+      - name: Run the LAB trust-policy negative suite
+        run: ./secureboot/trust-policies/test-neural-ice-secureboot-lab-v1.sh
