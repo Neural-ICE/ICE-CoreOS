@@ -93,10 +93,13 @@ An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An
 existing directory must already be a real mode-`0700` directory; `verify`
 warns and skips its best-effort verdict mirror rather than chmod-repairing an
-insecure directory or following a directory symlink. For an explicit relative
-`--applied-state applied.json`, `commit` may use an existing current directory
-that is not group/world-writable and never changes its mode. `bootstrap`
-always requires its state parent to be exactly mode `0700`.
+insecure directory. Every path component is resolved descriptor-relative with
+no symlink following; `..`, untrusted owners, and replaceable non-sticky
+ancestors are rejected. A root-owned sticky directory such as `/tmp` is only
+accepted when the next entry belongs to root or the verifier's EUID. For an
+explicit relative `--applied-state applied.json`, `commit` may use an existing
+current directory that is not group/world-writable and never changes its mode.
+`bootstrap` always requires its state parent to be exactly mode `0700`.
 
 ### Signed LAB USB baseline bootstrap
 

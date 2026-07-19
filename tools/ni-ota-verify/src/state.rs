@@ -5,11 +5,13 @@
 //! the SAME trait: the verify/commit logic never learns which backend it talks
 //! to, so the swap is a new `AppliedStateStore` impl, not a logic change.
 
+use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -113,21 +115,7 @@ impl FileStateStore {
     /// exact mode 0700 and, for a privileged caller, root ownership.
     pub(crate) fn validate_bootstrap_parent(&self) -> Result<(), String> {
         let dir = self.parent().map_err(|error| error.0)?;
-        let metadata = std::fs::symlink_metadata(dir)
-            .map_err(|e| format!("cannot inspect state dir {}: {e}", dir.display()))?;
-        if !metadata.file_type().is_dir() {
-            return Err(format!(
-                "state parent is not a real directory: {}",
-                dir.display()
-            ));
-        }
-        validate_owner_mode(
-            &format!("state dir {}", dir.display()),
-            metadata.uid(),
-            metadata.mode(),
-            effective_uid() == 0,
-            Some(0o700),
-        )
+        validate_secure_state_directory(dir)
     }
 
     /// Validate the published bootstrap inode without following symlinks.
@@ -230,14 +218,10 @@ impl FileStateStore {
         if !self.uses_current_directory_parent() {
             return validate_secure_state_directory(dir);
         }
-        let metadata = std::fs::symlink_metadata(dir)
-            .map_err(|e| format!("cannot inspect state dir {}: {e}", dir.display()))?;
-        if !metadata.file_type().is_dir() {
-            return Err(format!(
-                "state parent is not a real directory: {}",
-                dir.display()
-            ));
-        }
+        let directory = open_directory_chain(dir).map_err(|error| error.0)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|error| format!("cannot inspect state dir {}: {error}", dir.display()))?;
         let mode = metadata.mode() & 0o7777;
         if mode & 0o022 != 0 {
             return Err(format!(
@@ -250,7 +234,8 @@ impl FileStateStore {
             metadata.mode(),
             effective_uid() == 0,
             None,
-        )
+        )?;
+        validate_trusted_owner(&format!("state dir {}", dir.display()), metadata.uid())
     }
 
     fn uses_current_directory_parent(&self) -> bool {
@@ -286,9 +271,9 @@ impl FileStateStore {
         flock(&file, LOCK_EX)
             .map_err(|e| format!("cannot lock applied state {}: {e}", self.path.display()))?;
 
-        // Re-attest after acquisition. A root-owned 0700 parent prevents an
-        // unprivileged replacement; the identity comparison also detects an
-        // inode swap between pathname inspection and open.
+        // Re-attest the complete no-follow parent chain after acquisition. A
+        // root-owned 0700 parent prevents an unprivileged replacement; the
+        // identity comparison also detects a lock inode swap.
         let parent_validation = match parent_policy {
             ParentPolicy::Bootstrap => self.validate_bootstrap_parent(),
             ParentPolicy::Commit => self.validate_commit_parent(),
@@ -420,6 +405,12 @@ impl FileStateStore {
 
 impl AppliedStateStore for FileStateStore {
     fn read(&self) -> Result<StateRead, String> {
+        let parent = self.parent().map_err(|error| error.0)?;
+        match walk_directory_chain(parent, false, &mut |_, _| Ok(())) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(StateRead::Unseeded),
+            Err(error) => return Err(error.0),
+        }
         let metadata = match std::fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StateRead::Unseeded),
@@ -464,106 +455,27 @@ impl AppliedStateStore for FileStateStore {
 /// published directory entry and the new directory inode are fsynced before
 /// continuing. Existing directories are attested but never chmod-repaired.
 pub(crate) fn ensure_secure_state_directory(dir: &Path) -> Result<(), InternalError> {
-    ensure_secure_state_directory_with(dir, &mut sync_directory)
+    ensure_secure_state_directory_with(dir, &mut |directory, path| {
+        directory.sync_all().map_err(|error| {
+            InternalError(format!(
+                "cannot sync state directory {}: {error}",
+                path.display()
+            ))
+        })
+    })
 }
 
 fn ensure_secure_state_directory_with<F>(dir: &Path, sync: &mut F) -> Result<(), InternalError>
 where
-    F: FnMut(&Path) -> Result<(), InternalError>,
+    F: FnMut(&File, &Path) -> Result<(), InternalError>,
 {
-    match std::fs::symlink_metadata(dir) {
-        Ok(_) => return validate_secure_state_directory(dir).map_err(InternalError),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(InternalError(format!(
-                "cannot inspect state dir {}: {error}",
-                dir.display()
-            )))
-        }
-    }
-
-    let mut missing = Vec::new();
-    let mut ancestor = dir;
-    loop {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_dir() {
-                    return Err(InternalError(format!(
-                        "state directory ancestor is a symlink or non-directory: {}",
-                        ancestor.display()
-                    )));
-                }
-                let mode = metadata.mode() & 0o7777;
-                if mode & 0o022 != 0 {
-                    return Err(InternalError(format!(
-                        "existing state directory ancestor must not be group/world-writable: {} (mode={mode:04o})",
-                        ancestor.display()
-                    )));
-                }
-                validate_owner_mode(
-                    &format!("state directory ancestor {}", ancestor.display()),
-                    metadata.uid(),
-                    metadata.mode(),
-                    effective_uid() == 0,
-                    None,
-                )
-                .map_err(InternalError)?;
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(ancestor.to_path_buf());
-                ancestor = normalized_parent(ancestor).ok_or_else(|| {
-                    InternalError(format!(
-                        "state dir has no existing ancestor: {}",
-                        dir.display()
-                    ))
-                })?;
-            }
-            Err(error) => {
-                return Err(InternalError(format!(
-                    "cannot inspect state directory ancestor {}: {error}",
-                    ancestor.display()
-                )))
-            }
-        }
-    }
-
-    for path in missing.into_iter().rev() {
-        let parent = normalized_parent(&path).ok_or_else(|| {
-            InternalError(format!(
-                "state directory component has no parent: {}",
-                path.display()
-            ))
-        })?;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        match builder.create(&path) {
-            Ok(()) => {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
-                    |error| {
-                        InternalError(format!(
-                            "cannot secure state dir {} mode 0700: {error}",
-                            path.display()
-                        ))
-                    },
-                )?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A concurrent creator is acceptable only if it published the
-                // exact secure object we require. Never repair its inode.
-            }
-            Err(error) => {
-                return Err(InternalError(format!(
-                    "cannot create state dir {} mode 0700: {error}",
-                    path.display()
-                )))
-            }
-        }
-        validate_secure_state_directory(&path).map_err(InternalError)?;
-        sync(&path)?;
-        sync(parent)?;
-    }
-
+    let directory = walk_directory_chain(dir, true, sync)?.ok_or_else(|| {
+        InternalError(format!(
+            "state directory remained absent after creation: {}",
+            dir.display()
+        ))
+    })?;
+    validate_secure_directory_handle(dir, &directory).map_err(InternalError)?;
     validate_secure_state_directory(dir).map_err(InternalError)
 }
 
@@ -575,21 +487,220 @@ fn normalized_parent(path: &Path) -> Option<&Path> {
 }
 
 fn validate_secure_state_directory(dir: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(dir)
+    let directory = open_directory_chain(dir).map_err(|error| error.0)?;
+    validate_secure_directory_handle(dir, &directory)
+}
+
+fn validate_secure_directory_handle(dir: &Path, directory: &File) -> Result<(), String> {
+    let metadata = directory
+        .metadata()
         .map_err(|error| format!("cannot inspect state dir {}: {error}", dir.display()))?;
-    if !metadata.file_type().is_dir() {
-        return Err(format!(
-            "state parent is not a real directory: {}",
-            dir.display()
-        ));
-    }
     validate_owner_mode(
         &format!("state dir {}", dir.display()),
         metadata.uid(),
         metadata.mode(),
         effective_uid() == 0,
         Some(0o700),
+    )?;
+    validate_trusted_owner(&format!("state dir {}", dir.display()), metadata.uid())
+}
+
+/// Resolve every directory component relative to the descriptor of its
+/// predecessor. `O_NOFOLLOW|O_DIRECTORY` makes an intermediate symlink fail;
+/// unlike a final-component `symlink_metadata`, no prefix is ever followed.
+fn open_directory_chain(dir: &Path) -> Result<File, InternalError> {
+    walk_directory_chain(dir, false, &mut |_, _| Ok(()))?.ok_or_else(|| {
+        InternalError(format!(
+            "cannot open state directory without following symlinks: {}: not found",
+            dir.display()
+        ))
+    })
+}
+
+fn walk_directory_chain<F>(
+    dir: &Path,
+    create_missing: bool,
+    sync: &mut F,
+) -> Result<Option<File>, InternalError>
+where
+    F: FnMut(&File, &Path) -> Result<(), InternalError>,
+{
+    let mut current_path = if dir.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    let mut current = File::open(&current_path).map_err(|error| {
+        InternalError(format!(
+            "cannot open state directory root {}: {error}",
+            current_path.display()
+        ))
+    })?;
+    for component in dir.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(InternalError(format!(
+                    "state directory must not contain '..': {}",
+                    dir.display()
+                )))
+            }
+            Component::Normal(name) => name,
+            Component::Prefix(_) => {
+                return Err(InternalError(format!(
+                    "unsupported state directory prefix: {}",
+                    dir.display()
+                )))
+            }
+        };
+        current_path.push(name);
+        let parent_path = normalized_parent(&current_path).unwrap_or(Path::new("."));
+        let next = match openat_directory(&current, name) {
+            Ok(directory) => {
+                validate_directory_chain_step(parent_path, &current, &current_path, &directory)?;
+                directory
+            }
+            Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                validate_missing_chain_entry(parent_path, &current, &current_path)?;
+                let created = match mkdirat_directory(&current, name, 0o700) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(error) => {
+                        return Err(InternalError(format!(
+                            "cannot create state directory component {} mode 0700: {error}",
+                            current_path.display()
+                        )))
+                    }
+                };
+                let directory = openat_directory(&current, name).map_err(|error| {
+                    InternalError(format!(
+                        "cannot open newly published state directory component {} without following symlinks: {error}",
+                        current_path.display()
+                    ))
+                })?;
+                if created {
+                    directory
+                        .set_permissions(std::fs::Permissions::from_mode(0o700))
+                        .map_err(|error| {
+                            InternalError(format!(
+                                "cannot secure state dir {} mode 0700: {error}",
+                                current_path.display()
+                            ))
+                        })?;
+                }
+                validate_directory_chain_step(parent_path, &current, &current_path, &directory)?;
+                validate_secure_directory_handle(&current_path, &directory)
+                    .map_err(InternalError)?;
+                sync(&directory, &current_path)?;
+                sync(&current, parent_path)?;
+                directory
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                validate_missing_chain_entry(parent_path, &current, &current_path)?;
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(InternalError(format!(
+                    "cannot open state directory component {} without following symlinks: {error}",
+                    current_path.display()
+                )))
+            }
+        };
+        current = next;
+    }
+
+    Ok(Some(current))
+}
+
+fn validate_missing_chain_entry(
+    parent_path: &Path,
+    parent: &File,
+    missing_path: &Path,
+) -> Result<(), InternalError> {
+    let metadata = parent.metadata().map_err(|error| {
+        InternalError(format!(
+            "cannot inspect state directory component {}: {error}",
+            parent_path.display()
+        ))
+    })?;
+    let euid = effective_uid();
+    if metadata.uid() != 0 && metadata.uid() != euid {
+        return Err(InternalError(format!(
+            "state directory component has untrusted owner: {} (uid={}, expected root or euid {euid})",
+            parent_path.display(),
+            metadata.uid()
+        )));
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o022 != 0 && !(mode & 0o1000 != 0 && metadata.uid() == 0) {
+        return Err(InternalError(format!(
+            "missing state directory entry is replaceable through group/world-writable parent: {} (parent={}, mode={mode:04o})",
+            missing_path.display(),
+            parent_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_directory_chain_step(
+    parent_path: &Path,
+    parent: &File,
+    child_path: &Path,
+    child: &File,
+) -> Result<(), InternalError> {
+    let parent_metadata = parent.metadata().map_err(|error| {
+        InternalError(format!(
+            "cannot inspect state directory component {}: {error}",
+            parent_path.display()
+        ))
+    })?;
+    let child_metadata = child.metadata().map_err(|error| {
+        InternalError(format!(
+            "cannot inspect state directory component {}: {error}",
+            child_path.display()
+        ))
+    })?;
+    let euid = effective_uid();
+    validate_directory_chain_metadata(
+        parent_path,
+        parent_metadata.uid(),
+        parent_metadata.mode(),
+        child_path,
+        child_metadata.uid(),
+        euid,
     )
+    .map_err(InternalError)
+}
+
+fn validate_directory_chain_metadata(
+    parent_path: &Path,
+    parent_uid: u32,
+    parent_mode: u32,
+    child_path: &Path,
+    child_uid: u32,
+    euid: u32,
+) -> Result<(), String> {
+    for (path, uid) in [(parent_path, parent_uid), (child_path, child_uid)] {
+        if uid != 0 && uid != euid {
+            return Err(format!(
+                "state directory component has untrusted owner: {} (uid={uid}, expected root or euid {euid})",
+                path.display()
+            ));
+        }
+    }
+
+    let parent_mode = parent_mode & 0o7777;
+    let writable = parent_mode & 0o022 != 0;
+    let protected_by_sticky_owner =
+        parent_mode & 0o1000 != 0 && parent_uid == 0 && (child_uid == 0 || child_uid == euid);
+    if writable && !protected_by_sticky_owner {
+        return Err(format!(
+            "state directory component is replaceable through group/world-writable parent: {} (parent={}, mode={parent_mode:04o})",
+            child_path.display(),
+            parent_path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_secure_regular(path: &Path) -> Result<(), String> {
@@ -656,10 +767,73 @@ fn validate_owner_mode(
     Ok(())
 }
 
+fn validate_trusted_owner(label: &str, uid: u32) -> Result<(), String> {
+    let euid = effective_uid();
+    if uid == 0 || uid == euid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} has untrusted owner (uid={uid}, expected root or euid {euid})"
+        ))
+    }
+}
+
 fn sync_directory(dir: &Path) -> Result<(), InternalError> {
-    std::fs::File::open(dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| InternalError(format!("cannot sync state dir {}: {e}", dir.display())))
+    open_directory_chain(dir)?
+        .sync_all()
+        .map_err(|error| InternalError(format!("cannot sync state dir {}: {error}", dir.display())))
+}
+
+#[cfg(target_os = "linux")]
+const O_DIRECTORY: i32 = 0o200000;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: i32 = 0o2000000;
+
+#[cfg(target_os = "macos")]
+const O_DIRECTORY: i32 = 0x0010_0000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0000_0100;
+#[cfg(target_os = "macos")]
+const O_CLOEXEC: i32 = 0x0100_0000;
+
+#[cfg(target_os = "linux")]
+type ModeT = u32;
+#[cfg(target_os = "macos")]
+type ModeT = u16;
+
+fn openat_directory(parent: &File, name: &OsStr) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor and ownership is
+    // transferred exactly once to `File`.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn mkdirat_directory(parent: &File, name: &OsStr, mode: ModeT) -> std::io::Result<()> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if unsafe { mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+unsafe extern "C" {
+    fn openat(dirfd: i32, path: *const std::os::raw::c_char, flags: i32, ...) -> i32;
+    fn mkdirat(dirfd: i32, path: *const std::os::raw::c_char, mode: ModeT) -> i32;
 }
 
 const LOCK_EX: i32 = 2;
@@ -697,8 +871,9 @@ mod tests {
     use super::*;
 
     fn store(name: &str) -> FileStateStore {
-        let dir =
-            std::env::temp_dir().join(format!("ni-ota-verify-state-{name}-{}", std::process::id()));
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("ni-ota-verify-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -758,12 +933,49 @@ mod tests {
     }
 
     #[test]
+    fn directory_chain_policy_rejects_untrusted_owners_and_replaceable_entries() {
+        let parent = Path::new("/trusted");
+        let child = Path::new("/trusted/state");
+        assert!(validate_directory_chain_metadata(parent, 0, 0o40755, child, 1000, 1000).is_ok());
+        assert!(
+            validate_directory_chain_metadata(parent, 2000, 0o40700, child, 1000, 1000)
+                .unwrap_err()
+                .contains("untrusted owner")
+        );
+        assert!(
+            validate_directory_chain_metadata(parent, 1000, 0o40777, child, 1000, 1000)
+                .unwrap_err()
+                .contains("replaceable")
+        );
+        assert!(
+            validate_directory_chain_metadata(Path::new("/tmp"), 0, 0o41777, child, 1000, 1000)
+                .is_ok(),
+            "root-owned sticky directories protect entries owned by the caller"
+        );
+        assert!(validate_directory_chain_metadata(
+            Path::new("/tmp"),
+            0,
+            0o41777,
+            child,
+            2000,
+            1000,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn relative_filename_parent_is_current_directory() {
         let state = FileStateStore {
             path: PathBuf::from("applied.json"),
         };
         assert_eq!(state.parent().unwrap(), Path::new("."));
         assert!(state.uses_current_directory_parent());
+    }
+
+    #[test]
+    fn directory_chain_rejects_parent_traversal() {
+        let error = open_directory_chain(Path::new("../state")).unwrap_err();
+        assert!(error.0.contains("must not contain '..'"));
     }
 
     #[test]
@@ -774,7 +986,7 @@ mod tests {
         let nested = custom.join("nested");
         let mut synced = Vec::new();
 
-        ensure_secure_state_directory_with(&nested, &mut |path| {
+        ensure_secure_state_directory_with(&nested, &mut |_, path| {
             synced.push(path.to_path_buf());
             Ok(())
         })
@@ -791,7 +1003,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&nested).unwrap().mode() & 0o7777, 0o700);
 
         synced.clear();
-        ensure_secure_state_directory_with(&nested, &mut |path| {
+        ensure_secure_state_directory_with(&nested, &mut |_, path| {
             synced.push(path.to_path_buf());
             Ok(())
         })
@@ -812,7 +1024,7 @@ mod tests {
                 .unwrap()
                 .join(format!("custom-{fail_at}/nested"));
             let mut calls = 0;
-            let error = ensure_secure_state_directory_with(&nested, &mut |_| {
+            let error = ensure_secure_state_directory_with(&nested, &mut |_, _| {
                 let current = calls;
                 calls += 1;
                 if current == fail_at {

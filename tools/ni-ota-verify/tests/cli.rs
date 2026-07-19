@@ -55,8 +55,9 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("ni-ota-verify-cli-{name}-{}", std::process::id()));
+        let dir = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("ni-ota-verify-cli-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("state")).unwrap();
         fs::set_permissions(dir.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -77,6 +78,10 @@ impl Fixture {
     }
 
     fn write_config(&self, enforce: u8, extra: &str) -> PathBuf {
+        self.write_config_with_state(enforce, &self.path("state"), extra)
+    }
+
+    fn write_config_with_state(&self, enforce: u8, state_dir: &Path, extra: &str) -> PathBuf {
         let path = self.path("ota.conf");
         fs::write(
             &path,
@@ -84,7 +89,7 @@ impl Fixture {
                 "# test ota.conf\nenforce={enforce}\nregistry=registry.neural-ice.ch\n\
                  root_pubkey={}\nstate_dir={}\n{extra}",
                 self.path("ota-root.pub").display(),
-                self.path("state").display()
+                state_dir.display()
             ),
         )
         .unwrap();
@@ -195,6 +200,17 @@ impl Fixture {
     }
 }
 
+fn intermediate_symlink_state_parent(fx: &Fixture) -> (PathBuf, PathBuf) {
+    let outside = fx.path("outside-tree");
+    let target = outside.join("state");
+    fs::create_dir(&outside).unwrap();
+    fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let link = fx.path("state-prefix-link");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    (link.join("state"), target)
+}
+
 fn run(cmd: &mut Command) -> (i32, Value, String) {
     let out = cmd.output().expect("binary runs");
     let code = out.status.code().expect("exit code");
@@ -229,7 +245,9 @@ fn sha256_of(path: &Path) -> String {
 }
 
 fn wait_for_path(path: &Path) {
-    for _ in 0..200 {
+    // The full CLI suite runs many subprocess-heavy tests in parallel on
+    // self-hosted runners. Keep this bounded while allowing scheduling jitter.
+    for _ in 0..1000 {
         if path.exists() {
             return;
         }
@@ -808,7 +826,7 @@ fn bootstrap_refuses_symlink_and_non_directory_state_parent() {
     std::os::unix::fs::symlink(&real, symlinked.path("state")).unwrap();
     let (code, _, stderr) = run(&mut symlinked.bootstrap_cmd(&cfg, &bom, &sig));
     assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("not a real directory"));
+    assert!(stderr.contains("without following symlinks"), "{stderr}");
     assert!(!real.join("applied.json").exists());
 
     let regular = Fixture::new("bootstrap-parent-file");
@@ -819,7 +837,7 @@ fn bootstrap_refuses_symlink_and_non_directory_state_parent() {
     fs::write(regular.path("state"), "not a directory").unwrap();
     let (code, _, stderr) = run(&mut regular.bootstrap_cmd(&cfg, &bom, &sig));
     assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("not a real directory"));
+    assert!(stderr.contains("without following symlinks"), "{stderr}");
 
     let missing = Fixture::new("bootstrap-parent-missing");
     let bom = missing.write_bom("0.44.18", 4);
@@ -830,11 +848,25 @@ fn bootstrap_refuses_symlink_and_non_directory_state_parent() {
     command.args(["--applied-state".as_ref(), custom_state.as_os_str()]);
     let (code, _, stderr) = run(&mut command);
     assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("cannot inspect state dir"));
+    assert!(stderr.contains("not found"), "{stderr}");
     assert!(
         !custom_state.parent().unwrap().exists(),
         "bootstrap must not create its trust-boundary parent"
     );
+}
+
+#[test]
+fn bootstrap_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
+    let fx = Fixture::new("bootstrap-intermediate-parent-symlink");
+    let bom = fx.write_bom("0.44.18", 4);
+    let sig = fx.write_sig("bom.sig", true);
+    let (state_dir, target) = intermediate_symlink_state_parent(&fx);
+    let cfg = fx.write_config_with_state(1, &state_dir, "");
+
+    let (code, _, stderr) = run(&mut fx.bootstrap_cmd(&cfg, &bom, &sig));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("without following symlinks"), "{stderr}");
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
 }
 
 #[test]
@@ -1247,6 +1279,69 @@ fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
         .file_type()
         .is_symlink());
     assert!(!symlinked.path("outside-state/last-verdict.json").exists());
+}
+
+#[test]
+fn verify_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
+    let fx = Fixture::new("verify-intermediate-parent-symlink");
+    fx.write_bom("0.44.7", 7);
+    fx.write_record("0.44.7", "stable", 7);
+    fx.write_sig("bom.sig", true);
+    fx.write_sig("record.sig", true);
+    let (state_dir, target) = intermediate_symlink_state_parent(&fx);
+    let cfg = fx.write_config_with_state(0, &state_dir, "");
+
+    let (code, verdict, stderr) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 0, "shadow keeps its documented log-only exit code");
+    assert_eq!(verdict["verdict"], "refuse");
+    assert_eq!(check(&verdict, "anti_rollback")["ok"], false);
+    assert!(check(&verdict, "anti_rollback")["detail"]
+        .as_str()
+        .unwrap()
+        .contains("without following symlinks"));
+    assert!(stderr.contains("could not record last verdict"), "{stderr}");
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+}
+
+#[test]
+fn commit_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
+    let fx = Fixture::new("commit-intermediate-parent-symlink");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let (state_dir, target) = intermediate_symlink_state_parent(&fx);
+    let applied = state_dir.join("applied.json");
+
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .args(["--applied-state".as_ref(), applied.as_os_str()]));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("without following symlinks"), "{stderr}");
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+}
+
+#[test]
+fn commit_refuses_a_replaceable_intermediate_parent_without_target_writes() {
+    let fx = Fixture::new("commit-replaceable-intermediate-parent");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let replaceable = fx.path("replaceable");
+    let target = replaceable.join("state");
+    fs::create_dir(&replaceable).unwrap();
+    fs::set_permissions(&replaceable, fs::Permissions::from_mode(0o777)).unwrap();
+    let applied = target.join("applied.json");
+
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .args(["--applied-state".as_ref(), applied.as_os_str()]));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("replaceable"), "{stderr}");
+    assert!(!target.exists(), "commit must reject before mkdirat");
 }
 
 #[test]
