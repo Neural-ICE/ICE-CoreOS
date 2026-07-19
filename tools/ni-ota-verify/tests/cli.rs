@@ -3,7 +3,7 @@
 //! verdict is driven by the CONTENT of the signature file (`GOOD` accepts a
 //! fixture; `SHA256:<digest>` binds it to the exact blob), so every §0 check is
 //! exercised through the real subprocess plumbing.
-#![cfg(unix)]
+#![cfg(all(unix, feature = "test-path-overrides"))]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

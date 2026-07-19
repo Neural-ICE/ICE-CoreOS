@@ -202,7 +202,8 @@ ota.conf), seeded from the P2 record — a new store impl, not a logic change.
 ## Development
 
 ```
-cargo test                                  # unit + CLI tests; cosign is stubbed via NI_OTA_COSIGN
+cargo test --locked --all-targets           # default-feature unit tests
+cargo test --locked --features test-path-overrides  # unit + CLI tests; cosign is stubbed
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 
