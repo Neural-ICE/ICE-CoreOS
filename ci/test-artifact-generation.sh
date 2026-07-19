@@ -3,6 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO_ROOT/ci/artifact-generation.sh"
+BUILD_CONTEXT_SCRIPT="$REPO_ROOT/ci/verify-build-context.sh"
+BUILD_IMAGE_SCRIPT="$REPO_ROOT/ci/build-image.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ice-coreos-artifacts-test.XXXXXX")"
 trap 'chmod -R u+w "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
@@ -26,10 +28,43 @@ printf '%s\n' '#!/usr/bin/env bash' \
   > "$FAKE_SBVERIFY"
 # shellcheck disable=SC2016 # literal script body expands its own positional args
 printf '%s\n' '#!/usr/bin/env bash' 'cp "$1" "$2"' > "$FAKE_CANONICALIZE"
-printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FAKE_TRUST_POLICY"
+# shellcheck disable=SC2016 # literal script body expands its own environment/arguments
+printf '%s\n' '#!/usr/bin/env bash' \
+  '[[ "${PATH:-}" == /usr/sbin:/usr/bin:/sbin:/bin ]] || exit 91' \
+  '[[ "${LC_ALL:-}" == C ]] || exit 92' \
+  '[[ -z "${BASH_ENV:-}" && -z "${ENV:-}" && -z "${POLICY_ENV_POISON:-}" ]] || exit 93' \
+  'self_dir="$(cd "$(dirname "$0")" && pwd)"' \
+  'if [[ -e "$self_dir/.mutate-policy" ]]; then' \
+  '  printf "mutated\n" >> "$1/signed-boot-provenance.env"' \
+  'fi' \
+  'if [[ -e "$self_dir/.mutate-policy-rehash" ]]; then' \
+  '  file="$1/signed-boot-provenance.env"' \
+  '  manifest="$(dirname "$1")/manifest.sha256"' \
+  '  printf "mutated-and-rehashed\n" >> "$file"' \
+  '  if command -v sha256sum >/dev/null 2>&1; then hash="$(sha256sum "$file" | awk "{print \\$1}")"' \
+  '  else hash="$(shasum -a 256 "$file" | awk "{print \\$1}")"; fi' \
+  '  while read -r kind old path; do' \
+  '    if [[ "$path" == "signed-boot/signed-boot-provenance.env" ]]; then old="$hash"; fi' \
+  '    printf "%s\t%s\t%s\n" "$kind" "$old" "$path"' \
+  '  done < "$manifest" > "$manifest.new"' \
+  '  mv "$manifest.new" "$manifest"' \
+  'fi' \
+  'exit 0' > "$FAKE_TRUST_POLICY"
 chmod +x "$FAKE_SBVERIFY" "$FAKE_CANONICALIZE" "$FAKE_TRUST_POLICY"
+EVIL_BIN="$TMP/evil-bin"; install -d "$EVIL_BIN"
+printf '%s\n' '#!/usr/bin/bash' 'exit 0' > "$EVIL_BIN/bash"; chmod +x "$EVIL_BIN/bash"
+BASH_ENV_FILE="$TMP/bash-env"
+BASH_ENV_MARKER="$TMP/bash-env-was-sourced"
+printf '%s\n' 'export POLICY_ENV_POISON=from-bash-env' \
+  ": > \"$BASH_ENV_MARKER\"" > "$BASH_ENV_FILE"
+ENV_FILE="$TMP/posix-env"
+ENV_MARKER="$TMP/posix-env-was-sourced"
+printf '%s\n' 'export POLICY_ENV_POISON=from-posix-env' \
+  ": > \"$ENV_MARKER\"" > "$ENV_FILE"
 export SBVERIFY_BIN="$FAKE_SBVERIFY" VMLINUX_CANONICALIZE_BIN="$FAKE_CANONICALIZE" \
-  SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" SIGNED_BOOT_TRUST_POLICY_ID=test-policy-v1
+  SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" \
+  SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1
+FAKE_TRUST_POLICY_SHA256="$(file_hash "$FAKE_TRUST_POLICY")"
 
 make_sources() {
   local root="$1" release="${2:-1.el10}" name file uname_r
@@ -77,13 +112,88 @@ SRC1="$TMP/src1"; SIGNED1="$TMP/signed1"; make_sources "$SRC1"; make_signed_boot
 candidate gen-1 "$SRC1" >/dev/null
 [[ ! -e "$TMP/store/current" ]] || fail "candidate moved current"
 ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-candidate gen-1
-finalize gen-1 "$SIGNED1" >/dev/null
+env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct \
+  ARTIFACTS_ROOT="$TMP/store" SIGNEDBOOT_SRC="$SIGNED1" \
+  SIGNED_BOOT_TRUST_POLICY_BIN="$FAKE_TRUST_POLICY" \
+  SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1 \
+  "$SCRIPT" finalize gen-1 >/dev/null
+[[ ! -e "$BASH_ENV_MARKER" ]] || fail "artifact finalizer sourced inherited BASH_ENV"
+[[ ! -e "$ENV_MARKER" ]] || fail "artifact finalizer sourced inherited ENV"
 [[ "$(readlink "$TMP/store/current")" == generations/gen-1 ]] || fail "gen-1 not activated"
 
 DEST="$TMP/image"
 mkdir -p "$DEST"; printf 'FROM scratch\n' > "$DEST/Containerfile.bootc"
 ARTIFACTS_ROOT="$TMP/store" STAGING_DEST="$DEST" "$SCRIPT" materialize >/dev/null
-ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-context "$DEST" >/dev/null
+ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-context "$DEST" \
+  neural-ice-secureboot-lab-v1 "$FAKE_TRUST_POLICY_SHA256" >/dev/null
+# A LAB-finalized context must never satisfy the production build gate, even
+# when both policy executables happen to have identical bytes.
+expect_failure env ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-context "$DEST" \
+  neural-ice-secureboot-prod-v1 "$FAKE_TRUST_POLICY_SHA256"
+expect_failure env ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-context "$DEST" \
+  neural-ice-secureboot-lab-v1 "$(printf '%064d' 9)"
+expect_failure env ARTIFACTS_ROOT="$TMP/store" "$SCRIPT" verify-context "$DEST" \
+  neural-ice-secureboot-lab-v1
+
+# The shipping consumer uses a fixed, version-controlled variant allowlist and
+# re-runs the approved policy before any registry login or image build.
+TEST_REPO="$TMP/build-gate-repo"
+install -d "$TEST_REPO/ci" "$TEST_REPO/secureboot/trust-policies"
+cp "$SCRIPT" "$BUILD_CONTEXT_SCRIPT" "$BUILD_IMAGE_SCRIPT" "$TEST_REPO/ci/"
+cp "$FAKE_TRUST_POLICY" \
+  "$TEST_REPO/secureboot/trust-policies/neural-ice-secureboot-lab-v1"
+BUILD_GATE="$TEST_REPO/ci/verify-build-context.sh"
+gate_output="$(env PATH="$EVIL_BIN:$PATH" BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct \
+  "$BUILD_GATE" "$DEST" debug)"
+grep -q '^CURRENT_GENERATION=gen-1$' <<< "$gate_output" \
+  || fail "hardened build gate did not execute"
+[[ ! -e "$BASH_ENV_MARKER" ]] || fail "build gate sourced inherited BASH_ENV"
+[[ ! -e "$ENV_MARKER" ]] || fail "build gate sourced inherited ENV"
+expect_failure "$BUILD_GATE" "$DEST" prod
+expect_failure "$BUILD_GATE" "$DEST" ""
+printf '\n# changed after finalization\n' >> \
+  "$TEST_REPO/secureboot/trust-policies/neural-ice-secureboot-lab-v1"
+expect_failure "$BUILD_GATE" "$DEST" debug
+cp "$FAKE_TRUST_POLICY" \
+  "$TEST_REPO/secureboot/trust-policies/neural-ice-secureboot-lab-v1"
+
+# The build wrapper repeats the gate, emits both trust labels and does not reach
+# podman for an unavailable production policy.
+cp -a "$DEST" "$TEST_REPO/image"
+cp "$REPO_ROOT/VERSION" "$TEST_REPO/VERSION"
+install -d "$TMP/fake-bin"
+# shellcheck disable=SC2016 # literal script body expands its own environment
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$PODMAN_LOG"' > "$TMP/fake-bin/podman"
+chmod +x "$TMP/fake-bin/podman"
+rm -f "$TMP/podman-mutating.out"
+touch "$TEST_REPO/secureboot/trust-policies/.mutate-policy"
+expect_failure env PODMAN_LOG="$TMP/podman-mutating.out" \
+  PATH="$TMP/fake-bin:$PATH" VARIANT=debug "$TEST_REPO/ci/build-image.sh"
+rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy"
+[[ ! -e "$TMP/podman-mutating.out" ]] || fail "mutating policy reached podman"
+rm -rf "$TEST_REPO/image"
+cp -a "$DEST" "$TEST_REPO/image"
+rm -f "$TMP/podman-rehashed.out"
+touch "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
+expect_failure env PODMAN_LOG="$TMP/podman-rehashed.out" \
+  PATH="$TMP/fake-bin:$PATH" VARIANT=debug "$TEST_REPO/ci/build-image.sh"
+rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
+[[ ! -e "$TMP/podman-rehashed.out" ]] || fail "self-rehashing policy reached podman"
+rm -rf "$TEST_REPO/image"
+cp -a "$DEST" "$TEST_REPO/image"
+env PODMAN_LOG="$TMP/podman-debug.out" PATH="$EVIL_BIN:$TMP/fake-bin:$PATH" \
+  BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct VARIANT=debug \
+  "$TEST_REPO/ci/build-image.sh" > "$TMP/build-debug.out"
+[[ ! -e "$BASH_ENV_MARKER" ]] || fail "build wrapper sourced inherited BASH_ENV"
+[[ ! -e "$ENV_MARKER" ]] || fail "build wrapper sourced inherited ENV"
+grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-id=neural-ice-secureboot-lab-v1" \
+  "$TMP/podman-debug.out" >/dev/null
+grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-sha256=$FAKE_TRUST_POLICY_SHA256" \
+  "$TMP/podman-debug.out" >/dev/null
+rm -f "$TMP/podman-prod.out"
+expect_failure env PODMAN_LOG="$TMP/podman-prod.out" PATH="$EVIL_BIN:$PATH" VARIANT=prod \
+  "$TEST_REPO/ci/build-image.sh"
+[[ ! -e "$TMP/podman-prod.out" ]] || fail "prod policy failure reached podman"
 
 # Missing NVIDIA RPM and mismatched EVRA never create a candidate or move current.
 BROKEN="$TMP/broken"; make_sources "$BROKEN"; rm "$BROKEN/rpms/kernel-modules-nvidia-open-"*.rpm

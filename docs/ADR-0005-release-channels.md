@@ -13,6 +13,14 @@
 > `.github/workflows/promote.yml` is retired. The historical decision below is
 > retained to explain legacy tags; none of those tags is moved by current CI.
 
+> **Signed-boot variant gate (Owner GO, 2026-07-19):** the immutable CoreOS producer no longer
+> runs automatically on a push to `main`. It requires an explicit default-branch
+> `repository_dispatch` with `variant=debug|prod`. The finalized artifact generation must attest
+> the exact source-controlled trust-policy executable approved for that variant: LAB v1 for
+> `debug`, future PROD v1 for `prod`. Missing or mismatched policy fails closed, and PROD remains
+> unavailable until its reviewed policy exists. The resulting OCI image records the policy ID/hash;
+> this producer still moves no release channel or product alias.
+
 > **Ring set superseded (2026-07-11)**: the three-ring `alpha|beta|prod` set decided below
 > is reduced to **two rings: `beta|stable`**, unified with the appliance-bundle channels —
 > see ICE-Fabric. `beta` = validation ring (every push to `main`, runs on the
@@ -86,7 +94,13 @@ or `:beta`; production and the community track `:prod`. Switching channel = `boo
 
 - The package must stay **public** for free community pulls and OTA egress.
 - GHCR retention should keep recent immutable `-alpha.<run>` tags for rollback/forensics.
-- Heavy GB10 artifacts (kernel/driver) are built rarely (`build-kernel.yml`) and staged on
-  the runner; the per-push image build is fast (no kernel rebuild).
+- Heavy GB10 artifacts (kernel/driver) are built rarely (`build-kernel.yml`) and retained on
+  the Spark first as immutable, checksummed candidates. A candidate cannot move `current`.
+  Owner-controlled finalization requires the five exact kernel RPMs, NVIDIA userspace and a
+  signed-boot payload carrying the matching candidate ID, kernel uname and unsigned-vmlinuz hash.
+  Only then is the generation finalized and `current` replaced atomically. Build-kernel and
+  build-image share one concurrency group, and the consumer resolves and revalidates a single
+  finalized generation before building. Failed or interrupted build/sign/finalization therefore
+  leaves the last buildable generation untouched.
 - The same mechanism scales to future variants (x86, Strix Halo) by adding image
   names/tags, not new processes.

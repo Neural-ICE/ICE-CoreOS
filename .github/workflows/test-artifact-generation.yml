@@ -8,6 +8,8 @@ on:
       - "ci/stage-artifacts.sh"
       - "ci/test-artifact-generation.sh"
       - "ci/build-image.sh"
+      - "ci/verify-build-context.sh"
+      - "secureboot/trust-policies/**"
       - "build/build-kernel.sh"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
@@ -20,6 +22,8 @@ on:
       - "ci/stage-artifacts.sh"
       - "ci/test-artifact-generation.sh"
       - "ci/build-image.sh"
+      - "ci/verify-build-context.sh"
+      - "secureboot/trust-policies/**"
       - "build/build-kernel.sh"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
@@ -41,6 +45,7 @@ jobs:
         run: |
           shellcheck ci/artifact-generation.sh ci/canonicalize-vmlinuz.sh \
             ci/stage-artifacts.sh ci/test-artifact-generation.sh ci/build-image.sh \
+            ci/verify-build-context.sh \
             build/build-kernel.sh
       - name: Test crash-safe artifact generations
         run: ./ci/test-artifact-generation.sh
