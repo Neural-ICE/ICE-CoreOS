@@ -86,7 +86,13 @@ or `:beta`; production and the community track `:prod`. Switching channel = `boo
 
 - The package must stay **public** for free community pulls and OTA egress.
 - GHCR retention should keep recent immutable `-alpha.<run>` tags for rollback/forensics.
-- Heavy GB10 artifacts (kernel/driver) are built rarely (`build-kernel.yml`) and staged on
-  the runner; the per-push image build is fast (no kernel rebuild).
+- Heavy GB10 artifacts (kernel/driver) are built rarely (`build-kernel.yml`) and retained on
+  the Spark first as immutable, checksummed candidates. A candidate cannot move `current`.
+  Owner-controlled finalization requires the five exact kernel RPMs, NVIDIA userspace and a
+  signed-boot payload carrying the matching candidate ID, kernel uname and unsigned-vmlinuz hash.
+  Only then is the generation finalized and `current` replaced atomically. Build-kernel and
+  build-image share one concurrency group, and the consumer resolves and revalidates a single
+  finalized generation before building. Failed or interrupted build/sign/finalization therefore
+  leaves the last buildable generation untouched.
 - The same mechanism scales to future variants (x86, Strix Halo) by adding image
   names/tags, not new processes.

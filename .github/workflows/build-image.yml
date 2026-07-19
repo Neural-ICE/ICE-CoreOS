@@ -20,7 +20,9 @@ on:
     types: [build-coreos]
 
 concurrency:
-  group: build-image-gb10
+  # Shared with build-kernel because both workflows use the same runner-local
+  # immutable artifact store.
+  group: coreos-gb10-artifacts-nvidia-gb10-arm64
   cancel-in-progress: false
 
 permissions:
@@ -38,21 +40,17 @@ jobs:
       BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
       SOURCE_REVISION: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      - name: Stage GB10 artifacts
+      - name: Materialize verified GB10 artifact generation
         env:
-          ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR || '/opt/ice-coreos/artifacts' }}
+          ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR }}
         run: |
           set -euo pipefail
-          for d in rpms driver-modules nvidia-userspace signed-boot; do
-            if [ ! -d "$ARTIFACTS_DIR/$d" ]; then
-              echo "::error::missing artifacts dir $ARTIFACTS_DIR/$d on the runner"
-              exit 1
-            fi
-            rm -rf "image/$d"
-            cp -a "$ARTIFACTS_DIR/$d" "image/$d"
-          done
+          ARTIFACTS_ROOT="${ARTIFACTS_DIR:-$HOME/neural-ice/artifacts}" STAGING_DEST=image \
+            ./ci/artifact-generation.sh materialize | tee artifact-generation.out
+          generation="$(sed -n 's/^CURRENT_GENERATION=//p' artifact-generation.out)"
+          echo "ARTIFACT_GENERATION=$generation" >> "$GITHUB_ENV"
 
       - name: Log in to GHCR
         run: |
@@ -77,8 +75,17 @@ jobs:
           semver="$(grep -m1 '^SEMVER=' build.out | cut -d= -f2)"
           ref="$(grep -m1 '^REF=' build.out | cut -d= -f2)"
           digest="$(grep -m1 '^DIGEST=' build.out | cut -d= -f2)"
+          manifest_sha256="$(grep -m1 '^ARTIFACT_MANIFEST_SHA256=' build.out | cut -d= -f2)"
           sudo podman image inspect "$ref:$semver" --format '{{.Os}}/{{.Architecture}}' \
             | grep -qx linux/arm64
+          sudo podman image inspect "$ref:$semver" \
+            --format '{{index .Labels "ch.neural-ice.artifact-generation"}}' \
+            | grep -Fx "$ARTIFACT_GENERATION"
+          [[ "$manifest_sha256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "::error::invalid artifact manifest hash '$manifest_sha256'"; exit 1; }
+          sudo podman image inspect "$ref:$semver" \
+            --format '{{index .Labels "ch.neural-ice.artifact-manifest-sha256"}}' \
+            | grep -Fx "$manifest_sha256"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
             || { echo "::error::invalid published digest '$digest'"; exit 1; }
           {
@@ -88,6 +95,8 @@ jobs:
             echo "- immutable tag: \`$ref:$semver\`"
             echo "- variant: \`$VARIANT\`"
             echo "- platform: \`linux/arm64\` (GB10 ADR-0009)"
+            echo "- artifact generation: \`$ARTIFACT_GENERATION\`"
+            echo "- artifact manifest SHA-256: \`$manifest_sha256\`"
             echo "- next gate: ICE-Fabric central mirror + signed beta train"
             echo "- channel/alias mutation: none"
           } >> "$GITHUB_STEP_SUMMARY"
