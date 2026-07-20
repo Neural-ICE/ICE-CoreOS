@@ -169,7 +169,8 @@ RUN set -euxo pipefail; \
 
 # oras (static, official release binary): OCI-artifact FETCH for the signed OTA
 # metadata — the update path pulls the channel record from
-# …/neural-ice/channels:<ch> and the BOM pair from …/neural-ice/bundles:<train>
+# …/neural-ice/channels:<ch>, then the BOM pair exclusively from
+# …/neural-ice/bundles@<signed-record.bundle_digest> (never by a train tag)
 # (the distribution refs in ota.conf), then hands the files to
 # ni-ota-verify. Fetch side only: signature verification stays cosign's job.
 # Version-PINNED and sha256-VERIFIED at build, same interim supply-chain gate

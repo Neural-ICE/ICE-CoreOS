@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
+use crate::record::{self, ChannelRecord};
 use crate::state::{ensure_secure_state_directory, AppliedStateStore, FileStateStore, StateRead};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
@@ -53,15 +54,6 @@ pub(crate) struct BomSources {
 pub(crate) struct BomSource {
     #[serde(rename = "ref")]
     pub reference: String,
-}
-
-/// The signed channel record (`releases/channels/<ch>.json` — plan §2).
-#[derive(Deserialize)]
-struct ChannelRecord {
-    train: String,
-    hardware_target: String,
-    channel: String,
-    bundle_seq: u64,
 }
 
 #[derive(Serialize)]
@@ -120,6 +112,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "bom-sig",
             "record",
             "record-sig",
+            "bundle-digest",
             "config",
             "device-channel",
             "device-compat",
@@ -136,6 +129,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let bom_sig_path = path_of("bom-sig")?;
     let record_path = path_of("record")?;
     let record_sig_path = path_of("record-sig")?;
+    let bundle_digest = flags
+        .get("bundle-digest")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| InternalError("verify: --bundle-digest is required".to_string()))?;
 
     let config_path = flags.get("config").map_or(DEFAULT_CONFIG, String::as_str);
     let cfg = Config::load(Path::new(config_path))?;
@@ -194,13 +191,13 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
 
     // --- parse the (signed) artifacts; malformed content = refusal -----------
-    let record: Result<ChannelRecord, String> = read_json(&record_path);
+    let record: Result<ChannelRecord, String> = record::read(&record_path);
     checks.push(match &record {
         Ok(r) => Check::pass(
             "record_parse",
             format!(
-                "channel record well-formed (train '{}', channel '{}')",
-                r.train, r.channel
+                "channel record v{} well-formed (train '{}', channel '{}', key_version {}, assigned_at '{}')",
+                r.schema_version, r.train, r.channel, r.key_version, r.assigned_at
             ),
         ),
         Err(e) => Check::fail("record_parse", format!("channel record unusable: {e}")),
@@ -218,6 +215,24 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     });
 
     // --- §0 steps 3+4: the signed channel↔bundle binding ---------------------
+    if let Ok(rec) = &record {
+        checks.push(if bundle_digest == &rec.bundle_digest {
+            Check::pass(
+                "bundle_digest",
+                format!(
+                    "pulled OCI manifest digest matches signed record ({bundle_digest})"
+                ),
+            )
+        } else {
+            Check::fail(
+                "bundle_digest",
+                format!(
+                    "pulled OCI manifest digest '{bundle_digest}' differs from signed record '{}' — possible tag retarget",
+                    rec.bundle_digest
+                ),
+            )
+        });
+    }
     if let (Ok(rec), Ok(bom)) = (&record, &bom) {
         checks.push(if rec.train == bom.train {
             Check::pass(

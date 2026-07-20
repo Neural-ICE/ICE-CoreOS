@@ -18,6 +18,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_ni-ota-verify");
 const TEST_OS_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_OS_REF: &str = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_SEED_REF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TEST_BUNDLE_DIGEST: &str =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 const COSIGN_STUB: &str = r#"#!/bin/sh
 # Test stub for `cosign verify-blob` (see tests/cli.rs): a signature file
@@ -115,7 +117,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":{seq},"channel":"{channel}","hardware_target":"nvidia-gb10-arm64","key_version":1,"train":"{train}"}}"#
+                r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_digest":"{TEST_BUNDLE_DIGEST}","bundle_seq":{seq},"channel":"{channel}","hardware_target":"nvidia-gb10-arm64","key_version":1,"schema_version":2,"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -154,6 +156,10 @@ impl Fixture {
 
     /// 4-file verify invocation WITHOUT device identity flags.
     fn verify_cmd_bare(&self, config: &Path) -> Command {
+        self.verify_cmd_bare_with_digest(config, TEST_BUNDLE_DIGEST)
+    }
+
+    fn verify_cmd_bare_with_digest(&self, config: &Path, bundle_digest: &str) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.env("NI_OTA_COSIGN", self.path("cosign-stub.sh"))
             .env("NI_OTA_HARDWARE_TARGET_FILE", self.path("hardware-target"))
@@ -162,6 +168,7 @@ impl Fixture {
             .args(["--bom-sig".as_ref(), self.path("bom.sig").as_os_str()])
             .args(["--record".as_ref(), self.path("record.json").as_os_str()])
             .args(["--record-sig".as_ref(), self.path("record.sig").as_os_str()])
+            .args(["--bundle-digest", bundle_digest])
             .args(["--config".as_ref(), config.as_os_str()]);
         cmd
     }
@@ -273,6 +280,7 @@ fn happy_path_passes_in_both_modes() {
             "bom_sig",
             "record_parse",
             "bom_parse",
+            "bundle_digest",
             "train_match",
             "seq_match",
             "target_binding",
@@ -284,6 +292,68 @@ fn happy_path_passes_in_both_modes() {
             assert_eq!(check(&verdict, name)["ok"], true, "{mode}: check {name}");
         }
     }
+}
+
+#[test]
+fn signed_bundle_digest_blocks_registry_retag() {
+    let fx = Fixture::new("bundle-retag");
+    fx.arrange_happy();
+    let cfg = fx.write_config(1, "");
+    let observed = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let mut command = fx.verify_cmd_bare_with_digest(&cfg, observed);
+    command
+        .args(["--device-channel", "stable"])
+        .args(["--device-compat", "1,3"]);
+
+    let (code, verdict, _) = run(&mut command);
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(verdict["verdict"], "refuse");
+    assert_eq!(check(&verdict, "record_sig")["ok"], true);
+    assert_eq!(check(&verdict, "bundle_digest")["ok"], false);
+    assert!(check(&verdict, "bundle_digest")["detail"]
+        .as_str()
+        .unwrap()
+        .contains("possible tag retarget"));
+}
+
+#[test]
+fn channel_record_v1_missing_or_noncanonical_bundle_digest_refuses() {
+    for (name, mutation) in [
+        ("schema-v1", ("schema_version", Value::from(1_u64))),
+        (
+            "uppercase-digest",
+            (
+                "bundle_digest",
+                Value::String(TEST_BUNDLE_DIGEST.to_uppercase()),
+            ),
+        ),
+    ] {
+        let fx = Fixture::new(name);
+        fx.arrange_happy();
+        let mut record: Value =
+            serde_json::from_str(&fs::read_to_string(fx.path("record.json")).unwrap()).unwrap();
+        record[mutation.0] = mutation.1;
+        fs::write(fx.path("record.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        let cfg = fx.write_config(1, "");
+        let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+        assert_eq!(code, 1, "{name}: {verdict}");
+        assert_eq!(check(&verdict, "record_parse")["ok"], false);
+    }
+
+    let missing = Fixture::new("missing-bundle-digest");
+    missing.arrange_happy();
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(missing.path("record.json")).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("bundle_digest");
+    fs::write(
+        missing.path("record.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let cfg = missing.write_config(1, "");
+    let (code, verdict, _) = run(&mut missing.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "record_parse")["ok"], false);
 }
 
 // --- verify: each §0 check fails with its own code -----------------------------
@@ -346,13 +416,13 @@ fn seq_mismatch_refuses() {
 fn channel_mismatch_refuses() {
     let fx = Fixture::new("channel");
     fx.arrange_happy();
-    fx.write_record("0.44.7", "edge", 7);
+    fx.write_record("0.44.7", "beta", 7);
     let cfg = fx.write_config(1, "");
     let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
     assert_eq!(code, 1);
     let c = check(&verdict, "channel_match");
     assert_eq!(c["ok"], false);
-    assert!(c["detail"].as_str().unwrap().contains("edge"));
+    assert!(c["detail"].as_str().unwrap().contains("beta"));
 }
 
 #[test]
@@ -361,7 +431,7 @@ fn hardware_target_mismatch_refuses() {
     fx.arrange_happy();
     fs::write(
         fx.path("record.json"),
-        r#"{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":7,"channel":"stable","hardware_target":"nvidia-cuda-x86_64","key_version":1,"train":"0.44.7"}"#,
+        format!(r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_digest":"{TEST_BUNDLE_DIGEST}","bundle_seq":7,"channel":"stable","hardware_target":"nvidia-cuda-x86_64","key_version":1,"schema_version":2,"train":"0.44.7"}}"#),
     )
     .unwrap();
     let cfg = fx.write_config(1, "");
