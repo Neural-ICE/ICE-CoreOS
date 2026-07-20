@@ -36,8 +36,8 @@ log shows the full diagnostic picture:
 Missing device-side inputs (device channel, compat range) follow the same
 split as `unseeded`: skipped WITH a warning in shadow, refused in enforce.
 A missing/empty OTA root pubkey fails the two signature checks (the staged
-contract in `/etc/neural-ice/keys/README`) — it is a verification failure,
-not an internal error.
+contract in `/etc/neural-ice/keys/README`) and unconditionally exits `1` — it
+is an authenticity refusal, not an internal tooling error.
 
 Signature verification is delegated to the image's version-pinned
 `/usr/bin/cosign` (P0) — one verification stack, no crypto re-implemented:
@@ -64,14 +64,17 @@ there is deliberately no public Rekor entry to check.)
 | exit | meaning |
 |------|---------|
 | `0`  | verdict `pass` — or a legacy/non-authority policy refusal in **shadow** mode (`enforce=0`) |
-| `1`  | strict record-v2 or bundle-digest authority refusal in every mode; any refusal in **enforce** mode (`enforce=1`); all `bootstrap` and `commit` refusals |
+| `1`  | any authority refusal in every mode; any refusal in **enforce** mode (`enforce=1`); all `bootstrap` and `commit` refusals |
 | `2`  | internal error (missing cosign, unreadable config, …) — **always**, in every mode: broken tooling never passes, and never masquerades as a clean refusal |
 
-The shadow/enforce distinction affects only legacy/non-authority policy
-checks. A channel record that is not strict schema v2, or an observed bundle
-digest that does not equal the canonical digest in that signed record, always
-exits `1` in both modes. Internal errors always exit `2`; neither class can be
-converted into a shadow-mode success.
+The shadow/enforce distinction affects only non-authority rollout checks such
+as compatibility. Signatures, strict record/BOM parsing, signed
+record-to-BOM bindings, device channel/target authorization, evaluated
+anti-rollback state, and the observed-to-signed bundle digest are authority
+checks and always exit `1` on failure in both modes. A deliberately unseeded
+device or absent instance channel/compat input remains an explicit warning and
+passing check in shadow, then refuses in enforce. Internal errors always exit
+`2`; neither authority failures nor internal errors can become shadow success.
 
 ## Usage
 

@@ -354,14 +354,14 @@ fn channel_record_v1_missing_or_noncanonical_bundle_digest_refuses() {
 // --- verify: each §0 check fails with its own code -----------------------------
 
 #[test]
-fn bad_record_signature_refuses_shadow_exit0_enforce_exit1() {
-    for (enforce, want_code) in [(0, 0), (1, 1)] {
+fn bad_record_signature_refuses_in_every_mode() {
+    for enforce in [0, 1] {
         let fx = Fixture::new(&format!("recsig-{enforce}"));
         fx.arrange_happy();
         fx.write_sig("record.sig", false);
         let cfg = fx.write_config(enforce, "");
         let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-        assert_eq!(code, want_code);
+        assert_eq!(code, 1);
         assert_eq!(verdict["verdict"], "refuse");
         assert_eq!(check(&verdict, "record_sig")["ok"], false);
         assert_eq!(
@@ -374,14 +374,79 @@ fn bad_record_signature_refuses_shadow_exit0_enforce_exit1() {
 
 #[test]
 fn bad_bom_signature_refuses() {
-    let fx = Fixture::new("bomsig");
+    for enforce in [0, 1] {
+        let fx = Fixture::new(&format!("bomsig-{enforce}"));
+        fx.arrange_happy();
+        fx.write_sig("bom.sig", false);
+        let cfg = fx.write_config(enforce, "");
+        let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+        assert_eq!(code, 1);
+        assert_eq!(check(&verdict, "record_sig")["ok"], true);
+        assert_eq!(check(&verdict, "bom_sig")["ok"], false);
+    }
+}
+
+#[test]
+fn malformed_bom_and_signed_bindings_never_shadow_pass() {
+    let malformed = Fixture::new("shadow-malformed-bom");
+    malformed.arrange_happy();
+    fs::write(malformed.path("bom.json"), "{\"train\":").unwrap();
+    let cfg = malformed.write_config(0, "");
+    let (code, verdict, _) = run(&mut malformed.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "bom_parse")["ok"], false);
+
+    for (name, train, seq, channel) in [
+        ("train", "0.44.6", 7, "stable"),
+        ("seq", "0.44.7", 8, "stable"),
+        ("channel", "0.44.7", 7, "beta"),
+    ] {
+        let fx = Fixture::new(&format!("shadow-binding-{name}"));
+        fx.arrange_happy();
+        fx.write_record(train, channel, seq);
+        let cfg = fx.write_config(0, "");
+        let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+        assert_eq!(code, 1, "{name}: {verdict}");
+    }
+
+    let target = Fixture::new("shadow-target-binding");
+    target.arrange_happy();
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(target.path("record.json")).unwrap()).unwrap();
+    record["hardware_target"] = Value::String("nvidia-cuda-x86_64".to_string());
+    fs::write(
+        target.path("record.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let cfg = target.write_config(0, "");
+    let (code, verdict, _) = run(&mut target.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "target_binding")["ok"], false);
+    assert_eq!(check(&verdict, "hardware_target")["ok"], false);
+
+    let rollback = Fixture::new("shadow-rollback");
+    rollback.arrange_happy();
+    rollback.seed_applied(9, &"c".repeat(64));
+    let cfg = rollback.write_config(0, "");
+    let (code, verdict, _) = run(&mut rollback.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "anti_rollback")["ok"], false);
+}
+
+#[test]
+fn compatibility_remains_a_shadow_only_rollout_check() {
+    let fx = Fixture::new("shadow-compat");
     fx.arrange_happy();
-    fx.write_sig("bom.sig", false);
-    let cfg = fx.write_config(1, "");
-    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-    assert_eq!(code, 1);
-    assert_eq!(check(&verdict, "record_sig")["ok"], true);
-    assert_eq!(check(&verdict, "bom_sig")["ok"], false);
+    let cfg = fx.write_config(0, "");
+    let mut command = fx.verify_cmd_bare(&cfg);
+    command
+        .args(["--device-channel", "stable"])
+        .args(["--device-compat", "4,5"]);
+    let (code, verdict, _) = run(&mut command);
+    assert_eq!(code, 0, "{verdict}");
+    assert_eq!(verdict["verdict"], "refuse");
+    assert_eq!(check(&verdict, "compat_overlap")["ok"], false);
 }
 
 #[test]
@@ -591,7 +656,7 @@ fn missing_pubkey_fails_signature_checks_not_internally() {
     fs::remove_file(fx.path("ota-root.pub")).unwrap();
     let cfg = fx.write_config(0, "");
     let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-    assert_eq!(code, 0, "shadow logs, does not block: {verdict}");
+    assert_eq!(code, 1, "signature authority refuses in shadow: {verdict}");
     assert_eq!(verdict["verdict"], "refuse");
     assert_eq!(check(&verdict, "record_sig")["ok"], false);
     assert_eq!(check(&verdict, "bom_sig")["ok"], false);
@@ -1309,7 +1374,7 @@ fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
     fs::set_permissions(permissive.path("state"), fs::Permissions::from_mode(0o755)).unwrap();
 
     let (code, _, stderr) = run(&mut permissive.verify_cmd(&cfg));
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "unseeded shadow posture remains non-blocking");
     assert!(stderr.contains("could not record last verdict"), "{stderr}");
     assert_eq!(
         fs::metadata(permissive.path("state"))
@@ -1337,7 +1402,7 @@ fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
     std::os::unix::fs::symlink(symlinked.path("outside-state"), symlinked.path("state")).unwrap();
 
     let (code, _, stderr) = run(&mut symlinked.verify_cmd(&cfg));
-    assert_eq!(code, 0);
+    assert_eq!(code, 1, "untrusted anti-rollback state never shadow-passes");
     assert!(stderr.contains("could not record last verdict"), "{stderr}");
     assert!(fs::symlink_metadata(symlinked.path("state"))
         .unwrap()
@@ -1357,7 +1422,7 @@ fn verify_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
     let cfg = fx.write_config_with_state(0, &state_dir, "");
 
     let (code, verdict, stderr) = run(&mut fx.verify_cmd(&cfg));
-    assert_eq!(code, 0, "shadow keeps its documented log-only exit code");
+    assert_eq!(code, 1, "anti-rollback authority never shadow-passes");
     assert_eq!(verdict["verdict"], "refuse");
     assert_eq!(check(&verdict, "anti_rollback")["ok"], false);
     assert!(check(&verdict, "anti_rollback")["detail"]

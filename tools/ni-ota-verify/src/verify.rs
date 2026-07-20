@@ -175,9 +175,9 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             }
         }
         None => {
-            // Missing/empty trust anchor = a verification failure (the staged
-            // contract in /etc/neural-ice/keys/README: shadow logs, enforce
-            // refuses) — not an internal error, the tooling itself is fine.
+            // Missing/empty trust anchor = an unconditional authenticity
+            // refusal (the tooling itself remains operational, so this is not
+            // an internal error).
             let detail = match &cfg.root_pubkey {
                 Some(p) => format!(
                     "OTA root pubkey missing or empty: {} (staged at the P0 key ceremony — see /etc/neural-ice/keys/README)",
@@ -338,11 +338,27 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
 
     // --- verdict --------------------------------------------------------------
     let ok = checks.iter().all(|c| c.ok);
-    // Record v2 syntax and the signed OCI manifest binding are authority
-    // boundaries, not burn-in policy.  Shadow mode may observe legacy policy
-    // checks without blocking, but it must never turn an unauthoritative
-    // record or a retargeted bundle into exit 0 for the apply-side caller.
-    let record_authority_ok = record.is_ok() && bundle_digest_matches_record;
+    // Authenticity, artifact identity, target/ring authorization and
+    // anti-rollback are authority boundaries, not burn-in policy. Shadow mode
+    // may observe rollout checks such as compat without blocking, but it must
+    // never turn a failed authority check into exit 0 for the apply caller.
+    let authority_ok = [
+        "record_sig",
+        "bom_sig",
+        "record_parse",
+        "bom_parse",
+        "bundle_digest",
+        "train_match",
+        "seq_match",
+        "target_binding",
+        "channel_match",
+        "hardware_target",
+    ]
+    .iter()
+    .all(|name| check_passed(&checks, name))
+        && ["anti_rollback", "unseeded"]
+            .iter()
+            .any(|name| check_passed(&checks, name));
     let verdict = Verdict {
         verdict: if ok { "pass" } else { "refuse" },
         checks,
@@ -357,13 +373,20 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     // Shadow mode is log-only only for legacy/non-authority policy checks.
     // Record-v2 and bundle-digest authority failures always refuse. Internal
     // errors never reach this point (they exit 2 in every mode).
-    Ok(if !record_authority_ok {
+    Ok(if !authority_ok {
         EXIT_REFUSE
     } else if ok || !cfg.enforce {
         EXIT_PASS
     } else {
         EXIT_REFUSE
     })
+}
+
+fn check_passed(checks: &[Check], name: &str) -> bool {
+    checks
+        .iter()
+        .find(|check| check.name == name)
+        .is_some_and(|check| check.ok)
 }
 
 pub(crate) fn applied_state_path(

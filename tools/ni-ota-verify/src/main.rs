@@ -13,8 +13,8 @@
 //!
 //! Exit codes (the caller's contract — see README.md):
 //!   0  verdict "pass" — or a legacy/non-authority policy refusal in SHADOW
-//!      mode (enforce=0). Strict record-v2 and bundle-digest failures never
-//!      exit 0.
+//!      mode (enforce=0). Authenticity, signed artifact bindings, target/ring
+//!      authorization, anti-rollback, and bundle identity never exit 0.
 //!   1  authority refusal in every mode, or any refusal in ENFORCE mode
 //!      (enforce=1) — do not apply.
 //!      `bootstrap` and `commit` refusals also exit 1 (state mutation has no
