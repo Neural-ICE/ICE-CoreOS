@@ -215,8 +215,11 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     });
 
     // --- §0 steps 3+4: the signed channel↔bundle binding ---------------------
+    let bundle_digest_matches_record = record
+        .as_ref()
+        .is_ok_and(|record| bundle_digest == &record.bundle_digest);
     if let Ok(rec) = &record {
-        checks.push(if bundle_digest == &rec.bundle_digest {
+        checks.push(if bundle_digest_matches_record {
             Check::pass(
                 "bundle_digest",
                 format!(
@@ -335,6 +338,11 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
 
     // --- verdict --------------------------------------------------------------
     let ok = checks.iter().all(|c| c.ok);
+    // Record v2 syntax and the signed OCI manifest binding are authority
+    // boundaries, not burn-in policy.  Shadow mode may observe legacy policy
+    // checks without blocking, but it must never turn an unauthoritative
+    // record or a retargeted bundle into exit 0 for the apply-side caller.
+    let record_authority_ok = record.is_ok() && bundle_digest_matches_record;
     let verdict = Verdict {
         verdict: if ok { "pass" } else { "refuse" },
         checks,
@@ -346,10 +354,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     human_summary(&verdict);
     record_last_verdict(&cfg, &json);
 
-    // Shadow mode is LOG-ONLY: a clean "refuse" verdict still exits 0 — the
-    // caller decides nothing on the exit code in shadow. Internal errors never
-    // reach this point (they exit 2 in every mode).
-    Ok(if ok || !cfg.enforce {
+    // Shadow mode is log-only only for legacy/non-authority policy checks.
+    // Record-v2 and bundle-digest authority failures always refuse. Internal
+    // errors never reach this point (they exit 2 in every mode).
+    Ok(if !record_authority_ok {
+        EXIT_REFUSE
+    } else if ok || !cfg.enforce {
         EXIT_PASS
     } else {
         EXIT_REFUSE

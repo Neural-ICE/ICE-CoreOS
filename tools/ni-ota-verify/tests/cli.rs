@@ -296,64 +296,59 @@ fn happy_path_passes_in_both_modes() {
 
 #[test]
 fn signed_bundle_digest_blocks_registry_retag() {
-    let fx = Fixture::new("bundle-retag");
-    fx.arrange_happy();
-    let cfg = fx.write_config(1, "");
-    let observed = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    let mut command = fx.verify_cmd_bare_with_digest(&cfg, observed);
-    command
-        .args(["--device-channel", "stable"])
-        .args(["--device-compat", "1,3"]);
+    for enforce in [0, 1] {
+        let fx = Fixture::new(&format!("bundle-retag-{enforce}"));
+        fx.arrange_happy();
+        let cfg = fx.write_config(enforce, "");
+        let observed = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mut command = fx.verify_cmd_bare_with_digest(&cfg, observed);
+        command
+            .args(["--device-channel", "stable"])
+            .args(["--device-compat", "1,3"]);
 
-    let (code, verdict, _) = run(&mut command);
-    assert_eq!(code, 1, "{verdict}");
-    assert_eq!(verdict["verdict"], "refuse");
-    assert_eq!(check(&verdict, "record_sig")["ok"], true);
-    assert_eq!(check(&verdict, "bundle_digest")["ok"], false);
-    assert!(check(&verdict, "bundle_digest")["detail"]
-        .as_str()
-        .unwrap()
-        .contains("possible tag retarget"));
+        let (code, verdict, _) = run(&mut command);
+        assert_eq!(code, 1, "enforce={enforce}: {verdict}");
+        assert_eq!(verdict["verdict"], "refuse");
+        assert_eq!(check(&verdict, "record_sig")["ok"], true);
+        assert_eq!(check(&verdict, "bundle_digest")["ok"], false);
+        assert!(check(&verdict, "bundle_digest")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("possible tag retarget"));
+    }
 }
 
 #[test]
 fn channel_record_v1_missing_or_noncanonical_bundle_digest_refuses() {
-    for (name, mutation) in [
-        ("schema-v1", ("schema_version", Value::from(1_u64))),
-        (
+    for enforce in [0, 1] {
+        for name in [
+            "schema-v1",
             "uppercase-digest",
-            (
-                "bundle_digest",
-                Value::String(TEST_BUNDLE_DIGEST.to_uppercase()),
-            ),
-        ),
-    ] {
-        let fx = Fixture::new(name);
-        fx.arrange_happy();
-        let mut record: Value =
-            serde_json::from_str(&fs::read_to_string(fx.path("record.json")).unwrap()).unwrap();
-        record[mutation.0] = mutation.1;
-        fs::write(fx.path("record.json"), serde_json::to_vec(&record).unwrap()).unwrap();
-        let cfg = fx.write_config(1, "");
-        let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-        assert_eq!(code, 1, "{name}: {verdict}");
-        assert_eq!(check(&verdict, "record_parse")["ok"], false);
+            "missing-digest",
+            "extra-key",
+        ] {
+            let fx = Fixture::new(&format!("{name}-{enforce}"));
+            fx.arrange_happy();
+            let mut record: Value =
+                serde_json::from_str(&fs::read_to_string(fx.path("record.json")).unwrap()).unwrap();
+            match name {
+                "schema-v1" => record["schema_version"] = Value::from(1_u64),
+                "uppercase-digest" => {
+                    record["bundle_digest"] = Value::String(TEST_BUNDLE_DIGEST.to_uppercase())
+                }
+                "missing-digest" => {
+                    record.as_object_mut().unwrap().remove("bundle_digest");
+                }
+                "extra-key" => record["unexpected"] = Value::Bool(true),
+                _ => unreachable!(),
+            }
+            fs::write(fx.path("record.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+            let cfg = fx.write_config(enforce, "");
+            let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+            assert_eq!(code, 1, "{name} enforce={enforce}: {verdict}");
+            assert_eq!(check(&verdict, "record_parse")["ok"], false);
+        }
     }
-
-    let missing = Fixture::new("missing-bundle-digest");
-    missing.arrange_happy();
-    let mut record: Value =
-        serde_json::from_str(&fs::read_to_string(missing.path("record.json")).unwrap()).unwrap();
-    record.as_object_mut().unwrap().remove("bundle_digest");
-    fs::write(
-        missing.path("record.json"),
-        serde_json::to_vec(&record).unwrap(),
-    )
-    .unwrap();
-    let cfg = missing.write_config(1, "");
-    let (code, verdict, _) = run(&mut missing.verify_cmd(&cfg));
-    assert_eq!(code, 1, "{verdict}");
-    assert_eq!(check(&verdict, "record_parse")["ok"], false);
 }
 
 // --- verify: each §0 check fails with its own code -----------------------------

@@ -49,7 +49,8 @@ pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
 }
 
 pub(crate) struct Config {
-    /// false = shadow (verdicts are logged, refuse still exits 0);
+    /// false = shadow for legacy/non-authority policy checks; strict record-v2
+    /// and bundle-digest authority failures still exit 1;
     /// true = enforce (refuse exits nonzero). A missing/stripped `enforce`
     /// key defaults to TRUE: an incomplete config must lean strict, never
     /// silently downgrade to log-only (fail-closed bias).

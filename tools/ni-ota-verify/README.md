@@ -63,12 +63,15 @@ there is deliberately no public Rekor entry to check.)
 
 | exit | meaning |
 |------|---------|
-| `0`  | verdict `pass` — **or** verdict `refuse` in **shadow** mode (`enforce=0`): shadow is log-only, the caller decides nothing on the exit code |
-| `1`  | verdict `refuse` in **enforce** mode (`enforce=1`) — do not apply. `bootstrap` and `commit` refusals also exit 1 (state mutation is always enforced) |
+| `0`  | verdict `pass` — or a legacy/non-authority policy refusal in **shadow** mode (`enforce=0`) |
+| `1`  | strict record-v2 or bundle-digest authority refusal in every mode; any refusal in **enforce** mode (`enforce=1`); all `bootstrap` and `commit` refusals |
 | `2`  | internal error (missing cosign, unreadable config, …) — **always**, in every mode: broken tooling never passes, and never masquerades as a clean refusal |
 
-The shadow/enforce distinction affects **only** the exit code of a clean
-`refuse` verdict — never internal errors, never the verdict content.
+The shadow/enforce distinction affects only legacy/non-authority policy
+checks. A channel record that is not strict schema v2, or an observed bundle
+digest that does not equal the canonical digest in that signed record, always
+exits `1` in both modes. Internal errors always exit `2`; neither class can be
+converted into a shadow-mode success.
 
 ## Usage
 
