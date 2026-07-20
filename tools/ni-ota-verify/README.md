@@ -23,6 +23,7 @@ log shows the full diagnostic picture:
 | 2 | `bom_sig`       | BOM signature invalid against the baked OTA root pubkey                  |
 | — | `record_parse`  | channel record unreadable / malformed JSON                               |
 | — | `bom_parse`     | BOM unreadable / malformed JSON                                          |
+| 2b | `bundle_digest` | OCI manifest digest pulled by the caller differs from the canonical `sha256:…` digest in the signed v2 record |
 | 3 | `train_match`   | `record.train != bom.train`                                              |
 | 4 | `seq_match`     | `record.bundle_seq != bom.bundle_seq` (signed channel↔bundle binding)    |
 | 4b | `target_binding` | `record.hardware_target != bom.hardware_target`                         |
@@ -35,8 +36,8 @@ log shows the full diagnostic picture:
 Missing device-side inputs (device channel, compat range) follow the same
 split as `unseeded`: skipped WITH a warning in shadow, refused in enforce.
 A missing/empty OTA root pubkey fails the two signature checks (the staged
-contract in `/etc/neural-ice/keys/README`) — it is a verification failure,
-not an internal error.
+contract in `/etc/neural-ice/keys/README`) and unconditionally exits `1` — it
+is an authenticity refusal, not an internal tooling error.
 
 Signature verification is delegated to the image's version-pinned
 `/usr/bin/cosign` (P0) — one verification stack, no crypto re-implemented:
@@ -62,17 +63,24 @@ there is deliberately no public Rekor entry to check.)
 
 | exit | meaning |
 |------|---------|
-| `0`  | verdict `pass` — **or** verdict `refuse` in **shadow** mode (`enforce=0`): shadow is log-only, the caller decides nothing on the exit code |
-| `1`  | verdict `refuse` in **enforce** mode (`enforce=1`) — do not apply. `bootstrap` and `commit` refusals also exit 1 (state mutation is always enforced) |
+| `0`  | verdict `pass` — or a legacy/non-authority policy refusal in **shadow** mode (`enforce=0`) |
+| `1`  | any authority refusal in every mode; any refusal in **enforce** mode (`enforce=1`); all `bootstrap` and `commit` refusals |
 | `2`  | internal error (missing cosign, unreadable config, …) — **always**, in every mode: broken tooling never passes, and never masquerades as a clean refusal |
 
-The shadow/enforce distinction affects **only** the exit code of a clean
-`refuse` verdict — never internal errors, never the verdict content.
+The shadow/enforce distinction affects only non-authority rollout checks such
+as compatibility. Signatures, strict record/BOM parsing, signed
+record-to-BOM bindings, device channel/target authorization, evaluated
+anti-rollback state, and the observed-to-signed bundle digest are authority
+checks and always exit `1` on failure in both modes. A deliberately unseeded
+device or absent instance channel/compat input remains an explicit warning and
+passing check in shadow, then refuses in enforce. Internal errors always exit
+`2`; neither authority failures nor internal errors can become shadow success.
 
 ## Usage
 
 ```
 ni-ota-verify verify --bom <path> --bom-sig <path> --record <path> --record-sig <path>
+                     --bundle-digest <sha256:64-lowercase-hex>
                      [--config /etc/neural-ice/ota.conf] [--device-channel <ch>]
                      [--device-compat <min,max>] [--applied-state <path>]
 ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>
@@ -115,7 +123,9 @@ rollback does not require reversing the permission migration.
 `bootstrap` is the one-time bridge from a physically delivered, signed LAB USB
 image to the normal anti-rollback state. It consumes only the signed BOM and
 its detached signature: it neither accepts nor creates a channel record and
-cannot move a `beta`, `stable`, or product alias.
+cannot move a `beta`, `stable`, or product alias. It is exclusively an offline
+installation-media path; a registry-backed update must use the signed v2
+record and the normal `verify` gate below.
 
 The command always fails closed, including when `ota.conf` has `enforce=0`. It
 copies the BOM once to a protected mode-`0600` snapshot, verifies that snapshot
@@ -206,9 +216,10 @@ bootstrap nor concurrent commits can regress the anti-rollback state.
 ## Caller integration (the OTA path, ICE-Fabric side)
 
 ```
-oras pull <registry>/<channel_ref>:<hardware-target>-<device-channel> # signed channel record + .sig
-oras pull <registry>/<bundle_ref>:<record.train>          # signed BOM + .sig
-ni-ota-verify verify --bom … --bom-sig … --record … --record-sig …   # THE GATE
+oras pull <registry>/<channel_ref>:<hardware-target>-<device-channel> # signed v2 channel record + .sig
+oras pull <registry>/<bundle_ref>@<record.bundle_digest>  # signed BOM + .sig; never :<train>
+ni-ota-verify verify --bom … --bom-sig … --record … --record-sig … \
+    --bundle-digest <digest reported for the pulled OCI manifest>     # THE GATE
     → apply strictly by the digests in the verified BOM (never by tag)
     → health gate (NRestarts / is-active)
 ni-ota-verify commit --bom …                              # only after health passes
@@ -216,6 +227,15 @@ ni-ota-verify commit --bom …                              # only after health 
 
 `oras` (fetch) and `cosign` (verify) are both version-pinned in the OS image
 (`image/Containerfile.bootc` §2b).
+
+The v2 channel record has exactly these keys: `assigned_at`, `bundle_digest`,
+`bundle_seq`, `channel`, `hardware_target`, `key_version`, `schema_version`,
+and `train`. `schema_version` must be `2`; `channel` is `beta` or `stable`; and
+`bundle_digest` must be exactly `sha256:` followed by 64 lowercase hexadecimal
+characters. Missing fields, extra fields, legacy v1 records, non-canonical
+digests, and a pulled-manifest mismatch all refuse. A release-train tag is a
+publication/diagnostic convenience only and is never reconstructed or pulled
+by the device.
 
 ## P3 roadmap — the state-backend seam
 

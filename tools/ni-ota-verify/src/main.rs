@@ -3,18 +3,20 @@
 //!
 //! Verifies LOCAL FILES only. `bootstrap` binds a physically delivered LAB
 //! image to its signed BOM without trusting a channel record. The OTA caller
-//! fetches the signed channel record and BOM pair (oras, from the sovereign
-//! registry), hands the four files to `verify`, applies the update strictly by
-//! the digests in the verified BOM, runs its health gate, then calls `commit`
+//! fetches the signed channel record, pulls the bundle exclusively by the OCI
+//! manifest digest embedded in that record, and hands the local files plus the
+//! observed digest to `verify`. It then applies strictly by the digests in the
+//! verified BOM, runs its health gate, and calls `commit`
 //! to advance the applied-state record. Signature verification is delegated to
 //! the image's pinned /usr/bin/cosign — one verification stack, no crypto
 //! re-implemented here.
 //!
 //! Exit codes (the caller's contract — see README.md):
-//!   0  verdict "pass" — or verdict "refuse" in SHADOW mode (enforce=0):
-//!      shadow is log-only; the verdict is emitted, the caller decides nothing
-//!      on the exit code.
-//!   1  verdict "refuse" in ENFORCE mode (enforce=1) — do not apply.
+//!   0  verdict "pass" — or a legacy/non-authority policy refusal in SHADOW
+//!      mode (enforce=0). Authenticity, signed artifact bindings, target/ring
+//!      authorization, anti-rollback, and bundle identity never exit 0.
+//!   1  authority refusal in every mode, or any refusal in ENFORCE mode
+//!      (enforce=1) — do not apply.
 //!      `bootstrap` and `commit` refusals also exit 1 (state mutation has no
 //!      shadow semantics and is always enforced).
 //!   2  internal error (missing cosign, unreadable config, …) — ALWAYS,
@@ -23,6 +25,7 @@
 mod bootstrap;
 mod commit;
 mod config;
+mod record;
 mod runner;
 mod state;
 mod verify;
@@ -37,6 +40,7 @@ pub(crate) const DEFAULT_CONFIG: &str = "/etc/neural-ice/ota.conf";
 
 const USAGE: &str = "usage:
   ni-ota-verify verify --bom <path> --bom-sig <path> --record <path> --record-sig <path>
+                       --bundle-digest <sha256:64-lowercase-hex>
                        [--config /etc/neural-ice/ota.conf] [--device-channel <ch>]
                        [--device-compat <min,max>] [--applied-state <path>]
   ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>

@@ -37,8 +37,8 @@ pub(crate) enum StateRead {
 
 pub(crate) trait AppliedStateStore {
     /// Err = unreadable or corrupt state — surfaced as a FAILED anti-rollback
-    /// check (fail-closed verdict), not an internal error: in shadow mode a
-    /// broken state file must log-and-continue like any other failed check.
+    /// check (unconditional fail-closed verdict), not an internal error: the
+    /// tooling ran, but an unreadable authority state can never shadow-pass.
     fn read(&self) -> Result<StateRead, String>;
     /// Err = InternalError: a commit that cannot persist is broken tooling.
     fn write(&self, state: &AppliedState) -> Result<(), InternalError>;

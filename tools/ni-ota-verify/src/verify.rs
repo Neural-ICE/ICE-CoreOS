@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
+use crate::record::{self, ChannelRecord};
 use crate::state::{ensure_secure_state_directory, AppliedStateStore, FileStateStore, StateRead};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
@@ -53,15 +54,6 @@ pub(crate) struct BomSources {
 pub(crate) struct BomSource {
     #[serde(rename = "ref")]
     pub reference: String,
-}
-
-/// The signed channel record (`releases/channels/<ch>.json` — plan §2).
-#[derive(Deserialize)]
-struct ChannelRecord {
-    train: String,
-    hardware_target: String,
-    channel: String,
-    bundle_seq: u64,
 }
 
 #[derive(Serialize)]
@@ -120,6 +112,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "bom-sig",
             "record",
             "record-sig",
+            "bundle-digest",
             "config",
             "device-channel",
             "device-compat",
@@ -136,6 +129,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let bom_sig_path = path_of("bom-sig")?;
     let record_path = path_of("record")?;
     let record_sig_path = path_of("record-sig")?;
+    let bundle_digest = flags
+        .get("bundle-digest")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| InternalError("verify: --bundle-digest is required".to_string()))?;
 
     let config_path = flags.get("config").map_or(DEFAULT_CONFIG, String::as_str);
     let cfg = Config::load(Path::new(config_path))?;
@@ -178,9 +175,9 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             }
         }
         None => {
-            // Missing/empty trust anchor = a verification failure (the staged
-            // contract in /etc/neural-ice/keys/README: shadow logs, enforce
-            // refuses) — not an internal error, the tooling itself is fine.
+            // Missing/empty trust anchor = an unconditional authenticity
+            // refusal (the tooling itself remains operational, so this is not
+            // an internal error).
             let detail = match &cfg.root_pubkey {
                 Some(p) => format!(
                     "OTA root pubkey missing or empty: {} (staged at the P0 key ceremony — see /etc/neural-ice/keys/README)",
@@ -194,13 +191,13 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
 
     // --- parse the (signed) artifacts; malformed content = refusal -----------
-    let record: Result<ChannelRecord, String> = read_json(&record_path);
+    let record: Result<ChannelRecord, String> = record::read(&record_path);
     checks.push(match &record {
         Ok(r) => Check::pass(
             "record_parse",
             format!(
-                "channel record well-formed (train '{}', channel '{}')",
-                r.train, r.channel
+                "channel record v{} well-formed (train '{}', channel '{}', key_version {}, assigned_at '{}')",
+                r.schema_version, r.train, r.channel, r.key_version, r.assigned_at
             ),
         ),
         Err(e) => Check::fail("record_parse", format!("channel record unusable: {e}")),
@@ -218,6 +215,27 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     });
 
     // --- §0 steps 3+4: the signed channel↔bundle binding ---------------------
+    let bundle_digest_matches_record = record
+        .as_ref()
+        .is_ok_and(|record| bundle_digest == &record.bundle_digest);
+    if let Ok(rec) = &record {
+        checks.push(if bundle_digest_matches_record {
+            Check::pass(
+                "bundle_digest",
+                format!(
+                    "pulled OCI manifest digest matches signed record ({bundle_digest})"
+                ),
+            )
+        } else {
+            Check::fail(
+                "bundle_digest",
+                format!(
+                    "pulled OCI manifest digest '{bundle_digest}' differs from signed record '{}' — possible tag retarget",
+                    rec.bundle_digest
+                ),
+            )
+        });
+    }
     if let (Ok(rec), Ok(bom)) = (&record, &bom) {
         checks.push(if rec.train == bom.train {
             Check::pass(
@@ -320,6 +338,27 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
 
     // --- verdict --------------------------------------------------------------
     let ok = checks.iter().all(|c| c.ok);
+    // Authenticity, artifact identity, target/ring authorization and
+    // anti-rollback are authority boundaries, not burn-in policy. Shadow mode
+    // may observe rollout checks such as compat without blocking, but it must
+    // never turn a failed authority check into exit 0 for the apply caller.
+    let authority_ok = [
+        "record_sig",
+        "bom_sig",
+        "record_parse",
+        "bom_parse",
+        "bundle_digest",
+        "train_match",
+        "seq_match",
+        "target_binding",
+        "channel_match",
+        "hardware_target",
+    ]
+    .iter()
+    .all(|name| check_passed(&checks, name))
+        && ["anti_rollback", "unseeded"]
+            .iter()
+            .any(|name| check_passed(&checks, name));
     let verdict = Verdict {
         verdict: if ok { "pass" } else { "refuse" },
         checks,
@@ -331,14 +370,24 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     human_summary(&verdict);
     record_last_verdict(&cfg, &json);
 
-    // Shadow mode is LOG-ONLY: a clean "refuse" verdict still exits 0 — the
-    // caller decides nothing on the exit code in shadow. Internal errors never
-    // reach this point (they exit 2 in every mode).
-    Ok(if ok || !cfg.enforce {
+    // Shadow mode is log-only only for non-authority rollout checks. Every
+    // authenticity, signed binding, target/ring, anti-rollback or bundle
+    // identity failure above always refuses. Internal errors never reach this
+    // point (they exit 2 in every mode).
+    Ok(if !authority_ok {
+        EXIT_REFUSE
+    } else if ok || !cfg.enforce {
         EXIT_PASS
     } else {
         EXIT_REFUSE
     })
+}
+
+fn check_passed(checks: &[Check], name: &str) -> bool {
+    checks
+        .iter()
+        .find(|check| check.name == name)
+        .is_some_and(|check| check.ok)
 }
 
 pub(crate) fn applied_state_path(

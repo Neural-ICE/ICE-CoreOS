@@ -18,6 +18,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_ni-ota-verify");
 const TEST_OS_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_OS_REF: &str = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_SEED_REF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TEST_BUNDLE_DIGEST: &str =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 const COSIGN_STUB: &str = r#"#!/bin/sh
 # Test stub for `cosign verify-blob` (see tests/cli.rs): a signature file
@@ -115,7 +117,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":{seq},"channel":"{channel}","hardware_target":"nvidia-gb10-arm64","key_version":1,"train":"{train}"}}"#
+                r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_digest":"{TEST_BUNDLE_DIGEST}","bundle_seq":{seq},"channel":"{channel}","hardware_target":"nvidia-gb10-arm64","key_version":1,"schema_version":2,"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -154,6 +156,10 @@ impl Fixture {
 
     /// 4-file verify invocation WITHOUT device identity flags.
     fn verify_cmd_bare(&self, config: &Path) -> Command {
+        self.verify_cmd_bare_with_digest(config, TEST_BUNDLE_DIGEST)
+    }
+
+    fn verify_cmd_bare_with_digest(&self, config: &Path, bundle_digest: &str) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.env("NI_OTA_COSIGN", self.path("cosign-stub.sh"))
             .env("NI_OTA_HARDWARE_TARGET_FILE", self.path("hardware-target"))
@@ -162,6 +168,7 @@ impl Fixture {
             .args(["--bom-sig".as_ref(), self.path("bom.sig").as_os_str()])
             .args(["--record".as_ref(), self.path("record.json").as_os_str()])
             .args(["--record-sig".as_ref(), self.path("record.sig").as_os_str()])
+            .args(["--bundle-digest", bundle_digest])
             .args(["--config".as_ref(), config.as_os_str()]);
         cmd
     }
@@ -273,6 +280,7 @@ fn happy_path_passes_in_both_modes() {
             "bom_sig",
             "record_parse",
             "bom_parse",
+            "bundle_digest",
             "train_match",
             "seq_match",
             "target_binding",
@@ -286,17 +294,74 @@ fn happy_path_passes_in_both_modes() {
     }
 }
 
+#[test]
+fn signed_bundle_digest_blocks_registry_retag() {
+    for enforce in [0, 1] {
+        let fx = Fixture::new(&format!("bundle-retag-{enforce}"));
+        fx.arrange_happy();
+        let cfg = fx.write_config(enforce, "");
+        let observed = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mut command = fx.verify_cmd_bare_with_digest(&cfg, observed);
+        command
+            .args(["--device-channel", "stable"])
+            .args(["--device-compat", "1,3"]);
+
+        let (code, verdict, _) = run(&mut command);
+        assert_eq!(code, 1, "enforce={enforce}: {verdict}");
+        assert_eq!(verdict["verdict"], "refuse");
+        assert_eq!(check(&verdict, "record_sig")["ok"], true);
+        assert_eq!(check(&verdict, "bundle_digest")["ok"], false);
+        assert!(check(&verdict, "bundle_digest")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("possible tag retarget"));
+    }
+}
+
+#[test]
+fn channel_record_v1_missing_or_noncanonical_bundle_digest_refuses() {
+    for enforce in [0, 1] {
+        for name in [
+            "schema-v1",
+            "uppercase-digest",
+            "missing-digest",
+            "extra-key",
+        ] {
+            let fx = Fixture::new(&format!("{name}-{enforce}"));
+            fx.arrange_happy();
+            let mut record: Value =
+                serde_json::from_str(&fs::read_to_string(fx.path("record.json")).unwrap()).unwrap();
+            match name {
+                "schema-v1" => record["schema_version"] = Value::from(1_u64),
+                "uppercase-digest" => {
+                    record["bundle_digest"] = Value::String(TEST_BUNDLE_DIGEST.to_uppercase())
+                }
+                "missing-digest" => {
+                    record.as_object_mut().unwrap().remove("bundle_digest");
+                }
+                "extra-key" => record["unexpected"] = Value::Bool(true),
+                _ => unreachable!(),
+            }
+            fs::write(fx.path("record.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+            let cfg = fx.write_config(enforce, "");
+            let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+            assert_eq!(code, 1, "{name} enforce={enforce}: {verdict}");
+            assert_eq!(check(&verdict, "record_parse")["ok"], false);
+        }
+    }
+}
+
 // --- verify: each §0 check fails with its own code -----------------------------
 
 #[test]
-fn bad_record_signature_refuses_shadow_exit0_enforce_exit1() {
-    for (enforce, want_code) in [(0, 0), (1, 1)] {
+fn bad_record_signature_refuses_in_every_mode() {
+    for enforce in [0, 1] {
         let fx = Fixture::new(&format!("recsig-{enforce}"));
         fx.arrange_happy();
         fx.write_sig("record.sig", false);
         let cfg = fx.write_config(enforce, "");
         let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-        assert_eq!(code, want_code);
+        assert_eq!(code, 1);
         assert_eq!(verdict["verdict"], "refuse");
         assert_eq!(check(&verdict, "record_sig")["ok"], false);
         assert_eq!(
@@ -309,14 +374,79 @@ fn bad_record_signature_refuses_shadow_exit0_enforce_exit1() {
 
 #[test]
 fn bad_bom_signature_refuses() {
-    let fx = Fixture::new("bomsig");
+    for enforce in [0, 1] {
+        let fx = Fixture::new(&format!("bomsig-{enforce}"));
+        fx.arrange_happy();
+        fx.write_sig("bom.sig", false);
+        let cfg = fx.write_config(enforce, "");
+        let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+        assert_eq!(code, 1);
+        assert_eq!(check(&verdict, "record_sig")["ok"], true);
+        assert_eq!(check(&verdict, "bom_sig")["ok"], false);
+    }
+}
+
+#[test]
+fn malformed_bom_and_signed_bindings_never_shadow_pass() {
+    let malformed = Fixture::new("shadow-malformed-bom");
+    malformed.arrange_happy();
+    fs::write(malformed.path("bom.json"), "{\"train\":").unwrap();
+    let cfg = malformed.write_config(0, "");
+    let (code, verdict, _) = run(&mut malformed.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "bom_parse")["ok"], false);
+
+    for (name, train, seq, channel) in [
+        ("train", "0.44.6", 7, "stable"),
+        ("seq", "0.44.7", 8, "stable"),
+        ("channel", "0.44.7", 7, "beta"),
+    ] {
+        let fx = Fixture::new(&format!("shadow-binding-{name}"));
+        fx.arrange_happy();
+        fx.write_record(train, channel, seq);
+        let cfg = fx.write_config(0, "");
+        let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+        assert_eq!(code, 1, "{name}: {verdict}");
+    }
+
+    let target = Fixture::new("shadow-target-binding");
+    target.arrange_happy();
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(target.path("record.json")).unwrap()).unwrap();
+    record["hardware_target"] = Value::String("nvidia-cuda-x86_64".to_string());
+    fs::write(
+        target.path("record.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let cfg = target.write_config(0, "");
+    let (code, verdict, _) = run(&mut target.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "target_binding")["ok"], false);
+    assert_eq!(check(&verdict, "hardware_target")["ok"], false);
+
+    let rollback = Fixture::new("shadow-rollback");
+    rollback.arrange_happy();
+    rollback.seed_applied(9, &"c".repeat(64));
+    let cfg = rollback.write_config(0, "");
+    let (code, verdict, _) = run(&mut rollback.verify_cmd(&cfg));
+    assert_eq!(code, 1, "{verdict}");
+    assert_eq!(check(&verdict, "anti_rollback")["ok"], false);
+}
+
+#[test]
+fn compatibility_remains_a_shadow_only_rollout_check() {
+    let fx = Fixture::new("shadow-compat");
     fx.arrange_happy();
-    fx.write_sig("bom.sig", false);
-    let cfg = fx.write_config(1, "");
-    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-    assert_eq!(code, 1);
-    assert_eq!(check(&verdict, "record_sig")["ok"], true);
-    assert_eq!(check(&verdict, "bom_sig")["ok"], false);
+    let cfg = fx.write_config(0, "");
+    let mut command = fx.verify_cmd_bare(&cfg);
+    command
+        .args(["--device-channel", "stable"])
+        .args(["--device-compat", "4,5"]);
+    let (code, verdict, _) = run(&mut command);
+    assert_eq!(code, 0, "{verdict}");
+    assert_eq!(verdict["verdict"], "refuse");
+    assert_eq!(check(&verdict, "compat_overlap")["ok"], false);
 }
 
 #[test]
@@ -346,13 +476,13 @@ fn seq_mismatch_refuses() {
 fn channel_mismatch_refuses() {
     let fx = Fixture::new("channel");
     fx.arrange_happy();
-    fx.write_record("0.44.7", "edge", 7);
+    fx.write_record("0.44.7", "beta", 7);
     let cfg = fx.write_config(1, "");
     let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
     assert_eq!(code, 1);
     let c = check(&verdict, "channel_match");
     assert_eq!(c["ok"], false);
-    assert!(c["detail"].as_str().unwrap().contains("edge"));
+    assert!(c["detail"].as_str().unwrap().contains("beta"));
 }
 
 #[test]
@@ -361,7 +491,7 @@ fn hardware_target_mismatch_refuses() {
     fx.arrange_happy();
     fs::write(
         fx.path("record.json"),
-        r#"{"assigned_at":"2026-07-11T00:00:00Z","bundle_seq":7,"channel":"stable","hardware_target":"nvidia-cuda-x86_64","key_version":1,"train":"0.44.7"}"#,
+        format!(r#"{{"assigned_at":"2026-07-11T00:00:00Z","bundle_digest":"{TEST_BUNDLE_DIGEST}","bundle_seq":7,"channel":"stable","hardware_target":"nvidia-cuda-x86_64","key_version":1,"schema_version":2,"train":"0.44.7"}}"#),
     )
     .unwrap();
     let cfg = fx.write_config(1, "");
@@ -526,7 +656,7 @@ fn missing_pubkey_fails_signature_checks_not_internally() {
     fs::remove_file(fx.path("ota-root.pub")).unwrap();
     let cfg = fx.write_config(0, "");
     let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
-    assert_eq!(code, 0, "shadow logs, does not block: {verdict}");
+    assert_eq!(code, 1, "signature authority refuses in shadow: {verdict}");
     assert_eq!(verdict["verdict"], "refuse");
     assert_eq!(check(&verdict, "record_sig")["ok"], false);
     assert_eq!(check(&verdict, "bom_sig")["ok"], false);
@@ -1244,7 +1374,7 @@ fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
     fs::set_permissions(permissive.path("state"), fs::Permissions::from_mode(0o755)).unwrap();
 
     let (code, _, stderr) = run(&mut permissive.verify_cmd(&cfg));
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "unseeded shadow posture remains non-blocking");
     assert!(stderr.contains("could not record last verdict"), "{stderr}");
     assert_eq!(
         fs::metadata(permissive.path("state"))
@@ -1272,7 +1402,7 @@ fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
     std::os::unix::fs::symlink(symlinked.path("outside-state"), symlinked.path("state")).unwrap();
 
     let (code, _, stderr) = run(&mut symlinked.verify_cmd(&cfg));
-    assert_eq!(code, 0);
+    assert_eq!(code, 1, "untrusted anti-rollback state never shadow-passes");
     assert!(stderr.contains("could not record last verdict"), "{stderr}");
     assert!(fs::symlink_metadata(symlinked.path("state"))
         .unwrap()
@@ -1292,7 +1422,7 @@ fn verify_refuses_an_intermediate_state_parent_symlink_without_target_writes() {
     let cfg = fx.write_config_with_state(0, &state_dir, "");
 
     let (code, verdict, stderr) = run(&mut fx.verify_cmd(&cfg));
-    assert_eq!(code, 0, "shadow keeps its documented log-only exit code");
+    assert_eq!(code, 1, "anti-rollback authority never shadow-passes");
     assert_eq!(verdict["verdict"], "refuse");
     assert_eq!(check(&verdict, "anti_rollback")["ok"], false);
     assert!(check(&verdict, "anti_rollback")["detail"]
