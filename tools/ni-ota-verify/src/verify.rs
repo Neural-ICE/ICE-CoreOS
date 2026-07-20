@@ -370,9 +370,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     human_summary(&verdict);
     record_last_verdict(&cfg, &json);
 
-    // Shadow mode is log-only only for legacy/non-authority policy checks.
-    // Record-v2 and bundle-digest authority failures always refuse. Internal
-    // errors never reach this point (they exit 2 in every mode).
+    // Shadow mode is log-only only for non-authority rollout checks. Every
+    // authenticity, signed binding, target/ring, anti-rollback or bundle
+    // identity failure above always refuses. Internal errors never reach this
+    // point (they exit 2 in every mode).
     Ok(if !authority_ok {
         EXIT_REFUSE
     } else if ok || !cfg.enforce {
