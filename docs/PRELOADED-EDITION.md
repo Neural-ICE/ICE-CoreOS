@@ -23,7 +23,14 @@ expensive work happens **once on the build host, never on the target device**:
    on the real model tree, not on the symlink inode.
 3. The script grows the light raw, appends a **`ni-seed` GPT partition** (xfs, sized from the
    EXTRACTED store + models + headroom) and copies both payloads in.
-4. **`ota/neural-ice-autoinstall.sh`** (seed step, only when `/dev/disk/by-partlabel/ni-seed`
+4. After the writable build loop is detached, a Linux-only final-media gate reopens the exact raw
+   with a read-only loop, selects the `ni-seed` child partition from that loop (never from a global
+   label link), mounts XFS `ro,nosuid,nodev,noexec`, and recreates the complete namespace manifest.
+   The build refuses unless every file digest, directory, symlink, hard-link relation, owner, mode
+   and xattr matches the approved source manifest and the raw SHA-256 is unchanged before/after.
+   A `*.img.final-media.json` receipt binds the accepted raw digest, size, seed manifest and
+   `PARTUUID`; the raw is hashed again after compression to close the gate-to-artifact interval.
+5. **`ota/neural-ice-autoinstall.sh`** (seed step, only when `/dev/disk/by-partlabel/ni-seed`
    exists): after `bootc install`, it copies the ready store onto the encrypted data volume as
    `/var/lib/neural-ice/data/seed-store` (SELinux-labelled `container_ro_file_t`) and the models
    into `data/huggingface`. The image's `storage.conf.d` drop-in registers `seed-store` as a
@@ -57,6 +64,9 @@ VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
 
 Produces `ice-coreos-installer-preloaded-<version>.img.zst` (+ `.sha256`). Flash:
 `zstd -dc <img.zst> | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress`.
+
+The build also emits `<name>.img.final-media.json` and its `.sha256`. Release automation must
+retain that receipt and flash/read back exactly the raw digest recorded in it.
 
 Notes:
 - `OUT` names the output archive here but is the bib output DIR in

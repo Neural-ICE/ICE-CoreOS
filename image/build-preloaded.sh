@@ -61,7 +61,9 @@ echo "==> 2. build the READY overlay image store (ONCE, here) + size the seed"
 # wants a root-owned graphroot. All reads/copies/cleanup below therefore go through sudo.
 STORE_TMP="$(sudo mktemp -d /var/tmp/ni-seed-store.XXXXXX)"
 RUNROOT="$(sudo mktemp -d /run/ni-seed-runroot.XXXXXX)"
-storecleanup(){ sudo rm -rf "$STORE_TMP" "$RUNROOT" 2>/dev/null||true; }
+VERIFY_TMP="$(sudo mktemp -d /var/tmp/ni-seed-verify.XXXXXX)"
+EXPECTED_SEED_MANIFEST="${VERIFY_TMP}/expected-seed-manifest.json"
+storecleanup(){ sudo rm -rf "$STORE_TMP" "$RUNROOT" "$VERIFY_TMP" 2>/dev/null||true; }
 trap storecleanup EXIT
 shopt -s nullglob
 archives=("$SEED_IMAGES"/*.tar)
@@ -72,6 +74,22 @@ for a in "${archives[@]}"; do
 done
 echo "    store images:"
 sudo podman --root "$STORE_TMP" --runroot "$RUNROOT" --storage-driver overlay images
+
+# Freeze the complete approved source namespace before copying it. The final-media gate below
+# re-creates this manifest from the finalized XFS partition through a genuinely read-only loop.
+# Any concurrent source mutation therefore makes the build refuse instead of silently changing
+# the installer payload.
+manifest_args=(
+  --tree "store=${STORE_TMP}"
+  --tree "models=${SEED_MODELS}"
+)
+if [ -n "$SEED_PAYLOAD" ]; then
+  manifest_args+=(--tree "payload=${SEED_PAYLOAD}")
+fi
+sudo python3 image/seed-tree-manifest.py \
+  "${manifest_args[@]}" \
+  --output "$EXPECTED_SEED_MANIFEST"
+
 STORE_BYTES="$(sudo du -sb "$STORE_TMP" | cut -f1)"
 MODELS_BYTES="$(sudo du -sb "$SEED_MODELS" | cut -f1)"
 SEED_BYTES=$(( STORE_BYTES + MODELS_BYTES ))
@@ -105,9 +123,18 @@ if [ -n "$SEED_PAYLOAD" ]; then
 fi
 sudo sync
 echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
-sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; storecleanup; trap - EXIT
+sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"
 
-echo "==> 5. compress (${COMPRESS})"
+echo "==> 5. verify finalized ni-seed from the exact raw through a read-only loop"
+FINAL_MEDIA_RECEIPT="${RAW}.final-media.json"
+sudo python3 image/verify-preloaded-media.py \
+  --raw "$RAW" \
+  --expected-manifest "$EXPECTED_SEED_MANIFEST" \
+  --receipt "$FINAL_MEDIA_RECEIPT"
+sudo chmod 0644 "$FINAL_MEDIA_RECEIPT"
+storecleanup; trap - EXIT
+
+echo "==> 6. compress (${COMPRESS})"
 case "$COMPRESS" in
   zstd-fast) zstd -3 -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
   zstd-max)  zstd -19 --long -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
@@ -116,6 +143,26 @@ case "$COMPRESS" in
   *) echo "invalid COMPRESS"; exit 2 ;;
 esac
 [ "$COMPRESS" = none ] || sha256sum "$ART" > "${ART}.sha256"
+# The receipt binds the raw bytes accepted above. Re-read the raw after compression so a
+# concurrent writer cannot substitute bytes between the gate and artifact creation.
+python3 - "$FINAL_MEDIA_RECEIPT" "$RAW" <<'PY'
+import hashlib
+import json
+import sys
+
+receipt_path, raw_path = sys.argv[1:]
+with open(receipt_path, encoding="ascii") as stream:
+    expected = json.load(stream)["raw"]
+digest = hashlib.sha256()
+size = 0
+with open(raw_path, "rb", buffering=0) as stream:
+    while chunk := stream.read(8 * 1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+if size != expected["size"] or digest.hexdigest() != expected["sha256"]:
+    raise SystemExit("REFUSED: raw changed after final-media acceptance")
+PY
+sha256sum "$FINAL_MEDIA_RECEIPT" > "${FINAL_MEDIA_RECEIPT}.sha256"
 # Compressed outputs above stay repo-relative so their checksum entries remain
 # relocatable. Normalize a separate reporting path because the uncompressed
 # RAW is already absolute and must not receive REPO_ROOT a second time.

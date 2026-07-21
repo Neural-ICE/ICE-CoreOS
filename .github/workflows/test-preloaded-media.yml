@@ -6,8 +6,11 @@ on:
     branches:
       - main
     paths:
+      - 'image/build-preloaded.sh'
       - 'image/seed-tree-manifest.py'
+      - 'image/verify-preloaded-media.py'
       - 'image/test-seed-tree-manifest.py'
+      - 'image/test-verify-preloaded-media.sh'
       - '.github/workflows/test-preloaded-media.yml'
   workflow_dispatch:
 
@@ -29,8 +32,17 @@ jobs:
           persist-credentials: false
       - name: Portable manifest tests
         run: |
-          python3 -m py_compile image/seed-tree-manifest.py
+          python3 -m py_compile \
+            image/seed-tree-manifest.py \
+            image/verify-preloaded-media.py
           python3 image/test-seed-tree-manifest.py
+          shellcheck \
+            image/build-preloaded.sh \
+            image/test-verify-preloaded-media.sh
+      - name: Final raw-media integration
+        run: >-
+          sudo --non-interactive --preserve-env=PATH
+          bash image/test-verify-preloaded-media.sh
 
   linux-arm64:
     if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
@@ -42,5 +54,14 @@ jobs:
           persist-credentials: false
       - name: Portable manifest tests
         run: |
-          python3 -m py_compile image/seed-tree-manifest.py
+          python3 -m py_compile \
+            image/seed-tree-manifest.py \
+            image/verify-preloaded-media.py
           python3 image/test-seed-tree-manifest.py
+          shellcheck \
+            image/build-preloaded.sh \
+            image/test-verify-preloaded-media.sh
+      - name: Final raw-media integration
+        run: >-
+          sudo --non-interactive --preserve-env=PATH
+          bash image/test-verify-preloaded-media.sh
