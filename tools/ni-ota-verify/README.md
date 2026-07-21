@@ -94,6 +94,7 @@ ni-ota-verify verify-delegation-snapshot \
   --trusted-now <YYYY-MM-DDTHH:MM:SSZ> \
   [--accepted-snapshot <path> --accepted-delegation-seq <n> \
    --accepted-delegation-sha256 <64hex>] [--config …]
+ni-ota-verify capabilities
 ```
 
 Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
@@ -101,6 +102,13 @@ Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 `device_compat_max`; flags override. A missing `enforce` key defaults to
 **enforce** (an incomplete config leans strict, never silently log-only). The
 hardware target comes from the immutable image marker, not a CLI override.
+
+`capabilities` emits the bounded canonical JSON object
+`{"schema":1,"features":["bundle-digest-v1"]}`. The appliance controller uses
+this public compatibility handshake before any registry access; unknown output,
+missing `bundle-digest-v1`, extra top-level keys or a non-zero exit must fail
+closed. The feature states that `verify` requires and authorizes the signed OCI
+bundle manifest digest rather than a mutable tag.
 
 ### ADR-0039 delegation-snapshot trust gate
 

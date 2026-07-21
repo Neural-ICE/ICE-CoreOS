@@ -55,6 +55,7 @@ const USAGE: &str = "usage:
                        [--accepted-snapshot <path>]
                        [--accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>]
                        [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify capabilities
   ni-ota-verify --version";
 
 /// Environment/tooling failure — never a verification verdict. Always mapped
@@ -74,6 +75,10 @@ fn run() -> u8 {
         Some("bootstrap") => bootstrap::run(&args[1..]),
         Some("commit") => commit::run(&args[1..]),
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
+        Some("capabilities") if args.len() == 1 => {
+            println!("{{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}}");
+            return EXIT_PASS;
+        }
         Some("--version" | "version") => {
             println!("ni-ota-verify {}", env!("CARGO_PKG_VERSION"));
             return EXIT_PASS;
