@@ -111,6 +111,11 @@ pub(crate) struct Config {
     pub enforce: bool,
     pub root_pubkey: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    /// Legacy monotonic bundle floor. It remains reserved while state-v1 adds
+    /// a separate hash-chain anchor; an upgrade must never repurpose it.
+    pub nv_index: Option<u32>,
+    /// TPM NV EXTEND index for the complete state-v1 manifest chain.
+    pub state_nv_index: Option<u32>,
     /// Optional `device_channel=` key — the channel THIS device follows.
     /// Instance identity, so the vanilla image ships it unset; the
     /// `--device-channel` flag overrides.
@@ -133,6 +138,8 @@ impl Config {
         let mut root_pubkey = None;
         let mut state_dir = None;
         let mut device_channel = None;
+        let mut nv_index = None;
+        let mut state_nv_index = None;
         let mut compat_min: Option<i64> = None;
         let mut compat_max: Option<i64> = None;
 
@@ -172,6 +179,10 @@ impl Config {
                 },
                 "root_pubkey" => root_pubkey = Some(PathBuf::from(value)),
                 "state_dir" => state_dir = Some(PathBuf::from(value)),
+                "nv_index" => nv_index = Some(parse_nv_index(value, path, "nv_index")?),
+                "state_nv_index" => {
+                    state_nv_index = Some(parse_nv_index(value, path, "state_nv_index")?)
+                }
                 "device_channel" => device_channel = Some(value.to_string()),
                 "device_compat_min" => compat_min = Some(int("device_compat_min")?),
                 "device_compat_max" => compat_max = Some(int("device_compat_max")?),
@@ -200,10 +211,29 @@ impl Config {
             enforce: enforce.unwrap_or(true),
             root_pubkey,
             state_dir,
+            nv_index,
+            state_nv_index,
             device_channel,
             device_compat,
         })
     }
+}
+
+fn parse_nv_index(value: &str, path: &Path, key: &str) -> Result<u32, InternalError> {
+    let hex = value.strip_prefix("0x").ok_or_else(|| {
+        InternalError(format!(
+            "config {}: {key} must be an exact hexadecimal TPM NV index",
+            path.display()
+        ))
+    })?;
+    if hex.len() != 8 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(InternalError(format!(
+            "config {}: {key} must be 0x followed by eight hexadecimal digits",
+            path.display()
+        )));
+    }
+    u32::from_str_radix(hex, 16)
+        .map_err(|_| InternalError(format!("config {}: invalid {key}", path.display())))
 }
 
 /// `--device-compat <min,max>` flag value.
@@ -236,7 +266,7 @@ mod tests {
     #[test]
     fn parses_the_staged_ota_conf_shape() {
         let cfg = parse(
-            "# comment\nenforce=0\nnv_index=0x01500001\nregistry=registry.neural-ice.ch\n\
+            "# comment\nenforce=0\nnv_index=0x01500001\nstate_nv_index=0x01500002\nregistry=registry.neural-ice.ch\n\
              root_pubkey=/etc/neural-ice/keys/ota-root.pub\nstate_dir=/var/lib/neural-ice/ota\n",
         )
         .unwrap();
@@ -251,6 +281,8 @@ mod tests {
         );
         assert!(cfg.device_channel.is_none());
         assert!(cfg.device_compat.is_none());
+        assert_eq!(cfg.nv_index, Some(0x0150_0001));
+        assert_eq!(cfg.state_nv_index, Some(0x0150_0002));
     }
 
     #[test]
@@ -262,6 +294,8 @@ mod tests {
     fn bad_enforce_and_malformed_lines_abort() {
         assert!(parse("enforce=yes\n").is_err());
         assert!(parse("enforce\n").is_err());
+        assert!(parse("nv_index=0x1\n").is_err());
+        assert!(parse("state_nv_index=01500002\n").is_err());
     }
 
     #[test]

@@ -29,6 +29,7 @@ mod delegated;
 mod record;
 mod runner;
 mod state;
+mod state_v1;
 mod verify;
 
 use std::collections::HashMap;
@@ -93,7 +94,21 @@ fn run() -> u8 {
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
         Some("capabilities") if args.len() == 1 => {
-            println!("{{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}}");
+            let capability_ready =
+                match state_v1::capability_ready(std::path::Path::new(DEFAULT_CONFIG)) {
+                    Ok(ready) => ready,
+                    Err(InternalError(message)) => {
+                        eprintln!("ni-ota-verify: internal error: {message}");
+                        return EXIT_INTERNAL;
+                    }
+                };
+            if capability_ready {
+                println!(
+                    "{{\"schema\":1,\"features\":[\"atomic-state-v1\",\"bundle-digest-v1\"]}}"
+                );
+            } else {
+                println!("{{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}}");
+            }
             return EXIT_PASS;
         }
         Some("--version" | "version") => {

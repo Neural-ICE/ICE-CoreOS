@@ -1,0 +1,129 @@
+# ADR-0012 — Atomic TPM-anchored OTA state
+
+- Status: Accepted
+- Date: 2026-07-21
+- Owners: Neural ICE
+- Related: ADR-0003, ADR-0005, ADR-0010; ICE-Fabric ADR-0039
+
+## Context
+
+An appliance must not persist a new applied bundle while retaining older
+authority or trusted-time state. A crash between independent writes would
+create an ambiguous update baseline. Wall-clock time is not a trust source on
+an offline or power-cycled appliance.
+
+The deployed TPM NV index `0x01500001` remains the monotonic legacy bundle
+floor. It cannot be repurposed without breaking rollback compatibility.
+
+## Decision
+
+The verifier uses a separate SHA-256, 32-byte TPM NV EXTEND index at
+`0x01500002`. Its exact base attributes are
+`authread|authwrite|no_da|nt=extend|ownerread|platformcreate|policydelete`;
+`written` is the only permitted dynamic attribute. `platformcreate` is
+required by TPM 2.0 for `TPM2_NV_UndefineSpaceSpecial`; an owner-created index
+with `policydelete` is invalid and must never be provisioned. Runtime extension
+authenticates to this index, not to the owner hierarchy.
+
+Deletion is an exceptional root-recovery operation. The NV authorization
+policy is the SHA-256 policy digest
+`921f9fa2ce8c30bbf29b84500a8456188f1febc04f154e9eccca4d5b1bc8a25d`,
+constructed as:
+
+1. `TPM2_PolicyAuthorize` by the `ota-root-v1` public key whose TPM Name is
+   `000beb256627a4315f1a3d2a2a0c9931760ad30e8822b35c5ebed854f1829b07b7b1`,
+   with the exact binary policy reference
+   `neural-ice:ota:state-nv-delete:v1\0`;
+2. `TPM2_PolicyCommandCode(TPM_CC_NV_UndefineSpaceSpecial)`.
+
+Per TCG TPM 2.0 Library Part 3 section 23.2.3, `PolicyUpdate` hashes its
+variable-sized arguments in two distinct steps; it does not concatenate the
+key Name and `policyRef` into one hash. For SHA-256 the reproducible chain is:
+
+- `H(0^32 || 0000016a || ota-root-v1.Name)` =
+  `8599598585b872929367c006ff1e53da890a41a20a590f436b160ebb141d7e85`;
+- `H(previous || policyRef.buffer)` =
+  `acd9fab3a701a6738e092425f342abd45962ffc2808f399d59aa615f892df063`;
+- `H(previous || 0000016c || 0000011f)` = the pinned authorization policy
+  `921f9fa2ce8c30bbf29b84500a8456188f1febc04f154e9eccca4d5b1bc8a25d`.
+
+The same values are emitted by a trial policy session on `swtpm` through
+`tpm2_policyauthorize` and `tpm2_policycommandcode`.
+
+The root signature authorizes the approved recovery policy; it does not expose
+or import the root private key on the appliance. The platform hierarchy must
+also authorize the special undefine command. Owner/password undefine and an
+empty-policy fallback are forbidden.
+
+Capability discovery attests the complete public area, including the exact
+authorization-policy digest and the TPM-computed public Name. The only accepted
+Names are
+`000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62`
+before the first extend and
+`000b571132a9688f4088f3696fa9bf5d5793be7483202cee08ceb2261f2bbe89b440`
+after `written` is set. It accepts both zero-padded and canonical unpadded
+hexadecimal handles emitted by supported `tpm2-tools`, then compares the parsed
+numeric handle. It must additionally prove that the complete pre-apply guard
+and post-health commit command set is present. Consequently this first policy
+slice does **not** advertise `atomic-state-v1`, even when a correct index
+already exists.
+
+Each committed generation binds the complete root-signed delegation snapshot,
+the exact signed release authorization and BOM, the applied bundle floor, and
+a canonical trusted-time v2 assertion. The manifest also binds all artifact
+hashes, every monotonic floor, the previous manifest hash and the previous TPM
+anchor. The verifier stages and fsyncs all files, extends the TPM with the
+manifest hash, reads the expected anchor back, then publishes and rereads the
+current pointer and enforcement marker. No success receipt is emitted earlier.
+
+Trusted time is a short-lived signed artifact obtained by the controller from
+the allowlisted licensing service; the verifier itself remains networkless.
+The v2 assertion is valid for at most ten minutes and binds:
+
+- the exact release-authorization and root-signed snapshot hashes;
+- hardware target and release ring;
+- the appliance TPM-rooted device identity;
+- the current TPM NV anchor, clock, reset count, restart count and safe bit;
+- a fresh 32-byte appliance challenge consumed by the same atomic transaction.
+
+For a fresh appliance, the trusted-time key is provisionally authorized only
+by the candidate root-signed initial snapshot. Snapshot, assertion, release
+and first state generation are accepted atomically; none becomes independent
+authority on failure. A TPM-state recovery is a distinct root-signed artifact
+bound to a new one-use appliance challenge and the complete replacement state.
+Ordinary trusted-time assertions can never reset or lower a floor.
+
+## Crash recovery and rollback
+
+- A crash before NV EXTEND leaves a non-authoritative staged generation which
+  an exact retry may replace.
+- A crash after NV EXTEND recovers only the unique complete generation chain
+  whose derived anchor equals the observed TPM value.
+- An equal sequence is accepted only for byte-identical retry; a split view
+  refuses.
+- Existing state with a missing/recreated index, an unreadable legacy floor,
+  ambiguous history, unsafe TPM clock or invalid issuance window fails closed
+  for new updates while the installed workload keeps running.
+- The legacy floor is read and cross-checked but never redefined or lowered.
+- The previous immutable bootc deployment and OCI digests remain available for
+  local rollback. Rollback never lowers authority, bundle or trusted-time
+  floors; forward repair requires a newer signed release or root recovery.
+
+An N-1 verifier without `atomic-state-v1` may boot the retained deployment but
+cannot authorize a new atomic-state update. Operators must boot the retained
+newer deployment or signed recovery media before changing update state.
+
+## Delivery
+
+Implementation lands as a reviewable stack. This first layer only parses and
+attests the reserved index policy and cannot provision, extend, commit,
+recover or move any channel. Later layers add installer/first-boot
+provisioning, storage, transactional mutation, trusted-time v2 challenge
+handling and caller integration. The public capability remains absent until
+the exact index exists, passes attestation, and the same verifier binary
+contains the pre-apply and post-health state-v1 commands.
+
+No release channel, live appliance or USB medium is changed by this ADR.
+
+The attribute and command constraints follow the published TCG TPM 2.0 Library
+Part 2 (TPMA_NV) and Part 3 (`TPM2_NV_UndefineSpaceSpecial`) specifications.

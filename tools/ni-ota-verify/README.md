@@ -115,6 +115,19 @@ missing `bundle-digest-v1`, extra top-level keys or a non-zero exit must fail
 closed. The feature states that `verify` requires and authorizes the signed OCI
 bundle manifest digest rather than a mutable tag.
 
+The reserved atomic-state TPM index is not itself a protocol capability.
+`atomic-state-v1` remains deliberately absent until the same verifier binary
+contains the complete pre-apply guard and post-health commit commands and the
+installer provisions the attested index. Controllers must never infer atomic
+state support from `state_nv_index` configuration or TPM index presence.
+
+The later, complete stack may add the one exact negotiated response
+`{"schema":1,"features":["atomic-state-v1","bundle-digest-v1"]}` in the same
+change that updates the controller. A controller which understands that
+response must treat `features` as a closed set, require `bundle-digest-v1`, and
+use the atomic pre-apply and post-health flow whenever `atomic-state-v1` is
+present. Older controllers continue to reject that response fail-closed.
+
 The immediate prior bootc deployment predates this command. A one-version OS
 rollback therefore keeps the appliance running but intentionally disables new
 registry-backed OTA checks: a non-zero capability probe remains fail-closed.
