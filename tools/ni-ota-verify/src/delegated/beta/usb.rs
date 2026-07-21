@@ -9,7 +9,6 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::*;
-use crate::config::immutable_bootstrap_delegation_sha256;
 use crate::record::{self, ChannelRecord};
 use crate::runner;
 use crate::state::{ensure_secure_state_directory, FileStateStore};
@@ -75,6 +74,19 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "config",
         ],
     )?;
+    if [
+        "accepted-snapshot",
+        "accepted-delegation-seq",
+        "accepted-delegation-sha256",
+    ]
+    .iter()
+    .any(|name| flags.contains_key(*name))
+    {
+        return refusal(
+            "caller-provided accepted delegation state is forbidden for physical USB bootstrap"
+                .into(),
+        );
+    }
     let required = |name: &str| {
         flags
             .get(name)
@@ -137,7 +149,6 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let context = super::super::CandidateContext {
         now,
         minimum: immutable_minimum_delegation_seq()?,
-        bootstrap_sha256: Some(immutable_bootstrap_delegation_sha256()?),
         flags: &flags,
         snapshot_file: &snapshot_file,
         scratch: &scratch,

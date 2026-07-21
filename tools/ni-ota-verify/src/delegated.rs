@@ -6,7 +6,9 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-use crate::config::{immutable_minimum_delegation_seq, Config};
+use crate::config::{
+    immutable_bootstrap_delegation_sha256, immutable_minimum_delegation_seq, Config,
+};
 use crate::state::{ensure_secure_state_directory, FileStateStore, SecureTempFile};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
@@ -138,7 +140,6 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let context = CandidateContext {
         now: required("trusted-now")?,
         minimum: immutable_minimum_delegation_seq()?,
-        bootstrap_sha256: None,
         flags: &flags,
         snapshot_file: &snapshot,
         scratch: &scratch,
@@ -173,7 +174,6 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
 struct CandidateContext<'a> {
     now: &'a str,
     minimum: u64,
-    bootstrap_sha256: Option<String>,
     flags: &'a HashMap<String, String>,
     snapshot_file: &'a SecureTempFile,
     scratch: &'a FileStateStore,
@@ -201,11 +201,8 @@ fn validate_candidate(
         context.flags.get("accepted-snapshot"),
     ) {
         (None, None, None) if context.allow_unseeded_bootstrap => {
-            let Some(expected_hash) = context.bootstrap_sha256.as_deref() else {
-                return Err(ContractError::Internal(InternalError(
-                    "immutable bootstrap delegation SHA-256 is unavailable".into(),
-                )));
-            };
+            let expected_hash =
+                immutable_bootstrap_delegation_sha256().map_err(ContractError::Internal)?;
             if candidate.delegation_seq != context.minimum || hash != expected_hash {
                 return Err(
                     "snapshot differs from the immutable bootstrap delegation epoch".into(),

@@ -2150,6 +2150,22 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(verdict["bom_sha256"], bom_hash);
     assert!(!fx.path("state/applied.json").exists());
 
+    fs::remove_file(fx.path("bootstrap-delegation-sha256")).unwrap();
+    let mut seeded = command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST);
+    seeded
+        .args(["--accepted-snapshot".as_ref(), snapshot.as_os_str()])
+        .args(["--accepted-delegation-seq", "1"])
+        .args([
+            "--accepted-delegation-sha256",
+            "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
+        ]);
+    let (code, verdict, stderr) = run(&mut seeded);
+    assert_eq!(code, 1, "{verdict:?} {stderr}");
+    assert!(
+        stderr.contains("caller-provided accepted delegation state is forbidden"),
+        "{stderr}"
+    );
+
     fs::write(
         fx.path("bootstrap-delegation-sha256"),
         format!("{}\n", "f".repeat(64)),
@@ -2172,6 +2188,23 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
         stderr.contains("invalid immutable bootstrap delegation SHA-256"),
         "{stderr}"
     );
+    for malformed in [
+        " a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500\n",
+        "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500 \n",
+        "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500\n\n",
+        "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
+    ] {
+        fs::write(fx.path("bootstrap-delegation-sha256"), malformed).unwrap();
+        let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+        assert_eq!(
+            code, 2,
+            "accepted non-canonical marker {malformed:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("invalid immutable bootstrap delegation SHA-256"),
+            "{stderr}"
+        );
+    }
     fs::remove_file(fx.path("bootstrap-delegation-sha256")).unwrap();
     let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
     assert_eq!(code, 2, "{stderr}");

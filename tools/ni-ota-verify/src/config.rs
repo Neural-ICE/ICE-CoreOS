@@ -112,16 +112,17 @@ pub(crate) fn immutable_bootstrap_delegation_sha256() -> Result<String, Internal
     );
     #[cfg(not(feature = "test-path-overrides"))]
     let path = PathBuf::from(DEFAULT_BOOTSTRAP_DELEGATION_SHA256_FILE);
-    let value = std::fs::read_to_string(&path).map_err(|error| {
+    let value = std::fs::read(&path).map_err(|error| {
         InternalError(format!(
             "unreadable immutable bootstrap delegation SHA-256 {}: {error}",
             path.display()
         ))
     })?;
-    let digest = value.trim();
-    if digest.len() != 64
-        || !digest
-            .bytes()
+    if value.len() != 65
+        || value[64] != b'\n'
+        || !value[..64]
+            .iter()
+            .copied()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(InternalError(format!(
@@ -129,7 +130,12 @@ pub(crate) fn immutable_bootstrap_delegation_sha256() -> Result<String, Internal
             path.display()
         )));
     }
-    Ok(digest.to_owned())
+    String::from_utf8(value[..64].to_vec()).map_err(|_| {
+        InternalError(format!(
+            "invalid immutable bootstrap delegation SHA-256 in {}",
+            path.display()
+        ))
+    })
 }
 
 pub(crate) struct Config {
