@@ -4,8 +4,10 @@
 The manifest deliberately excludes timestamps and inode numbers, which change
 when a seed is copied to XFS. It includes every namespace entry, file digest,
 mode, owner, symlink target, hard-link relationship and extended attribute.
-The CLI accepts only trees exposed through read-only filesystem mounts so the
-captured namespace cannot change during traversal.
+
+This is an unprivileged serialization primitive. Its caller must supply stable
+input trees (normally immutable build outputs or read-only snapshots). The
+final-media gate owns mount isolation, topology and capacity enforcement.
 """
 
 from __future__ import annotations
@@ -17,9 +19,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 
@@ -166,172 +170,116 @@ def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
         raise ManifestError(f"{kind} changed while walking: {path}")
 
 
-def mountinfo_has_writable_alias(
-    lines: list[bytes],
-    device: bytes,
-) -> tuple[bool, bool]:
-    found = False
-    for line in lines:
-        fields = line.split()
-        try:
-            separator = fields.index(b"-")
-            mounted_device = fields[2]
-            mount_options = fields[5].split(b",")
-            superblock_options = fields[separator + 3].split(b",")
-        except (IndexError, ValueError) as error:
-            raise ManifestError("cannot parse /proc/self/mountinfo") from error
-        if mounted_device != device:
-            continue
-        found = True
-        if b"rw" in mount_options or b"rw" in superblock_options:
-            return found, True
-    return found, False
-
-
-def require_private_mount_namespace() -> None:
-    try:
-        current = Path("/proc/self/ns/mnt").stat()
-        initial = Path("/proc/1/ns/mnt").stat()
-    except OSError as error:
-        raise ManifestError(f"cannot verify private mount namespace: {error}") from error
-    if (current.st_dev, current.st_ino) == (initial.st_dev, initial.st_ino):
-        raise ManifestError("manifest traversal requires a private mount namespace")
-
-
-def require_exclusive_read_only_mount(root: Path, metadata: os.stat_result) -> None:
-    if not hasattr(os, "ST_RDONLY"):
-        raise ManifestError("read-only filesystem verification is unavailable")
-    try:
-        filesystem = os.statvfs(root)
-    except OSError as error:
-        raise ManifestError(f"cannot inspect tree filesystem {root}: {error}") from error
-    if not filesystem.f_flag & os.ST_RDONLY:
-        raise ManifestError(f"tree filesystem is not read-only: {root}")
-    if sys.platform != "linux":
-        raise ManifestError("exclusive read-only mount verification requires Linux")
-    try:
-        mountinfo = Path("/proc/self/mountinfo").read_bytes().splitlines()
-    except OSError as error:
-        raise ManifestError(f"cannot read mount topology for {root}: {error}") from error
-    device = f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}".encode("ascii")
-    found, writable = mountinfo_has_writable_alias(mountinfo, device)
-    if not found:
-        raise ManifestError(f"tree mount is absent from mount topology: {root}")
-    if writable:
-        raise ManifestError(f"tree filesystem has a writable mount alias: {root}")
-
-
-def walk_tree(
+def inspect_entry(
     name: str,
-    root: Path,
-    hardlink_candidates: dict[tuple[int, int], list[str]],
-    directory_identities: set[tuple[int, int]],
-    *,
-    require_read_only: bool,
-) -> list[dict[str, Any]]:
+    path: Path,
+    relative: PurePosixPath | None,
+    expected: os.stat_result | None,
+) -> tuple[dict[str, Any], os.stat_result]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ManifestError(f"cannot stat {path}: {error}") from error
+    if expected is not None and identity(metadata) != identity(expected):
+        raise ManifestError(f"tree root changed before traversal: {path}")
+    manifest_path = stable_path(name, relative)
+    item: dict[str, Any] = {"path": manifest_path, **metadata_fields(metadata)}
+
+    if stat.S_ISDIR(metadata.st_mode):
+        item["type"] = "directory"
+        item["xattrs"] = xattrs(path, follow_symlinks=False)
+    elif stat.S_ISREG(metadata.st_mode):
+        item.update(
+            {
+                "sha256": file_digest(path, metadata),
+                "size": metadata.st_size,
+                "type": "file",
+                "xattrs": xattrs(path, follow_symlinks=False),
+            }
+        )
+    elif stat.S_ISLNK(metadata.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as error:
+            raise ManifestError(f"cannot read symlink {path}: {error}") from error
+        item.update(
+            {
+                "target": target,
+                "type": "symlink",
+                "xattrs": xattrs(path, follow_symlinks=False),
+            }
+        )
+    elif stat.S_ISCHR(metadata.st_mode):
+        # containers/storage represents OCI whiteouts in an extracted overlay
+        # graphroot as character devices with the reserved 0:0 device number.
+        if not is_allowed_overlay_whiteout(name, relative, metadata):
+            raise ManifestError(f"unsupported character device at {path}")
+        item.update(
+            {
+                "device": "0:0",
+                "type": "overlay-whiteout",
+                "xattrs": xattrs(path, follow_symlinks=False),
+            }
+        )
+    else:
+        raise ManifestError(f"unsupported seed entry type at {path}")
+
+    revalidate(path, metadata, "seed entry")
+    return item, metadata
+
+
+def walk_tree(name: str, root: Path):
     try:
         root_metadata = root.lstat()
     except OSError as error:
         raise ManifestError(f"cannot stat tree root {root}: {error}") from error
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise ManifestError(f"tree root is not a real directory: {root}")
-    if require_read_only:
-        require_exclusive_read_only_mount(root, root_metadata)
 
-    entries: list[dict[str, Any]] = []
-    stack: list[tuple[Path, PurePosixPath | None, os.stat_result | None]] = [
-        (root, None, root_metadata)
-    ]
-    while stack:
-        path, relative, expected = stack.pop()
-        try:
-            metadata = path.lstat()
-        except OSError as error:
-            raise ManifestError(f"cannot stat {path}: {error}") from error
-        if expected is not None and identity(metadata) != identity(expected):
-            raise ManifestError(f"tree root changed before traversal: {path}")
-        if require_read_only and metadata.st_dev != root_metadata.st_dev:
-            raise ManifestError(f"tree crosses a filesystem boundary: {path}")
-        manifest_path = stable_path(name, relative)
-        item: dict[str, Any] = {"path": manifest_path, **metadata_fields(metadata)}
+    root_item, opened_root_metadata = inspect_entry(name, root, None, root_metadata)
+    yield root_item, opened_root_metadata
+    try:
+        root_iterator = os.scandir(root)
+    except OSError as error:
+        raise ManifestError(f"cannot scan directory {root}: {error}") from error
 
-        if stat.S_ISDIR(metadata.st_mode):
-            directory_identities.add((metadata.st_dev, metadata.st_ino))
-            item["type"] = "directory"
-            item["xattrs"] = xattrs(path, follow_symlinks=False)
-            entries.append(item)
+    frames: list[
+        tuple[Path, PurePosixPath | None, os.stat_result, os.ScandirIterator[str]]
+    ] = [(root, None, root_metadata, root_iterator)]
+    try:
+        while frames:
+            directory, relative, directory_metadata, iterator = frames[-1]
             try:
-                with os.scandir(path) as iterator:
-                    children = sorted(iterator, key=lambda child: os.fsencode(child.name))
+                child = next(iterator)
+            except StopIteration:
+                iterator.close()
+                frames.pop()
+                revalidate(directory, directory_metadata, "seed directory")
+                continue
             except OSError as error:
-                raise ManifestError(f"cannot scan directory {path}: {error}") from error
-            for child in reversed(children):
-                child_relative = (
-                    PurePosixPath(child.name)
-                    if relative is None
-                    else relative / child.name
-                )
-                stack.append((Path(child.path), child_relative, None))
-            continue
+                raise ManifestError(f"cannot scan directory {directory}: {error}") from error
 
-        if stat.S_ISREG(metadata.st_mode):
-            item.update(
-                {
-                    "sha256": file_digest(path, metadata),
-                    "size": metadata.st_size,
-                    "type": "file",
-                    "xattrs": xattrs(path, follow_symlinks=False),
-                }
+            child_relative = (
+                PurePosixPath(child.name) if relative is None else relative / child.name
             )
-            entries.append(item)
-            hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
-                manifest_path
-            )
-            continue
+            child_path = Path(child.path)
+            item, metadata = inspect_entry(name, child_path, child_relative, None)
+            yield item, metadata
+            if stat.S_ISDIR(metadata.st_mode):
+                try:
+                    child_iterator = os.scandir(child_path)
+                except OSError as error:
+                    raise ManifestError(
+                        f"cannot scan directory {child_path}: {error}"
+                    ) from error
+                frames.append((child_path, child_relative, metadata, child_iterator))
+    finally:
+        for _, _, _, iterator in frames:
+            iterator.close()
 
-        if stat.S_ISLNK(metadata.st_mode):
-            try:
-                target = os.readlink(path)
-            except OSError as error:
-                raise ManifestError(f"cannot read symlink {path}: {error}") from error
-            item.update(
-                {
-                    "target": target,
-                    "type": "symlink",
-                    "xattrs": xattrs(path, follow_symlinks=False),
-                }
-            )
-            entries.append(item)
-            hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
-                manifest_path
-            )
-            continue
 
-        # containers/storage represents OCI whiteouts in an extracted overlay
-        # graphroot as character devices with the reserved 0:0 device number.
-        # They are required for a faithful offline image store. No other device
-        # node is accepted in a preload tree.
-        if stat.S_ISCHR(metadata.st_mode):
-            if not is_allowed_overlay_whiteout(name, relative, metadata):
-                raise ManifestError(f"unsupported character device at {path}")
-            item.update(
-                {
-                    "device": "0:0",
-                    "type": "overlay-whiteout",
-                    "xattrs": xattrs(path, follow_symlinks=False),
-                }
-            )
-            entries.append(item)
-            hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
-                manifest_path
-            )
-            continue
-
-        raise ManifestError(f"unsupported seed entry type at {path}")
-    revalidate(root, root_metadata, "tree root")
-    if require_read_only:
-        require_exclusive_read_only_mount(root, root_metadata)
-    return entries
+def path_sort_key(path: str) -> bytes:
+    return path.encode("utf-8", errors="surrogatepass")
 
 
 def output_is_within_tree(output: Path, root: Path) -> bool:
@@ -344,7 +292,7 @@ def output_is_within_tree(output: Path, root: Path) -> bool:
     return True
 
 
-def open_output_parent(output: Path) -> tuple[int, str, os.stat_result]:
+def open_output_parent(output: Path) -> tuple[int, str, Path, os.stat_result]:
     if not output.name:
         raise ManifestError(f"output must name a file: {output}")
     try:
@@ -355,34 +303,33 @@ def open_output_parent(output: Path) -> tuple[int, str, os.stat_result]:
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
-        descriptor = os.open(parent, flags)
+        descriptor = os.open(Path(parent.anchor), flags)
+        try:
+            for component in parent.parts[1:]:
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+        except BaseException:
+            os.close(descriptor)
+            raise
     except OSError as error:
         raise ManifestError(f"cannot open output directory for {output}: {error}") from error
     metadata = os.fstat(descriptor)
     if not stat.S_ISDIR(metadata.st_mode):
         os.close(descriptor)
         raise ManifestError(f"output parent is not a directory: {parent}")
-    return descriptor, output.name, metadata
+    return descriptor, output.name, parent, metadata
 
 
-def output_parent_is_manifested_directory(
-    metadata: os.stat_result,
-    directory_identities: set[tuple[int, int]],
-) -> bool:
-    parent_identity = (metadata.st_dev, metadata.st_ino)
-    return parent_identity in directory_identities
-
-
-def remove_failed_output(
+def remove_owned_name(
     parent_descriptor: int,
-    output_name: str,
+    name: str,
     created_identity: tuple[int, int],
-    output: Path,
     original_error: BaseException,
 ) -> None:
     try:
         metadata = os.stat(
-            output_name,
+            name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
@@ -390,118 +337,201 @@ def remove_failed_output(
         return
     except OSError as cleanup_error:
         raise ManifestError(
-            f"cannot inspect failed manifest {output}: {cleanup_error}"
+            f"cannot inspect failed manifest file {name}: {cleanup_error}"
         ) from original_error
     if (metadata.st_dev, metadata.st_ino) != created_identity:
         raise ManifestError(
-            f"refusing to remove replaced failed manifest: {output}"
+            f"refusing to remove replaced manifest file: {name}"
         ) from original_error
     try:
-        os.unlink(output_name, dir_fd=parent_descriptor)
+        os.unlink(name, dir_fd=parent_descriptor)
     except OSError as cleanup_error:
         raise ManifestError(
-            f"cannot remove failed manifest {output}: {cleanup_error}"
+            f"cannot remove failed manifest file {name}: {cleanup_error}"
         ) from original_error
+
+
+def write_all(descriptor: int, data: bytes, output: Path) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written == 0:
+            raise ManifestError(f"short write while creating manifest: {output}")
+        view = view[written:]
+
+
+def secure_parent_is_unchanged(parent: Path, expected: os.stat_result) -> bool:
+    descriptor, _, _, current = open_output_parent(parent / "manifest.identity-check")
+    os.close(descriptor)
+    return (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
 
 
 def write_manifest(
     trees: list[tuple[str, Path]],
     output: Path,
-    *,
-    require_read_only: bool,
 ) -> None:
     names = [name for name, _ in trees]
     if not trees or len(names) != len(set(names)):
         raise ManifestError("tree names must be non-empty and unique")
-    if require_read_only:
-        require_private_mount_namespace()
     for _, root in trees:
         if output_is_within_tree(output, root):
             raise ManifestError(f"output path is inside input tree: {output}")
 
-    entries: list[dict[str, Any]] = []
-    hardlink_candidates: dict[tuple[int, int], list[str]] = {}
-    directory_identities: set[tuple[int, int]] = set()
-    for name, root in sorted(trees):
-        entries.extend(
-            walk_tree(
-                name,
-                root,
-                hardlink_candidates,
-                directory_identities,
-                require_read_only=require_read_only,
+    with tempfile.TemporaryDirectory(prefix="seed-tree-manifest-") as spool_directory:
+        database_path = Path(spool_directory) / "entries.sqlite3"
+        with sqlite3.connect(database_path) as spool:
+            spool.execute("PRAGMA temp_store=FILE")
+            spool.execute("PRAGMA cache_size=-2048")
+            spool.execute(
+                "CREATE TABLE entries (path_key BLOB PRIMARY KEY, entry BLOB NOT NULL)"
             )
-        )
-    # A depth-first walk is deterministic but not globally lexicographic.  For
-    # example, "tree/bucket-archive" sorts before "tree/bucket/child" even
-    # though DFS visits the child before returning to the sibling.  Canonical
-    # manifests therefore sort the completed cross-tree namespace explicitly.
-    entries.sort(key=lambda entry: entry["path"])
-    paths = [entry["path"] for entry in entries]
-    if len(paths) != len(set(paths)):
-        raise ManifestError("manifest paths are not unique")
-    hardlink_roots: dict[str, str] = {}
-    for linked_paths in hardlink_candidates.values():
-        if len(linked_paths) < 2:
-            continue
-        representative = min(linked_paths)
-        for linked_path in linked_paths:
-            hardlink_roots[linked_path] = representative
-    for item in entries:
-        if item["path"] in hardlink_roots:
-            item["hardlink_to"] = hardlink_roots[item["path"]]
-    document = {
-        "entries": entries,
-        "schema": "neural-ice-offline-seed-tree-v1",
-        "trees": sorted(names),
-    }
-    encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            spool.execute(
+                "CREATE TABLE hardlinks (identity BLOB NOT NULL, path_key BLOB NOT NULL)"
+            )
+            spool.execute("CREATE INDEX hardlinks_identity ON hardlinks(identity)")
+            spool.execute("CREATE INDEX hardlinks_path ON hardlinks(path_key)")
+            for name, root in sorted(trees):
+                for item, metadata in walk_tree(name, root):
+                    manifest_path = item["path"]
+                    sort_key = path_sort_key(manifest_path)
+                    try:
+                        spool.execute(
+                            "INSERT INTO entries(path_key, entry) VALUES (?, ?)",
+                            (
+                                sort_key,
+                                json.dumps(
+                                    item,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("ascii"),
+                            ),
+                        )
+                    except sqlite3.IntegrityError as error:
+                        raise ManifestError(
+                            f"duplicate manifest path: {manifest_path}"
+                        ) from error
+                    if metadata.st_nlink > 1 and not stat.S_ISDIR(metadata.st_mode):
+                        identity_key = (
+                            f"{metadata.st_dev}:{metadata.st_ino}".encode("ascii")
+                        )
+                        spool.execute(
+                            "INSERT INTO hardlinks(identity, path_key) VALUES (?, ?)",
+                            (identity_key, sort_key),
+                        )
 
-    parent_descriptor, output_name, parent_metadata = open_output_parent(output)
-    try:
-        if output_parent_is_manifested_directory(
-            parent_metadata,
-            directory_identities,
-        ):
-            raise ManifestError(f"output path is inside input tree: {output}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(output_name, flags, 0o600, dir_fd=parent_descriptor)
-        created_metadata = os.fstat(descriptor)
-        created_identity = (created_metadata.st_dev, created_metadata.st_ino)
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written == 0:
-                    raise ManifestError(f"short write while creating manifest: {output}")
-                view = view[written:]
-            os.fsync(descriptor)
-        except BaseException as error:
+            parent_descriptor, output_name, canonical_parent, parent_metadata = (
+                open_output_parent(output)
+            )
+            temporary_name = f".{output_name}.tmp-{os.getpid()}-{os.urandom(16).hex()}"
+            temporary_identity: tuple[int, int] | None = None
+            published = False
+            descriptor: int | None = None
             try:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                created_metadata = os.fstat(descriptor)
+                temporary_identity = (created_metadata.st_dev, created_metadata.st_ino)
+
+                write_all(descriptor, b'{"entries":[', output)
+                first = True
+                for encoded_item, encoded_representative in spool.execute(
+                    """
+                    WITH groups AS (
+                        SELECT identity, MIN(path_key) AS representative
+                        FROM hardlinks
+                        GROUP BY identity
+                        HAVING COUNT(*) > 1
+                    )
+                    SELECT entry.entry, representative.entry
+                    FROM entries AS entry
+                    LEFT JOIN hardlinks AS link ON link.path_key = entry.path_key
+                    LEFT JOIN groups AS linked_group ON linked_group.identity = link.identity
+                    LEFT JOIN entries AS representative
+                        ON representative.path_key = linked_group.representative
+                    ORDER BY entry.path_key
+                    """
+                ):
+                    item = json.loads(encoded_item)
+                    if encoded_representative is not None:
+                        item["hardlink_to"] = json.loads(encoded_representative)["path"]
+                    if not first:
+                        write_all(descriptor, b",", output)
+                    write_all(
+                        descriptor,
+                        json.dumps(
+                            item,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("ascii"),
+                        output,
+                    )
+                    first = False
+                suffix = (
+                    '],"schema":"neural-ice-offline-seed-tree-v1","trees":'
+                    + json.dumps(sorted(names), separators=(",", ":"))
+                    + "}\n"
+                ).encode("ascii")
+                write_all(descriptor, suffix, output)
+                os.fsync(descriptor)
                 os.close(descriptor)
-            except OSError:
-                pass
-            remove_failed_output(
-                parent_descriptor,
-                output_name,
-                created_identity,
-                output,
-                error,
-            )
-            raise
-        try:
-            os.close(descriptor)
-        except BaseException as error:
-            remove_failed_output(
-                parent_descriptor,
-                output_name,
-                created_identity,
-                output,
-                error,
-            )
-            raise
-    finally:
-        os.close(parent_descriptor)
+                descriptor = None
+
+                os.link(
+                    temporary_name,
+                    output_name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                published = True
+                final_metadata = os.stat(
+                    output_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (final_metadata.st_dev, final_metadata.st_ino) != temporary_identity:
+                    raise ManifestError(f"published manifest identity changed: {output}")
+                if not secure_parent_is_unchanged(canonical_parent, parent_metadata):
+                    raise ManifestError(
+                        f"output directory changed while creating manifest: {output}"
+                    )
+                os.fsync(parent_descriptor)
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+                temporary_identity = None
+            except BaseException as error:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                if published and temporary_identity is not None:
+                    remove_owned_name(
+                        parent_descriptor,
+                        output_name,
+                        temporary_identity,
+                        error,
+                    )
+                if temporary_identity is not None:
+                    remove_owned_name(
+                        parent_descriptor,
+                        temporary_name,
+                        temporary_identity,
+                        error,
+                    )
+                raise
+            finally:
+                os.close(parent_descriptor)
 
 
 def main() -> int:
@@ -513,7 +543,6 @@ def main() -> int:
         write_manifest(
             arguments.tree,
             arguments.output,
-            require_read_only=True,
         )
     except (ManifestError, OSError) as error:
         print(f"REFUSED: {error}", file=sys.stderr)

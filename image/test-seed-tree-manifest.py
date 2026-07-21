@@ -61,7 +61,6 @@ class SeedTreeManifestTests(unittest.TestCase):
                     ("payload", source / "payload"),
                 ],
                 output,
-                require_read_only=False,
             )
         except (MANIFEST_MODULE.ManifestError, OSError) as error:
             return subprocess.CompletedProcess(
@@ -182,8 +181,8 @@ class SeedTreeManifestTests(unittest.TestCase):
             # the platform utility before TemporaryDirectory tears down.
             subprocess.run(("rm", "-rf", str(deep_root)), check=True)
 
-    def test_cli_refuses_a_writable_input_filesystem(self) -> None:
-        output = self.root / "writable-refused.json"
+    def test_cli_accepts_a_stable_unprivileged_input_tree(self) -> None:
+        output = self.root / "unprivileged.json"
         result = subprocess.run(
             (
                 sys.executable,
@@ -198,56 +197,8 @@ class SeedTreeManifestTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=False,
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("REFUSED:", result.stderr)
-        self.assertFalse(output.exists())
-
-    def test_tree_root_replacement_after_read_only_check_is_refused(self) -> None:
-        models = self.source / "models"
-        original = self.source / "models-original"
-        replacement = self.source / "replacement"
-        replacement.mkdir()
-
-        def replace_root(_: Path, __: os.stat_result) -> None:
-            models.rename(original)
-            models.symlink_to(replacement, target_is_directory=True)
-
-        with (
-            mock.patch.object(MANIFEST_MODULE, "require_private_mount_namespace"),
-            mock.patch.object(
-                MANIFEST_MODULE,
-                "require_exclusive_read_only_mount",
-                side_effect=replace_root,
-            ),
-        ):
-            with self.assertRaisesRegex(
-                MANIFEST_MODULE.ManifestError,
-                "tree root changed before traversal",
-            ):
-                MANIFEST_MODULE.write_manifest(
-                    [("models", models)],
-                    self.root / "root-replaced.json",
-                    require_read_only=True,
-                )
-
-    def test_mount_topology_refuses_any_writable_alias(self) -> None:
-        read_only = b"101 1 8:4 / /media/\xc3\xa9 ro,nosuid - xfs /dev/sda4 ro,inode64"
-        writable_alias = b"102 1 8:4 / /media/alias rw - xfs /dev/sda4 rw,inode64"
-        other_device = b"103 1 8:5 / /media/other rw - xfs /dev/sda5 rw,inode64"
-        self.assertEqual(
-            MANIFEST_MODULE.mountinfo_has_writable_alias(
-                [read_only, other_device],
-                b"8:4",
-            ),
-            (True, False),
-        )
-        self.assertEqual(
-            MANIFEST_MODULE.mountinfo_has_writable_alias(
-                [read_only, writable_alias],
-                b"8:4",
-            ),
-            (True, True),
-        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.is_file())
 
     def test_output_inside_input_tree_is_refused_before_walk(self) -> None:
         output = self.source / "models" / "manifest.json"
@@ -255,24 +206,6 @@ class SeedTreeManifestTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("output path is inside input tree", result.stderr)
         self.assertFalse(output.exists())
-
-    def test_output_parent_identity_detects_an_aliased_tree_directory(self) -> None:
-        models = self.source / "models"
-        alias = self.root / "models-alias"
-        alias.symlink_to(models, target_is_directory=True)
-        descriptor, _, alias_metadata = MANIFEST_MODULE.open_output_parent(
-            alias / "manifest.json"
-        )
-        try:
-            metadata = models.lstat()
-            self.assertTrue(
-                MANIFEST_MODULE.output_parent_is_manifested_directory(
-                    alias_metadata,
-                    {(metadata.st_dev, metadata.st_ino)},
-                )
-            )
-        finally:
-            os.close(descriptor)
 
     def test_failed_manifest_write_removes_partial_output(self) -> None:
         output = self.root / "partial.json"
@@ -285,9 +218,42 @@ class SeedTreeManifestTests(unittest.TestCase):
                 MANIFEST_MODULE.write_manifest(
                     [("models", self.source / "models")],
                     output,
-                    require_read_only=False,
                 )
         self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".partial.json.tmp-*")), [])
+
+    def test_failed_atomic_publish_removes_private_temporary_output(self) -> None:
+        output = self.root / "link-failure.json"
+        with mock.patch.object(
+            MANIFEST_MODULE.os,
+            "link",
+            side_effect=OSError("simulated link failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated link failure"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".link-failure.json.tmp-*")), [])
+
+    def test_output_parent_change_removes_the_published_inode(self) -> None:
+        output = self.root / "parent-change.json"
+        with mock.patch.object(
+            MANIFEST_MODULE,
+            "secure_parent_is_unchanged",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "output directory changed",
+            ):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".parent-change.json.tmp-*")), [])
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
     def test_fifo_is_rejected_without_reading_it(self) -> None:
