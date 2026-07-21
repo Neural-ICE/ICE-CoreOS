@@ -64,7 +64,9 @@ The raw→archive compression is the build bottleneck (a ~110 GiB raw).
 SEED_IMAGES=$HOME/ice-seed/images \
 SEED_MODELS=$HOME/ice-seed/models \
 BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<train-digest> \
-VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
+SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
+SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
+COMPRESS=zstd-fast ./image/build-preloaded.sh
 ```
 
 Produces `ice-coreos-installer-preloaded-<version>.img.zst` (+ `.sha256`). Flash:
@@ -75,6 +77,11 @@ verify both checksums, retain the receipt, expand exactly the archive digest rec
 flash/read back exactly the raw digest and size recorded in the same receipt. Existing artifact,
 checksum or receipt paths are never overwritten; retry with a fresh output name after diagnosing a
 failed build.
+
+For debug media, the optional SSH public-key file is validated, hash-bound and written to
+`EFI:/ice-coreos/authorized_keys` before final-media acceptance. Injection is refused unless the
+base image self-identifies as debug. The delivered USB therefore remains byte-for-byte covered by
+the raw and artifact digests in the final receipt; do not modify its ESP after acceptance.
 
 Notes:
 - `OUT` names the output archive here but is the bib output DIR in

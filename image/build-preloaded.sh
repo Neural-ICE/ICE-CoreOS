@@ -16,7 +16,9 @@
 #   SEED_IMAGES=$HOME/ice-seed/images \
 #   SEED_MODELS=$HOME/ice-seed/models \
 #   BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<digest> \
-#   VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
+#   SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
+#   SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
+#   COMPRESS=zstd-fast ./image/build-preloaded.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
 

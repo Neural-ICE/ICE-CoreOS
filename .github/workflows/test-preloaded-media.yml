@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - 'image/build-preloaded.sh'
+      - 'image/build-installer-usb.sh'
       - 'image/seed-tree-manifest.py'
       - 'image/verify-preloaded-media.py'
       - 'image/test-seed-tree-manifest.py'
@@ -37,6 +38,7 @@ jobs:
             image/verify-preloaded-media.py
           python3 image/test-seed-tree-manifest.py
           shellcheck \
+            image/build-installer-usb.sh \
             image/build-preloaded.sh \
             image/test-verify-preloaded-media.sh
   linux-arm64:
@@ -54,6 +56,7 @@ jobs:
             image/verify-preloaded-media.py
           python3 image/test-seed-tree-manifest.py
           shellcheck \
+            image/build-installer-usb.sh \
             image/build-preloaded.sh \
             image/test-verify-preloaded-media.sh
       - name: Final raw-media integration

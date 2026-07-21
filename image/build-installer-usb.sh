@@ -30,12 +30,32 @@ OUT_NAME="${OUT_NAME:-}"            # if set, copy the final raw to <REPO>/<OUT_
 BG_SRC="${BG_SRC:-${REPO_ROOT}/image/branding/grub-bg.png}"
 CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer.toml}"
 BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
+# Debug media may carry an operator public key on the ESP. The expected hash is
+# mandatory so a mutable build-host pathname cannot silently change the key.
+SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
+SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: BASE_IMAGE is required as a digest-pinned OCI reference" >&2; exit 1; }
 [[ "$TARGET_IMGREF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_IMGREF must be a digest-pinned OCI reference" >&2; exit 1; }
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+  [[ -f "$SSH_AUTHORIZED_KEYS_FILE" && ! -L "$SSH_AUTHORIZED_KEYS_FILE" ]] \
+    || { echo "ERROR: SSH_AUTHORIZED_KEYS_FILE must be a regular non-symlink file" >&2; exit 1; }
+  [[ "$SSH_AUTHORIZED_KEYS_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "ERROR: SSH_AUTHORIZED_KEYS_SHA256 is required with the public key file" >&2; exit 1; }
+  key_size="$(wc -c < "$SSH_AUTHORIZED_KEYS_FILE")"
+  (( key_size > 0 && key_size <= 16384 )) \
+    || { echo "ERROR: SSH authorized_keys input must contain 1..16384 bytes" >&2; exit 1; }
+  [[ "$(sha256sum "$SSH_AUTHORIZED_KEYS_FILE" | awk '{print $1}')" = "$SSH_AUTHORIZED_KEYS_SHA256" ]] \
+    || { echo "ERROR: SSH authorized_keys input differs from the approved hash" >&2; exit 1; }
+  ssh-keygen -l -f "$SSH_AUTHORIZED_KEYS_FILE" >/dev/null \
+    || { echo "ERROR: SSH authorized_keys input contains no valid public key" >&2; exit 1; }
+elif [[ -n "$SSH_AUTHORIZED_KEYS_SHA256" ]]; then
+  echo "ERROR: SSH_AUTHORIZED_KEYS_SHA256 requires SSH_AUTHORIZED_KEYS_FILE" >&2
+  exit 1
+fi
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -44,6 +64,12 @@ if sudo podman image exists "$BASE_IMAGE"; then
   echo "    (using local content-addressed ${BASE_IMAGE})"
 else
   sudo podman pull "$BASE_IMAGE"
+fi
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+  sudo podman run --rm --network none --read-only \
+    --entrypoint /usr/bin/grep "$BASE_IMAGE" \
+    -qx 'PRETTY_NAME="Neural ICE CoreOS (debug)"' /usr/lib/os-release \
+    || { echo "ERROR: operator SSH key injection is restricted to a debug base image" >&2; exit 1; }
 fi
 sudo podman build --platform linux/arm64 \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
@@ -134,6 +160,16 @@ done
 [[ -n "$ESPPART" ]] || { echo "ERROR: installer ESP not found" >&2; exit 1; }
 sudo mount "$ESPPART" "$MNT"
 sudo find "$MNT/EFI" -maxdepth 2 \( -iname 'fbaa64.efi' -o -iname 'BOOT*.CSV' \) -print -delete
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+  SSH_DEST="$MNT/ice-coreos/authorized_keys"
+  [[ ! -e "$SSH_DEST" && ! -L "$SSH_DEST" ]] \
+    || { echo "ERROR: installer ESP already contains an SSH authorized_keys path" >&2; exit 1; }
+  sudo install -D -m 0644 "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_DEST"
+  [[ "$(sudo sha256sum "$SSH_DEST" | awk '{print $1}')" = "$SSH_AUTHORIZED_KEYS_SHA256" ]] \
+    || { echo "ERROR: installer ESP SSH key readback differs from the approved hash" >&2; exit 1; }
+  sudo ssh-keygen -l -f "$SSH_DEST" \
+    | sed 's/^/    [debug SSH] /'
+fi
 sync
 sudo umount "$MNT"; sudo losetup -d "$LOOP"; trap - EXIT
 
