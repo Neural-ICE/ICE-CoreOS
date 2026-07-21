@@ -118,17 +118,14 @@ fn authority<'a>(
         .filter(|key| {
             key.key_id == assertion.key_id
                 && key.role == "trusted-time"
-                && matches!(key.status.as_str(), "active" | "retiring")
                 && key.artifact_types == ["trusted-time-assertion"]
                 && key
                     .hardware_targets
                     .iter()
                     .any(|value| value == expected.hardware_target)
                 && key.rings.iter().any(|value| value == expected.ring)
-                && key.valid_from <= assertion.issued_at
-                && assertion.issued_at < key.valid_until
-                && key.valid_from <= assertion.trusted_time
-                && assertion.trusted_time < key.valid_until
+                && key.authorizes_at(&assertion.issued_at)
+                && key.authorizes_at(&assertion.trusted_time)
         })
         .collect();
     if keys.len() != 1 {
@@ -396,27 +393,55 @@ mod tests {
     }
 
     #[test]
-    fn v2_binds_the_actual_snapshot_and_accepts_a_retiring_authority() {
+    fn v2_binds_the_actual_snapshot_and_bounds_a_retiring_authority() {
         let mut snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
         let value = assertion();
-        let expected = expected(&value);
-        assert!(validate(&value, &snapshot, &"f".repeat(64), &expected).is_err());
+        let baseline = expected(&value);
+        assert!(validate(&value, &snapshot, &"f".repeat(64), &baseline).is_err());
 
-        let key = snapshot
-            .keys
-            .iter_mut()
-            .find(|key| key.key_id == value.key_id)
-            .unwrap();
-        key.status = "retiring".into();
-        assert!(authority(&snapshot, &value, &expected).is_ok());
+        let mut encoded = serde_json::to_value(&snapshot).unwrap();
+        {
+            let key = encoded["keys"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|key| key["key_id"] == value.key_id)
+                .unwrap();
+            key["status"] = "retiring".into();
+        }
+        snapshot = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(authority(&snapshot, &value, &baseline).is_err());
 
-        let key = snapshot
-            .keys
+        {
+            let key = encoded["keys"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|key| key["key_id"] == value.key_id)
+                .unwrap();
+            key["rotation_overlap"] = serde_json::json!({
+                "mode": "bounded",
+                "valid_from": "2026-07-22T00:00:00Z",
+                "valid_until": "2026-07-22T00:02:00Z",
+                "with_key_id": "trusted-time-v2"
+            });
+        }
+        snapshot = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(authority(&snapshot, &value, &baseline).is_ok());
+
+        let mut outside = value.clone();
+        outside.trusted_time = "2026-07-22T00:02:00Z".into();
+        assert!(authority(&snapshot, &outside, &expected(&outside)).is_err());
+
+        let key = encoded["keys"]
+            .as_array_mut()
+            .unwrap()
             .iter_mut()
-            .find(|key| key.key_id == value.key_id)
+            .find(|key| key["key_id"] == value.key_id)
             .unwrap();
-        key.status = "revoked".into();
-        assert!(authority(&snapshot, &value, &expected).is_err());
+        key["status"] = "revoked".into();
+        snapshot = serde_json::from_value(encoded).unwrap();
+        assert!(authority(&snapshot, &value, &baseline).is_err());
     }
 
     #[test]
