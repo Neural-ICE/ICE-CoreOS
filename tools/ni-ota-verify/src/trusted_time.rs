@@ -112,6 +112,9 @@ fn authority<'a>(
     assertion: &TrustedTimeAssertion,
     expected: &ExpectedTrustedTime<'_>,
 ) -> Result<&'a crate::delegated::contract::DelegatedKey, ContractError> {
+    let consumption_time = consumption_utc_seconds(assertion, expected).ok_or_else(|| {
+        ContractError::Refusal("trusted-time TPM consumption tuple is invalid".into())
+    })?;
     let keys: Vec<_> = snapshot
         .keys
         .iter()
@@ -126,6 +129,10 @@ fn authority<'a>(
                 && key.rings.iter().any(|value| value == expected.ring)
                 && key.authorizes_at(&assertion.issued_at)
                 && key.authorizes_at(&assertion.trusted_time)
+                && key
+                    .authorization_deadline()
+                    .and_then(utc_seconds)
+                    .is_some_and(|deadline| consumption_time < deadline)
         })
         .collect();
     if keys.len() != 1 {
@@ -195,21 +202,20 @@ fn consumption_precedes_expiry(
     value: &TrustedTimeAssertion,
     expected: &ExpectedTrustedTime<'_>,
 ) -> bool {
-    let Some(elapsed_ms) = expected
+    consumption_utc_seconds(value, expected)
+        .zip(utc_seconds(&value.valid_until))
+        .is_some_and(|(consumption, valid_until)| consumption < valid_until)
+}
+
+fn consumption_utc_seconds(
+    value: &TrustedTimeAssertion,
+    expected: &ExpectedTrustedTime<'_>,
+) -> Option<u64> {
+    let elapsed_ms = expected
         .consumption_tpm_clock
-        .checked_sub(expected.tpm_clock)
-    else {
-        return false;
-    };
-    let Some(elapsed_seconds) = elapsed_ms.checked_add(999).map(|value| value / 1_000) else {
-        return false;
-    };
-    let Some(consumption_time) =
-        utc_seconds(&value.trusted_time).and_then(|value| value.checked_add(elapsed_seconds))
-    else {
-        return false;
-    };
-    utc_seconds(&value.valid_until).is_some_and(|valid_until| consumption_time < valid_until)
+        .checked_sub(expected.tpm_clock)?;
+    let elapsed_seconds = elapsed_ms.checked_add(999).map(|value| value / 1_000)?;
+    utc_seconds(&value.trusted_time)?.checked_add(elapsed_seconds)
 }
 
 fn is_lower_hex_32(value: &str) -> bool {
@@ -428,6 +434,12 @@ mod tests {
         }
         snapshot = serde_json::from_value(encoded.clone()).unwrap();
         assert!(authority(&snapshot, &value, &baseline).is_ok());
+
+        let mut before_overlap_end = expected(&value);
+        before_overlap_end.consumption_tpm_clock += 118_000;
+        assert!(authority(&snapshot, &value, &before_overlap_end).is_ok());
+        before_overlap_end.consumption_tpm_clock += 1;
+        assert!(authority(&snapshot, &value, &before_overlap_end).is_err());
 
         let mut outside = value.clone();
         outside.trusted_time = "2026-07-22T00:02:00Z".into();

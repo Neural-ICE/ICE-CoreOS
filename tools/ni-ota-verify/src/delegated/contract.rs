@@ -109,6 +109,18 @@ impl DelegatedKey {
                 _ => false,
             }
     }
+
+    pub(crate) fn authorization_deadline(&self) -> Option<&str> {
+        match self.status.as_str() {
+            "active" => Some(self.valid_until.as_str()),
+            "retiring" if self.rotation_overlap.mode == "bounded" => self
+                .rotation_overlap
+                .valid_until
+                .as_deref()
+                .map(|overlap| overlap.min(self.valid_until.as_str())),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
