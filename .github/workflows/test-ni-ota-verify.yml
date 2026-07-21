@@ -6,11 +6,13 @@ name: test-ni-ota-verify
 # digest-pinned Rust image used by the bootc build, so runners stay toolchain-free.
 # The tests stub cosign via NI_OTA_COSIGN, so no signing infrastructure is needed
 # here. Persistent self-hosted runners never execute pull_request-controlled
-# workflow definitions; only pushes to this repository or an explicit dispatch
-# can schedule the jobs.
+# workflow definitions. Only the protected main ref may schedule these jobs;
+# workflow_dispatch is guarded at the job boundary as defense in depth.
 
 on:
   push:
+    branches:
+      - main
     paths:
       - 'tools/ni-ota-verify/**'
       - '.github/workflows/test-ni-ota-verify.yml'
@@ -25,6 +27,7 @@ permissions:
 
 jobs:
   linux-x86_64:
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     env:
@@ -58,6 +61,7 @@ jobs:
         run: rm -rf tools/ni-ota-verify/target .cargo-ci
 
   linux-arm64:
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 30
     env:
