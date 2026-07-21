@@ -27,6 +27,11 @@ pub(crate) const LEGACY_NV_INDEX: u32 = 0x0150_0001;
 // non-exportable OTA/licensing device root is provisioned at this separate
 // handle before trusted-time preparation is available on a clean install.
 const DEVICE_ROOT_HANDLE: u32 = 0x8101_0005;
+const DEVICE_ROOT_HELPER: &str = "/usr/libexec/neural-ice-device-root";
+const DEVICE_ROOT_IDENTITY: &str = "/var/lib/neural-ice/ota/device-root-v1.json";
+const DEVICE_ROOT_SCHEMA: &str = "neural-ice-device-root-tpm-v1";
+const DEVICE_ROOT_ATTRIBUTES: &str =
+    "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign|noda";
 const STATE_NV_ATTRIBUTES: &str =
     "authread|authwrite|no_da|nt=0x1|ownerread|platformcreate|policydelete";
 const STATE_NV_DELETE_AUTH_POLICY: &str =
@@ -133,6 +138,22 @@ pub(crate) struct TimeChallenge {
     pub(crate) tpm_reset_count: u32,
     pub(crate) tpm_restart_count: u32,
     pub(crate) tpm_safe: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceRootReceipt {
+    attributes: String,
+    curve: String,
+    handle: String,
+    hierarchy: String,
+    name: String,
+    name_algorithm: String,
+    public_area_sha256: String,
+    qualified_name: String,
+    schema: String,
+    scheme: String,
+    spki_sha256: String,
 }
 
 #[derive(Default)]
@@ -357,6 +378,7 @@ impl CommandTpm {
     }
 
     fn device_fingerprint(&self) -> Result<String, InternalError> {
+        let receipt = self.attested_device_root_receipt()?;
         let output = self
             .scratch
             .secure_temp_bytes("device-root-public", b"pending")?;
@@ -365,7 +387,7 @@ impl CommandTpm {
                 "-c",
                 &format!("0x{DEVICE_ROOT_HANDLE:08x}"),
                 "-f",
-                "pem",
+                "der",
                 "-o",
             ])
             .arg(output.path())
@@ -376,18 +398,58 @@ impl CommandTpm {
                 "cannot read TPM device root handle 0x{DEVICE_ROOT_HANDLE:08x}"
             )));
         }
-        let pem = String::from_utf8(output.read()?)
-            .map_err(|_| InternalError("TPM device root PEM is not UTF-8".into()))?;
-        let pem = pem.trim();
-        if !pem.starts_with("-----BEGIN PUBLIC KEY-----")
-            || !pem.ends_with("-----END PUBLIC KEY-----")
-        {
+        let observed_spki_sha256 = runner::sha256_file(output.path())?;
+        if observed_spki_sha256 != receipt.spki_sha256 {
             return Err(InternalError(
-                "TPM device root is not a public-key PEM".into(),
+                "TPM device root changed after ADR-0013 attestation".into(),
             ));
         }
-        runner::sha256_bytes(format!("tpm-pub-v1:{pem}").as_bytes())
+        runner::sha256_bytes(format!("tpm-pub-v1:{}", receipt.spki_sha256).as_bytes())
     }
+
+    fn attested_device_root_receipt(&self) -> Result<DeviceRootReceipt, InternalError> {
+        let output = Command::new(DEVICE_ROOT_HELPER)
+            .args(["attest", "--identity", DEVICE_ROOT_IDENTITY])
+            .output()
+            .map_err(|error| {
+                InternalError(format!("cannot execute ADR-0013 device-root gate: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(InternalError(
+                "ADR-0013 device-root attestation/receipt gate refused trusted-time preparation"
+                    .into(),
+            ));
+        }
+        let receipt: DeviceRootReceipt = parse_canonical(&output.stdout, "device-root receipt")
+            .map_err(|reason| {
+                InternalError(format!("invalid attested device-root receipt: {reason}"))
+            })?;
+        validate_device_root_receipt(&receipt)?;
+        Ok(receipt)
+    }
+}
+
+fn validate_device_root_receipt(receipt: &DeviceRootReceipt) -> Result<(), InternalError> {
+    let closed_name =
+        |value: &str| value.len() == 68 && value.starts_with("000b") && sha256(&value[4..]);
+    if receipt.attributes != DEVICE_ROOT_ATTRIBUTES
+        || receipt.curve != "nist-p256"
+        || receipt.handle != format!("0x{DEVICE_ROOT_HANDLE:08x}")
+        || receipt.hierarchy != "endorsement"
+        || receipt.name_algorithm != "sha256"
+        || receipt.schema != DEVICE_ROOT_SCHEMA
+        || receipt.scheme != "ecdsa-sha256"
+        || !sha256(&receipt.public_area_sha256)
+        || !sha256(&receipt.spki_sha256)
+        || receipt.name != format!("000b{}", receipt.public_area_sha256)
+        || !closed_name(&receipt.name)
+        || !closed_name(&receipt.qualified_name)
+    {
+        return Err(InternalError(
+            "attested device-root receipt is outside the ADR-0013 closed contract".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Store {
@@ -2418,6 +2480,29 @@ mod tests {
         // would silently couple OTA identity to that unrelated lifecycle.
         assert_eq!(DEVICE_ROOT_HANDLE, 0x8101_0005);
         assert_ne!(DEVICE_ROOT_HANDLE, 0x8101_0004);
+    }
+
+    #[test]
+    fn device_root_receipt_is_closed_before_trusted_time_fingerprinting() {
+        let public_area_sha256 = "a".repeat(64);
+        let receipt = DeviceRootReceipt {
+            attributes: DEVICE_ROOT_ATTRIBUTES.into(),
+            curve: "nist-p256".into(),
+            handle: "0x81010005".into(),
+            hierarchy: "endorsement".into(),
+            name: format!("000b{public_area_sha256}"),
+            name_algorithm: "sha256".into(),
+            public_area_sha256,
+            qualified_name: format!("000b{}", "b".repeat(64)),
+            schema: DEVICE_ROOT_SCHEMA.into(),
+            scheme: "ecdsa-sha256".into(),
+            spki_sha256: "c".repeat(64),
+        };
+        assert!(validate_device_root_receipt(&receipt).is_ok());
+
+        let mut substituted = receipt;
+        substituted.handle = "0x81010004".into();
+        assert!(validate_device_root_receipt(&substituted).is_err());
     }
 
     #[test]
