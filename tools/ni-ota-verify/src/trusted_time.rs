@@ -220,8 +220,8 @@ fn validate(
         || value.issued_at > value.trusted_time
         || value.trusted_time >= value.valid_until
         || !consumption_precedes_expiry(value, expected)
-        || !assertion_lifetime_seconds(&value.issued_at, &value.valid_until)
-            .is_some_and(|seconds| seconds <= 600)
+        || assertion_lifetime_seconds(&value.issued_at, &value.valid_until)
+            .is_none_or(|seconds| seconds > 600)
         || value.issued_at < snapshot.valid_from
         || value.issued_at >= snapshot.valid_until
         || value.trusted_time < snapshot.valid_from
