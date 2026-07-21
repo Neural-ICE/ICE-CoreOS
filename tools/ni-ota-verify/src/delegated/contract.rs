@@ -549,7 +549,7 @@ pub(crate) fn validate_der_signature(bytes: &[u8]) -> Result<(), String> {
 fn signature_profile(algorithm: &str, encoding: &str) -> bool {
     algorithm == "ecdsa-p256-sha256" && encoding == "asn1-der"
 }
-fn sha256(v: &str) -> bool {
+pub(crate) fn sha256(v: &str) -> bool {
     v.len() == 64
         && v.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -576,7 +576,7 @@ fn subset(a: &[String], b: &[String]) -> bool {
 fn optional_ident(value: &Option<String>) -> bool {
     value.as_deref().is_none_or(ident)
 }
-fn safe_uint(value: u64) -> bool {
+pub(crate) fn safe_uint(value: u64) -> bool {
     (1..=9_007_199_254_740_991).contains(&value)
 }
 fn timestamp(v: &str) -> bool {
