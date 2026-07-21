@@ -220,6 +220,25 @@ both that history and the image-baked minimum. Root-anchor rotation itself is
 outside this gate and requires a separately approved image/trust-anchor
 transition; accepted snapshot chains keep the immutable root unchanged.
 
+`prepare-trusted-time-v2` is the networkless appliance-side preparation step.
+It accepts `--snapshot`, `--snapshot-sig`, `--release` and `--release-sig`,
+freezes each caller-controlled file as a bounded stable regular file, and
+verifies the root and release signatures before writing anything persistent.
+The release must match the immutable hardware target, immutable
+`debug|prod` appliance variant and beta ring. During a bounded rotation both
+`active` and `retiring` release-beta keys remain eligible; all other statuses
+refuse. A nonzero TPM state anchor must resolve to one complete generation.
+
+Success atomically replaces the canonical mode-`0600`
+`state_dir/state-v1/pending-time-challenge.json` and prints the same challenge
+for the controller to send to the allowlisted licensing service. Replacement
+supersedes an abandoned attempt but advances no authority, time or bundle
+floor. The later transaction must consume the exact challenge; a crash or an
+N-1 rollback may leave it unread, but cannot turn it into update authority.
+The controller can retry preparation after restoring the current verifier.
+Malformed candidate files are refusals (exit `1`); local storage, TPM and
+verifier failures are internal errors (exit `2`).
+
 `verify-delegated-beta` composes that same root/chain gate with independently
 domain-separated `release-beta` signatures for the closed beta release and its
 publication receipt. It requires exact snapshot, target, train, BOM,

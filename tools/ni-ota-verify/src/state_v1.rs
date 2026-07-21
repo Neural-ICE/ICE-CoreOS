@@ -404,11 +404,7 @@ impl Store {
     ) -> Result<TimeChallenge, InternalError> {
         ensure_secure_state_directory(&self.root)?;
         let anchor = tpm.initial_or_existing_anchor()?;
-        if anchor == ZERO_ANCHOR && self.scan_generations()?.has_evidence {
-            return Err(InternalError(
-                "zero TPM anchor with existing state history requires signed recovery".into(),
-            ));
-        }
+        self.validate_challenge_continuity(tpm, &anchor)?;
         let clock = tpm.clock()?;
         if !clock.safe {
             return Err(InternalError("TPM clock is not safe".into()));
@@ -442,6 +438,25 @@ impl Store {
         Ok(challenge)
     }
 
+    fn validate_challenge_continuity(
+        &self,
+        nv: &dyn NvAnchor,
+        anchor: &str,
+    ) -> Result<(), InternalError> {
+        if anchor == ZERO_ANCHOR {
+            if self.scan_generations()?.has_evidence {
+                return Err(InternalError(
+                    "zero TPM anchor with existing state history requires signed recovery".into(),
+                ));
+            }
+        } else if self.read_current_locked(nv)?.is_none() {
+            return Err(InternalError(
+                "nonzero TPM anchor has no complete state-v1 generation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn pending_time_challenge(&self) -> Result<TimeChallenge, InternalError> {
         let bytes = read_regular(&self.root.join("pending-time-challenge.json"), 0o600)?;
         let challenge: TimeChallenge =
@@ -450,6 +465,7 @@ impl Store {
         Ok(challenge)
     }
 
+    #[cfg(test)]
     fn read_current(&self, nv: &dyn NvAnchor) -> Result<Option<LoadedGeneration>, InternalError> {
         let _lock = self.lock_store().lock_commit()?;
         self.read_current_locked(nv)
@@ -2359,5 +2375,37 @@ mod tests {
         noncanonical_nonce.nonce = "C".repeat(64);
         assert!(validate_time_challenge(&noncanonical_nonce).is_err());
         assert_eq!(nonce_from(Path::new("/dev/zero")).unwrap(), "0".repeat(64));
+    }
+
+    #[test]
+    fn challenge_continuity_ignores_lock_scratch_but_refuses_orphaned_anchor() {
+        let (store, root) = test_store();
+        write_file(
+            &store
+                .root
+                .join(".transaction.json.time-v2-snapshot.1.1.tmp"),
+            b"scratch",
+        );
+        let fresh = TestAnchor {
+            anchor: [0; 32],
+            initialized: false,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        assert!(store
+            .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
+            .is_ok());
+
+        let orphaned = TestAnchor {
+            anchor: [7; 32],
+            initialized: true,
+            ..fresh
+        };
+        let error = store
+            .validate_challenge_continuity(&orphaned, &hex(orphaned.anchor))
+            .unwrap_err();
+        assert!(error.0.contains("no complete state-v1 generation"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

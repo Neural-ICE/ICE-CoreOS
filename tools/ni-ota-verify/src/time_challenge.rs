@@ -2,13 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{immutable_hardware_target, immutable_minimum_delegation_seq, Config};
+use crate::config::{
+    immutable_appliance_variant, immutable_hardware_target, immutable_minimum_delegation_seq,
+    Config,
+};
 use crate::delegated::beta::{ReleaseAuthorization, RELEASE_DOMAIN};
 use crate::delegated::contract::{
     canonical_hash, parse_canonical, public_key_pem, safe_uint, sha256, signature_profile, target,
     timestamp, validate_snapshot, verify_root_binding, ContractError, Snapshot,
 };
-use crate::delegated::{freeze, freeze_root, verify_signature, SNAPSHOT_DOMAIN};
+use crate::delegated::{freeze_authority, freeze_root, verify_signature, SNAPSHOT_DOMAIN};
 use crate::state_v1::{CommandTpm, Store, STATE_NV_INDEX};
 use crate::{parse_flags, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
@@ -54,18 +57,18 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let scratch = store.lock_store();
     let _lock = scratch.lock_commit()?;
 
-    let snapshot_file = freeze(&scratch, &required("snapshot")?, "time-v2-snapshot")?;
-    let snapshot_sig = freeze(
-        &scratch,
-        &required("snapshot-sig")?,
-        "time-v2-snapshot-signature",
-    )?;
-    let release_file = freeze(&scratch, &required("release")?, "time-v2-release")?;
-    let release_sig = freeze(
-        &scratch,
-        &required("release-sig")?,
-        "time-v2-release-signature",
-    )?;
+    macro_rules! artifact {
+        ($flag:literal, $label:literal) => {
+            match freeze_authority(&scratch, &required($flag)?, $label)? {
+                Ok(file) => file,
+                Err(reason) => return refusal(reason),
+            }
+        };
+    }
+    let snapshot_file = artifact!("snapshot", "time-v2-snapshot");
+    let snapshot_sig = artifact!("snapshot-sig", "time-v2-snapshot-signature");
+    let release_file = artifact!("release", "time-v2-release");
+    let release_sig = artifact!("release-sig", "time-v2-release-signature");
     let root = match freeze_root(&scratch, root_path, "time-v2-root")? {
         Ok(value) => value,
         Err(reason) => return refusal(reason),
@@ -106,7 +109,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             Ok(value) => value,
             Err(reason) => return refusal(reason),
         };
-    if let Err(reason) = validate_release_shape(&release, &snapshot, &snapshot_hash, &target) {
+    let variant = immutable_appliance_variant()?;
+    if let Err(reason) =
+        validate_release_shape(&release, &snapshot, &snapshot_hash, &target, &variant)
+    {
         return refusal(reason);
     }
     let keys: Vec<_> = snapshot
@@ -115,7 +121,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         .filter(|key| {
             key.key_id == release.key_id
                 && key.role == "release-beta"
-                && key.status == "active"
+                && release_key_status(&key.status)
                 && key
                     .artifact_types
                     .iter()
@@ -127,7 +133,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         })
         .collect();
     if keys.len() != 1 {
-        return refusal("release has no unique active beta authority".into());
+        return refusal("release has no unique active or retiring beta authority".into());
     }
     let release_key = match public_key_pem(&keys[0].public_key) {
         Ok(value) => value,
@@ -165,6 +171,7 @@ fn validate_release_shape(
     snapshot: &Snapshot,
     snapshot_hash: &str,
     target_name: &str,
+    variant: &str,
 ) -> Result<(), String> {
     if value.schema != "neural-ice-ota-release-authorization-v1"
         || value.signing_role != "release-beta"
@@ -176,6 +183,7 @@ fn validate_release_shape(
         || !safe_uint(value.bundle_seq)
         || !target(&value.hardware_target)
         || value.hardware_target != target_name
+        || !release_variant(&value.variant, variant)
         || ![&value.bom_sha256, &value.channel_record_sha256]
             .into_iter()
             .all(|hash| sha256(hash))
@@ -190,6 +198,14 @@ fn validate_release_shape(
     Ok(())
 }
 
+fn release_key_status(value: &str) -> bool {
+    matches!(value, "active" | "retiring")
+}
+
+fn release_variant(value: &str, immutable: &str) -> bool {
+    matches!(immutable, "debug" | "prod") && value == immutable
+}
+
 fn contract_refusal(error: ContractError) -> Result<u8, InternalError> {
     match error {
         ContractError::Refusal(reason) => refusal(reason),
@@ -200,4 +216,27 @@ fn contract_refusal(error: ContractError) -> Result<u8, InternalError> {
 fn refusal(reason: String) -> Result<u8, InternalError> {
     eprintln!("ni-ota-verify: trusted-time-v2 REFUSED: {reason}");
     Ok(EXIT_REFUSE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{release_key_status, release_variant};
+
+    #[test]
+    fn release_rotation_accepts_only_active_or_retiring() {
+        assert!(release_key_status("active"));
+        assert!(release_key_status("retiring"));
+        for status in ["revoked", "retired", "pending", "ACTIVE", ""] {
+            assert!(!release_key_status(status));
+        }
+    }
+
+    #[test]
+    fn release_variant_must_equal_the_immutable_host_marker() {
+        assert!(release_variant("debug", "debug"));
+        assert!(release_variant("prod", "prod"));
+        assert!(!release_variant("debug", "prod"));
+        assert!(!release_variant("prod", "debug"));
+        assert!(!release_variant("debug", "unknown"));
+    }
 }
