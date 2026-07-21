@@ -165,6 +165,7 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
             || !timestamp(&tombstone.revoked_at)
             || tombstone.revoked_at > snapshot.issued_at
             || !ident(&tombstone.reason)
+            || !distinct_lineage(&tombstone.predecessor_key_id, &tombstone.successor_key_id)
         {
             return Err("invalid, duplicate or unsorted tombstone inventory".into());
         }
@@ -195,6 +196,7 @@ fn validate_key(key: &DelegatedKey) -> Result<(), String> {
         || !key.hardware_targets.iter().all(|v| target(v))
         || !optional_ident(&key.predecessor_key_id)
         || !optional_ident(&key.successor_key_id)
+        || !distinct_lineage(&key.predecessor_key_id, &key.successor_key_id)
     {
         return Err("invalid delegated key".into());
     }
@@ -384,6 +386,16 @@ pub(crate) fn validate_chain(old: &Snapshot, new: &Snapshot, old_hash: &str) -> 
     for dead in &old.tombstones {
         if !new.tombstones.contains(dead) {
             return Err("delegation tombstone was omitted or changed".into());
+        }
+    }
+    for dead in &new.tombstones {
+        if old.tombstones.iter().any(|old| old.key_id == dead.key_id) {
+            continue;
+        }
+        if !old.keys.iter().any(|key| key.key_id == dead.key_id)
+            || dead.revocation_seq != new.delegation_seq
+        {
+            return Err("new delegation tombstone is backdated or lacks a live predecessor".into());
         }
     }
     for key in &old.keys {
@@ -607,6 +619,9 @@ fn subset(a: &[String], b: &[String]) -> bool {
 fn optional_ident(value: &Option<String>) -> bool {
     value.as_deref().is_none_or(ident)
 }
+fn distinct_lineage(predecessor: &Option<String>, successor: &Option<String>) -> bool {
+    predecessor.is_none() || successor.is_none() || predecessor != successor
+}
 pub(crate) fn safe_uint(value: u64) -> bool {
     (1..=9_007_199_254_740_991).contains(&value)
 }
@@ -722,6 +737,37 @@ mod tests {
         new.delegation_seq = 2;
         new.previous_snapshot_sha256 = Some(old_hash.clone());
         new.keys.retain(|key| key.key_id != "release-beta-v1");
+        assert!(validate_chain(&old, &new, &old_hash).is_err());
+    }
+
+    #[test]
+    fn snapshot_refuses_reused_lineage_identifier() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let mut key = snapshot.keys[1].clone();
+        key.predecessor_key_id = Some("release-beta-v0".into());
+        key.successor_key_id = Some("release-beta-v0".into());
+        assert!(validate_key(&key).is_err());
+    }
+
+    #[test]
+    fn chain_refuses_backdated_or_invented_tombstone() {
+        let old: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let old_hash = canonical_hash(SNAPSHOT).unwrap();
+        let mut new = old.clone();
+        new.delegation_seq = 2;
+        new.previous_snapshot_sha256 = Some(old_hash.clone());
+        new.tombstones.push(Tombstone {
+            key_id: "release-beta-retired".into(),
+            predecessor_key_id: None,
+            reason: "key-compromise".into(),
+            revocation_seq: 1,
+            revoked_at: "2026-07-21T00:00:00Z".into(),
+            role: "release-beta".into(),
+            spki_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            successor_key_id: None,
+            terminal_status: "revoked".into(),
+        });
+        assert!(validate_snapshot(&new).is_ok());
         assert!(validate_chain(&old, &new, &old_hash).is_err());
     }
 
