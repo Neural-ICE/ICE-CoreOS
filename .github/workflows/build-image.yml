@@ -14,37 +14,19 @@ on:
   repository_dispatch:
     types: [build-coreos]
 
-concurrency:
-  # Shared with build-kernel because both workflows use the same runner-local
-  # immutable artifact store.
-  group: coreos-gb10-artifacts-nvidia-gb10-arm64
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-  packages: write
-
 jobs:
-  build:
-    # Reject an accidental workflow_dispatch branch selection before a
-    # self-hosted runner or package-write token is allocated. The step-level
-    # check below remains as defense in depth.
-    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, ARM64, spark]
-    timeout-minutes: 120
+  validate-request:
+    # This architecture-neutral guard runs without checkout or token privileges,
+    # so an invalid manual ref fails visibly without reserving the Spark.
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+    permissions: {}
     env:
-      REGISTRY: ghcr.io/neural-ice
-      IMAGE: neural-ice-coreos
+      EVENT_NAME: ${{ github.event_name }}
+      REQUEST_REF: ${{ github.ref }}
       VARIANT: ${{ github.event_name == 'workflow_dispatch' && 'debug' || github.event.client_payload.variant }}
-      BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
-      SOURCE_REVISION: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-
       - name: Validate the explicit build request
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REQUEST_REF: ${{ github.ref }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUEST_REF" != refs/heads/main ]; then
             echo "::error::manual debug builds must run from refs/heads/main"; exit 2
@@ -53,6 +35,28 @@ jobs:
             debug|prod) ;;
             *) echo "::error::the requested variant must be exactly debug or prod"; exit 2 ;;
           esac
+
+  build:
+    needs: validate-request
+    # Shared with build-kernel because both workflows use the same runner-local
+    # immutable artifact store. Validation above is intentionally outside this
+    # queue so malformed requests fail immediately.
+    concurrency:
+      group: coreos-gb10-artifacts-nvidia-gb10-arm64
+      cancel-in-progress: false
+    runs-on: [self-hosted, Linux, ARM64, spark]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io/neural-ice
+      IMAGE: neural-ice-coreos
+      VARIANT: ${{ github.event_name == 'workflow_dispatch' && 'debug' || github.event.client_payload.variant }}
+      BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
+      SOURCE_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Materialize verified GB10 artifact generation
         env:

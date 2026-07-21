@@ -23,8 +23,11 @@ refute_fixed() {
 require_fixed "  workflow_dispatch:" "$WORKFLOW"
 require_fixed "  repository_dispatch:" "$WORKFLOW"
 require_fixed "VARIANT: \${{ github.event_name == 'workflow_dispatch' && 'debug' || github.event.client_payload.variant }}" "$WORKFLOW"
-require_fixed "if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'" "$WORKFLOW"
+require_fixed "  validate-request:" "$WORKFLOW"
+require_fixed "runs-on: [self-hosted, Linux, X64]" "$WORKFLOW"
+require_fixed "permissions: {}" "$WORKFLOW"
 require_fixed 'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUEST_REF" != refs/heads/main ]; then' "$WORKFLOW"
+require_fixed "needs: validate-request" "$WORKFLOW"
 require_fixed "runs-on: [self-hosted, Linux, ARM64, spark]" "$WORKFLOW"
 
 # The producer authenticates only to GHCR. Product mirroring and channel/alias

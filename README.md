@@ -181,14 +181,25 @@ SSH_AUTHORIZED_KEY="ssh-ed25519 AAAA... me@host" VARIANT=debug ./ci/build-image.
 # generation finalized by that exact policy exist.
 ```
 
-CI publishes only through an explicit repository dispatch, which always executes the workflow
-from the default branch. There is no push/merge default and the variant has no implicit value. A
-keyless LAB debug build is requested with:
+CI has no push/merge trigger. The simplest Owner-operated LAB path is an input-free manual dispatch:
+it accepts only `main`, forces the keyless `debug` variant and publishes one immutable GHCR tag.
+Invalid refs fail in a tokenless X64 validation job before the Spark build is allocated:
+
+```sh
+gh workflow run build-image.yml --ref main
+```
+
+Automation retains the explicit `repository_dispatch` variant contract, which GitHub executes from
+the default branch:
 
 ```sh
 gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
   -f event_type=build-coreos -F 'client_payload[variant]=debug'
 ```
+
+Neither path mirrors to the sovereign registry or moves `beta`, `stable`, `*-debug` or another
+product alias. Discarding a manual artifact therefore requires no channel rollback: omit its digest
+from the Fabric train and retain the immutable artifact/generation as audit evidence.
 
 Run-unique CoreOS source artifacts keep the native `bootc-fetch-apply-updates.timer`
 masked: an immutable tag cannot be an update channel. Fabric composes the branded
