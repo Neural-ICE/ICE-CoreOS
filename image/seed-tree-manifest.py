@@ -27,8 +27,10 @@ import stat
 import struct
 import subprocess
 import sys
-import tempfile
 from typing import Any
+
+
+MAX_PREFLIGHT_DIRECTORIES = 1_000_000
 
 
 class ManifestError(RuntimeError):
@@ -344,6 +346,7 @@ def output_parent_aliases_input(
     parent_metadata: os.stat_result,
 ) -> bool:
     target_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+    visited: set[tuple[int, int]] = set()
     with open_preflight_queue(parent_descriptor) as queue:
         for _, root in trees:
             append_path(queue, root)
@@ -360,8 +363,14 @@ def output_parent_aliases_input(
                 ) from error
             if not stat.S_ISDIR(metadata.st_mode):
                 continue
-            if (metadata.st_dev, metadata.st_ino) == target_identity:
+            directory_identity = (metadata.st_dev, metadata.st_ino)
+            if directory_identity == target_identity:
                 return True
+            if directory_identity in visited:
+                raise ManifestError(f"directory identity revisited during preflight: {path}")
+            visited.add(directory_identity)
+            if len(visited) > MAX_PREFLIGHT_DIRECTORIES:
+                raise ManifestError("directory preflight limit exceeded")
             try:
                 with os.scandir(path) as iterator:
                     for child in iterator:
@@ -450,21 +459,17 @@ def remove_owned_names(
     original_error: BaseException,
 ) -> None:
     cleanup_errors: list[BaseException] = []
-    removed = False
     for name, created_identity in owned_names:
         try:
-            removed = (
-                remove_owned_name(
-                    parent_descriptor,
-                    name,
-                    created_identity,
-                    original_error,
-                )
-                or removed
+            remove_owned_name(
+                parent_descriptor,
+                name,
+                created_identity,
+                original_error,
             )
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
-    if removed:
+    if owned_names:
         try:
             os.fsync(parent_descriptor)
         except OSError as cleanup_error:
@@ -503,6 +508,56 @@ def directory_was_manifested(
     )
 
 
+def spool_database_path(spool_descriptor: int, spool_name: str, parent: Path) -> Path:
+    if sys.platform == "linux":
+        return Path(f"/proc/self/fd/{spool_descriptor}/entries.sqlite3")
+    return parent / spool_name / "entries.sqlite3"
+
+
+def remove_spool(
+    parent_descriptor: int,
+    spool_descriptor: int,
+    spool_name: str,
+    spool_identity: tuple[int, int],
+    original_error: BaseException | None = None,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    try:
+        os.unlink("entries.sqlite3", dir_fd=spool_descriptor)
+    except FileNotFoundError:
+        pass
+    except OSError as cleanup_error:
+        cleanup_errors.append(cleanup_error)
+    try:
+        metadata = os.stat(
+            spool_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        metadata = None
+    except OSError as cleanup_error:
+        metadata = None
+        cleanup_errors.append(cleanup_error)
+    if metadata is not None:
+        if (metadata.st_dev, metadata.st_ino) != spool_identity:
+            cleanup_errors.append(
+                ManifestError(f"refusing to remove replaced manifest spool: {spool_name}")
+            )
+        else:
+            try:
+                os.rmdir(spool_name, dir_fd=parent_descriptor)
+            except OSError as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+    try:
+        os.fsync(parent_descriptor)
+    except OSError as cleanup_error:
+        cleanup_errors.append(cleanup_error)
+    if cleanup_errors:
+        cause = original_error if original_error is not None else cleanup_errors[0]
+        raise ManifestError("manifest spool cleanup failed") from cause
+
+
 def write_manifest(
     trees: list[tuple[str, Path]],
     output: Path,
@@ -520,143 +575,195 @@ def write_manifest(
     temporary_name = f".seed-manifest-{os.urandom(16).hex()}"
     temporary_identity: tuple[int, int] | None = None
     descriptor: int | None = None
+    spool_name: str | None = None
+    spool_descriptor: int | None = None
+    spool_identity: tuple[int, int] | None = None
+    spool: sqlite3.Connection | None = None
+    committed = False
     try:
         if output_parent_aliases_input(trees, parent_descriptor, parent_metadata):
             raise ManifestError(f"output path is inside input tree: {output}")
         if not secure_parent_is_unchanged(supplied_parent, parent_metadata):
             raise ManifestError(f"output directory changed before traversal: {output}")
 
-        with tempfile.TemporaryDirectory(
-            prefix=".seed-manifest-spool-",
-            dir=supplied_parent,
-        ) as spool_directory:
-            os.chmod(spool_directory, 0o700)
-            database_path = Path(spool_directory) / "entries.sqlite3"
-            spool = sqlite3.connect(database_path)
-            os.chmod(database_path, 0o600)
-            try:
-                spool.execute("PRAGMA temp_store=FILE")
-                spool.execute("PRAGMA cache_size=-2048")
-                spool.execute("PRAGMA journal_mode=OFF")
-                spool.execute("PRAGMA synchronous=OFF")
-                spool.execute(
-                    "CREATE TABLE entries (path_key BLOB PRIMARY KEY, entry BLOB NOT NULL)"
-                )
-                spool.execute(
-                    "CREATE TABLE hardlinks (identity BLOB NOT NULL, path_key BLOB NOT NULL)"
-                )
-                spool.execute(
-                    "CREATE TABLE directories (identity BLOB PRIMARY KEY)"
-                )
-                spool.execute(
-                    """
-                    CREATE TABLE pending (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        path BLOB NOT NULL,
-                        relative_path BLOB
-                    )
-                    """
-                )
-                spool.execute("CREATE INDEX hardlinks_identity ON hardlinks(identity)")
-                spool.execute("CREATE INDEX hardlinks_path ON hardlinks(path_key)")
-                for name, root in sorted(trees):
-                    for item, metadata in walk_tree(name, root, spool):
-                        manifest_path = item["path"]
-                        sort_key = path_sort_key(manifest_path)
-                        try:
-                            spool.execute(
-                                "INSERT INTO entries(path_key, entry) VALUES (?, ?)",
-                                (
-                                    sort_key,
-                                    json.dumps(
-                                        item,
-                                        sort_keys=True,
-                                        separators=(",", ":"),
-                                    ).encode("ascii"),
-                                ),
-                            )
-                        except sqlite3.IntegrityError as error:
-                            raise ManifestError(
-                                f"duplicate manifest path: {manifest_path}"
-                            ) from error
-                        if stat.S_ISDIR(metadata.st_mode):
-                            spool.execute(
-                                "INSERT OR IGNORE INTO directories(identity) VALUES (?)",
-                                (inode_key(metadata),),
-                            )
-                        elif metadata.st_nlink > 1:
-                            spool.execute(
-                                "INSERT INTO hardlinks(identity, path_key) VALUES (?, ?)",
-                                (inode_key(metadata), sort_key),
-                            )
-
-                if directory_was_manifested(spool, parent_metadata):
-                    raise ManifestError(f"output path is inside input tree: {output}")
-
-                flags = (
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0)
-                )
-                descriptor = os.open(
-                    temporary_name,
-                    flags,
-                    0o600,
-                    dir_fd=parent_descriptor,
-                )
-                created_metadata = os.fstat(descriptor)
-                temporary_identity = (created_metadata.st_dev, created_metadata.st_ino)
-                os.fchmod(descriptor, 0o600)
-
-                write_all(descriptor, b'{"entries":[', output)
-                first = True
-                for encoded_item, encoded_representative in spool.execute(
-                    """
-                    WITH groups AS (
-                        SELECT identity, MIN(path_key) AS representative
-                        FROM hardlinks
-                        GROUP BY identity
-                        HAVING COUNT(*) > 1
-                    )
-                    SELECT entry.entry, representative.entry
-                    FROM entries AS entry
-                    LEFT JOIN hardlinks AS link ON link.path_key = entry.path_key
-                    LEFT JOIN groups AS linked_group ON linked_group.identity = link.identity
-                    LEFT JOIN entries AS representative
-                        ON representative.path_key = linked_group.representative
-                    ORDER BY entry.path_key
-                    """
-                ):
-                    item = json.loads(encoded_item)
-                    if encoded_representative is not None:
-                        item["hardlink_to"] = json.loads(encoded_representative)["path"]
-                    if not first:
-                        write_all(descriptor, b",", output)
-                    write_all(
-                        descriptor,
-                        json.dumps(
-                            item,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("ascii"),
-                        output,
-                    )
-                    first = False
-                suffix = (
-                    '],"schema":"neural-ice-offline-seed-tree-v1","trees":'
-                    + json.dumps(sorted(names), separators=(",", ":"))
-                    + "}\n"
-                ).encode("ascii")
-                write_all(descriptor, suffix, output)
-                os.fsync(descriptor)
-                os.close(descriptor)
-                descriptor = None
-            finally:
+        spool_name = f".seed-manifest-spool-{os.urandom(16).hex()}"
+        os.mkdir(spool_name, 0o700, dir_fd=parent_descriptor)
+        spool_metadata = os.stat(
+            spool_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        spool_identity = (spool_metadata.st_dev, spool_metadata.st_ino)
+        os.chmod(spool_name, 0o700, dir_fd=parent_descriptor)
+        spool_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        spool_descriptor = os.open(
+            spool_name,
+            spool_flags,
+            dir_fd=parent_descriptor,
+        )
+        spool_metadata = os.fstat(spool_descriptor)
+        if (spool_metadata.st_dev, spool_metadata.st_ino) != spool_identity:
+            raise ManifestError("manifest spool identity changed before opening")
+        if not secure_parent_is_unchanged(supplied_parent, parent_metadata):
+            raise ManifestError(f"output directory changed before spool creation: {output}")
+        database_path = spool_database_path(
+            spool_descriptor,
+            spool_name,
+            supplied_parent,
+        )
+        spool = sqlite3.connect(database_path)
+        os.chmod(
+            "entries.sqlite3",
+            0o600,
+            dir_fd=spool_descriptor,
+        )
+        spool.execute("PRAGMA temp_store=MEMORY")
+        spool.execute("PRAGMA cache_size=-2048")
+        spool.execute("PRAGMA automatic_index=OFF")
+        spool.execute("PRAGMA journal_mode=OFF")
+        spool.execute("PRAGMA synchronous=OFF")
+        spool.execute(
+            "CREATE TABLE entries (path_key BLOB PRIMARY KEY, entry BLOB NOT NULL)"
+        )
+        spool.execute(
+            "CREATE TABLE hardlinks (path_key BLOB PRIMARY KEY, identity BLOB NOT NULL)"
+        )
+        spool.execute(
+            """
+            CREATE TABLE hardlink_groups (
+                identity BLOB PRIMARY KEY,
+                representative BLOB NOT NULL,
+                link_count INTEGER NOT NULL
+            )
+            """
+        )
+        spool.execute("CREATE TABLE directories (identity BLOB PRIMARY KEY)")
+        spool.execute(
+            """
+            CREATE TABLE pending (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path BLOB NOT NULL,
+                relative_path BLOB
+            )
+            """
+        )
+        for name, root in sorted(trees):
+            for item, metadata in walk_tree(name, root, spool):
+                manifest_path = item["path"]
+                sort_key = path_sort_key(manifest_path)
                 try:
-                    spool.rollback()
-                finally:
-                    spool.close()
+                    spool.execute(
+                        "INSERT INTO entries(path_key, entry) VALUES (?, ?)",
+                        (
+                            sort_key,
+                            json.dumps(
+                                item,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("ascii"),
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise ManifestError(f"duplicate manifest path: {manifest_path}") from error
+                if stat.S_ISDIR(metadata.st_mode):
+                    spool.execute(
+                        "INSERT OR IGNORE INTO directories(identity) VALUES (?)",
+                        (inode_key(metadata),),
+                    )
+                elif metadata.st_nlink > 1:
+                    linked_identity = inode_key(metadata)
+                    spool.execute(
+                        "INSERT INTO hardlinks(path_key, identity) VALUES (?, ?)",
+                        (sort_key, linked_identity),
+                    )
+                    spool.execute(
+                        """
+                        INSERT INTO hardlink_groups(identity, representative, link_count)
+                        VALUES (?, ?, 1)
+                        ON CONFLICT(identity) DO UPDATE SET
+                            representative = CASE
+                                WHEN excluded.representative < representative
+                                THEN excluded.representative
+                                ELSE representative
+                            END,
+                            link_count = link_count + 1
+                        """,
+                        (linked_identity, sort_key),
+                    )
+
+        if directory_was_manifested(spool, parent_metadata):
+            raise ManifestError(f"output path is inside input tree: {output}")
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        created_metadata = os.fstat(descriptor)
+        temporary_identity = (created_metadata.st_dev, created_metadata.st_ino)
+        os.fchmod(descriptor, 0o600)
+
+        write_all(descriptor, b'{"entries":[', output)
+        first = True
+        for encoded_item, encoded_representative in spool.execute(
+            """
+            SELECT entry.entry, representative.entry
+            FROM entries AS entry
+            LEFT JOIN hardlinks AS link ON link.path_key = entry.path_key
+            LEFT JOIN hardlink_groups AS linked_group
+                ON linked_group.identity = link.identity AND linked_group.link_count > 1
+            LEFT JOIN entries AS representative
+                ON representative.path_key = linked_group.representative
+            ORDER BY entry.path_key
+            """
+        ):
+            item = json.loads(encoded_item)
+            if encoded_representative is not None:
+                item["hardlink_to"] = json.loads(encoded_representative)["path"]
+            if not first:
+                write_all(descriptor, b",", output)
+            write_all(
+                descriptor,
+                json.dumps(item, sort_keys=True, separators=(",", ":")).encode("ascii"),
+                output,
+            )
+            first = False
+        suffix = (
+            '],"schema":"neural-ice-offline-seed-tree-v1","trees":'
+            + json.dumps(sorted(names), separators=(",", ":"))
+            + "}\n"
+        ).encode("ascii")
+        write_all(descriptor, suffix, output)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            spool.rollback()
+        finally:
+            spool.close()
+            spool = None
+        remove_spool(
+            parent_descriptor,
+            spool_descriptor,
+            spool_name,
+            spool_identity,
+        )
+        os.close(spool_descriptor)
+        spool_descriptor = None
+        spool_name = None
+        spool_identity = None
 
         if not secure_parent_is_unchanged(supplied_parent, parent_metadata):
             raise ManifestError(f"output directory changed while creating manifest: {output}")
@@ -680,21 +787,78 @@ def write_manifest(
         os.unlink(temporary_name, dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
         temporary_identity = None
+        committed = True
     except BaseException as error:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+        cleanup_errors: list[BaseException] = []
+        if spool is not None:
+            try:
+                spool.rollback()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                spool.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            spool = None
+        if (
+            spool_name is not None
+            and spool_descriptor is not None
+            and spool_identity is not None
+        ):
+            try:
+                remove_spool(
+                    parent_descriptor,
+                    spool_descriptor,
+                    spool_name,
+                    spool_identity,
+                    error,
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        elif spool_name is not None and spool_identity is not None:
+            try:
+                metadata = os.stat(
+                    spool_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (metadata.st_dev, metadata.st_ino) != spool_identity:
+                    raise ManifestError("refusing to remove replaced empty manifest spool")
+                os.rmdir(spool_name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if spool_descriptor is not None:
+            try:
+                os.close(spool_descriptor)
+            except OSError as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            spool_descriptor = None
         owned_names: list[tuple[str, tuple[int, int]]] = []
         if temporary_identity is not None:
             owned_names.append((output_name, temporary_identity))
         if temporary_identity is not None:
             owned_names.append((temporary_name, temporary_identity))
-        remove_owned_names(parent_descriptor, owned_names, error)
+        try:
+            remove_owned_names(parent_descriptor, owned_names, error)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            raise ManifestError("manifest failure cleanup was incomplete") from cleanup_errors[0]
         raise
     finally:
-        os.close(parent_descriptor)
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            if not committed:
+                raise
 
 
 def main() -> int:

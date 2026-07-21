@@ -286,23 +286,20 @@ class SeedTreeManifestTests(unittest.TestCase):
 
     def test_spool_teardown_failure_does_not_publish_output(self) -> None:
         output = self.root / "spool-teardown.json"
-        original_temporary_directory = tempfile.TemporaryDirectory
+        original_remove_spool = MANIFEST_MODULE.remove_spool
+        calls = 0
 
-        class FailingTemporaryDirectory:
-            def __init__(self, *args, **kwargs) -> None:
-                self.inner = original_temporary_directory(*args, **kwargs)
-
-            def __enter__(self):
-                return self.inner.__enter__()
-
-            def __exit__(self, exception_type, exception, traceback) -> None:
-                self.inner.__exit__(exception_type, exception, traceback)
+        def fail_once(*args, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
+            original_remove_spool(*args, **kwargs)
+            if calls == 1:
                 raise OSError("simulated spool teardown failure")
 
         with mock.patch.object(
-            MANIFEST_MODULE.tempfile,
-            "TemporaryDirectory",
-            FailingTemporaryDirectory,
+            MANIFEST_MODULE,
+            "remove_spool",
+            side_effect=fail_once,
         ):
             with self.assertRaisesRegex(OSError, "simulated spool teardown failure"):
                 MANIFEST_MODULE.write_manifest(
@@ -332,16 +329,39 @@ class SeedTreeManifestTests(unittest.TestCase):
 
     def test_caller_tmpdir_is_not_used_for_the_spool(self) -> None:
         output = self.root / "safe-spool.json"
-        with mock.patch.object(
-            MANIFEST_MODULE.tempfile,
-            "gettempdir",
-            return_value=str(self.source / "models"),
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TMPDIR": str(self.source / "models"),
+                "SQLITE_TMPDIR": str(self.source / "models"),
+            },
         ):
             MANIFEST_MODULE.write_manifest(
                 [("models", self.source / "models")],
                 output,
             )
         self.assertTrue(output.is_file())
+        self.assertEqual(list((self.source / "models").glob("etilqs_*")), [])
+        self.assertEqual(list(self.root.glob(".seed-manifest-spool-*")), [])
+
+    def test_directory_identity_cycle_is_refused_during_preflight(self) -> None:
+        parent_descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            parent_metadata = os.fstat(parent_descriptor)
+            with self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "directory identity revisited",
+            ):
+                MANIFEST_MODULE.output_parent_aliases_input(
+                    [
+                        ("models-a", self.source / "models"),
+                        ("models-b", self.source / "models"),
+                    ],
+                    parent_descriptor,
+                    parent_metadata,
+                )
+        finally:
+            os.close(parent_descriptor)
 
     def test_output_symlink_ancestor_is_refused(self) -> None:
         alias = self.root / "output-alias"
@@ -407,7 +427,10 @@ class SeedTreeManifestTests(unittest.TestCase):
             if name == "published":
                 raise MANIFEST_MODULE.ManifestError("simulated replacement")
 
-        with mock.patch.object(MANIFEST_MODULE, "remove_owned_name", side_effect=remove):
+        with (
+            mock.patch.object(MANIFEST_MODULE, "remove_owned_name", side_effect=remove),
+            mock.patch.object(MANIFEST_MODULE.os, "fsync") as synced,
+        ):
             with self.assertRaisesRegex(
                 MANIFEST_MODULE.ManifestError,
                 "one or more owned manifest files",
@@ -417,6 +440,7 @@ class SeedTreeManifestTests(unittest.TestCase):
                     [("published", (1, 1)), ("temporary", (1, 1))],
                     OSError("original"),
                 )
+            synced.assert_called_once_with(1)
         self.assertEqual(attempted, ["published", "temporary"])
 
     def test_cleanup_syncs_the_parent_after_removal(self) -> None:
