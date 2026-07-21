@@ -177,7 +177,6 @@ pub(crate) struct Candidate<'a> {
     pub(crate) trusted: TrustedTimeState,
     pub(crate) trusted_assertion: &'a [u8],
     pub(crate) trusted_signature: &'a [u8],
-    pub(crate) trusted_valid_until: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,7 +198,7 @@ pub(crate) struct PreapplyCandidate<'a> {
     pub(crate) snapshot_sha256: &'a str,
     pub(crate) snapshot_signature: &'a [u8],
     pub(crate) trusted: &'a TrustedTimeState,
-    pub(crate) trusted_valid_until: &'a str,
+    pub(crate) trusted_assertion: &'a [u8],
 }
 
 pub(crate) struct Store {
@@ -688,6 +687,15 @@ impl Store {
         nv: &dyn NvAnchor,
         candidate: &PreapplyCandidate<'_>,
     ) -> Result<Result<(), String>, InternalError> {
+        let _lock = self.lock_store().lock_commit()?;
+        self.guard_preapply_locked(nv, candidate)
+    }
+
+    fn guard_preapply_locked(
+        &self,
+        nv: &dyn NvAnchor,
+        candidate: &PreapplyCandidate<'_>,
+    ) -> Result<Result<(), String>, InternalError> {
         validate_preapply_candidate(candidate)?;
         if self.pending_time_challenge()? != *candidate.challenge {
             return Ok(Err("pending trusted-time challenge differs".into()));
@@ -695,8 +703,8 @@ impl Store {
         if let Err(reason) = self.challenge_is_live(
             nv,
             candidate.challenge,
-            &candidate.trusted.trusted_time,
-            candidate.trusted_valid_until,
+            candidate.trusted,
+            candidate.trusted_assertion,
         )? {
             return Ok(Err(reason));
         }
@@ -720,7 +728,7 @@ impl Store {
             };
         }
         let current = self
-            .read_current(nv)?
+            .read_current_locked(nv)?
             .ok_or_else(|| InternalError("TPM-anchored state is unavailable".into()))?;
         let legacy_floor = nv.legacy_bundle_floor()?;
         if current.manifest.legacy_bundle_floor.is_some() && legacy_floor.is_none() {
@@ -735,7 +743,7 @@ impl Store {
                 "legacy TPM floor regressed after state-v1 seeding".into()
             ));
         }
-        self.verify_enforce_ready(nv)?;
+        self.verify_enforce_ready_locked(nv)?;
         if candidate.bundle_seq < observed_floor.max(persisted_floor)
             || candidate.bundle_seq < current.manifest.bundle_seq_floor
             || (candidate.bundle_seq == current.manifest.bundle_seq_floor
@@ -867,8 +875,8 @@ impl Store {
         if let Err(reason) = self.challenge_is_live(
             nv,
             &candidate.challenge,
-            &candidate.trusted.trusted_time,
-            candidate.trusted_valid_until,
+            &candidate.trusted,
+            candidate.trusted_assertion,
         )? {
             return Ok(Err(reason));
         }
@@ -1078,8 +1086,8 @@ impl Store {
         &self,
         nv: &dyn NvAnchor,
         challenge: &TimeChallenge,
-        trusted_time: &str,
-        valid_until: &str,
+        trusted: &TrustedTimeState,
+        trusted_assertion: &[u8],
     ) -> Result<Result<(), String>, InternalError> {
         let live = nv.clock()?;
         if !live.safe {
@@ -1104,10 +1112,12 @@ impl Store {
                 "trusted-time challenge exceeded its freshness window".into()
             ));
         }
-        let trusted_time = crate::trusted_time::utc_seconds(trusted_time).ok_or_else(|| {
-            InternalError("trusted-time assertion has invalid trusted time".into())
-        })?;
-        let valid_until = crate::trusted_time::utc_seconds(valid_until)
+        let valid_until = signed_assertion_valid_until(trusted, trusted_assertion)?;
+        let trusted_time =
+            crate::trusted_time::utc_seconds(&trusted.trusted_time).ok_or_else(|| {
+                InternalError("trusted-time assertion has invalid trusted time".into())
+            })?;
+        let valid_until = crate::trusted_time::utc_seconds(&valid_until)
             .ok_or_else(|| InternalError("trusted-time assertion has invalid expiry".into()))?;
         let elapsed_seconds = elapsed
             .checked_add(999)
@@ -1195,6 +1205,7 @@ impl Store {
         Ok(verify_generation(&dir, &observed).is_ok())
     }
 
+    #[allow(dead_code, reason = "used by state-v1 adversarial tests")]
     fn read_current(&self, nv: &dyn NvAnchor) -> Result<Option<LoadedGeneration>, InternalError> {
         let _lock = self.lock_store().lock_commit()?;
         self.read_current_locked(nv)
@@ -1760,8 +1771,6 @@ fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
         || !safe_uint(value.trusted.assertion_seq)
         || value.trusted.delegation_seq != value.authority.delegation_seq
         || !timestamp(&value.trusted.trusted_time)
-        || !timestamp(value.trusted_valid_until)
-        || value.trusted.trusted_time.as_str() >= value.trusted_valid_until
         || !sha256(&value.authority.snapshot_sha256)
         || !sha256(&value.authority.snapshot_signature_sha256)
         || !sha256(&value.applied.bom_sha256)
@@ -1776,6 +1785,7 @@ fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
     {
         return Err(InternalError("invalid state-v1 candidate".into()));
     }
+    signed_assertion_valid_until(&value.trusted, value.trusted_assertion)?;
     Ok(())
 }
 
@@ -1785,12 +1795,12 @@ fn validate_preapply_candidate(value: &PreapplyCandidate<'_>) -> Result<(), Inte
         || !safe_uint(value.snapshot.delegation_seq)
         || value.snapshot.delegation_seq != value.trusted.delegation_seq
         || value.snapshot_sha256 != value.challenge.delegation_snapshot_sha256
-        || !timestamp(value.trusted_valid_until)
-        || value.trusted.trusted_time.as_str() >= value.trusted_valid_until
     {
         return Err(InternalError("invalid state-v1 pre-apply candidate".into()));
     }
-    validate_trusted_challenge(value.trusted, value.challenge)
+    validate_trusted_challenge(value.trusted, value.challenge)?;
+    signed_assertion_valid_until(value.trusted, value.trusted_assertion)?;
+    Ok(())
 }
 
 fn validate_trusted_challenge(
@@ -1817,6 +1827,35 @@ fn validate_trusted_challenge(
         ));
     }
     Ok(())
+}
+
+fn signed_assertion_valid_until(
+    trusted: &TrustedTimeState,
+    assertion_bytes: &[u8],
+) -> Result<String, InternalError> {
+    let assertion: crate::trusted_time::TrustedTimeAssertion =
+        parse_canonical(assertion_bytes, "state-v1 trusted-time assertion")
+            .map_err(InternalError)?;
+    if state_canonical_hash(assertion_bytes, "state-v1 trusted-time assertion")?
+        != trusted.assertion_sha256
+        || assertion.assertion_seq != trusted.assertion_seq
+        || assertion.delegation_seq != trusted.delegation_seq
+        || assertion.device_fingerprint != trusted.device_fingerprint
+        || assertion.key_id != trusted.key_id
+        || assertion.trusted_time != trusted.trusted_time
+        || assertion.tpm_clock != trusted.tpm_clock
+        || assertion.tpm_reset_count != trusted.tpm_reset_count
+        || assertion.tpm_restart_count != trusted.tpm_restart_count
+        || assertion.tpm_safe != trusted.tpm_safe
+        || hash(assertion.nonce.as_bytes())? != trusted.challenge_sha256
+        || !timestamp(&assertion.valid_until)
+        || assertion.trusted_time >= assertion.valid_until
+    {
+        return Err(InternalError(
+            "trusted-time state is not bound to its signed assertion".into(),
+        ));
+    }
+    Ok(assertion.valid_until)
 }
 
 fn monotonic(
@@ -2585,6 +2624,42 @@ mod tests {
         }
     }
 
+    fn test_signed_assertion(
+        challenge: &TimeChallenge,
+        trusted: &TrustedTimeState,
+        valid_until: &str,
+    ) -> &'static [u8] {
+        Box::leak(
+            canonical(&crate::trusted_time::TrustedTimeAssertion {
+                assertion_seq: trusted.assertion_seq,
+                delegation_seq: trusted.delegation_seq,
+                delegation_snapshot_sha256: challenge.delegation_snapshot_sha256.clone(),
+                device_fingerprint: trusted.device_fingerprint.clone(),
+                hardware_target: challenge.hardware_target.clone(),
+                issuance_id: "assertion-1".into(),
+                issued_at: "2026-07-22T00:00:00Z".into(),
+                issuer: "licensing.neural-ice.ch".into(),
+                key_id: trusted.key_id.clone(),
+                nonce: challenge.nonce.clone(),
+                release_authorization_sha256: challenge.release_authorization_sha256.clone(),
+                ring: challenge.ring.clone(),
+                schema: "neural-ice-ota-trusted-time-v2".into(),
+                signature_algorithm: "ECDSA".into(),
+                signature_encoding: "der".into(),
+                signing_role: "trusted-time".into(),
+                state_nv_anchor: challenge.state_nv_anchor.clone(),
+                tpm_clock: trusted.tpm_clock,
+                tpm_reset_count: trusted.tpm_reset_count,
+                tpm_restart_count: trusted.tpm_restart_count,
+                tpm_safe: trusted.tpm_safe,
+                trusted_time: trusted.trusted_time.clone(),
+                valid_until: valid_until.into(),
+            })
+            .unwrap()
+            .into_boxed_slice(),
+        )
+    }
+
     fn candidate() -> Candidate<'static> {
         let challenge = TimeChallenge {
             delegation_snapshot_sha256: state_canonical_hash(b"{}\n", "test snapshot").unwrap(),
@@ -2600,6 +2675,24 @@ mod tests {
             tpm_restart_count: 1,
             tpm_safe: true,
         };
+        let mut trusted = TrustedTimeState {
+            assertion_seq: 1,
+            assertion_sha256: String::new(),
+            challenge_sha256: hash(challenge.nonce.as_bytes()).unwrap(),
+            delegation_seq: 1,
+            device_fingerprint: challenge.device_fingerprint.clone(),
+            key_id: "trusted-time-v1".into(),
+            schema: "neural-ice-ota-trusted-time-state-v2".into(),
+            signature_sha256: hash(b"sig").unwrap(),
+            tpm_clock: challenge.tpm_clock,
+            tpm_reset_count: challenge.tpm_reset_count,
+            tpm_restart_count: challenge.tpm_restart_count,
+            tpm_safe: true,
+            trusted_time: "2026-07-22T00:00:01Z".into(),
+        };
+        let assertion = test_signed_assertion(&challenge, &trusted, "2026-07-22T00:05:00Z");
+        trusted.assertion_sha256 =
+            state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
         Candidate {
             applied: AppliedStateV1 {
                 bom_sha256: "e".repeat(64),
@@ -2617,24 +2710,9 @@ mod tests {
             release_signature: b"sig",
             snapshot: b"{}\n",
             snapshot_signature: b"sig",
-            trusted: TrustedTimeState {
-                assertion_seq: 1,
-                assertion_sha256: state_canonical_hash(b"{}\n", "test assertion").unwrap(),
-                challenge_sha256: hash(challenge.nonce.as_bytes()).unwrap(),
-                delegation_seq: 1,
-                device_fingerprint: challenge.device_fingerprint.clone(),
-                key_id: "trusted-time-v1".into(),
-                schema: "neural-ice-ota-trusted-time-state-v2".into(),
-                signature_sha256: hash(b"sig").unwrap(),
-                tpm_clock: challenge.tpm_clock,
-                tpm_reset_count: challenge.tpm_reset_count,
-                tpm_restart_count: challenge.tpm_restart_count,
-                tpm_safe: true,
-                trusted_time: "2026-07-22T00:00:01Z".into(),
-            },
-            trusted_assertion: b"{}\n",
+            trusted,
+            trusted_assertion: assertion,
             trusted_signature: b"sig",
-            trusted_valid_until: "2026-07-22T00:05:00Z",
         }
     }
 
@@ -3715,6 +3793,14 @@ mod tests {
         let mut commit_candidate = candidate();
         commit_candidate.challenge.tpm_clock = 999;
         commit_candidate.trusted.tpm_clock = 999;
+        let assertion = test_signed_assertion(
+            &commit_candidate.challenge,
+            &commit_candidate.trusted,
+            "2026-07-22T00:05:00Z",
+        );
+        commit_candidate.trusted.assertion_sha256 =
+            state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
+        commit_candidate.trusted_assertion = assertion;
         let commit_refusal = store.commit(&commit_candidate, &nv).unwrap().unwrap_err();
         assert!(commit_refusal.contains("freshness window"));
 
@@ -3728,6 +3814,9 @@ mod tests {
         let mut trusted = candidate().trusted;
         trusted.delegation_seq = snapshot.delegation_seq;
         trusted.tpm_clock = challenge.tpm_clock;
+        let assertion = test_signed_assertion(&challenge, &trusted, "2026-07-22T00:05:00Z");
+        trusted.assertion_sha256 =
+            state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
         atomic_replace(
             &store.root,
             "pending-time-challenge.json",
@@ -3742,7 +3831,7 @@ mod tests {
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
             snapshot_signature: b"sig",
             trusted: &trusted,
-            trusted_valid_until: "2026-07-22T00:05:00Z",
+            trusted_assertion: assertion,
         };
         let preapply_refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
         assert!(preapply_refusal.contains("freshness window"));
@@ -3752,12 +3841,11 @@ mod tests {
     #[test]
     fn commit_refuses_an_assertion_that_expires_before_the_freshness_cap() {
         let (store, root) = test_store();
-        let mut value = candidate();
-        value.trusted_valid_until = "2026-07-22T00:00:02Z";
+        let value = candidate();
         let nv = MemoryNv {
             anchor: Cell::new([0; 32]),
             clock: Cell::new(TpmClockState {
-                clock: value.challenge.tpm_clock + 1_000,
+                clock: value.challenge.tpm_clock + 300_000,
                 reset_count: value.challenge.tpm_reset_count,
                 restart_count: value.challenge.tpm_restart_count,
                 safe: true,
@@ -3787,6 +3875,9 @@ mod tests {
         trusted.tpm_clock = challenge.tpm_clock;
         trusted.tpm_reset_count = challenge.tpm_reset_count;
         trusted.tpm_restart_count = challenge.tpm_restart_count;
+        let assertion = test_signed_assertion(&challenge, &trusted, "2026-07-22T00:05:00Z");
+        trusted.assertion_sha256 =
+            state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
         atomic_replace(
             &store.root,
             "pending-time-challenge.json",
@@ -3808,7 +3899,7 @@ mod tests {
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
             snapshot_signature: b"sig",
             trusted: &trusted,
-            trusted_valid_until: "2026-07-22T00:05:00Z",
+            trusted_assertion: assertion,
         };
         let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
         assert!(refusal.contains("legacy TPM floor is absent"));
@@ -3886,6 +3977,9 @@ mod tests {
         trusted.tpm_clock = challenge.tpm_clock;
         trusted.tpm_reset_count = challenge.tpm_reset_count;
         trusted.tpm_restart_count = challenge.tpm_restart_count;
+        let assertion = test_signed_assertion(&challenge, &trusted, "2026-07-22T00:05:00Z");
+        trusted.assertion_sha256 =
+            state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
         atomic_replace(
             &store.root,
             "pending-time-challenge.json",
@@ -3907,7 +4001,7 @@ mod tests {
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
             snapshot_signature: b"sig",
             trusted: &trusted,
-            trusted_valid_until: "2026-07-22T00:05:00Z",
+            trusted_assertion: assertion,
         };
         let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
         assert!(refusal.contains("legacy TPM floor disappeared"));
