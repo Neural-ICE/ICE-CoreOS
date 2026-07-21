@@ -30,10 +30,8 @@ mod record;
 mod runner;
 mod state;
 mod state_v1;
-#[allow(
-    dead_code,
-    reason = "used by the next stacked atomic-state command layer"
-)]
+mod time_challenge;
+#[allow(dead_code, reason = "used by the next stacked atomic commit layer")]
 mod trusted_time;
 mod verify;
 
@@ -56,6 +54,9 @@ const USAGE: &str = "usage:
                           [--config /etc/neural-ice/ota.conf]
                           [--device-compat <min,max>] [--applied-state <path>]
   ni-ota-verify commit --bom <path> [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
+  ni-ota-verify prepare-trusted-time-v2 --snapshot <path> --snapshot-sig <path>
+                       --release <path> --release-sig <path>
+                       [--config /etc/neural-ice/ota.conf]
   ni-ota-verify verify-delegation-snapshot --snapshot <path> --snapshot-sig <path>
                        --trusted-now <UTC-seconds>
                        --accepted-snapshot <path>
@@ -95,6 +96,7 @@ fn run() -> u8 {
         Some("verify") => verify::run(&args[1..]),
         Some("bootstrap") => bootstrap::run(&args[1..]),
         Some("commit") => commit::run(&args[1..]),
+        Some("prepare-trusted-time-v2") => time_challenge::run(&args[1..]),
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),

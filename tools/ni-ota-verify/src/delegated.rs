@@ -10,7 +10,7 @@ use crate::config::{immutable_minimum_delegation_seq, Config};
 use crate::state::{ensure_secure_state_directory, FileStateStore, SecureTempFile};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
-mod beta;
+pub(crate) mod beta;
 pub(crate) mod contract;
 
 pub(crate) use beta::run as run_beta;
@@ -22,7 +22,7 @@ use contract::{
     ContractError, Snapshot,
 };
 
-const SNAPSHOT_DOMAIN: &[u8] = b"neural-ice:ota:delegation-snapshot:v1\0";
+pub(crate) const SNAPSHOT_DOMAIN: &[u8] = b"neural-ice:ota:delegation-snapshot:v1\0";
 const MAX_ARTIFACT: usize = 128 * 1024;
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0x800;
@@ -238,7 +238,7 @@ fn validate_candidate(
     Ok(hash)
 }
 
-fn freeze(
+pub(crate) fn freeze(
     store: &FileStateStore,
     source: &Path,
     label: &str,
@@ -343,7 +343,7 @@ pub(super) fn freeze_authority(
     store.secure_temp_bytes(label, &bytes).map(Ok)
 }
 
-fn freeze_root(
+pub(crate) fn freeze_root(
     store: &FileStateStore,
     source: &Path,
     label: &str,
