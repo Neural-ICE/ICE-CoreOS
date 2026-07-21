@@ -1,14 +1,24 @@
 //! TPM capability gate for the atomic OTA state chain.
 //!
-//! This first, non-mutating layer attests the configured NV index's exact fixed
-//! SHA-256 EXTEND policy. The public capability remains gated until later,
-//! independently reviewed layers add both provisioning and the complete
-//! pre-apply/post-health command set.
+//! This non-mutating layer recovers only complete generations whose manifest
+//! chain reproduces the observed TPM anchor. The public capability remains
+//! gated until the complete guard/commit command set lands.
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::state::FileStateStore;
+use serde::{Deserialize, Serialize};
+
+use crate::delegated::contract::{
+    canonical_hash, parse_canonical, safe_uint, sha256, timestamp, ContractError,
+};
+use crate::runner;
+use crate::state::{
+    ensure_secure_state_directory, validate_secure_state_directory, FileStateStore, O_NOFOLLOW,
+};
 use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
@@ -21,11 +31,101 @@ const STATE_NV_NAME_UNWRITTEN: &str =
     "000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62";
 const STATE_NV_NAME_WRITTEN: &str =
     "000b571132a9688f4088f3696fa9bf5d5793be7483202cee08ceb2261f2bbe89b440";
+const ZERO_ANCHOR: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const GENERATION_ARTIFACTS: &[&str] = &[
+    "applied.json",
+    "authority.json",
+    "delegation-snapshot.json",
+    "delegation-snapshot.sig",
+    "manifest.json",
+    "release-authorization.json",
+    "release-authorization.sig",
+    "trusted-time-assertion.json",
+    "trusted-time-assertion.sig",
+    "trusted-time.json",
+];
 
-// Index attestation alone is not an update protocol. A later slice may change
-// this only in the same commit that exposes and tests the complete guard and
-// commit command set. This prevents a manually pre-created index from
-// advertising a protocol this binary cannot enforce.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityState {
+    delegation_seq: u64,
+    schema: String,
+    snapshot_sha256: String,
+    snapshot_signature_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AppliedStateV1 {
+    bom_sha256: String,
+    bundle_seq: u64,
+    schema: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedTimeState {
+    assertion_seq: u64,
+    assertion_sha256: String,
+    challenge_sha256: String,
+    delegation_seq: u64,
+    device_fingerprint: String,
+    key_id: String,
+    schema: String,
+    signature_sha256: String,
+    tpm_clock: u64,
+    tpm_reset_count: u32,
+    tpm_restart_count: u32,
+    tpm_safe: bool,
+    trusted_time: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StateManifest {
+    applied_sha256: String,
+    applied_bom_sha256: String,
+    authority_sha256: String,
+    bundle_seq_floor: u64,
+    delegation_seq_floor: u64,
+    delegation_snapshot_canonical_sha256: String,
+    delegation_snapshot_sha256: String,
+    delegation_snapshot_signature_sha256: String,
+    generation: u64,
+    legacy_bundle_floor: Option<u64>,
+    previous_manifest_sha256: Option<String>,
+    previous_nv_anchor: String,
+    release_authorization_sha256: String,
+    release_authorization_signature_sha256: String,
+    schema: String,
+    trusted_time_assertion_canonical_sha256: String,
+    trusted_time_assertion_sha256: String,
+    trusted_time_assertion_signature_sha256: String,
+    trusted_time_floor: String,
+    trusted_time_seq_floor: u64,
+    trusted_time_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadedGeneration {
+    manifest: StateManifest,
+    manifest_sha256: String,
+    nv_anchor: String,
+    trusted: TrustedTimeState,
+}
+
+#[derive(Default)]
+struct GenerationScan {
+    has_evidence: bool,
+    numbers: Vec<u64>,
+}
+
+pub(crate) struct Store {
+    pub(crate) root: PathBuf,
+}
+
+// A readable store and TPM index are not by themselves an update protocol.
+// This changes only with the complete guard/commit command set and controller.
 const STATE_V1_COMMAND_SET_READY: bool = false;
 
 pub(crate) fn capability_ready(config_path: &Path) -> Result<bool, InternalError> {
@@ -55,7 +155,12 @@ fn capability_ready_for(
             path: state_dir.join("state-v1-capability.json"),
         },
     };
-    continuity_ready(&tpm)
+    let store = Store {
+        root: state_dir.join("state-v1"),
+    };
+    continuity_ready(&tpm)?;
+    store.verify_enforce_ready(&tpm)?;
+    Ok(true)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +311,708 @@ impl CommandTpm {
     }
 }
 
+impl Store {
+    pub(crate) fn lock_store(&self) -> FileStateStore {
+        FileStateStore {
+            path: self.root.join("transaction.json"),
+        }
+    }
+
+    #[cfg(test)]
+    fn read_current(&self, nv: &dyn NvAnchor) -> Result<Option<LoadedGeneration>, InternalError> {
+        let _lock = self.lock_store().lock_commit()?;
+        self.read_current_locked(nv)
+    }
+
+    fn read_current_locked(
+        &self,
+        nv: &dyn NvAnchor,
+    ) -> Result<Option<LoadedGeneration>, InternalError> {
+        let observed = hex(nv.read()?);
+        if !secure_optional_dir(&self.root)? {
+            return if observed == ZERO_ANCHOR {
+                Ok(None)
+            } else {
+                Err(InternalError(
+                    "TPM NV anchor exists while state-v1 root is absent".into(),
+                ))
+            };
+        }
+        let pointer = self.root.join("current");
+        let pointer_generation = if let Some(bytes) = read_optional_regular(&pointer, 0o600)? {
+            Some(parse_pointer(&bytes)?)
+        } else {
+            None
+        };
+        let scan = self.scan_generations()?;
+        let loaded = self.load_generations(&scan.numbers)?;
+        let matches: Vec<_> = loaded
+            .iter()
+            .filter(|value| value.nv_anchor == observed)
+            .cloned()
+            .collect();
+        if let Some(generation) = pointer_generation {
+            let pointed = loaded
+                .iter()
+                .find(|value| value.manifest.generation == generation)
+                .ok_or_else(|| {
+                    InternalError("state-v1 CURRENT names an absent generation".into())
+                })?;
+            if pointed.nv_anchor == observed {
+                return match matches.as_slice() {
+                    [anchored] if anchored.manifest.generation == pointed.manifest.generation => {
+                        self.accept_current(nv, &observed, pointed, false)
+                    }
+                    _ => Err(InternalError(
+                        "state-v1 CURRENT does not identify one unique anchored generation".into(),
+                    )),
+                };
+            }
+        }
+        match matches.as_slice() {
+            [] if observed == ZERO_ANCHOR && !scan.has_evidence => Ok(None),
+            [] if observed == ZERO_ANCHOR => Err(InternalError(
+                "zero TPM anchor with existing state history requires signed recovery".into(),
+            )),
+            [] => Err(InternalError(
+                "TPM NV anchor has no complete state-v1 generation".into(),
+            )),
+            [value] => self.accept_current(nv, &observed, value, true),
+            _ => Err(InternalError(
+                "TPM NV anchor matches multiple state-v1 generations".into(),
+            )),
+        }
+    }
+
+    fn accept_current(
+        &self,
+        nv: &dyn NvAnchor,
+        observed: &str,
+        value: &LoadedGeneration,
+        publish: bool,
+    ) -> Result<Option<LoadedGeneration>, InternalError> {
+        if hex(nv.read()?) != observed {
+            return Err(InternalError(
+                "TPM NV anchor changed before state-v1 recovery publication".into(),
+            ));
+        }
+        if publish {
+            self.publish_current(value.manifest.generation)?;
+        }
+        let pointer = read_regular(&self.root.join("current"), 0o600)?;
+        if parse_pointer(&pointer)? != value.manifest.generation {
+            return Err(InternalError(
+                "state-v1 CURRENT readback differs after recovery".into(),
+            ));
+        }
+        if hex(nv.read()?) != observed {
+            return Err(InternalError(
+                "TPM NV anchor changed during state-v1 recovery".into(),
+            ));
+        }
+        Ok(Some(value.clone()))
+    }
+
+    fn load_generations(&self, numbers: &[u64]) -> Result<Vec<LoadedGeneration>, InternalError> {
+        if numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (offset, number) in numbers.iter().enumerate() {
+            let expected = offset as u64 + 1;
+            if *number != expected || !safe_uint(*number) {
+                return Err(InternalError(
+                    "state-v1 generations are not one contiguous canonical sequence".into(),
+                ));
+            }
+        }
+        let mut previous_hash: Option<String> = None;
+        let mut anchor = ZERO_ANCHOR.to_owned();
+        let mut previous_manifest: Option<StateManifest> = None;
+        let mut previous_trusted: Option<TrustedTimeState> = None;
+        let mut result = Vec::with_capacity(numbers.len());
+        for &generation in numbers {
+            let dir = self
+                .root
+                .join("generations")
+                .join(format!("generation-{generation:016}"));
+            secure_existing_dir(&dir)?;
+            let manifest_bytes = read_regular(&dir.join("manifest.json"), 0o600)?;
+            let manifest: StateManifest =
+                parse_canonical(&manifest_bytes, "state-v1 manifest").map_err(InternalError)?;
+            if manifest.generation != generation
+                || manifest.previous_manifest_sha256 != previous_hash
+                || manifest.previous_nv_anchor != anchor
+            {
+                return Err(InternalError("state-v1 generation chain is broken".into()));
+            }
+            let trusted = verify_generation(&dir, &manifest)?;
+            if let Some(previous) = &previous_manifest {
+                verify_floor_continuity(previous, &manifest)?;
+            }
+            if let Some(previous) = &previous_trusted {
+                verify_clock_continuity(previous, &trusted)?;
+            }
+            let manifest_sha256 = hash(&manifest_bytes)?;
+            anchor = extend_value(&anchor, &manifest_sha256)?;
+            previous_hash = Some(manifest_sha256.clone());
+            result.push(LoadedGeneration {
+                manifest: manifest.clone(),
+                manifest_sha256,
+                nv_anchor: anchor.clone(),
+                trusted: trusted.clone(),
+            });
+            previous_manifest = Some(manifest);
+            previous_trusted = Some(trusted);
+        }
+        Ok(result)
+    }
+
+    fn scan_generations(&self) -> Result<GenerationScan, InternalError> {
+        let generations = self.root.join("generations");
+        match std::fs::symlink_metadata(&generations) {
+            Ok(_) => secure_existing_dir(&generations)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(GenerationScan::default())
+            }
+            Err(error) => {
+                return Err(InternalError(format!(
+                    "cannot inspect {}: {error}",
+                    generations.display()
+                )))
+            }
+        }
+        let mut scan = GenerationScan::default();
+        for entry in std::fs::read_dir(&generations).map_err(|error| {
+            InternalError(format!(
+                "cannot enumerate {}: {error}",
+                generations.display()
+            ))
+        })? {
+            let entry = entry
+                .map_err(|error| InternalError(format!("cannot enumerate generation: {error}")))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(InternalError(
+                    "state-v1 generation name is not UTF-8".into(),
+                ));
+            };
+            if let Some(number) = generation_number(name) {
+                secure_existing_dir(&entry.path())?;
+                scan.numbers.push(number);
+                scan.has_evidence = true;
+            } else if temporary_generation(name) {
+                secure_existing_dir(&entry.path())?;
+                scan.has_evidence = true;
+            } else {
+                return Err(InternalError(format!(
+                    "unexpected entry in state-v1 generations: {name}"
+                )));
+            }
+        }
+        scan.numbers.sort_unstable();
+        Ok(scan)
+    }
+
+    fn publish_current(&self, generation: u64) -> Result<(), InternalError> {
+        atomic_replace(
+            &self.root,
+            "current",
+            format!("generation-{generation:016}\n").as_bytes(),
+        )
+    }
+
+    pub(crate) fn verify_enforce_ready(&self, nv: &dyn NvAnchor) -> Result<(), InternalError> {
+        let _lock = self.lock_store().lock_commit()?;
+        secure_existing_dir(&self.root)?;
+        let current = self
+            .read_current_locked(nv)?
+            .ok_or_else(|| InternalError("state-v1 is unseeded".into()))?;
+        let legacy_floor = nv
+            .legacy_bundle_floor()?
+            .ok_or_else(|| InternalError("legacy TPM floor is absent".into()))?;
+        if current.manifest.legacy_bundle_floor != Some(legacy_floor) {
+            return Err(InternalError(
+                "legacy floor differs from TPM-anchored state-v1 manifest".into(),
+            ));
+        }
+        let expected = EnforceReady {
+            manifest_sha256: current.manifest_sha256,
+            nv_anchor: current.nv_anchor,
+            schema: "neural-ice-ota-enforce-ready-v1".into(),
+        };
+        let marker = self.root.join("enforce-ready.json");
+        let publish = match read_optional_regular(&marker, 0o600)? {
+            None => true,
+            Some(bytes) => {
+                let value: EnforceReady =
+                    parse_canonical(&bytes, "state-v1 enforce-ready").map_err(InternalError)?;
+                if value.schema != "neural-ice-ota-enforce-ready-v1"
+                    || !sha256(&value.manifest_sha256)
+                    || !sha256(&value.nv_anchor)
+                {
+                    return Err(InternalError(
+                        "invalid state-v1 enforce marker contract".into(),
+                    ));
+                }
+                value != expected
+            }
+        };
+        if publish {
+            atomic_replace(&self.root, "enforce-ready.json", &canonical(&expected)?)?;
+        }
+        let readback: EnforceReady = parse_canonical(
+            &read_regular(&marker, 0o600)?,
+            "state-v1 enforce-ready readback",
+        )
+        .map_err(InternalError)?;
+        if readback != expected {
+            return Err(InternalError(
+                "state-v1 enforce marker readback differs after publication".into(),
+            ));
+        }
+        if hex(nv.read()?) != expected.nv_anchor {
+            return Err(InternalError(
+                "TPM NV anchor changed during enforce-ready publication".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnforceReady {
+    manifest_sha256: String,
+    nv_anchor: String,
+    schema: String,
+}
+
+fn verify_generation(dir: &Path, value: &StateManifest) -> Result<TrustedTimeState, InternalError> {
+    verify_generation_inventory(dir)?;
+    if value.schema != "neural-ice-ota-state-manifest-v1"
+        || !safe_uint(value.generation)
+        || !safe_uint(value.bundle_seq_floor)
+        || !safe_uint(value.delegation_seq_floor)
+        || !safe_uint(value.trusted_time_seq_floor)
+        || !sha256(&value.applied_bom_sha256)
+        || !sha256(&value.delegation_snapshot_canonical_sha256)
+        || !sha256(&value.trusted_time_assertion_canonical_sha256)
+        || !timestamp(&value.trusted_time_floor)
+        || !sha256(&value.previous_nv_anchor)
+        || value
+            .previous_manifest_sha256
+            .as_deref()
+            .is_some_and(|hash| !sha256(hash))
+        || value
+            .legacy_bundle_floor
+            .is_some_and(|floor| !safe_uint(floor))
+    {
+        return Err(InternalError("invalid state-v1 manifest contract".into()));
+    }
+    let applied: AppliedStateV1 = parse_canonical(
+        &read_manifest_artifact(dir, "applied.json", &value.applied_sha256)?,
+        "state-v1 applied state",
+    )
+    .map_err(InternalError)?;
+    let authority: AuthorityState = parse_canonical(
+        &read_manifest_artifact(dir, "authority.json", &value.authority_sha256)?,
+        "state-v1 authority state",
+    )
+    .map_err(InternalError)?;
+    let snapshot = read_manifest_artifact(
+        dir,
+        "delegation-snapshot.json",
+        &value.delegation_snapshot_sha256,
+    )?;
+    let _: serde_json::Value =
+        parse_canonical(&snapshot, "state-v1 delegation snapshot").map_err(InternalError)?;
+    if state_canonical_hash(&snapshot, "delegation snapshot")?
+        != value.delegation_snapshot_canonical_sha256
+    {
+        return Err(InternalError(
+            "state-v1 delegation snapshot bytes differ from their canonical hash".into(),
+        ));
+    }
+    let assertion = read_manifest_artifact(
+        dir,
+        "trusted-time-assertion.json",
+        &value.trusted_time_assertion_sha256,
+    )?;
+    let _: serde_json::Value =
+        parse_canonical(&assertion, "state-v1 trusted-time assertion").map_err(InternalError)?;
+    if state_canonical_hash(&assertion, "trusted-time assertion")?
+        != value.trusted_time_assertion_canonical_sha256
+    {
+        return Err(InternalError(
+            "state-v1 trusted-time assertion bytes differ from their canonical hash".into(),
+        ));
+    }
+    for (name, expected) in [
+        (
+            "delegation-snapshot.sig",
+            &value.delegation_snapshot_signature_sha256,
+        ),
+        (
+            "release-authorization.sig",
+            &value.release_authorization_signature_sha256,
+        ),
+        (
+            "trusted-time-assertion.sig",
+            &value.trusted_time_assertion_signature_sha256,
+        ),
+    ] {
+        read_manifest_artifact(dir, name, expected)?;
+    }
+    let release = read_manifest_artifact(
+        dir,
+        "release-authorization.json",
+        &value.release_authorization_sha256,
+    )?;
+    let _: serde_json::Value =
+        parse_canonical(&release, "state-v1 release authorization").map_err(InternalError)?;
+    let trusted: TrustedTimeState = parse_canonical(
+        &read_manifest_artifact(dir, "trusted-time.json", &value.trusted_time_sha256)?,
+        "trusted-time state",
+    )
+    .map_err(InternalError)?;
+    if applied.schema != "neural-ice-ota-applied-state-v1"
+        || applied.bundle_seq != value.bundle_seq_floor
+        || applied.bom_sha256 != value.applied_bom_sha256
+        || authority.schema != "neural-ice-ota-authority-state-v1"
+        || authority.delegation_seq != value.delegation_seq_floor
+        || authority.snapshot_sha256 != value.delegation_snapshot_canonical_sha256
+        || authority.snapshot_signature_sha256 != value.delegation_snapshot_signature_sha256
+        || trusted.schema != "neural-ice-ota-trusted-time-state-v2"
+        || trusted.assertion_seq != value.trusted_time_seq_floor
+        || trusted.assertion_sha256 != value.trusted_time_assertion_canonical_sha256
+        || trusted.signature_sha256 != value.trusted_time_assertion_signature_sha256
+        || trusted.delegation_seq != value.delegation_seq_floor
+        || trusted.trusted_time != value.trusted_time_floor
+        || !safe_uint(trusted.assertion_seq)
+        || !safe_uint(trusted.delegation_seq)
+        || !safe_uint(trusted.tpm_clock)
+        || !sha256(&trusted.assertion_sha256)
+        || !sha256(&trusted.signature_sha256)
+        || !sha256(&trusted.challenge_sha256)
+        || !sha256(&trusted.device_fingerprint)
+        || !safe_key_id(&trusted.key_id)
+        || !trusted.tpm_safe
+        || !timestamp(&trusted.trusted_time)
+    {
+        return Err(InternalError(
+            "state-v1 semantic state differs from its manifest floors".into(),
+        ));
+    }
+    verify_generation_inventory(dir)?;
+    Ok(trusted)
+}
+
+fn verify_generation_inventory(dir: &Path) -> Result<(), InternalError> {
+    let mut observed = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| {
+        InternalError(format!(
+            "cannot enumerate state-v1 generation {}: {error}",
+            dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            InternalError(format!(
+                "cannot enumerate state-v1 generation {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| InternalError("state-v1 generation contains a non-UTF-8 entry".into()))?;
+        observed.push(name);
+    }
+    observed.sort_unstable();
+    if observed != GENERATION_ARTIFACTS {
+        return Err(InternalError(
+            "state-v1 generation artifact inventory is not exact".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_manifest_artifact(
+    dir: &Path,
+    name: &str,
+    expected: &str,
+) -> Result<Vec<u8>, InternalError> {
+    if !sha256(expected) {
+        return Err(InternalError(format!(
+            "state-v1 manifest has invalid hash for {name}"
+        )));
+    }
+    let bytes = read_regular(&dir.join(name), 0o600)?;
+    if hash(&bytes)? != expected {
+        return Err(InternalError(format!(
+            "state-v1 artifact {name} hash differs from manifest"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn state_canonical_hash(bytes: &[u8], what: &str) -> Result<String, InternalError> {
+    match canonical_hash(bytes) {
+        Ok(value) => Ok(value),
+        Err(ContractError::Refusal(reason)) => Err(InternalError(format!(
+            "invalid state-v1 canonical {what}: {reason}"
+        ))),
+        Err(ContractError::Internal(error)) => Err(error),
+    }
+}
+
+fn verify_floor_continuity(
+    previous: &StateManifest,
+    current: &StateManifest,
+) -> Result<(), InternalError> {
+    let legacy_regressed = match (previous.legacy_bundle_floor, current.legacy_bundle_floor) {
+        (Some(_), None) => true,
+        (Some(old), Some(new)) => new < old,
+        _ => false,
+    };
+    if current.bundle_seq_floor < previous.bundle_seq_floor
+        || current.delegation_seq_floor < previous.delegation_seq_floor
+        || current.trusted_time_seq_floor < previous.trusted_time_seq_floor
+        || current.trusted_time_floor < previous.trusted_time_floor
+        || legacy_regressed
+        || (current.bundle_seq_floor == previous.bundle_seq_floor
+            && (current.applied_sha256 != previous.applied_sha256
+                || current.applied_bom_sha256 != previous.applied_bom_sha256
+                || current.release_authorization_sha256 != previous.release_authorization_sha256
+                || current.release_authorization_signature_sha256
+                    != previous.release_authorization_signature_sha256))
+        || (current.delegation_seq_floor == previous.delegation_seq_floor
+            && (current.authority_sha256 != previous.authority_sha256
+                || current.delegation_snapshot_canonical_sha256
+                    != previous.delegation_snapshot_canonical_sha256
+                || current.delegation_snapshot_sha256 != previous.delegation_snapshot_sha256
+                || current.delegation_snapshot_signature_sha256
+                    != previous.delegation_snapshot_signature_sha256))
+        || (current.trusted_time_seq_floor == previous.trusted_time_seq_floor
+            && (current.trusted_time_sha256 != previous.trusted_time_sha256
+                || current.trusted_time_assertion_canonical_sha256
+                    != previous.trusted_time_assertion_canonical_sha256
+                || current.trusted_time_assertion_sha256 != previous.trusted_time_assertion_sha256
+                || current.trusted_time_assertion_signature_sha256
+                    != previous.trusted_time_assertion_signature_sha256
+                || current.trusted_time_floor != previous.trusted_time_floor))
+    {
+        return Err(InternalError(
+            "state-v1 persisted monotonic floor regressed or split".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_clock_continuity(
+    previous: &TrustedTimeState,
+    current: &TrustedTimeState,
+) -> Result<(), InternalError> {
+    let regressed = current.device_fingerprint != previous.device_fingerprint
+        || current.tpm_reset_count < previous.tpm_reset_count
+        || current.trusted_time < previous.trusted_time
+        || (current.tpm_reset_count == previous.tpm_reset_count
+            && (current.tpm_clock < previous.tpm_clock
+                || current.tpm_restart_count < previous.tpm_restart_count))
+        || (current.tpm_reset_count > previous.tpm_reset_count
+            && (current.assertion_seq <= previous.assertion_seq
+                || current.trusted_time <= previous.trusted_time));
+    if regressed {
+        return Err(InternalError(
+            "state-v1 persisted TPM clock continuity regressed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn safe_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn parse_pointer(bytes: &[u8]) -> Result<u64, InternalError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| InternalError("state-v1 CURRENT is not UTF-8".into()))?;
+    let name = text
+        .strip_suffix('\n')
+        .ok_or_else(|| InternalError("state-v1 CURRENT lacks final LF".into()))?;
+    generation_number(name).ok_or_else(|| InternalError("invalid state-v1 CURRENT".into()))
+}
+
+fn generation_number(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("generation-")?;
+    if digits.len() != 16 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.parse().ok()?;
+    safe_uint(value).then_some(value)
+}
+
+fn temporary_generation(name: &str) -> bool {
+    let Some(value) = name
+        .strip_prefix(".generation-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((digits, writer)) = value.split_once('.') else {
+        return false;
+    };
+    generation_number(&format!("generation-{digits}")).is_some()
+        && !writer.is_empty()
+        && writer.len() <= 32
+        && writer.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn hash(bytes: &[u8]) -> Result<String, InternalError> {
+    runner::sha256_bytes(bytes)
+}
+
+fn extend_value(old: &str, manifest: &str) -> Result<String, InternalError> {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(&decode_hash(old)?);
+    bytes.extend_from_slice(&decode_hash(manifest)?);
+    hash(&bytes)
+}
+
+fn decode_hash(value: &str) -> Result<[u8; 32], InternalError> {
+    if !sha256(value) {
+        return Err(InternalError("invalid SHA-256 hash".into()));
+    }
+    let mut out = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        out[index] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or(""), 16)
+            .map_err(|_| InternalError("invalid SHA-256 hash".into()))?;
+    }
+    Ok(out)
+}
+
+fn hex(value: [u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn secure_existing_dir(path: &Path) -> Result<(), InternalError> {
+    validate_secure_state_directory(path).map_err(InternalError)
+}
+
+fn secure_optional_dir(path: &Path) -> Result<bool, InternalError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            secure_existing_dir(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(InternalError(format!(
+            "cannot inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn atomic_replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), InternalError> {
+    ensure_secure_state_directory(dir)?;
+    let destination = dir.join(name);
+    let _ = read_optional_regular(&destination, 0o600)?;
+    let (temp, mut file) = (0_u16..=u16::MAX)
+        .find_map(|attempt| {
+            let path = dir.join(format!(".{name}.{}.{attempt}.tmp", std::process::id()));
+            match new_file(&path) {
+                Ok(file) => Some(Ok((path, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(InternalError(format!(
+                    "cannot stage state-v1 {name}: {error}"
+                )))),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| InternalError(format!("no free staging name for state-v1 {name}")))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(InternalError(format!(
+            "cannot sync {}: {error}",
+            temp.display()
+        )));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temp, &destination) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(InternalError(format!(
+            "cannot publish state-v1 {name}: {error}"
+        )));
+    }
+    sync_dir(dir)
+}
+
+fn new_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+fn read_optional_regular(path: &Path, mode: u32) -> Result<Option<Vec<u8>>, InternalError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => read_regular(path, mode).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(InternalError(format!(
+            "cannot inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_regular(path: &Path, mode: u32) -> Result<Vec<u8>, InternalError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| InternalError(format!("cannot open {}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| InternalError(format!("cannot inspect {}: {error}", path.display())))?;
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| InternalError(format!("cannot inspect {}: {error}", path.display())))?;
+    if !metadata.file_type().is_file()
+        || !named.file_type().is_file()
+        || metadata.dev() != named.dev()
+        || metadata.ino() != named.ino()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != mode
+        || (unsafe { geteuid() } == 0 && metadata.uid() != 0)
+    {
+        return Err(InternalError(format!(
+            "{} is not a stable regular mode-{mode:04o} file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| InternalError(format!("cannot read {}: {error}", path.display())))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(InternalError(format!(
+            "state-v1 file {} exceeds 1 MiB",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn sync_dir(path: &Path) -> Result<(), InternalError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| InternalError(format!("cannot sync {}: {error}", path.display())))
+}
+
 fn parse_clock(output: &str) -> Result<TpmClockState, InternalError> {
     let field = |name: &str| -> Result<&str, InternalError> {
         let mut values = output
@@ -242,6 +1049,15 @@ fn parse_clock(output: &str) -> Result<TpmClockState, InternalError> {
             .map_err(|_| InternalError("TPM restart_count overflow".into()))?,
         safe,
     })
+}
+
+fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, InternalError> {
+    let value = serde_json::to_value(value)
+        .map_err(|error| InternalError(format!("cannot encode state-v1 value: {error}")))?;
+    let mut bytes = serde_json::to_vec(&value)
+        .map_err(|error| InternalError(format!("cannot encode state-v1 value: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> {
@@ -419,10 +1235,15 @@ fn tool(name: &str) -> PathBuf {
     PathBuf::from(format!("/usr/bin/{name}"))
 }
 
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn hex_bytes(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);
@@ -465,6 +1286,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct TestAnchor {
+        anchor: [u8; 32],
         initialized: bool,
         readable: bool,
         legacy_floor: Option<u64>,
@@ -480,7 +1302,7 @@ mod tests {
 
         fn read(&self) -> Result<[u8; 32], InternalError> {
             self.readable
-                .then_some([0x42; 32])
+                .then_some(self.anchor)
                 .ok_or_else(|| InternalError("unreadable state anchor".into()))
         }
 
@@ -495,6 +1317,210 @@ mod tests {
                 restart_count: 4,
                 safe: self.safe_clock,
             })
+        }
+    }
+
+    struct ChangingAnchor {
+        first: [u8; 32],
+        later: [u8; 32],
+        reads: Cell<u8>,
+    }
+
+    impl NvAnchor for ChangingAnchor {
+        fn attest(&self) -> Result<(), InternalError> {
+            Ok(())
+        }
+
+        fn read(&self) -> Result<[u8; 32], InternalError> {
+            let reads = self.reads.get();
+            self.reads.set(reads.saturating_add(1));
+            Ok(if reads == 0 { self.first } else { self.later })
+        }
+
+        fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+            Ok(Some(1))
+        }
+
+        fn clock(&self) -> Result<TpmClockState, InternalError> {
+            Ok(TpmClockState {
+                clock: 42,
+                reset_count: 1,
+                restart_count: 1,
+                safe: true,
+            })
+        }
+    }
+
+    struct GenerationSpec<'a> {
+        generation: u64,
+        bundle: u64,
+        delegation: u64,
+        time_seq: u64,
+        trusted_time: &'a str,
+        legacy: Option<u64>,
+        previous_manifest: Option<String>,
+        previous_anchor: String,
+    }
+
+    #[derive(Clone, Copy)]
+    struct GenerationArtifacts {
+        bind_assertion: bool,
+        bind_snapshot: bool,
+        release_json: u8,
+        variant: u8,
+    }
+
+    impl Default for GenerationArtifacts {
+        fn default() -> Self {
+            Self {
+                bind_assertion: true,
+                bind_snapshot: true,
+                release_json: 0,
+                variant: 0,
+            }
+        }
+    }
+
+    fn test_store() -> (Store, PathBuf) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = temp.join(format!(
+            "ni-ota-state-read-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_secure_state_directory(&root).unwrap();
+        ensure_secure_state_directory(&root.join("generations")).unwrap();
+        (Store { root: root.clone() }, root)
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        let mut file = new_file(path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn write_generation(store: &Store, spec: GenerationSpec<'_>) -> (String, String) {
+        write_generation_with_artifacts(store, spec, GenerationArtifacts::default())
+    }
+
+    fn write_generation_with_artifacts(
+        store: &Store,
+        spec: GenerationSpec<'_>,
+        artifacts: GenerationArtifacts,
+    ) -> (String, String) {
+        let dir = store
+            .root
+            .join("generations")
+            .join(format!("generation-{:016}", spec.generation));
+        ensure_secure_state_directory(&dir).unwrap();
+
+        let snapshot = b"{}\n";
+        let assertion = b"{}\n";
+        let snapshot_signature = artifact_variant(b"snapshot-signature", artifacts.variant);
+        let release = artifact_variant(
+            match artifacts.release_json {
+                0 => b"{}\n".as_slice(),
+                1 => b"{ }\n".as_slice(),
+                _ => b"{\n".as_slice(),
+            },
+            artifacts.variant,
+        );
+        let release_signature = artifact_variant(b"release-signature", artifacts.variant);
+        let assertion_signature = artifact_variant(b"trusted-time-signature", artifacts.variant);
+        let snapshot_canonical_hash = if artifacts.bind_snapshot {
+            canonical_hash(snapshot).unwrap()
+        } else {
+            canonical_hash(b"{\"different\":true}\n").unwrap()
+        };
+        let assertion_canonical_hash = if artifacts.bind_assertion {
+            canonical_hash(assertion).unwrap()
+        } else {
+            canonical_hash(b"{\"different\":true}\n").unwrap()
+        };
+        let applied = AppliedStateV1 {
+            bom_sha256: format!("{:x}", spec.bundle)
+                .repeat(64)
+                .chars()
+                .take(64)
+                .collect(),
+            bundle_seq: spec.bundle,
+            schema: "neural-ice-ota-applied-state-v1".into(),
+        };
+        let authority = AuthorityState {
+            delegation_seq: spec.delegation,
+            schema: "neural-ice-ota-authority-state-v1".into(),
+            snapshot_sha256: snapshot_canonical_hash,
+            snapshot_signature_sha256: hash(&snapshot_signature).unwrap(),
+        };
+        let trusted = TrustedTimeState {
+            assertion_seq: spec.time_seq,
+            assertion_sha256: assertion_canonical_hash,
+            challenge_sha256: hash(b"challenge").unwrap(),
+            delegation_seq: spec.delegation,
+            device_fingerprint: "d".repeat(64),
+            key_id: "trusted-time-v1".into(),
+            schema: "neural-ice-ota-trusted-time-state-v2".into(),
+            signature_sha256: hash(&assertion_signature).unwrap(),
+            tpm_clock: spec.generation * 1_000,
+            tpm_reset_count: 1,
+            tpm_restart_count: spec.generation as u32,
+            tpm_safe: true,
+            trusted_time: spec.trusted_time.into(),
+        };
+        let applied_bytes = canonical(&applied).unwrap();
+        let authority_bytes = canonical(&authority).unwrap();
+        let trusted_bytes = canonical(&trusted).unwrap();
+        for (name, bytes) in [
+            ("applied.json", applied_bytes.as_slice()),
+            ("authority.json", authority_bytes.as_slice()),
+            ("delegation-snapshot.json", snapshot),
+            ("delegation-snapshot.sig", snapshot_signature.as_slice()),
+            ("release-authorization.json", release.as_slice()),
+            ("release-authorization.sig", release_signature.as_slice()),
+            ("trusted-time-assertion.json", assertion),
+            ("trusted-time-assertion.sig", assertion_signature.as_slice()),
+            ("trusted-time.json", trusted_bytes.as_slice()),
+        ] {
+            write_file(&dir.join(name), bytes);
+        }
+        let manifest = StateManifest {
+            applied_sha256: hash(&applied_bytes).unwrap(),
+            applied_bom_sha256: applied.bom_sha256,
+            authority_sha256: hash(&authority_bytes).unwrap(),
+            bundle_seq_floor: spec.bundle,
+            delegation_seq_floor: spec.delegation,
+            delegation_snapshot_canonical_sha256: authority.snapshot_sha256,
+            delegation_snapshot_sha256: hash(snapshot).unwrap(),
+            delegation_snapshot_signature_sha256: hash(&snapshot_signature).unwrap(),
+            generation: spec.generation,
+            legacy_bundle_floor: spec.legacy,
+            previous_manifest_sha256: spec.previous_manifest,
+            previous_nv_anchor: spec.previous_anchor.clone(),
+            release_authorization_sha256: hash(&release).unwrap(),
+            release_authorization_signature_sha256: hash(&release_signature).unwrap(),
+            schema: "neural-ice-ota-state-manifest-v1".into(),
+            trusted_time_assertion_canonical_sha256: trusted.assertion_sha256,
+            trusted_time_assertion_sha256: hash(assertion).unwrap(),
+            trusted_time_assertion_signature_sha256: hash(&assertion_signature).unwrap(),
+            trusted_time_floor: trusted.trusted_time,
+            trusted_time_seq_floor: spec.time_seq,
+            trusted_time_sha256: hash(&trusted_bytes).unwrap(),
+        };
+        let manifest_bytes = canonical(&manifest).unwrap();
+        write_file(&dir.join("manifest.json"), &manifest_bytes);
+        sync_dir(&dir).unwrap();
+        sync_dir(&store.root.join("generations")).unwrap();
+        let manifest_hash = hash(&manifest_bytes).unwrap();
+        let anchor = extend_value(&spec.previous_anchor, &manifest_hash).unwrap();
+        (manifest_hash, anchor)
+    }
+
+    fn artifact_variant(base: &[u8], variant: u8) -> Vec<u8> {
+        if variant == 0 {
+            base.to_vec()
+        } else {
+            [base, format!("-{variant}").as_bytes()].concat()
         }
     }
 
@@ -607,8 +1633,31 @@ mod tests {
     }
 
     #[test]
+    fn extend_chain_is_ordered_and_not_overwritable() {
+        let first = extend_value(ZERO_ANCHOR, &"1".repeat(64)).unwrap();
+        let second = extend_value(&first, &"2".repeat(64)).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, extend_value(ZERO_ANCHOR, &"2".repeat(64)).unwrap());
+    }
+
+    #[test]
+    fn pointers_are_exact_and_bounded() {
+        assert_eq!(parse_pointer(b"generation-0000000000000001\n").unwrap(), 1);
+        assert!(parse_pointer(b"generation-0000000000000001").is_err());
+        assert!(parse_pointer(b"generation-0000000000000000\n").is_err());
+        assert!(parse_pointer(b"generation-9007199254740992\n").is_err());
+        assert!(parse_pointer(b"../generation-0000000000000001\n").is_err());
+        assert!(temporary_generation(".generation-0000000000000001.123.tmp"));
+        assert!(!temporary_generation(".anything.tmp"));
+        assert!(!temporary_generation(
+            ".generation-0000000000000001.writer.tmp"
+        ));
+    }
+
+    #[test]
     fn continuity_requires_initialized_anchor_legacy_floor_and_safe_clock() {
         let ready = TestAnchor {
+            anchor: [0x42; 32],
             initialized: true,
             readable: true,
             legacy_floor: Some(7),
@@ -635,5 +1684,479 @@ mod tests {
             ..ready
         })
         .is_err());
+    }
+
+    #[test]
+    fn missing_current_recovers_only_the_complete_tpm_anchored_generation() {
+        let (store, root) = test_store();
+        let (_, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        let nv = TestAnchor {
+            anchor: decode_hash(&anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        let loaded = store.read_current(&nv).unwrap().unwrap();
+        assert_eq!(loaded.manifest.generation, 1);
+        assert_eq!(
+            std::fs::read(store.root.join("current")).unwrap(),
+            b"generation-0000000000000001\n"
+        );
+        assert!(store.verify_enforce_ready(&nv).is_ok());
+        assert!(store.root.join("enforce-ready.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_symlink_current_is_never_repaired() {
+        use std::os::unix::fs::symlink;
+
+        let (store, root) = test_store();
+        let (_, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        let nv = TestAnchor {
+            anchor: decode_hash(&anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        let current = store.root.join("current");
+        write_file(&current, b"partial\n");
+        assert!(store.read_current(&nv).is_err());
+        assert_eq!(std::fs::read(&current).unwrap(), b"partial\n");
+        std::fs::remove_file(&current).unwrap();
+        symlink(
+            store
+                .root
+                .join("generations/generation-0000000000000001/manifest.json"),
+            &current,
+        )
+        .unwrap();
+        assert!(store.read_current(&nv).is_err());
+        assert!(std::fs::symlink_metadata(&current)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_or_nonregular_generation_evidence_fails_closed() {
+        let (store, root) = test_store();
+        ensure_secure_state_directory(&store.root.join("generations/generation-0000000000000001"))
+            .unwrap();
+        let nv = TestAnchor {
+            anchor: [0x55; 32],
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        assert!(store.read_current(&nv).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (store, root) = test_store();
+        write_file(
+            &store
+                .root
+                .join("generations/.generation-0000000000000001.7.tmp"),
+            b"partial",
+        );
+        assert!(store
+            .read_current(&TestAnchor {
+                anchor: [0; 32],
+                initialized: false,
+                readable: true,
+                legacy_floor: None,
+                safe_clock: true,
+            })
+            .is_err());
+        assert!(!store.root.join("current").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generation_inventory_and_recovery_anchor_are_revalidated_before_publication() {
+        let (store, root) = test_store();
+        let (_, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        let generation = store.root.join("generations/generation-0000000000000001");
+        write_file(&generation.join("unexpected"), b"not-manifest-bound");
+        let stable = TestAnchor {
+            anchor: decode_hash(&anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        assert!(store.read_current(&stable).is_err());
+        std::fs::remove_file(generation.join("unexpected")).unwrap();
+
+        let changing = ChangingAnchor {
+            first: decode_hash(&anchor).unwrap(),
+            later: [0x55; 32],
+            reads: Cell::new(0),
+        };
+        assert!(store.read_current(&changing).is_err());
+        assert!(!store.root.join("current").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artifact_tamper_and_persisted_floor_regression_fail_closed() {
+        let (store, root) = test_store();
+        let (first_manifest, first_anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 2,
+                delegation: 2,
+                time_seq: 2,
+                trusted_time: "2026-07-21T12:00:02Z",
+                legacy: Some(2),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        let (_, second_anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 2,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:01Z",
+                legacy: Some(1),
+                previous_manifest: Some(first_manifest),
+                previous_anchor: first_anchor,
+            },
+        );
+        write_file(
+            &store.root.join("current"),
+            b"generation-0000000000000002\n",
+        );
+        let nv = TestAnchor {
+            anchor: decode_hash(&second_anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        assert!(store.read_current(&nv).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (store, root) = test_store();
+        let (_, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        write_file(
+            &store.root.join("current"),
+            b"generation-0000000000000001\n",
+        );
+        std::fs::write(
+            store
+                .root
+                .join("generations/generation-0000000000000001/applied.json"),
+            b"{}\n",
+        )
+        .unwrap();
+        assert!(store
+            .read_current(&TestAnchor {
+                anchor: decode_hash(&anchor).unwrap(),
+                initialized: true,
+                readable: true,
+                legacy_floor: Some(1),
+                safe_clock: true,
+            })
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_hashes_are_bound_to_the_recovered_artifact_bytes() {
+        for artifacts in [
+            GenerationArtifacts {
+                bind_snapshot: false,
+                ..GenerationArtifacts::default()
+            },
+            GenerationArtifacts {
+                bind_assertion: false,
+                ..GenerationArtifacts::default()
+            },
+        ] {
+            let (store, root) = test_store();
+            let (_, anchor) = write_generation_with_artifacts(
+                &store,
+                GenerationSpec {
+                    generation: 1,
+                    bundle: 1,
+                    delegation: 1,
+                    time_seq: 1,
+                    trusted_time: "2026-07-21T12:00:00Z",
+                    legacy: Some(1),
+                    previous_manifest: None,
+                    previous_anchor: ZERO_ANCHOR.into(),
+                },
+                artifacts,
+            );
+            assert!(store
+                .read_current(&TestAnchor {
+                    anchor: decode_hash(&anchor).unwrap(),
+                    initialized: true,
+                    readable: true,
+                    legacy_floor: Some(1),
+                    safe_clock: true,
+                })
+                .is_err());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn release_authorization_must_be_canonical_json_before_recovery() {
+        for release_json in [1, 2] {
+            let (store, root) = test_store();
+            let (_, anchor) = write_generation_with_artifacts(
+                &store,
+                GenerationSpec {
+                    generation: 1,
+                    bundle: 1,
+                    delegation: 1,
+                    time_seq: 1,
+                    trusted_time: "2026-07-21T12:00:00Z",
+                    legacy: Some(1),
+                    previous_manifest: None,
+                    previous_anchor: ZERO_ANCHOR.into(),
+                },
+                GenerationArtifacts {
+                    release_json,
+                    ..GenerationArtifacts::default()
+                },
+            );
+            let error = store
+                .read_current(&TestAnchor {
+                    anchor: decode_hash(&anchor).unwrap(),
+                    initialized: true,
+                    readable: true,
+                    legacy_floor: Some(1),
+                    safe_clock: true,
+                })
+                .unwrap_err();
+            assert!(error.0.contains("release authorization"));
+            assert!(!store.root.join("current").exists());
+            assert!(!store.root.join("enforce-ready.json").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn equal_sequences_require_every_scoped_artifact_to_be_byte_identical() {
+        let (store, root) = test_store();
+        let (first_manifest, first_anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        let (_, second_anchor) = write_generation_with_artifacts(
+            &store,
+            GenerationSpec {
+                generation: 2,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: Some(first_manifest),
+                previous_anchor: first_anchor,
+            },
+            GenerationArtifacts {
+                variant: 1,
+                ..GenerationArtifacts::default()
+            },
+        );
+        assert!(store
+            .read_current(&TestAnchor {
+                anchor: decode_hash(&second_anchor).unwrap(),
+                initialized: true,
+                readable: true,
+                legacy_floor: Some(1),
+                safe_clock: true,
+            })
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let manifest = StateManifest {
+            applied_sha256: "1".repeat(64),
+            applied_bom_sha256: "2".repeat(64),
+            authority_sha256: "3".repeat(64),
+            bundle_seq_floor: 1,
+            delegation_seq_floor: 1,
+            delegation_snapshot_canonical_sha256: "4".repeat(64),
+            delegation_snapshot_sha256: "5".repeat(64),
+            delegation_snapshot_signature_sha256: "6".repeat(64),
+            generation: 1,
+            legacy_bundle_floor: Some(1),
+            previous_manifest_sha256: None,
+            previous_nv_anchor: ZERO_ANCHOR.into(),
+            release_authorization_sha256: "7".repeat(64),
+            release_authorization_signature_sha256: "8".repeat(64),
+            schema: "neural-ice-ota-state-manifest-v1".into(),
+            trusted_time_assertion_canonical_sha256: "9".repeat(64),
+            trusted_time_assertion_sha256: "a".repeat(64),
+            trusted_time_assertion_signature_sha256: "b".repeat(64),
+            trusted_time_floor: "2026-07-21T12:00:00Z".into(),
+            trusted_time_seq_floor: 1,
+            trusted_time_sha256: "c".repeat(64),
+        };
+        for mutate in [
+            |value: &mut StateManifest| {
+                value.release_authorization_signature_sha256 = "d".repeat(64)
+            },
+            |value: &mut StateManifest| value.delegation_snapshot_signature_sha256 = "d".repeat(64),
+            |value: &mut StateManifest| {
+                value.trusted_time_assertion_signature_sha256 = "d".repeat(64)
+            },
+        ] {
+            let mut split = manifest.clone();
+            mutate(&mut split);
+            assert!(verify_floor_continuity(&manifest, &split).is_err());
+        }
+    }
+
+    #[test]
+    fn enforce_ready_binds_the_exact_legacy_floor_without_mutating_it() {
+        let (store, root) = test_store();
+        let (manifest, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 7,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(7),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        write_file(
+            &store.root.join("current"),
+            b"generation-0000000000000001\n",
+        );
+        write_file(
+            &store.root.join("enforce-ready.json"),
+            &canonical(&EnforceReady {
+                manifest_sha256: "0".repeat(64),
+                nv_anchor: "0".repeat(64),
+                schema: "neural-ice-ota-enforce-ready-v1".into(),
+            })
+            .unwrap(),
+        );
+        let exact = TestAnchor {
+            anchor: decode_hash(&anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(7),
+            safe_clock: true,
+        };
+        assert!(store.verify_enforce_ready(&exact).is_ok());
+        let marker: EnforceReady = parse_canonical(
+            &std::fs::read(store.root.join("enforce-ready.json")).unwrap(),
+            "test enforce-ready",
+        )
+        .unwrap();
+        assert_eq!(marker.manifest_sha256, manifest);
+        assert_eq!(marker.nv_anchor, anchor);
+        assert!(store
+            .verify_enforce_ready(&TestAnchor {
+                legacy_floor: Some(6),
+                ..exact
+            })
+            .is_err());
+        assert!(store
+            .verify_enforce_ready(&TestAnchor {
+                legacy_floor: Some(8),
+                ..exact
+            })
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pointer_publication_skips_stale_temp_but_refuses_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let (store, root) = test_store();
+        let stale = store
+            .root
+            .join(format!(".current.{}.0.tmp", std::process::id()));
+        write_file(&stale, b"stale");
+        store.publish_current(1).unwrap();
+        assert_eq!(
+            std::fs::read(store.root.join("current")).unwrap(),
+            b"generation-0000000000000001\n"
+        );
+        std::fs::remove_file(store.root.join("current")).unwrap();
+        symlink(&stale, store.root.join("current")).unwrap();
+        assert!(store.publish_current(2).is_err());
+        assert!(std::fs::symlink_metadata(store.root.join("current"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -595,7 +595,7 @@ fn legacy_migration_required(
     Ok(true)
 }
 
-fn validate_secure_state_directory(dir: &Path) -> Result<(), String> {
+pub(crate) fn validate_secure_state_directory(dir: &Path) -> Result<(), String> {
     let directory = open_directory_chain(dir).map_err(|error| error.0)?;
     validate_secure_directory_handle(dir, &directory)
 }
@@ -896,11 +896,11 @@ fn sync_directory(dir: &Path) -> Result<(), InternalError> {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_DIRECTORY: i32 = 0o200000;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const O_NOFOLLOW: i32 = 0o400000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const O_DIRECTORY: i32 = 0o40000;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const O_NOFOLLOW: i32 = 0o100000;
+pub(crate) const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(target_os = "linux")]
 const O_CLOEXEC: i32 = 0o2000000;
 
@@ -913,7 +913,7 @@ compile_error!("ni-ota-verify supports only linux/amd64 and linux/arm64");
 #[cfg(target_os = "macos")]
 const O_DIRECTORY: i32 = 0x0010_0000;
 #[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0000_0100;
+pub(crate) const O_NOFOLLOW: i32 = 0x0000_0100;
 #[cfg(target_os = "macos")]
 const O_CLOEXEC: i32 = 0x0100_0000;
 
