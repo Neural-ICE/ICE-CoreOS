@@ -171,9 +171,11 @@ delegation-state persistence are deliberately subsequent slices; this command
 does not authorize a release, publish a channel, or mutate accepted state.
 
 The sole unseeded exception belongs to the distinct physical
-`verify-delegated-usb` path. It is explicitly floor-bound to the immutable
-`/usr/lib/neural-ice/ota-min-delegation-seq` and additionally requires the
-signed debug target/release/media bindings. Omitting accepted state from the
+`verify-delegated-usb` path. It is explicitly bound to both the immutable
+`/usr/lib/neural-ice/ota-min-delegation-seq` and the exact canonical snapshot
+hash in `/usr/lib/neural-ice/ota-bootstrap-delegation-sha256`, and additionally
+requires the signed debug target/release/media bindings. A missing, malformed,
+or different immutable hash fails closed. Omitting accepted state from the
 generic or network verifier is always an authority refusal.
 
 Owner authorization for this gate is recorded in the 2026-07-20/21 task by

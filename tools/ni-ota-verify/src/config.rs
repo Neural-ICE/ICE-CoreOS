@@ -12,6 +12,8 @@ use crate::InternalError;
 const DEFAULT_HARDWARE_TARGET_FILE: &str = "/usr/lib/neural-ice/hardware-target";
 const DEFAULT_APPLIANCE_VARIANT_FILE: &str = "/usr/lib/neural-ice/appliance-variant";
 const DEFAULT_MIN_DELEGATION_SEQ_FILE: &str = "/usr/lib/neural-ice/ota-min-delegation-seq";
+const DEFAULT_BOOTSTRAP_DELEGATION_SHA256_FILE: &str =
+    "/usr/lib/neural-ice/ota-bootstrap-delegation-sha256";
 
 pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
     #[cfg(feature = "test-path-overrides")]
@@ -100,6 +102,34 @@ pub(crate) fn immutable_minimum_delegation_seq() -> Result<u64, InternalError> {
         )));
     }
     Ok(sequence)
+}
+
+pub(crate) fn immutable_bootstrap_delegation_sha256() -> Result<String, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let path = std::env::var_os("NI_OTA_BOOTSTRAP_DELEGATION_SHA256_FILE").map_or_else(
+        || PathBuf::from(DEFAULT_BOOTSTRAP_DELEGATION_SHA256_FILE),
+        PathBuf::from,
+    );
+    #[cfg(not(feature = "test-path-overrides"))]
+    let path = PathBuf::from(DEFAULT_BOOTSTRAP_DELEGATION_SHA256_FILE);
+    let value = std::fs::read_to_string(&path).map_err(|error| {
+        InternalError(format!(
+            "unreadable immutable bootstrap delegation SHA-256 {}: {error}",
+            path.display()
+        ))
+    })?;
+    let digest = value.trim();
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(InternalError(format!(
+            "invalid immutable bootstrap delegation SHA-256 in {}",
+            path.display()
+        )));
+    }
+    Ok(digest.to_owned())
 }
 
 pub(crate) struct Config {

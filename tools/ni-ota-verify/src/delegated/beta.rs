@@ -155,6 +155,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let context = super::CandidateContext {
         now,
         minimum: immutable_minimum_delegation_seq()?,
+        bootstrap_sha256: None,
         flags: &flags,
         snapshot_file: &snapshot_file,
         scratch: &scratch,

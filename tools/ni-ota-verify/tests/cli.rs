@@ -1995,6 +1995,11 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
         include_bytes!("fixtures/delegated-v1/delegation-snapshot.json"),
     )
     .unwrap();
+    fs::write(
+        fx.path("bootstrap-delegation-sha256"),
+        "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500\n",
+    )
+    .unwrap();
     let snapshot_value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
     let encoded = snapshot_value["root_key"]["public_key"]["spki_der_base64"]
         .as_str()
@@ -2113,6 +2118,10 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
                 "NI_OTA_MIN_DELEGATION_SEQ_FILE",
                 fx.path("min-delegation-seq"),
             )
+            .env(
+                "NI_OTA_BOOTSTRAP_DELEGATION_SHA256_FILE",
+                fx.path("bootstrap-delegation-sha256"),
+            )
             .arg("verify-delegated-usb")
             .args(["--snapshot".as_ref(), snapshot.as_os_str()])
             .args([
@@ -2140,6 +2149,41 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(verdict["mode"], "delegated-usb-beta");
     assert_eq!(verdict["bom_sha256"], bom_hash);
     assert!(!fx.path("state/applied.json").exists());
+
+    fs::write(
+        fx.path("bootstrap-delegation-sha256"),
+        format!("{}\n", "f".repeat(64)),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("immutable bootstrap delegation epoch"),
+        "{stderr}"
+    );
+    fs::write(
+        fx.path("bootstrap-delegation-sha256"),
+        format!("{}\n", "A".repeat(64)),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("invalid immutable bootstrap delegation SHA-256"),
+        "{stderr}"
+    );
+    fs::remove_file(fx.path("bootstrap-delegation-sha256")).unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("unreadable immutable bootstrap delegation SHA-256"),
+        "{stderr}"
+    );
+    fs::write(
+        fx.path("bootstrap-delegation-sha256"),
+        "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500\n",
+    )
+    .unwrap();
 
     fs::write(fx.path("attestation.sig"), []).unwrap();
     let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));

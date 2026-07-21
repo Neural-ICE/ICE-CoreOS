@@ -138,6 +138,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let context = CandidateContext {
         now: required("trusted-now")?,
         minimum: immutable_minimum_delegation_seq()?,
+        bootstrap_sha256: None,
         flags: &flags,
         snapshot_file: &snapshot,
         scratch: &scratch,
@@ -172,6 +173,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
 struct CandidateContext<'a> {
     now: &'a str,
     minimum: u64,
+    bootstrap_sha256: Option<String>,
     flags: &'a HashMap<String, String>,
     snapshot_file: &'a SecureTempFile,
     scratch: &'a FileStateStore,
@@ -198,8 +200,18 @@ fn validate_candidate(
         context.flags.get("accepted-delegation-sha256"),
         context.flags.get("accepted-snapshot"),
     ) {
-        (None, None, None)
-            if context.allow_unseeded_bootstrap && candidate.delegation_seq == context.minimum => {}
+        (None, None, None) if context.allow_unseeded_bootstrap => {
+            let Some(expected_hash) = context.bootstrap_sha256.as_deref() else {
+                return Err(ContractError::Internal(InternalError(
+                    "immutable bootstrap delegation SHA-256 is unavailable".into(),
+                )));
+            };
+            if candidate.delegation_seq != context.minimum || hash != expected_hash {
+                return Err(
+                    "snapshot differs from the immutable bootstrap delegation epoch".into(),
+                );
+            }
+        }
         (None, None, None) => {
             return Err(
                 "accepted delegation state is required outside explicit floor-bound bootstrap"
