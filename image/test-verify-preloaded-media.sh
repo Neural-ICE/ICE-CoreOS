@@ -88,9 +88,9 @@ loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
 mkfs.vfat -n EFI-SYSTEM "${loop}p1" >/dev/null
 mount "${loop}p1" "$mountpoint"
-mkdir -p "$mountpoint/ice-coreos"
-cp "$work/ota-lab-baseline.json" "$mountpoint/ice-coreos/ota-lab-baseline.json"
-cp "$work/ota-lab-baseline.sig" "$mountpoint/ice-coreos/ota-lab-baseline.sig"
+"$ROOT/ota/neural-ice-lab-baseline-handoff.sh" stage-media \
+  "$work/ota-lab-baseline.json" "$bom_sha256" \
+  "$work/ota-lab-baseline.sig" "$signature_sha256" "$mountpoint"
 sync
 umount "$mountpoint"
 mkfs.xfs -q -L ni-seed "${loop}p2"
@@ -190,8 +190,9 @@ expect_baseline_refusal absent "${baseline_args[@]}"
 loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
 mount "${loop}p1" "$mountpoint"
-cp "$work/ota-lab-baseline.json" "$mountpoint/ice-coreos/ota-lab-baseline.json"
-cp "$work/ota-lab-baseline.sig" "$mountpoint/ice-coreos/ota-lab-baseline.sig"
+"$ROOT/ota/neural-ice-lab-baseline-handoff.sh" stage-media \
+  "$work/ota-lab-baseline.json" "$bom_sha256" \
+  "$work/ota-lab-baseline.sig" "$signature_sha256" "$mountpoint"
 sync
 umount "$mountpoint"
 losetup --detach "$loop"
