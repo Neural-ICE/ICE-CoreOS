@@ -131,12 +131,25 @@ strictly below signed `valid_until`. The canonical hash is computed from the
 supplied snapshot bytes, not accepted from a separate caller claim. A scoped
 `retiring` time key remains valid only during its bounded snapshot overlap.
 
-For a fresh appliance, the trusted-time key is provisionally authorized only
-by the candidate root-signed initial snapshot. Snapshot, assertion, release
-and first state generation are accepted atomically; none becomes independent
-authority on failure. A TPM-state recovery is a distinct root-signed artifact
-bound to a new one-use appliance challenge and the complete replacement state.
-Ordinary trusted-time assertions can never reset or lower a floor.
+For a fresh appliance, the candidate root-signed initial snapshot
+provisionally authorizes one exact `licensing-bootstrap` proof before it
+provisionally authorizes trusted time. The canonical proof binds an opaque
+licence record, the dedicated device-root TPM Name and SPKI digest, a distinct
+one-use challenge, the exact immutable image/baseline/root/snapshot identity,
+and either `initial_activation` or the complete server-held forward-only state
+for `state_loss_recovery`. A simultaneous disk and TPM loss therefore always
+requires the signed online recovery proof; there is no local fallback.
+
+Root recovery additionally requires the exact licensing recovery
+acknowledgement signed by the one key and scope embedded in the root artifact;
+generic snapshot membership does not grant that acknowledgement authority.
+Snapshot, licensing proof, assertion, release and first state generation are
+accepted atomically; none becomes independent authority on failure. The
+contract verifier is compiled before that transaction but deliberately exposes
+no standalone command or capability. A TPM-state recovery remains a distinct
+root-signed artifact bound to a new one-use appliance challenge and the
+complete replacement state. Ordinary trusted-time or licensing artifacts can
+never reset or lower a floor.
 
 ## Crash recovery and rollback
 
