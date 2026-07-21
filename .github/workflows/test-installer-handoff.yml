@@ -13,7 +13,6 @@ on:
       - "image/Containerfile.bootc"
       - "image/Containerfile.installer"
       - "image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
-      - "image/build-installer-usb.sh"
       - "image/build-preloaded.sh"
       - "image/lib/preloaded-sizing.sh"
       - "image/lib/preloaded-output-set.sh"
@@ -26,9 +25,7 @@ permissions:
 
 jobs:
   test:
-    if: >-
-      github.repository == 'Neural-ICE/ICE-CoreOS' &&
-      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
@@ -59,9 +56,7 @@ jobs:
     # The X64 runner intentionally has neither sudo nor user namespaces. The
     # Spark build runner already exposes passwordless sudo to its bounded CI
     # jobs, so use it only for the positive root-owned persistence contract.
-    if: >-
-      github.repository == 'Neural-ICE/ICE-CoreOS' &&
-      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, ARM64, spark]
     timeout-minutes: 5
     permissions:

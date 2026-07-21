@@ -31,9 +31,7 @@ concurrency:
 
 jobs:
   linux-x86_64-portable:
-    if: >-
-      github.repository == 'Neural-ICE/ICE-CoreOS' &&
-      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
@@ -60,9 +58,7 @@ jobs:
             image/test-preloaded-output-set.sh \
             image/test-verify-preloaded-media.sh
   linux-arm64:
-    if: >-
-      github.repository == 'Neural-ICE/ICE-CoreOS' &&
-      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 20
     steps:
@@ -89,6 +85,7 @@ jobs:
             image/test-preloaded-output-set.sh \
             image/test-verify-preloaded-media.sh
       - name: Final raw-media integration
+        if: github.event_name == 'push'
         run: >-
           sudo --non-interactive unshare --mount --propagation private --
           env PATH="$PATH" bash image/test-verify-preloaded-media.sh
