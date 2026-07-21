@@ -1695,6 +1695,25 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
     assert_eq!(verdict["verdict"], "pass");
     assert!(verdict.get("ring").is_none());
 
+    let mut missing_cosign = Command::new(BIN);
+    missing_cosign
+        .env("NI_OTA_COSIGN", fx.path("missing-cosign"))
+        .env(
+            "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+            fx.path("min-delegation-seq"),
+        )
+        .arg("verify-delegation-snapshot")
+        .args(["--snapshot".as_ref(), snapshot.as_os_str()])
+        .args([
+            "--snapshot-sig".as_ref(),
+            fx.path("snapshot.sig").as_os_str(),
+        ])
+        .args(["--trusted-now", "2026-07-22T00:00:00Z"])
+        .args(["--config".as_ref(), cfg.as_os_str()]);
+    let (code, _, stderr) = run(&mut missing_cosign);
+    assert_eq!(code, 2, "broken verifier tooling is an internal error");
+    assert!(stderr.contains("cosign not found"), "{stderr}");
+
     let (code, _, stderr) = command("2");
     assert_eq!(code, 1);
     assert!(stderr.contains("delegation snapshot REFUSED"));

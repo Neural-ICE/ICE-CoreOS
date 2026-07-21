@@ -140,6 +140,26 @@ scope or validity. Multi-snapshot offline catch-up and atomic TPM-backed
 delegation-state persistence are deliberately subsequent slices; this command
 does not authorize a release, publish a channel, or mutate accepted state.
 
+Owner authorization for this gate is recorded in the 2026-07-20/21 task by
+the explicit decisions `GO signed-boot LAB debug ... gate LAB/PROD #37`,
+`GO ADR délégation OTA v2 — racine offline uniquement pour
+délégation/révocation/secours`, and `GO parcours opérateur simplifié —
+cérémonie root-only, bootstrap KMS automatisé`. These approvals cover the
+delegated trust model and its local verifier only; they authorize no channel
+movement.
+
+Recovery is fail-closed but does not stop the installed release. An unavailable,
+expired, malformed or rollback snapshot leaves the last accepted snapshot and
+the running bootc deployment untouched and denies only the candidate update.
+The offline root recovers by signing exactly the next snapshot, chained to the
+last accepted canonical hash; compromise recovery tombstones the affected key
+in that successor and installs a separately scoped replacement. Sequence floors
+are never lowered and accepted history is never deleted. For a one-version OS
+rollback, this slice adds no persisted schema and mutates no delegation state,
+so the retained prior verifier and retained bootc deployment remain usable with
+the existing state. Recovery of a newer candidate resumes only after a valid
+root-signed successor satisfies both that history and the image-baked minimum.
+
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An
 existing directory must already be a real mode-`0700` directory; `verify`

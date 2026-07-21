@@ -75,27 +75,24 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         snapshot_file: &snapshot,
         scratch: &scratch,
     };
-    let result = validate_candidate(&candidate, &context).and_then(|hash| {
-        let root_bytes = root.read().map_err(|e| e.0)?;
-        verify_root_binding(&candidate, &root_bytes)?;
-        verify_signature(
-            &root_bytes,
-            &snapshot_bytes,
-            &signature.read().map_err(|e| e.0)?,
-            &scratch,
-        )?;
-        Ok(hash)
-    });
-    match result {
-        Ok(hash) => {
-            println!(
-                "{{\"verdict\":\"pass\",\"delegation_seq\":{},\"snapshot_sha256\":\"{}\"}}",
-                candidate.delegation_seq, hash
-            );
-            Ok(EXIT_PASS)
-        }
-        Err(reason) => refusal(reason),
+    let hash = match validate_candidate(&candidate, &context) {
+        Ok(hash) => hash,
+        Err(reason) => return refusal(reason),
+    };
+    let root_bytes = root.read()?;
+    if let Err(reason) = verify_root_binding(&candidate, &root_bytes) {
+        return refusal(reason);
     }
+    let signature_bytes = signature.read()?;
+    if let Err(reason) = verify_signature(&root_bytes, &snapshot_bytes, &signature_bytes, &scratch)?
+    {
+        return refusal(reason);
+    }
+    println!(
+        "{{\"verdict\":\"pass\",\"delegation_seq\":{},\"snapshot_sha256\":\"{}\"}}",
+        candidate.delegation_seq, hash
+    );
+    Ok(EXIT_PASS)
 }
 
 struct CandidateContext<'a> {
@@ -187,26 +184,21 @@ fn verify_signature(
     payload: &[u8],
     der: &[u8],
     store: &FileStateStore,
-) -> Result<(), String> {
-    validate_der_signature(der)?;
+) -> Result<Result<(), String>, InternalError> {
+    if let Err(reason) = validate_der_signature(der) {
+        return Ok(Err(reason));
+    }
     let mut message = SNAPSHOT_DOMAIN.to_vec();
-    message.extend_from_slice(
-        payload
-            .strip_suffix(b"\n")
-            .ok_or("canonical payload lacks LF")?,
-    );
-    let key = store
-        .secure_temp_bytes("delegated-key", root)
-        .map_err(|e| e.0)?;
-    let message = store
-        .secure_temp_bytes("delegated-message", &message)
-        .map_err(|e| e.0)?;
+    let Some(payload) = payload.strip_suffix(b"\n") else {
+        return Ok(Err("canonical payload lacks LF".into()));
+    };
+    message.extend_from_slice(payload);
+    let key = store.secure_temp_bytes("delegated-key", root)?;
+    let message = store.secure_temp_bytes("delegated-message", &message)?;
     let encoded = encode_base64(der);
-    let signature = store
-        .secure_temp_bytes("delegated-signature-b64", encoded.as_bytes())
-        .map_err(|e| e.0)?;
-    let cosign = runner::cosign_path().map_err(|e| e.0)?;
-    runner::verify_blob(&cosign, key.path(), signature.path(), message.path()).map_err(|e| e.0)?
+    let signature = store.secure_temp_bytes("delegated-signature-b64", encoded.as_bytes())?;
+    let cosign = runner::cosign_path()?;
+    runner::verify_blob(&cosign, key.path(), signature.path(), message.path())
 }
 
 fn refusal(reason: String) -> Result<u8, InternalError> {

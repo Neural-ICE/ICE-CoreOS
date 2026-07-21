@@ -358,8 +358,30 @@ fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
         .flatten()
         .filter_map(live)
         .collect();
+        let dead_peers: Vec<_> = [
+            key.predecessor_key_id.as_deref(),
+            key.successor_key_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(dead)
+        .collect();
         match live_peers.as_slice() {
             [] if key.rotation_overlap.mode == "none" => {}
+            [] if matches!(dead_peers.as_slice(), [peer]
+                if key.rotation_overlap.mode == "bounded"
+                    && key.rotation_overlap.with_key_id.as_deref()
+                        == Some(peer.key_id.as_str())
+                    && peer.role == key.role
+                    && ((key.predecessor_key_id.as_deref() == Some(peer.key_id.as_str())
+                        && peer.successor_key_id.as_deref() == Some(key.key_id.as_str()))
+                        || (key.successor_key_id.as_deref() == Some(peer.key_id.as_str())
+                            && peer.predecessor_key_id.as_deref()
+                                == Some(key.key_id.as_str())))
+                    && key.rotation_overlap.valid_from.as_deref()
+                        .is_some_and(|from| from <= peer.revoked_at.as_str())
+                    && key.rotation_overlap.valid_until.as_deref()
+                        .is_some_and(|until| peer.revoked_at.as_str() < until)) => {}
             [peer]
                 if key.rotation_overlap.mode == "bounded"
                     && key.rotation_overlap.with_key_id.as_deref()
@@ -441,6 +463,16 @@ pub(crate) fn validate_chain(
                 || next.valid_from < key.valid_from
                 || next.valid_until > key.valid_until
                 || (key.status == "retiring" && next.status != "retiring")
+                || key
+                    .predecessor_key_id
+                    .as_ref()
+                    .is_some_and(|old| next.predecessor_key_id.as_ref() != Some(old))
+                || key
+                    .successor_key_id
+                    .as_ref()
+                    .is_some_and(|old| next.successor_key_id.as_ref() != Some(old))
+                || (key.rotation_overlap.mode == "bounded"
+                    && next.rotation_overlap != key.rotation_overlap)
             {
                 return Err("retained delegation widened or changed identity".into());
             }
@@ -918,6 +950,60 @@ mod tests {
         invalid.tombstones[0].successor_key_id = Some("image-ci-v1".into());
         assert!(validate_snapshot(&invalid).is_err());
         assert!(validate_chain(&old, &invalid, &old_hash).is_err());
+    }
+    #[test]
+    fn chain_preserves_reciprocal_lineage_and_overlap_after_peer_revocation() {
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        value["keys"][2]["key_id"] = serde_json::json!("release-beta-v2");
+        value["keys"][2]["role"] = serde_json::json!("release-beta");
+        value["keys"][2]["artifact_types"] =
+            serde_json::json!(["beta-publication-receipt", "beta-release-authorization"]);
+        value["keys"][2]["rings"] = serde_json::json!(["beta"]);
+        value["keys"][1]["successor_key_id"] = serde_json::json!("release-beta-v2");
+        value["keys"][2]["predecessor_key_id"] = serde_json::json!("release-beta-v1");
+        for (index, peer) in [(1, "release-beta-v2"), (2, "release-beta-v1")] {
+            value["keys"][index]["rotation_overlap"] = serde_json::json!({
+                "mode": "bounded",
+                "with_key_id": peer,
+                "valid_from": "2026-07-21T01:00:00Z",
+                "valid_until": "2027-07-21T01:00:00Z"
+            });
+        }
+        let old: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        validate_snapshot(&old).unwrap();
+        let old_bytes = canonical(&serde_json::to_value(&old).unwrap());
+        let old_hash = canonical_hash(&old_bytes).unwrap();
+
+        let mut new = old.clone();
+        new.delegation_seq = 2;
+        new.previous_snapshot_sha256 = Some(old_hash.clone());
+        new.issued_at = "2026-08-01T00:45:00Z".into();
+        new.valid_from = "2026-08-01T01:00:00Z".into();
+        let removed = new.keys.remove(1);
+        new.tombstones.push(Tombstone {
+            key_id: removed.key_id,
+            predecessor_key_id: removed.predecessor_key_id,
+            reason: "key-compromise".into(),
+            revocation_seq: 2,
+            revoked_at: "2026-08-01T00:30:00Z".into(),
+            role: removed.role,
+            spki_sha256: removed.public_key.spki_sha256,
+            successor_key_id: removed.successor_key_id,
+            terminal_status: "revoked".into(),
+        });
+        validate_snapshot(&new).unwrap();
+        validate_chain(&old, &new, &old_hash).unwrap();
+
+        let mut cleared = new;
+        cleared.keys[1].predecessor_key_id = None;
+        cleared.keys[1].rotation_overlap = RotationOverlap {
+            mode: "none".into(),
+            with_key_id: None,
+            valid_from: None,
+            valid_until: None,
+        };
+        validate_snapshot(&cleared).unwrap();
+        assert!(validate_chain(&old, &cleared, &old_hash).is_err());
     }
     #[test]
     fn timestamp_rejects_impossible_dates() {
