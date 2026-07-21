@@ -12,7 +12,14 @@ use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
 const LEGACY_NV_INDEX: u32 = 0x0150_0001;
-const STATE_NV_ATTRIBUTES: &str = "authread|authwrite|no_da|nt=extend|ownerread|policydelete";
+const STATE_NV_ATTRIBUTES: &str =
+    "authread|authwrite|no_da|nt=0x1|ownerread|platformcreate|policydelete";
+const STATE_NV_DELETE_AUTH_POLICY: &str =
+    "921f9fa2ce8c30bbf29b84500a8456188f1febc04f154e9eccca4d5b1bc8a25d";
+const STATE_NV_NAME_UNWRITTEN: &str =
+    "000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62";
+const STATE_NV_NAME_WRITTEN: &str =
+    "000b571132a9688f4088f3696fa9bf5d5793be7483202cee08ceb2261f2bbe89b440";
 
 // Index attestation alone is not an update protocol. A later slice may change
 // this only in the same commit that exposes and tests the complete guard and
@@ -59,14 +66,24 @@ fn inspect_index(index: u32) -> Result<bool, InternalError> {
 }
 
 fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> {
+    #[derive(Clone, Copy)]
+    enum Section {
+        HashAlgorithm,
+        Attributes,
+    }
+
     let mut in_index = false;
+    let mut section = None;
+    let mut name = None;
     let mut algorithm = None;
     let mut attributes = None;
     let mut size = None;
+    let mut authorization_policy = None;
     for line in output.lines() {
         let trimmed = line.trim();
         if parse_index_header(trimmed) == Some(index) {
             in_index = true;
+            section = None;
             continue;
         }
         if !in_index {
@@ -75,27 +92,123 @@ fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> 
         if !line.chars().next().is_some_and(char::is_whitespace) && trimmed.ends_with(':') {
             break;
         }
-        if let Some(value) = trimmed.strip_prefix("hash algorithm:") {
-            algorithm = Some(value.trim());
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            name = parse_unique_hex(name, value, 34, "name", index)?;
+            section = None;
+        } else if let Some(value) = trimmed.strip_prefix("hash algorithm:") {
+            let value = value.trim();
+            if value.is_empty() {
+                section = Some(Section::HashAlgorithm);
+            } else {
+                algorithm = parse_unique_text(algorithm, value, "hash algorithm", index)?;
+                section = None;
+            }
+        } else if trimmed == "attributes:" {
+            section = Some(Section::Attributes);
         } else if let Some(value) = trimmed.strip_prefix("friendly:") {
-            let mut values: Vec<_> = value.trim().split('|').collect();
-            values.sort_unstable();
-            attributes = Some(values.join("|"));
+            match section {
+                Some(Section::HashAlgorithm) => {
+                    algorithm =
+                        parse_unique_text(algorithm, value.trim(), "hash algorithm", index)?;
+                }
+                Some(Section::Attributes) => {
+                    if attributes.is_some() {
+                        return Err(invalid_index(index, "duplicate attributes"));
+                    }
+                    let mut values: Vec<_> = value
+                        .trim()
+                        .split('|')
+                        .map(|attribute| match attribute {
+                            // tpm2-tools has emitted both spellings for the
+                            // same TPM_NT_EXTEND bitfield across supported
+                            // releases. Normalize the presentation, not the
+                            // underlying policy.
+                            "nt=extend" => "nt=0x1",
+                            other => other,
+                        })
+                        .collect();
+                    values.sort_unstable();
+                    attributes = Some(values.join("|"));
+                }
+                None => return Err(invalid_index(index, "friendly value outside a section")),
+            }
         } else if let Some(value) = trimmed.strip_prefix("size:") {
+            if size.is_some() {
+                return Err(invalid_index(index, "duplicate size"));
+            }
             size = value.trim().parse::<u64>().ok();
+            section = None;
+        } else if let Some(value) = trimmed.strip_prefix("authorization policy:") {
+            authorization_policy = parse_unique_hex(
+                authorization_policy,
+                value,
+                32,
+                "authorization policy",
+                index,
+            )?;
+            section = None;
         }
     }
     let expected_written = format!("{STATE_NV_ATTRIBUTES}|written");
     let written = attributes.as_deref() == Some(expected_written.as_str());
+    let expected_name = if written {
+        STATE_NV_NAME_WRITTEN
+    } else {
+        STATE_NV_NAME_UNWRITTEN
+    };
     if algorithm != Some("sha256")
         || (!written && attributes.as_deref() != Some(STATE_NV_ATTRIBUTES))
         || size != Some(32)
+        || name.as_deref() != Some(expected_name)
+        || authorization_policy.as_deref() != Some(STATE_NV_DELETE_AUTH_POLICY)
     {
-        return Err(InternalError(format!(
-            "TPM NV 0x{index:08x} is not the exact SHA-256 32-byte EXTEND index policy"
-        )));
+        return Err(invalid_index(
+            index,
+            "public area, name, or root-authorized deletion policy mismatch",
+        ));
     }
     Ok(written)
+}
+
+fn parse_unique_text<'a>(
+    current: Option<&'a str>,
+    value: &'a str,
+    field: &str,
+    index: u32,
+) -> Result<Option<&'a str>, InternalError> {
+    if current.is_some() || value.is_empty() {
+        return Err(invalid_index(
+            index,
+            &format!("invalid or duplicate {field}"),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn parse_unique_hex(
+    current: Option<String>,
+    value: &str,
+    bytes: usize,
+    field: &str,
+    index: u32,
+) -> Result<Option<String>, InternalError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if current.is_some()
+        || normalized.len() != bytes * 2
+        || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid_index(
+            index,
+            &format!("invalid or duplicate {field}"),
+        ));
+    }
+    Ok(Some(normalized))
+}
+
+fn invalid_index(index: u32, reason: &str) -> InternalError {
+    InternalError(format!(
+        "TPM NV 0x{index:08x} is not the exact SHA-256 32-byte EXTEND index: {reason}"
+    ))
 }
 
 fn parse_index_header(line: &str) -> Option<u32> {
@@ -120,31 +233,62 @@ mod tests {
 
     #[test]
     fn state_nv_attestation_requires_exact_index_type_size_and_policy() {
-        let base = "0x01500002:\n  name: 000b00\n  hash algorithm: sha256\n  attributes:\n    friendly: authread|authwrite|no_da|nt=extend|ownerread|policydelete\n  size: 32\n";
+        let base = "0x1500002:\n  name: 000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n  attributes:\n    friendly: authwrite|nt=0x1|policydelete|ownerread|authread|no_da|platformcreate\n    value: 0x42060444\n  size: 32\n  authorization policy: 921F9FA2CE8C30BBF29B84500A8456188F1FEBC04F154E9ECCCA4D5B1BC8A25D\n";
         assert!(!inspect_state_index(base, STATE_NV_INDEX).unwrap());
+        assert!(
+            !inspect_state_index(&base.replace("nt=0x1", "nt=extend"), STATE_NV_INDEX).unwrap()
+        );
         assert!(!inspect_state_index(
-            &base.replacen("0x01500002:", "0x1500002:", 1),
+            &base.replacen("0x1500002:", "0x01500002:", 1),
             STATE_NV_INDEX
         )
         .unwrap());
-        let written = base.replace("policydelete", "policydelete|written");
+        let written = base
+            .replace(
+                "000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62",
+                "000b571132a9688f4088f3696fa9bf5d5793be7483202cee08ceb2261f2bbe89b440",
+            )
+            .replace("no_da|platformcreate", "no_da|written|platformcreate");
         assert!(inspect_state_index(&written, STATE_NV_INDEX).unwrap());
         assert!(inspect_state_index(
-            &written.replacen("0x01500002:", "0x1500002:", 1),
+            &written.replacen("0x1500002:", "0x01500002:", 1),
             STATE_NV_INDEX
         )
         .unwrap());
         assert!(inspect_state_index(
-            &written.replacen("0x01500002:", "0x1500003:", 1),
+            &written.replacen("0x1500002:", "0x1500003:", 1),
             STATE_NV_INDEX
         )
         .is_err());
         assert!(inspect_state_index(&base.replace("size: 32", "size: 8"), STATE_NV_INDEX).is_err());
         assert!(
-            inspect_state_index(&base.replace("nt=extend", "nt=counter"), STATE_NV_INDEX).is_err()
+            inspect_state_index(&base.replace("nt=0x1", "nt=counter"), STATE_NV_INDEX).is_err()
         );
         assert!(inspect_state_index(
             &base.replace("ownerread|", "ownerread|ownerwrite|"),
+            STATE_NV_INDEX
+        )
+        .is_err());
+        assert!(inspect_state_index(
+            &base.replace("platformcreate", "platformcreate|policywrite"),
+            STATE_NV_INDEX
+        )
+        .is_err());
+        assert!(inspect_state_index(
+            &base.replace(
+                STATE_NV_DELETE_AUTH_POLICY.to_ascii_uppercase().as_str(),
+                &"00".repeat(32)
+            ),
+            STATE_NV_INDEX
+        )
+        .is_err());
+        assert!(inspect_state_index(
+            &base.replace(STATE_NV_NAME_UNWRITTEN, &format!("000b{}", "00".repeat(32))),
+            STATE_NV_INDEX
+        )
+        .is_err());
+        assert!(inspect_state_index(
+            &format!("{base}  authorization policy: {STATE_NV_DELETE_AUTH_POLICY}\n"),
             STATE_NV_INDEX
         )
         .is_err());

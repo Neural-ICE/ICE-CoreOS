@@ -19,14 +19,40 @@ floor. It cannot be repurposed without breaking rollback compatibility.
 
 The verifier uses a separate SHA-256, 32-byte TPM NV EXTEND index at
 `0x01500002`. Its exact base attributes are
-`authread|authwrite|no_da|nt=extend|ownerread|policydelete`; `written` is the
-only permitted dynamic attribute. Runtime extension authenticates to this
-index, not to the owner hierarchy. The index attestation accepts both the
-zero-padded and canonical unpadded hexadecimal handle emitted by supported
-`tpm2-tools`, then compares the parsed numeric handle. Capability discovery
-must additionally prove that the complete pre-apply guard and post-health
-commit command set is present. Consequently this first policy slice does
-**not** advertise `atomic-state-v1`, even when a correct index already exists.
+`authread|authwrite|no_da|nt=extend|ownerread|platformcreate|policydelete`;
+`written` is the only permitted dynamic attribute. `platformcreate` is
+required by TPM 2.0 for `TPM2_NV_UndefineSpaceSpecial`; an owner-created index
+with `policydelete` is invalid and must never be provisioned. Runtime extension
+authenticates to this index, not to the owner hierarchy.
+
+Deletion is an exceptional root-recovery operation. The NV authorization
+policy is the SHA-256 policy digest
+`921f9fa2ce8c30bbf29b84500a8456188f1febc04f154e9eccca4d5b1bc8a25d`,
+constructed as:
+
+1. `TPM2_PolicyAuthorize` by the `ota-root-v1` public key whose TPM Name is
+   `000beb256627a4315f1a3d2a2a0c9931760ad30e8822b35c5ebed854f1829b07b7b1`,
+   with the exact binary policy reference
+   `neural-ice:ota:state-nv-delete:v1\0`;
+2. `TPM2_PolicyCommandCode(TPM_CC_NV_UndefineSpaceSpecial)`.
+
+The root signature authorizes the approved recovery policy; it does not expose
+or import the root private key on the appliance. The platform hierarchy must
+also authorize the special undefine command. Owner/password undefine and an
+empty-policy fallback are forbidden.
+
+Capability discovery attests the complete public area, including the exact
+authorization-policy digest and the TPM-computed public Name. The only accepted
+Names are
+`000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62`
+before the first extend and
+`000b571132a9688f4088f3696fa9bf5d5793be7483202cee08ceb2261f2bbe89b440`
+after `written` is set. It accepts both zero-padded and canonical unpadded
+hexadecimal handles emitted by supported `tpm2-tools`, then compares the parsed
+numeric handle. It must additionally prove that the complete pre-apply guard
+and post-health commit command set is present. Consequently this first policy
+slice does **not** advertise `atomic-state-v1`, even when a correct index
+already exists.
 
 Each committed generation binds the complete root-signed delegation snapshot,
 the exact signed release authorization and BOM, the applied bundle floor, and
@@ -84,3 +110,6 @@ the exact index exists, passes attestation, and the same verifier binary
 contains the pre-apply and post-health state-v1 commands.
 
 No release channel, live appliance or USB medium is changed by this ADR.
+
+The attribute and command constraints follow the published TCG TPM 2.0 Library
+Part 2 (TPMA_NV) and Part 3 (`TPM2_NV_UndefineSpaceSpecial`) specifications.
