@@ -190,6 +190,12 @@ releases, receipts or channels. On first bootstrap, the immutable root may
 authenticate the physically delivered candidate snapshot before trusted time is
 available; the snapshot is accepted only in the later atomic transaction after
 an assertion under that candidate's scoped time key proves the snapshot current.
+The verifier hashes the supplied canonical snapshot bytes itself, accepts an
+`active` or bounded-overlap `retiring` time key, and binds the assertion to the
+locally observed TPM safe bit. At consumption it re-reads the TPM tuple:
+reset/restart counts must be unchanged, the clock must be monotonic and signed
+`valid_until` must remain strictly in the future after conservatively rounded
+TPM elapsed time. A delayed response therefore cannot revive expired time.
 Subsequent rotations must chain from the persisted snapshot and floors. An N-1
 rollback keeps the installed deployment bootable but cannot authorize a new
 trusted-time update until the newer state-capable verifier is restored. Loss,

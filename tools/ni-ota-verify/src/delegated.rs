@@ -29,6 +29,56 @@ const O_NONBLOCK: i32 = 0x800;
 #[cfg(target_os = "macos")]
 const O_NONBLOCK: i32 = 0x4;
 
+/// A delegation snapshot whose contract, immutable root binding and root
+/// signature have all been verified.  Keeping the fields private prevents a
+/// downstream verifier from accidentally treating parsed, attacker-supplied
+/// JSON as delegated authority.
+pub(crate) struct AuthenticatedSnapshot {
+    snapshot: Snapshot,
+    canonical_sha256: String,
+}
+
+impl AuthenticatedSnapshot {
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the next stacked atomic-state command layer"
+)]
+pub(crate) fn authenticate_snapshot(
+    snapshot_bytes: &[u8],
+    snapshot_signature: &[u8],
+    immutable_root_pem: &[u8],
+    scratch: &FileStateStore,
+) -> Result<AuthenticatedSnapshot, ContractError> {
+    let snapshot: Snapshot = parse_canonical(snapshot_bytes, "delegation snapshot")?;
+    validate_snapshot(&snapshot)?;
+    verify_root_binding(&snapshot, immutable_root_pem).map_err(ContractError::Refusal)?;
+    match verify_signature(
+        immutable_root_pem,
+        SNAPSHOT_DOMAIN,
+        snapshot_bytes,
+        snapshot_signature,
+        scratch,
+    )
+    .map_err(ContractError::Internal)?
+    {
+        Ok(()) => {}
+        Err(reason) => return Err(reason.into()),
+    }
+    Ok(AuthenticatedSnapshot {
+        snapshot,
+        canonical_sha256: canonical_hash(snapshot_bytes)?,
+    })
+}
+
 pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let flags = parse_flags(
         args,
@@ -325,7 +375,7 @@ fn freeze_root(
     freeze(store, source, label).map(Ok)
 }
 
-fn verify_signature(
+pub(crate) fn verify_signature(
     public_key: &[u8],
     domain: &[u8],
     payload: &[u8],
@@ -360,6 +410,68 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    const SNAPSHOT: &[u8] =
+        include_bytes!("../tests/fixtures/delegated-v1/delegation-snapshot.json");
+
+    fn scratch(label: &str) -> (std::path::PathBuf, FileStateStore) {
+        let root = std::env::temp_dir().join(format!(
+            "ni-ota-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = FileStateStore {
+            path: root.join("applied.json"),
+        };
+        (root, store)
+    }
+
+    #[test]
+    fn authenticated_snapshot_refuses_self_authored_authority_and_unsigned_input() {
+        let snapshot: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        let root_spki = snapshot["root_key"]["public_key"]["spki_der_base64"]
+            .as_str()
+            .unwrap();
+        let trusted_root = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &root_spki[..64],
+            &root_spki[64..]
+        )
+        .into_bytes();
+        let (root, store) = scratch("authenticated-snapshot");
+
+        let attacker_spki = snapshot["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["role"] == "trusted-time")
+            .unwrap()["public_key"]["spki_der_base64"]
+            .as_str()
+            .unwrap();
+        let attacker_root = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &attacker_spki[..64],
+            &attacker_spki[64..]
+        )
+        .into_bytes();
+        let result = authenticate_snapshot(SNAPSHOT, &[0], &attacker_root, &store);
+        match result {
+            Err(ContractError::Refusal(reason)) => assert_eq!(
+                reason,
+                "snapshot root SPKI differs from immutable trust anchor"
+            ),
+            Err(ContractError::Internal(error)) => panic!("unexpected internal error: {error:?}"),
+            Ok(_) => panic!("self-authored snapshot was accepted"),
+        }
+
+        let result = authenticate_snapshot(SNAPSHOT, &[0], &trusted_root, &store);
+        assert!(matches!(result, Err(ContractError::Refusal(_))));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn authority_freeze_refuses_fifo_and_oversize_before_opening() {

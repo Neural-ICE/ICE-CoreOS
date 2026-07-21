@@ -87,6 +87,42 @@ pub(crate) struct DelegatedKey {
     pub(crate) valid_until: String,
 }
 
+impl DelegatedKey {
+    pub(crate) fn authorizes_at(&self, at: &str) -> bool {
+        self.valid_from.as_str() <= at
+            && at < self.valid_until.as_str()
+            && match self.status.as_str() {
+                "active" => true,
+                "retiring" => {
+                    self.rotation_overlap.mode == "bounded"
+                        && self
+                            .rotation_overlap
+                            .valid_from
+                            .as_deref()
+                            .is_some_and(|valid_from| valid_from <= at)
+                        && self
+                            .rotation_overlap
+                            .valid_until
+                            .as_deref()
+                            .is_some_and(|valid_until| at < valid_until)
+                }
+                _ => false,
+            }
+    }
+
+    pub(crate) fn authorization_deadline(&self) -> Option<&str> {
+        match self.status.as_str() {
+            "active" => Some(self.valid_until.as_str()),
+            "retiring" if self.rotation_overlap.mode == "bounded" => self
+                .rotation_overlap
+                .valid_until
+                .as_deref()
+                .map(|overlap| overlap.min(self.valid_until.as_str())),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Tombstone {

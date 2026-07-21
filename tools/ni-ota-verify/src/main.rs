@@ -30,6 +30,11 @@ mod record;
 mod runner;
 mod state;
 mod state_v1;
+#[allow(
+    dead_code,
+    reason = "used by the next stacked atomic-state command layer"
+)]
+mod trusted_time;
 mod verify;
 
 use std::collections::HashMap;
