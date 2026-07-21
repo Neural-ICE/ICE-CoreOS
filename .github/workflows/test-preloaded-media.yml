@@ -23,20 +23,34 @@ concurrency:
 
 jobs:
   linux-x86_64:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+      github.event.pull_request.author_association))
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Portable manifest tests
         run: |
           python3 -m py_compile image/seed-tree-manifest.py
           python3 image/test-seed-tree-manifest.py
 
   linux-arm64:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+      github.event.pull_request.author_association))
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Portable manifest tests
         run: |
           python3 -m py_compile image/seed-tree-manifest.py
