@@ -37,6 +37,30 @@ fn structure_fields(name: &str) -> Vec<String> {
         .collect()
 }
 
+fn nullable_fields(section: &str, name: &str) -> Vec<String> {
+    let contract: serde_json::Value = serde_json::from_slice(CONTRACT).unwrap();
+    if section == "artifacts" {
+        contract["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["schema"] == name)
+            .unwrap()["nullable_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap().to_owned())
+            .collect()
+    } else {
+        contract["structures_nullable_fields"][name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap().to_owned())
+            .collect()
+    }
+}
+
 fn serialized_fields<T: Serialize>(value: &T) -> Vec<String> {
     serde_json::to_value(value)
         .unwrap()
@@ -400,6 +424,26 @@ fn recovery_floors_and_release_high_water_are_closed_and_baseline_bounded() {
             "{case}"
         );
     }
+}
+
+#[test]
+fn root_transition_is_null_at_any_exact_baseline_and_required_only_after_advance() {
+    let snapshot = snapshot();
+    let mut exact_v2 = state(&snapshot);
+    exact_v2.baseline.ota_root_version = 2;
+    exact_v2.root_version = 2;
+    exact_v2.root_transition_sha256 = None;
+    assert!(valid_authoritative_state(&exact_v2));
+
+    let mut advanced = exact_v2.clone();
+    advanced.root_version = 3;
+    advanced.root_spki_sha256 = "8".repeat(64);
+    assert!(!valid_authoritative_state(&advanced));
+    advanced.root_transition_sha256 = Some("9".repeat(64));
+    assert!(valid_authoritative_state(&advanced));
+
+    advanced.root_version = 2;
+    assert!(!valid_authoritative_state(&advanced));
 }
 
 #[test]
@@ -834,4 +878,20 @@ fn exported_machine_contract_matches_every_closed_licensing_artifact() {
     ] {
         assert_eq!(fields, structure_fields(name), "{name}");
     }
+    assert_eq!(
+        nullable_fields("artifacts", "ota-licensing-bootstrap-v1"),
+        [
+            "authoritative_state",
+            "previous_authorization_sha256",
+            "previous_device_root",
+        ]
+    );
+    assert_eq!(
+        nullable_fields("artifacts", "ota-state-recovery-v1"),
+        ["previous_recovery_sha256", "release_authorization_sha256",]
+    );
+    assert_eq!(
+        nullable_fields("structures", "authoritative_state"),
+        ["recovery_sha256", "root_transition_sha256"]
+    );
 }

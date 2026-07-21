@@ -29,6 +29,11 @@
         "tpm_safe",
         "valid_until"
       ],
+      "nullable_fields": [
+        "authoritative_state",
+        "previous_authorization_sha256",
+        "previous_device_root"
+      ],
       "schema": "ota-licensing-bootstrap-v1",
       "terminal_nul": true
     },
@@ -63,6 +68,10 @@
         "tpm_safe",
         "valid_until"
       ],
+      "nullable_fields": [
+        "previous_recovery_sha256",
+        "release_authorization_sha256"
+      ],
       "schema": "ota-state-recovery-v1",
       "terminal_nul": true
     },
@@ -89,6 +98,7 @@
         "tpm_safe",
         "valid_until"
       ],
+      "nullable_fields": [],
       "schema": "ota-licensing-recovery-ack-v1",
       "terminal_nul": true
     },
@@ -121,6 +131,9 @@
         "trusted_time",
         "valid_until"
       ],
+      "nullable_fields": [
+        "bootstrap_authorization_sha256"
+      ],
       "schema": "neural-ice-ota-trusted-time-v2",
       "terminal_nul": true
     }
@@ -138,6 +151,7 @@
     "same_sequence_identity": "byte-identical"
   },
   "canonical_encoding": "compact-sorted-json-plus-single-lf",
+  "nullability": "only-fields-listed-in-nullable_fields",
   "schema": "neural-ice-ota-licensing-contract-set-v1",
   "signature_encoding": "asn1-der-low-s",
   "signature_profile": "ecdsa-p256-sha256",
@@ -203,6 +217,19 @@
       "trusted_time",
       "trusted_time_recovery_floor",
       "trusted_time_seq"
+    ]
+  },
+  "structures_nullable_fields": {
+    "acknowledgement_authority": [],
+    "authoritative_state": [
+      "recovery_sha256",
+      "root_transition_sha256"
+    ],
+    "baseline_identity": [],
+    "device_root_identity": [],
+    "public_key": [],
+    "recovery_target_state": [
+      "root_transition_sha256"
     ]
   },
   "unknown_fields": "refuse"
