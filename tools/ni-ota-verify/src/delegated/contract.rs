@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use p256::{elliptic_curve::sec1::FromEncodedPoint, AffinePoint, EncodedPoint};
 use serde::{Deserialize, Serialize};
 
 use crate::{runner, InternalError};
@@ -446,6 +447,13 @@ fn validate_public_key(key: &PublicKey) -> Result<(), ContractError> {
     if der.len() != 91 || !der.starts_with(P256_SPKI_PREFIX) {
         return Err("public key is not canonical uncompressed P-256 SPKI DER".into());
     }
+    let encoded = EncodedPoint::from_bytes(&der[P256_SPKI_PREFIX.len() - 1..])
+        .map_err(|_| ContractError::Refusal("public key has invalid SEC1 encoding".into()))?;
+    let point = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&encoded))
+        .ok_or_else(|| ContractError::Refusal("public key point is not on P-256".into()))?;
+    if bool::from(point.is_identity()) {
+        return Err("public key is the P-256 identity".into());
+    }
     if hash_bytes(&der)? != key.spki_sha256 {
         return Err("public-key SPKI pin mismatch".into());
     }
@@ -775,6 +783,32 @@ mod tests {
             assert_eq!(decode_base64(&value).unwrap(), bytes);
         }
         assert!(decode_base64("YR==").is_err());
+    }
+
+    #[test]
+    fn public_key_rejects_off_curve_and_identity_sec1_points() {
+        let mut off_curve = P256_SPKI_PREFIX.to_vec();
+        off_curve.extend_from_slice(&[0; 64]);
+        let key = PublicKey {
+            algorithm: "ecdsa-p256-sha256".into(),
+            encoding: "spki-der-base64".into(),
+            spki_der_base64: encode_base64(&off_curve),
+            spki_sha256: hash_bytes(&off_curve).unwrap(),
+        };
+        assert!(matches!(
+            validate_public_key(&key),
+            Err(ContractError::Refusal(reason)) if reason.contains("not on P-256")
+        ));
+
+        let mut identity = off_curve;
+        identity[P256_SPKI_PREFIX.len() - 1] = 0;
+        let key = PublicKey {
+            algorithm: "ecdsa-p256-sha256".into(),
+            encoding: "spki-der-base64".into(),
+            spki_der_base64: encode_base64(&identity),
+            spki_sha256: hash_bytes(&identity).unwrap(),
+        };
+        assert!(validate_public_key(&key).is_err());
     }
 
     #[test]

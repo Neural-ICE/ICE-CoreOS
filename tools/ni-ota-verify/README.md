@@ -50,6 +50,11 @@ cosign verify-blob --key <root_pubkey> --insecure-ignore-tlog=true \
 (`--insecure-ignore-tlog=true` is private-infrastructure mode:
 there is deliberately no public Rekor entry to check.)
 
+Delegation snapshots additionally validate that every canonical uncompressed
+P-256 SPKI contains a non-identity point on the curve. This public-key parsing
+uses the exactly pinned `p256` 0.13.2 crate with default features disabled and
+only its arithmetic feature; Cosign remains the sole signature verifier.
+
 ## Output and exit codes
 
 `verify` prints exactly one JSON verdict line on stdout —
