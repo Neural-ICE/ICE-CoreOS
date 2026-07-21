@@ -882,12 +882,22 @@ fn sync_directory(dir: &Path) -> Result<(), InternalError> {
         .map_err(|error| InternalError(format!("cannot sync state dir {}: {error}", dir.display())))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_DIRECTORY: i32 = 0o200000;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_DIRECTORY: i32 = 0o40000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(target_os = "linux")]
 const O_CLOEXEC: i32 = 0o2000000;
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+compile_error!("ni-ota-verify supports only linux/amd64 and linux/arm64");
 
 #[cfg(target_os = "macos")]
 const O_DIRECTORY: i32 = 0x0010_0000;
