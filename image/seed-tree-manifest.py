@@ -243,9 +243,14 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
     entries: list[dict[str, Any]] = []
     for name, root in sorted(trees):
         entries.extend(walk_tree(name, root))
+    # A depth-first walk is deterministic but not globally lexicographic.  For
+    # example, "tree/bucket-archive" sorts before "tree/bucket/child" even
+    # though DFS visits the child before returning to the sibling.  Canonical
+    # manifests therefore sort the completed cross-tree namespace explicitly.
+    entries.sort(key=lambda entry: entry["path"])
     paths = [entry["path"] for entry in entries]
-    if paths != sorted(paths) or len(paths) != len(set(paths)):
-        raise ManifestError("manifest paths are not sorted and unique")
+    if len(paths) != len(set(paths)):
+        raise ManifestError("manifest paths are not unique")
     document = {
         "entries": entries,
         "schema": "neural-ice-offline-seed-tree-v1",

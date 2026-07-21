@@ -90,6 +90,22 @@ class SeedTreeManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(first.read_bytes(), second.read_bytes())
 
+    def test_manifest_globally_sorts_dfs_children_and_siblings(self) -> None:
+        bucket = self.source / "models" / "bucket"
+        bucket.mkdir()
+        (bucket / "child").write_bytes(b"child")
+        (self.source / "models" / "bucket-archive").write_bytes(b"sibling")
+
+        output = self.root / "globally-sorted.json"
+        result = self.generate(self.source, output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = [entry["path"] for entry in json.loads(output.read_bytes())["entries"]]
+        self.assertEqual(paths, sorted(paths))
+        self.assertLess(
+            paths.index("models/bucket-archive"),
+            paths.index("models/bucket/child"),
+        )
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
     def test_fifo_is_rejected_without_reading_it(self) -> None:
         os.mkfifo(self.source / "models" / "model-a" / "hostile")
