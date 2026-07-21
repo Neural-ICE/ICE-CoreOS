@@ -228,6 +228,11 @@ The release must match the immutable hardware target, immutable
 `debug|prod` appliance variant and beta ring. During a bounded rotation both
 `active` and `retiring` release-beta keys remain eligible; all other statuses
 refuse. A nonzero TPM state anchor must resolve to one complete generation.
+On a clean install the command reads the dedicated non-exportable TPM
+device-root at `0x81010005`, provisioned and attested by the installer and
+`neural-ice-device-root.service` under ADR-0013; it never reads the appliance
+PKI root at `0x81010004`. A missing or malformed device-root is an internal
+TPM prerequisite failure (exit `2`) and cannot produce a challenge.
 
 Success atomically replaces the canonical mode-`0600`
 `state_dir/state-v1/pending-time-challenge.json` and prints the same challenge

@@ -154,6 +154,11 @@ trusted-time service. Replacement deliberately invalidates an earlier pending
 attempt; no release has been applied at this point. The later atomic commit
 must bind and consume the exact pending challenge. A malformed candidate exits
 as a refusal, while local I/O, TPM or verifier failures remain internal errors.
+The challenge fingerprints only the separate, installer-provisioned,
+non-exportable device root at persistent handle `0x81010005` (ADR-0013); the
+appliance PKI handle `0x81010004` is never read or reused. Thus a clean install
+must complete the ADR-0013 device-root gate before trusted-time preparation;
+failure denies only the candidate update and cannot create substitute identity.
 
 ## Crash recovery and rollback
 

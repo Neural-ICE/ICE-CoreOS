@@ -23,7 +23,10 @@ use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
 pub(crate) const LEGACY_NV_INDEX: u32 = 0x0150_0001;
-const DEVICE_ROOT_HANDLE: u32 = 0x8101_0004;
+// ADR-0013 reserves 0x81010004 for the appliance PKI. The installer-owned,
+// non-exportable OTA/licensing device root is provisioned at this separate
+// handle before trusted-time preparation is available on a clean install.
+const DEVICE_ROOT_HANDLE: u32 = 0x8101_0005;
 const STATE_NV_ATTRIBUTES: &str =
     "authread|authwrite|no_da|nt=0x1|ownerread|platformcreate|policydelete";
 const STATE_NV_DELETE_AUTH_POLICY: &str =
@@ -2375,6 +2378,14 @@ mod tests {
         noncanonical_nonce.nonce = "C".repeat(64);
         assert!(validate_time_challenge(&noncanonical_nonce).is_err());
         assert_eq!(nonce_from(Path::new("/dev/zero")).unwrap(), "0".repeat(64));
+    }
+
+    #[test]
+    fn trusted_time_fingerprint_uses_the_dedicated_device_root() {
+        // 0x81010004 is the appliance PKI root. A future handle regression
+        // would silently couple OTA identity to that unrelated lifecycle.
+        assert_eq!(DEVICE_ROOT_HANDLE, 0x8101_0005);
+        assert_ne!(DEVICE_ROOT_HANDLE, 0x8101_0004);
     }
 
     #[test]
