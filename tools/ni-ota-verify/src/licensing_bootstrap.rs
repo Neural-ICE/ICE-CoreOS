@@ -370,7 +370,6 @@ fn valid_authoritative_state(value: &AuthoritativeState) -> bool {
     valid_baseline(&value.baseline)
         && safe_uint(value.root_version)
         && sha256(&value.root_spki_sha256)
-        && optional_hash_for_sequence(value.root_version - 1, &value.root_transition_sha256)
         && safe_uint(value.delegation_seq)
         && sha256(&value.delegation_snapshot_sha256)
         && safe_uint(value.bundle_seq)
@@ -382,10 +381,11 @@ fn valid_authoritative_state(value: &AuthoritativeState) -> bool {
         && value.recovery_seq <= MAX_SAFE_INTEGER
         && optional_hash_for_sequence(value.recovery_seq, &value.recovery_sha256)
         && valid_release_authorizations(value)
-        && value.root_version >= value.baseline.ota_root_version
-        && (value.root_version != value.baseline.ota_root_version
-            || (value.root_spki_sha256 == value.baseline.ota_root_spki_sha256
-                && value.root_transition_sha256.is_none()))
+        && ((value.root_version == value.baseline.ota_root_version
+            && value.root_spki_sha256 == value.baseline.ota_root_spki_sha256
+            && value.root_transition_sha256.is_none())
+            || (value.root_version > value.baseline.ota_root_version
+                && value.root_transition_sha256.as_deref().is_some_and(sha256)))
         && value.delegation_seq >= value.baseline.bootstrap_delegation_seq
         && value.bundle_seq >= value.baseline.minimum_bundle_seq
         && value.delegation_seq >= value.baseline.minimum_delegation_seq

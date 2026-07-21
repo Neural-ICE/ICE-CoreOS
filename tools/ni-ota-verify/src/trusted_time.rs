@@ -623,6 +623,10 @@ mod tests {
             .collect();
         assert_eq!(artifact["domain_hex"], domain_hex);
         assert_eq!(artifact["terminal_nul"], true);
+        assert_eq!(
+            artifact["nullable_fields"],
+            serde_json::json!(["bootstrap_authorization_sha256"])
+        );
     }
 
     #[test]
