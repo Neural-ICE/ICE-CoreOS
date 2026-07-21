@@ -326,6 +326,8 @@ RUN set -euxo pipefail; \
 RUN set -euxo pipefail; \
     sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
     install -d -m 0755 /usr/lib/bootc/kargs.d; \
+    case "${VARIANT}" in debug|prod) ;; *) echo "invalid VARIANT" >&2; exit 2 ;; esac; \
+    printf '%s\n' "${VARIANT}" > /usr/lib/neural-ice/appliance-variant; \
     if [ "${VARIANT}" = "debug" ]; then \
         printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0"]\n' \
             > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \

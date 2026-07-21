@@ -610,6 +610,17 @@ fn validate_public_key(key: &PublicKey) -> Result<(), ContractError> {
     Ok(())
 }
 
+pub(crate) fn public_key_pem(key: &PublicKey) -> Result<Vec<u8>, ContractError> {
+    validate_public_key(key)?;
+    let mut pem = b"-----BEGIN PUBLIC KEY-----\n".to_vec();
+    for chunk in key.spki_der_base64.as_bytes().chunks(64) {
+        pem.extend_from_slice(chunk);
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(b"-----END PUBLIC KEY-----\n");
+    Ok(pem)
+}
+
 fn decode_pem(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "root public key is not UTF-8 PEM")?;
     let body = text
@@ -746,7 +757,7 @@ fn scalar_below_or_equal(value: &[u8], upper: &[u8; 32]) -> bool {
     significant.len() < 32 || (significant.len() == 32 && significant <= upper)
 }
 
-fn signature_profile(algorithm: &str, encoding: &str) -> bool {
+pub(crate) fn signature_profile(algorithm: &str, encoding: &str) -> bool {
     algorithm == "ecdsa-p256-sha256" && encoding == "asn1-der"
 }
 pub(crate) fn sha256(v: &str) -> bool {
@@ -754,14 +765,14 @@ pub(crate) fn sha256(v: &str) -> bool {
         && v.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn ident(v: &str) -> bool {
+pub(crate) fn ident(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 127
         && v.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
         && v.as_bytes()[0].is_ascii_alphanumeric()
 }
-fn target(v: &str) -> bool {
+pub(crate) fn target(v: &str) -> bool {
     matches!(
         v,
         "amd-rocm-x86_64" | "nvidia-cuda-x86_64" | "nvidia-gb10-arm64"
@@ -782,7 +793,7 @@ fn distinct_lineage(predecessor: &Option<String>, successor: &Option<String>) ->
 pub(crate) fn safe_uint(value: u64) -> bool {
     (1..=9_007_199_254_740_991).contains(&value)
 }
-fn timestamp(v: &str) -> bool {
+pub(crate) fn timestamp(v: &str) -> bool {
     let b = v.as_bytes();
     if b.len() != 20
         || b[4] != b'-'
