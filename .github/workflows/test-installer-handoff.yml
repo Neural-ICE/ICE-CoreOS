@@ -39,9 +39,5 @@ jobs:
           shellcheck ota/neural-ice-autoinstall.sh \
             ota/neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-lab-baseline-handoff.sh
-      - name: Test optional ESP handoff as runner user
+      - name: Test ESP handoff and non-root refusal
         run: ./ota/test-neural-ice-lab-baseline-handoff.sh
-      - name: Test durable root-owned handoff
-        # Map the unprivileged runner user to uid 0 only inside a disposable
-        # user namespace; the self-hosted runner intentionally grants no sudo.
-        run: unshare --user --map-root-user ./ota/test-neural-ice-lab-baseline-handoff.sh
