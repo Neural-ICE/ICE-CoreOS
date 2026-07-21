@@ -42,4 +42,6 @@ jobs:
       - name: Test optional ESP handoff as runner user
         run: ./ota/test-neural-ice-lab-baseline-handoff.sh
       - name: Test durable root-owned handoff
-        run: sudo -n ./ota/test-neural-ice-lab-baseline-handoff.sh
+        # Map the unprivileged runner user to uid 0 only inside a disposable
+        # user namespace; the self-hosted runner intentionally grants no sudo.
+        run: unshare --user --map-root-user ./ota/test-neural-ice-lab-baseline-handoff.sh
