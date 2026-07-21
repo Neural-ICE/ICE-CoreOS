@@ -4,6 +4,7 @@
 //! chain reproduces the observed TPM anchor. The public capability remains
 //! gated until the complete guard/commit command set lands.
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -363,21 +364,24 @@ impl NvAnchor for CommandTpm {
     }
 
     fn provision_initial(&self) -> Result<(), InternalError> {
-        if self.inspect().is_ok() {
+        if self.index_present()? {
+            if !self.inspect()? {
+                // A prior first commit can crash after NV_Define but before
+                // its first extend. The exact, policy-attested unwritten
+                // index is the same zero anchor and may resume; any written
+                // or malformed occupied index remains non-reseedable.
+                return Ok(());
+            }
             return Err(InternalError(
                 "state-v1 index already exists; automatic reseeding is forbidden".into(),
             ));
         }
+        let policy = self.scratch.secure_temp_bytes(
+            "state-nv-delete-policy",
+            &decode_hash(STATE_NV_DELETE_AUTH_POLICY)?,
+        )?;
         let status = Command::new(tool("tpm2_nvdefine"))
-            .args([
-                format!("0x{:08x}", self.index),
-                "-C".into(),
-                "o".into(),
-                "-s".into(),
-                "32".into(),
-                "-a".into(),
-                STATE_NV_ATTRIBUTES.into(),
-            ])
+            .args(nvdefine_args(self.index, policy.path()))
             .status()
             .map_err(|error| InternalError(format!("cannot execute tpm2_nvdefine: {error}")))?;
         if !status.success() {
@@ -386,7 +390,12 @@ impl NvAnchor for CommandTpm {
                 self.index
             )));
         }
-        self.attest()
+        if self.inspect()? {
+            return Err(InternalError(
+                "new state-v1 index is unexpectedly written before its first extend".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn extend(&self, digest: [u8; 32]) -> Result<(), InternalError> {
@@ -410,6 +419,20 @@ impl NvAnchor for CommandTpm {
             )))
         }
     }
+}
+
+fn nvdefine_args(index: u32, policy: &Path) -> Vec<OsString> {
+    vec![
+        format!("0x{index:08x}").into(),
+        "-C".into(),
+        "p".into(),
+        "-s".into(),
+        "32".into(),
+        "-a".into(),
+        STATE_NV_ATTRIBUTES.into(),
+        "-L".into(),
+        policy.as_os_str().to_owned(),
+    ]
 }
 
 fn continuity_ready(tpm: &impl NvAnchor) -> Result<bool, InternalError> {
@@ -751,14 +774,23 @@ impl Store {
         candidate: &Candidate<'_>,
         nv: &dyn NvAnchor,
     ) -> Result<Result<CommitReceipt, String>, InternalError> {
+        let _lock = self.lock_store().lock_commit()?;
+        self.commit_locked(candidate, nv)
+    }
+
+    fn commit_locked(
+        &self,
+        candidate: &Candidate<'_>,
+        nv: &dyn NvAnchor,
+    ) -> Result<Result<CommitReceipt, String>, InternalError> {
         let prior_history = self.has_durable_state_history()?;
         ensure_secure_state_directory(&self.root)?;
         ensure_secure_state_directory(&self.root.join("generations"))?;
         validate_candidate(candidate)?;
-        if let Err(reason) = self.challenge_is_live(nv, &candidate.challenge)? {
-            return Ok(Err(reason));
-        }
         let initial_anchor = hex(nv.read_initial()?);
+        if initial_anchor == ZERO_ANCHOR && !prior_history {
+            self.remove_temporary_generation("generation-0000000000000001")?;
+        }
         let state_index_ready = nv.attest().is_ok();
         let scan = self.scan_generations()?;
         let current = if initial_anchor == ZERO_ANCHOR {
@@ -778,7 +810,7 @@ impl Store {
             None
         } else {
             nv.attest()?;
-            self.read_current(nv)?
+            self.read_current_locked(nv)?
         };
         let legacy_floor = nv.legacy_bundle_floor()?;
         if current
@@ -811,13 +843,16 @@ impl Store {
                 self.publish_current(loaded.manifest.generation)?;
                 self.publish_enforce_ready(&loaded.manifest_sha256, &loaded.nv_anchor)?;
                 self.consume_challenge_if_present(&candidate.challenge)?;
-                self.verify_enforce_ready(nv)?;
+                self.verify_enforce_ready_locked(nv)?;
                 return Ok(Ok(CommitReceipt {
                     generation: loaded.manifest.generation,
                     manifest_sha256: loaded.manifest_sha256.clone(),
                     nv_anchor: loaded.nv_anchor.clone(),
                 }));
             }
+        }
+        if let Err(reason) = self.challenge_is_live(nv, &candidate.challenge)? {
+            return Ok(Err(reason));
         }
         if self.pending_time_challenge()? != candidate.challenge {
             return Ok(Err(
@@ -841,7 +876,7 @@ impl Store {
             // continue. Staging first would strand evidence beside a zero
             // anchor and correctly trigger the no-auto-reseed refusal.
             nv.provision_initial()?;
-            if hex(nv.read()?) != ZERO_ANCHOR {
+            if hex(nv.read_initial()?) != ZERO_ANCHOR {
                 return Ok(Err("new state-v1 index did not read back zero".into()));
             }
         }
@@ -863,7 +898,7 @@ impl Store {
             return Ok(Err("TPM NV readback differs after extend".into()));
         }
         self.publish_current(generation)?;
-        let readback = self.read_current(nv)?;
+        let readback = self.read_current_locked(nv)?;
         if !readback.as_ref().is_some_and(|value| {
             value.manifest == manifest
                 && value.manifest_sha256 == manifest_sha256
@@ -875,7 +910,7 @@ impl Store {
         }
         self.publish_enforce_ready(&manifest_sha256, &expected)?;
         self.consume_challenge_if_present(&candidate.challenge)?;
-        self.verify_enforce_ready(nv)?;
+        self.verify_enforce_ready_locked(nv)?;
         Ok(Ok(CommitReceipt {
             generation,
             manifest_sha256,
@@ -1331,6 +1366,10 @@ impl Store {
 
     pub(crate) fn verify_enforce_ready(&self, nv: &dyn NvAnchor) -> Result<(), InternalError> {
         let _lock = self.lock_store().lock_commit()?;
+        self.verify_enforce_ready_locked(nv)
+    }
+
+    fn verify_enforce_ready_locked(&self, nv: &dyn NvAnchor) -> Result<(), InternalError> {
         secure_existing_dir(&self.root)?;
         let current = self
             .read_current_locked(nv)?
@@ -1695,6 +1734,10 @@ fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
         || !sha256(&value.trusted.signature_sha256)
         || !sha256(&value.trusted.challenge_sha256)
         || !sha256(&value.trusted.device_fingerprint)
+        || value.authority.snapshot_signature_sha256 != hash(value.snapshot_signature)?
+        || value.trusted.assertion_sha256
+            != state_canonical_hash(value.trusted_assertion, "trusted-time assertion")?
+        || value.trusted.signature_sha256 != hash(value.trusted_signature)?
     {
         return Err(InternalError("invalid state-v1 candidate".into()));
     }
@@ -1752,12 +1795,16 @@ fn monotonic(
         return Err("state-v1 monotonic floor would decrease".into());
     }
     if new.authority.delegation_seq == old.delegation_seq_floor
-        && new.authority.snapshot_sha256 != old.delegation_snapshot_canonical_sha256
+        && (new.authority.snapshot_sha256 != old.delegation_snapshot_canonical_sha256
+            || new.authority.snapshot_signature_sha256 != old.delegation_snapshot_signature_sha256)
     {
         return Err("equal delegation sequence has a different snapshot".into());
     }
     if new.applied.bundle_seq == old.bundle_seq_floor
-        && new.applied.bom_sha256 != old.applied_bom_sha256
+        && (new.applied.bom_sha256 != old.applied_bom_sha256
+            || hash(new.release).map_err(|error| error.0)? != old.release_authorization_sha256
+            || hash(new.release_signature).map_err(|error| error.0)?
+                != old.release_authorization_signature_sha256)
     {
         return Err("equal bundle sequence has a different BOM".into());
     }
@@ -1774,6 +1821,7 @@ fn monotonic_trusted(
     }
     if new.assertion_seq == old.trusted_time_seq_floor
         && (new.assertion_sha256 != old.trusted_time_assertion_canonical_sha256
+            || new.signature_sha256 != old.trusted_time_assertion_signature_sha256
             || new.trusted_time != old.trusted_time_floor)
     {
         return Err("equal trusted-time sequence has different evidence".into());
@@ -2295,6 +2343,30 @@ mod tests {
             runner::sha256_bytes(&command_code).unwrap(),
             STATE_NV_DELETE_AUTH_POLICY
         );
+    }
+
+    #[test]
+    fn provisioning_uses_the_platform_hierarchy_and_pinned_policy() {
+        let args = nvdefine_args(STATE_NV_INDEX, Path::new("/run/private/policy.bin"));
+        let args: Vec<_> = args
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "0x01500002",
+                "-C",
+                "p",
+                "-s",
+                "32",
+                "-a",
+                STATE_NV_ATTRIBUTES,
+                "-L",
+                "/run/private/policy.bin",
+            ]
+        );
+        assert!(!args.iter().any(|value| value == "o"));
     }
 
     #[derive(Clone, Copy)]
@@ -3452,6 +3524,12 @@ mod tests {
         assert_eq!(first.generation, 1);
         assert!(nv.exists.get());
         assert!(!store.root.join("pending-time-challenge.json").exists());
+        nv.clock.set(TpmClockState {
+            clock: 1_000 + TRUSTED_TIME_MAX_ELAPSED_MS + 1,
+            reset_count: 2,
+            restart_count: 1,
+            safe: true,
+        });
         assert_eq!(store.commit(&candidate, &nv).unwrap().unwrap(), first);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3482,6 +3560,41 @@ mod tests {
         let receipt = store.commit(&candidate, &nv).unwrap().unwrap();
         assert_eq!(receipt.generation, 1);
         assert!(!store.root.join("pending-time-challenge.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_retry_cleans_an_abandoned_first_generation_temp_directory() {
+        let (store, root) = test_store();
+        let candidate = candidate();
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&candidate.challenge).unwrap(),
+        )
+        .unwrap();
+        let abandoned = store
+            .root
+            .join("generations/.generation-0000000000000001.42.tmp");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&abandoned)
+            .unwrap();
+        let nv = MemoryNv {
+            anchor: Cell::new([0; 32]),
+            clock: Cell::new(TpmClockState {
+                clock: 1_000,
+                reset_count: 1,
+                restart_count: 1,
+                safe: true,
+            }),
+            exists: Cell::new(false),
+        };
+        assert_eq!(
+            store.commit(&candidate, &nv).unwrap().unwrap().generation,
+            1
+        );
+        assert!(!abandoned.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3517,6 +3630,20 @@ mod tests {
         let mut altered_snapshot = candidate();
         altered_snapshot.snapshot = b"{ }\n";
         assert!(validate_candidate(&altered_snapshot).is_err());
+
+        let mut altered_snapshot_signature = candidate();
+        altered_snapshot_signature
+            .authority
+            .snapshot_signature_sha256 = "f".repeat(64);
+        assert!(validate_candidate(&altered_snapshot_signature).is_err());
+
+        let mut altered_assertion = candidate();
+        altered_assertion.trusted.assertion_sha256 = "f".repeat(64);
+        assert!(validate_candidate(&altered_assertion).is_err());
+
+        let mut altered_assertion_signature = candidate();
+        altered_assertion_signature.trusted.signature_sha256 = "f".repeat(64);
+        assert!(validate_candidate(&altered_assertion_signature).is_err());
     }
 
     #[test]
@@ -3636,18 +3763,18 @@ mod tests {
             bundle_seq_floor: 1,
             delegation_seq_floor: 1,
             delegation_snapshot_canonical_sha256: baseline.authority.snapshot_sha256.clone(),
-            delegation_snapshot_sha256: "0".repeat(64),
-            delegation_snapshot_signature_sha256: "0".repeat(64),
+            delegation_snapshot_sha256: hash(baseline.snapshot).unwrap(),
+            delegation_snapshot_signature_sha256: hash(baseline.snapshot_signature).unwrap(),
             generation: 1,
             legacy_bundle_floor: None,
             previous_manifest_sha256: None,
             previous_nv_anchor: ZERO_ANCHOR.into(),
-            release_authorization_sha256: "0".repeat(64),
-            release_authorization_signature_sha256: "0".repeat(64),
+            release_authorization_sha256: hash(baseline.release).unwrap(),
+            release_authorization_signature_sha256: hash(baseline.release_signature).unwrap(),
             schema: "neural-ice-ota-state-manifest-v1".into(),
             trusted_time_assertion_canonical_sha256: baseline.trusted.assertion_sha256.clone(),
-            trusted_time_assertion_sha256: "0".repeat(64),
-            trusted_time_assertion_signature_sha256: "0".repeat(64),
+            trusted_time_assertion_sha256: hash(baseline.trusted_assertion).unwrap(),
+            trusted_time_assertion_signature_sha256: hash(baseline.trusted_signature).unwrap(),
             trusted_time_floor: baseline.trusted.trusted_time.clone(),
             trusted_time_seq_floor: 1,
             trusted_time_sha256: "0".repeat(64),
@@ -3655,6 +3782,16 @@ mod tests {
         let mut split = candidate();
         split.applied.bom_sha256 = "9".repeat(64);
         assert!(monotonic(&manifest, &baseline.trusted, &split).is_err());
+        let mut re_signed_snapshot = candidate();
+        re_signed_snapshot.snapshot_signature = b"different-signature";
+        re_signed_snapshot.authority.snapshot_signature_sha256 =
+            hash(re_signed_snapshot.snapshot_signature).unwrap();
+        assert!(monotonic(&manifest, &baseline.trusted, &re_signed_snapshot).is_err());
+        let mut re_signed_assertion = candidate();
+        re_signed_assertion.trusted_signature = b"different-signature";
+        re_signed_assertion.trusted.signature_sha256 =
+            hash(re_signed_assertion.trusted_signature).unwrap();
+        assert!(monotonic(&manifest, &baseline.trusted, &re_signed_assertion).is_err());
         let mut jump = candidate();
         jump.applied.bundle_seq = 2;
         jump.trusted.assertion_seq = 2;
