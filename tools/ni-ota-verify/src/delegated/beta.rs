@@ -478,9 +478,11 @@ fn authorized_key<'a>(
                 && key.artifact_types.iter().any(|value| value == artifact)
                 && key.rings.iter().any(|value| value == "beta")
                 && key.hardware_targets.iter().any(|value| value == target)
-                && matches!(key.status.as_str(), "active" | "retiring")
-                && key.valid_from.as_str() <= issued_at
-                && issued_at < key.valid_until.as_str()
+                // `retiring` is never broad-key-valid by itself.  Its bounded
+                // rotation interval is authority at issuance, while `now`
+                // still checks that the snapshot itself has not selected a
+                // key outside its wider declared lifetime.
+                && key.authorizes_at(issued_at)
                 && key.valid_from.as_str() <= now
                 && now < key.valid_until.as_str()
         })
@@ -620,5 +622,28 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn retiring_beta_key_cannot_authorize_after_its_bounded_overlap() {
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        let key = &mut value["keys"][1];
+        key["status"] = "retiring".into();
+        key["rotation_overlap"] = serde_json::json!({
+            "mode": "bounded",
+            "with_key_id": "release-beta-v2",
+            "valid_from": "2026-07-21T01:00:00Z",
+            "valid_until": "2026-07-22T01:00:00Z"
+        });
+        let snapshot: Snapshot = serde_json::from_value(value).unwrap();
+        assert!(authorized_key(
+            &snapshot,
+            "release-beta-v1",
+            "beta-release-authorization",
+            "nvidia-gb10-arm64",
+            "2026-07-22T01:00:00Z",
+            "2026-07-22T01:00:00Z",
+        )
+        .is_err());
     }
 }
