@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
@@ -362,6 +363,46 @@ class SeedTreeManifestTests(unittest.TestCase):
                 )
         finally:
             os.close(parent_descriptor)
+
+    def test_directory_preflight_cap_is_enforced_before_enqueue(self) -> None:
+        parent_descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            parent_metadata = os.fstat(parent_descriptor)
+            with (
+                mock.patch.object(MANIFEST_MODULE, "MAX_PREFLIGHT_DIRECTORIES", 1),
+                self.assertRaisesRegex(
+                    MANIFEST_MODULE.ManifestError,
+                    "directory preflight limit exceeded",
+                ),
+            ):
+                MANIFEST_MODULE.output_parent_aliases_input(
+                    [
+                        ("models", self.source / "models"),
+                        ("payload", self.source / "payload"),
+                    ],
+                    parent_descriptor,
+                    parent_metadata,
+                )
+        finally:
+            os.close(parent_descriptor)
+
+    def test_cli_translates_sqlite_failures_to_refused(self) -> None:
+        standard_error = io.StringIO()
+        with (
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "write_manifest",
+                side_effect=MANIFEST_MODULE.sqlite3.OperationalError("simulated sqlite failure"),
+            ),
+            mock.patch.object(
+                MANIFEST_MODULE.sys,
+                "argv",
+                ["seed-tree-manifest.py", "--tree", "models=/tmp", "--output", "/tmp/x"],
+            ),
+            mock.patch.object(MANIFEST_MODULE.sys, "stderr", standard_error),
+        ):
+            self.assertEqual(MANIFEST_MODULE.main(), 1)
+        self.assertIn("REFUSED: simulated sqlite failure", standard_error.getvalue())
 
     def test_output_symlink_ancestor_is_refused(self) -> None:
         alias = self.root / "output-alias"

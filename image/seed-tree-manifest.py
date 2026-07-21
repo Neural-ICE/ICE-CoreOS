@@ -7,7 +7,9 @@ mode, owner, symlink target, hard-link relationship and extended attribute.
 
 This is an unprivileged serialization primitive. Its caller must supply stable
 input trees (normally immutable build outputs or read-only snapshots). The
-final-media gate owns mount isolation, topology and capacity enforcement.
+output directory must be caller-owned and exclusive for the invocation. The
+final-media gate owns mount isolation, topology, workspace exclusivity and
+capacity enforcement.
 Identity rechecks detect some accidental changes but are defense in depth, not
 a substitute for that caller-provided stable snapshot.
 """
@@ -348,7 +350,11 @@ def output_parent_aliases_input(
     target_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
     visited: set[tuple[int, int]] = set()
     with open_preflight_queue(parent_descriptor) as queue:
+        enqueued = 0
         for _, root in trees:
+            enqueued += 1
+            if enqueued > MAX_PREFLIGHT_DIRECTORIES:
+                raise ManifestError("directory preflight limit exceeded")
             append_path(queue, root)
         offset = 0
         while True:
@@ -375,6 +381,9 @@ def output_parent_aliases_input(
                 with os.scandir(path) as iterator:
                     for child in iterator:
                         if child.is_dir(follow_symlinks=False):
+                            enqueued += 1
+                            if enqueued > MAX_PREFLIGHT_DIRECTORIES:
+                                raise ManifestError("directory preflight limit exceeded")
                             append_path(queue, Path(child.path))
             except OSError as error:
                 raise ManifestError(
@@ -576,6 +585,7 @@ def write_manifest(
     temporary_identity: tuple[int, int] | None = None
     descriptor: int | None = None
     spool_name: str | None = None
+    spool_created = False
     spool_descriptor: int | None = None
     spool_identity: tuple[int, int] | None = None
     spool: sqlite3.Connection | None = None
@@ -588,27 +598,27 @@ def write_manifest(
 
         spool_name = f".seed-manifest-spool-{os.urandom(16).hex()}"
         os.mkdir(spool_name, 0o700, dir_fd=parent_descriptor)
-        spool_metadata = os.stat(
-            spool_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        spool_identity = (spool_metadata.st_dev, spool_metadata.st_ino)
-        os.chmod(spool_name, 0o700, dir_fd=parent_descriptor)
-        spool_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
+        spool_created = True
+        path_only_flag = getattr(os, "O_PATH", 0) if sys.platform == "linux" else 0
+        spool_flags = path_only_flag or os.O_RDONLY
+        spool_flags |= (
+            getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
+        if not path_only_flag:
+            # Non-Linux callers are restricted to the documented exclusive
+            # output directory, so this cannot target an attacker replacement.
+            os.chmod(spool_name, 0o700, dir_fd=parent_descriptor)
         spool_descriptor = os.open(
             spool_name,
             spool_flags,
             dir_fd=parent_descriptor,
         )
         spool_metadata = os.fstat(spool_descriptor)
-        if (spool_metadata.st_dev, spool_metadata.st_ino) != spool_identity:
-            raise ManifestError("manifest spool identity changed before opening")
+        spool_identity = (spool_metadata.st_dev, spool_metadata.st_ino)
+        if path_only_flag:
+            os.chmod(f"/proc/self/fd/{spool_descriptor}", 0o700)
         if not secure_parent_is_unchanged(supplied_parent, parent_metadata):
             raise ManifestError(f"output directory changed before spool creation: {output}")
         database_path = spool_database_path(
@@ -764,6 +774,7 @@ def write_manifest(
         spool_descriptor = None
         spool_name = None
         spool_identity = None
+        spool_created = False
 
         if not secure_parent_is_unchanged(supplied_parent, parent_metadata):
             raise ManifestError(f"output directory changed while creating manifest: {output}")
@@ -820,15 +831,8 @@ def write_manifest(
                 )
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
-        elif spool_name is not None and spool_identity is not None:
+        elif spool_created and spool_name is not None:
             try:
-                metadata = os.stat(
-                    spool_name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (metadata.st_dev, metadata.st_ino) != spool_identity:
-                    raise ManifestError("refusing to remove replaced empty manifest spool")
                 os.rmdir(spool_name, dir_fd=parent_descriptor)
                 os.fsync(parent_descriptor)
             except FileNotFoundError:
@@ -871,7 +875,7 @@ def main() -> int:
             arguments.tree,
             arguments.output,
         )
-    except (ManifestError, OSError) as error:
+    except (ManifestError, OSError, sqlite3.Error) as error:
         print(f"REFUSED: {error}", file=sys.stderr)
         return 1
     return 0
