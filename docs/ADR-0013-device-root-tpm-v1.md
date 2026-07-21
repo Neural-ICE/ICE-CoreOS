@@ -38,8 +38,9 @@ under a process lock. It checks every algorithm and attribute by its numeric
 TPM identifier, proves `Name = TPM_ALG_SHA256 || SHA256(TPMT_PUBLIC)`, then
 binds the exact public-area and SPKI hashes in canonical JSON. Installer and
 the enabled `neural-ice-device-root.service` run the same idempotent gate. An
-existing exact key is reused. An occupied but non-conforming handle, a changed
-identity or a missing handle for an established disk identity fails closed.
+existing exact key is reused. Outside the signed recovery path, an occupied
+but non-conforming handle, a changed identity or a missing handle for an
+established disk identity fails closed.
 
 The service emits no key identity to journald. It is an OTA/licensing
 prerequisite, not a boot dependency: failure blocks new trust bootstrap and
@@ -64,6 +65,12 @@ challenge. The binary ECDSA DER signature is transported to the image-pinned
 Cosign verifier as base64; no second production crypto stack is introduced. The authorization
 binds the prior TPM Name and SPKI hash, exact handle and fresh nonce. It never
 authorizes `0x81010004`, any EK handle or a caller-selected root key.
+
+If the current receipt still matches that signed prior identity, recovery may
+evict an occupied but malformed object at `0x81010005` without attesting it
+first. If a later receipt exists, the TPM must instead attest that exact later
+receipt before the surviving challenge can be consumed; it can never adopt a
+third identity.
 
 A simultaneous disk and TPM loss has no local continuity evidence. A fresh
 install may create a new device root, but the OTA/licensing state remains

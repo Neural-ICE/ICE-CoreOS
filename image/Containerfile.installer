@@ -18,10 +18,14 @@ FROM ${BASE_IMAGE}
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
 COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-baseline-handoff
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
+COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
+COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service \
+     /usr/lib/systemd/system/neural-ice-device-root.service
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
-      /usr/local/libexec/neural-ice-lab-baseline-handoff; \
-    systemctl enable neural-ice-autoinstall.service
+      /usr/local/libexec/neural-ice-lab-baseline-handoff \
+      /usr/libexec/neural-ice-device-root; \
+    systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service
 
 # Branding (os-release, Plymouth, kargs) is inherited from the canonical image.
 LABEL org.opencontainers.image.title="Neural ICE CoreOS (DGX Spark installer)" \

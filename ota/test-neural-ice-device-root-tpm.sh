@@ -79,6 +79,9 @@ cat > "$TOOLS/tpm2_evictcontrol" <<'EOF'
 printf 'evictcontrol %s\n' "$*" >> "$MOCK_STATE/calls"
 if [[ " $* " == *' -c 0x81010005 '* ]]; then
   printf '0\n' > "$MOCK_STATE/present"
+  # The replacement primary has the closed template even when the object being
+  # evicted was malformed.
+  printf 'valid\n' > "$MOCK_STATE/public-mode"
 else
   [[ "${*: -1}" == 0x81010005 ]] || exit 4
   printf '1\n' > "$MOCK_STATE/present"
@@ -194,6 +197,12 @@ SIG="$TMP/authorization.sig"
 grep -Fq 'COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root' \
   "$ROOT/image/Containerfile.bootc"
 grep -Fq 'systemctl enable neural-ice-device-root.service' "$ROOT/image/Containerfile.bootc"
+grep -Fq 'COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root' \
+  "$ROOT/image/Containerfile.installer"
+grep -Fq 'COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service' \
+  "$ROOT/image/Containerfile.installer"
+grep -Fq 'systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service' \
+  "$ROOT/image/Containerfile.installer"
 grep -Fq '/usr/libexec/neural-ice-device-root ensure' "$ROOT/ota/neural-ice-autoinstall.sh"
 grep -Fq 'ExecStart=/usr/libexec/neural-ice-device-root ensure' \
   "$ROOT/image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
@@ -255,9 +264,9 @@ expect_refuse 'not a regular file' recover --identity "$IDENTITY" --pending "$PE
   --authorization "$AUTH" --signature "$SIG"
 if grep -q 'evictcontrol .*0x81010004' "$STATE/calls"; then exit 1; fi
 
-# A crash after a replacement was attested/published but before pending-marker
-# deletion is finalized without a second eviction, even when the new TPM seed
-# gives the replacement a different public identity.
+# A stale authorization must not adopt a third conforming key after its
+# replacement receipt was already published. Restoring the matching TPM key
+# then permits the surviving marker to be consumed without another eviction.
 run recovery-challenge --identity "$IDENTITY" --pending "$PENDING" >/dev/null
 cp "$PENDING" "$AUTH"
 { printf 'neural-ice:ota:device-root-recovery:v1\0'; cat "$AUTH"; } > "$TMP/signing-bytes"
@@ -266,9 +275,31 @@ printf 'v2\n' > "$STATE/public-version"
 rm "$IDENTITY"
 run ensure --identity "$IDENTITY" >/dev/null
 before="$(grep -c '^evictcontrol' "$STATE/calls")"
+cp "$IDENTITY" "$TMP/published-v2.json"
+printf 'v3\n' > "$STATE/public-version"
+expect_refuse 'recovery authorization is stale for the current identity' recover \
+  --identity "$IDENTITY" --pending "$PENDING" --authorization "$AUTH" --signature "$SIG"
+[[ -e "$PENDING" ]]
+cmp -s "$IDENTITY" "$TMP/published-v2.json"
+[[ "$(grep -c '^evictcontrol' "$STATE/calls")" == "$before" ]]
+printf 'v2\n' > "$STATE/public-version"
 run recover --identity "$IDENTITY" --pending "$PENDING" \
   --authorization "$AUTH" --signature "$SIG" >/dev/null
 [[ ! -e "$PENDING" ]]
 [[ "$(grep -c '^evictcontrol' "$STATE/calls")" == "$before" ]]
+
+# A root-signed recovery can replace a malformed object at the exact dedicated
+# handle when the established receipt still matches the authorization.
+run recovery-challenge --identity "$IDENTITY" --pending "$PENDING" >/dev/null
+cp "$PENDING" "$AUTH"
+{ printf 'neural-ice:ota:device-root-recovery:v1\0'; cat "$AUTH"; } > "$TMP/signing-bytes"
+"$REAL_OPENSSL" dgst -sha256 -sign "$TMP/root-private.pem" -out "$SIG" "$TMP/signing-bytes"
+printf 'attributes\n' > "$STATE/public-mode"
+before="$(grep -c '^evictcontrol' "$STATE/calls")"
+run recover --identity "$IDENTITY" --pending "$PENDING" \
+  --authorization "$AUTH" --signature "$SIG" >/dev/null
+[[ ! -e "$PENDING" ]]
+[[ "$(grep -c '^evictcontrol' "$STATE/calls")" == "$((before + 2))" ]]
+if grep -q 'evictcontrol .*0x81010004' "$STATE/calls"; then exit 1; fi
 
 echo 'device-root TPM v1 tests: PASS'

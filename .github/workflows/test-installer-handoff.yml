@@ -9,6 +9,7 @@ on:
       - "ota/test-neural-ice-lab-baseline-handoff.sh"
       - "ota/neural-ice-device-root-tpm.sh"
       - "ota/test-neural-ice-device-root-tpm.sh"
+      - "image/Containerfile.bootc"
       - "image/Containerfile.installer"
       - "image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
       - "image/build-preloaded.sh"

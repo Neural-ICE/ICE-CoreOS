@@ -269,23 +269,38 @@ recover_identity() {
 
   identity_fields "$identity"
   if handle_present; then
-    actual="$(capture_identity "$WORK")"
-    if ! cmp -s <(printf '%s\n' "$actual") "$identity"; then
-      # Authorized recovery already created and attested a replacement but
-      # crashed before publishing its receipt. Finalize that exact state.
-      atomic_write "$identity" "$actual"
-      rm -f -- "$pending"
-      sync -f "$(dirname -- "$pending")"
-      printf '%s\n' "$actual"
-      return 0
-    fi
-    if [[ "$CURRENT_NAME" != "$PREVIOUS_NAME" || "$CURRENT_SPKI" != "$PREVIOUS_SPKI" ]]; then
-      # Receipt and TPM already describe the authorized replacement; only the
-      # one-use pending marker survived the prior crash.
-      rm -f -- "$pending"
-      sync -f "$(dirname -- "$pending")"
-      printf '%s\n' "$actual"
-      return 0
+    # A signed authorization names the *receipt* it is allowed to replace. A
+    # later receipt may only consume a surviving marker when the TPM still
+    # attests that same receipt; it must never adopt an unrelated third key.
+    # Conversely, when the receipt is still the signed prior identity, a
+    # malformed object at this exact dedicated handle is recoverable: signed
+    # recovery may evict it without first trusting its public area.
+    if actual="$(capture_identity "$WORK" 2>"$WORK/capture.err")"; then
+      rm -f -- "$WORK/capture.err"
+      if ! cmp -s <(printf '%s\n' "$actual") "$identity"; then
+        if [[ "$CURRENT_NAME" != "$PREVIOUS_NAME" || "$CURRENT_SPKI" != "$PREVIOUS_SPKI" ]]; then
+          die "recovery authorization is stale for the current identity"
+        fi
+        # Authorized recovery created and attested a replacement but crashed
+        # before publishing its receipt. Finalize that exact replacement.
+        atomic_write "$identity" "$actual"
+        rm -f -- "$pending"
+        sync -f "$(dirname -- "$pending")"
+        printf '%s\n' "$actual"
+        return 0
+      fi
+      if [[ "$CURRENT_NAME" != "$PREVIOUS_NAME" || "$CURRENT_SPKI" != "$PREVIOUS_SPKI" ]]; then
+        # Receipt and TPM already describe the authorized replacement; only
+        # the one-use pending marker survived the prior crash.
+        rm -f -- "$pending"
+        sync -f "$(dirname -- "$pending")"
+        printf '%s\n' "$actual"
+        return 0
+      fi
+    else
+      rm -f -- "$WORK/capture.err"
+      [[ "$CURRENT_NAME" == "$PREVIOUS_NAME" && "$CURRENT_SPKI" == "$PREVIOUS_SPKI" ]] \
+        || die "recovery authorization is stale for the current identity"
     fi
     "$(tool tpm2_evictcontrol)" -Q -C o -c "$HANDLE" \
       || die "cannot evict the authorized device-root"
