@@ -128,6 +128,14 @@ def metadata_fields(metadata: os.stat_result) -> dict[str, Any]:
     }
 
 
+def is_overlay_whiteout(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISCHR(metadata.st_mode)
+        and os.major(metadata.st_rdev) == 0
+        and os.minor(metadata.st_rdev) == 0
+    )
+
+
 def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
     try:
         root_metadata = root.lstat()
@@ -189,6 +197,23 @@ def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
                 {
                     "target": target,
                     "type": "symlink",
+                    "xattrs": xattrs(path, follow_symlinks=False),
+                }
+            )
+            entries.append(item)
+            return
+
+        # containers/storage represents OCI whiteouts in an extracted overlay
+        # graphroot as character devices with the reserved 0:0 device number.
+        # They are required for a faithful offline image store. No other device
+        # node is accepted in a preload tree.
+        if stat.S_ISCHR(metadata.st_mode):
+            if not is_overlay_whiteout(metadata):
+                raise ManifestError(f"unsupported character device at {path}")
+            item.update(
+                {
+                    "device": "0:0",
+                    "type": "overlay-whiteout",
                     "xattrs": xattrs(path, follow_symlinks=False),
                 }
             )

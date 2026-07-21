@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 
 TOOL = Path(__file__).with_name("seed-tree-manifest.py")
+SPEC = importlib.util.spec_from_file_location("seed_tree_manifest", TOOL)
+assert SPEC is not None and SPEC.loader is not None
+MANIFEST_MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MANIFEST_MODULE)
 
 
 class SeedTreeManifestTests(unittest.TestCase):
@@ -96,6 +103,14 @@ class SeedTreeManifestTests(unittest.TestCase):
         result = self.generate(self.source, output)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(output.read_text(encoding="ascii"), "owner-data")
+
+    def test_only_reserved_zero_zero_character_device_is_a_whiteout(self) -> None:
+        whiteout = SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=os.makedev(0, 0))
+        host_device = SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=os.makedev(1, 3))
+        regular = SimpleNamespace(st_mode=stat.S_IFREG, st_rdev=os.makedev(0, 0))
+        self.assertTrue(MANIFEST_MODULE.is_overlay_whiteout(whiteout))
+        self.assertFalse(MANIFEST_MODULE.is_overlay_whiteout(host_device))
+        self.assertFalse(MANIFEST_MODULE.is_overlay_whiteout(regular))
 
 
 if __name__ == "__main__":
