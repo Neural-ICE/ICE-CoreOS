@@ -509,8 +509,8 @@ pub(crate) fn validate_der_signature(bytes: &[u8]) -> Result<(), String> {
         return Err("signature is not minimal ASN.1 DER".into());
     }
     let mut offset = 2;
-    let mut s = &[][..];
-    for index in 0..2 {
+    let mut integers = [&[][..]; 2];
+    for integer in &mut integers {
         if offset + 2 > bytes.len() || bytes[offset] != 0x02 {
             return Err("signature is not ASN.1 DER integers".into());
         }
@@ -527,23 +527,38 @@ pub(crate) fn validate_der_signature(bytes: &[u8]) -> Result<(), String> {
         {
             return Err("signature integer is non-minimal".into());
         }
-        if index == 1 {
-            s = raw;
-        }
+        *integer = raw;
     }
     if offset != bytes.len() {
         return Err("signature has trailing bytes".into());
     }
+    const ORDER: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
     const HALF: [u8; 32] = [
         0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         0xff, 0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31,
         0x92, 0xa8,
     ];
-    let significant = if s.first() == Some(&0) { &s[1..] } else { s };
-    if significant.len() > 32 || (significant.len() == 32 && significant > HALF.as_slice()) {
+    if integers.iter().any(|value| !scalar_below(value, &ORDER)) {
+        return Err("signature integer is outside the P-256 scalar range".into());
+    }
+    if !scalar_below_or_equal(integers[1], &HALF) {
         return Err("signature is not low-S".into());
     }
     Ok(())
+}
+
+fn scalar_below(value: &[u8], upper: &[u8; 32]) -> bool {
+    let significant = value.strip_prefix(&[0]).unwrap_or(value);
+    significant.len() < 32 || (significant.len() == 32 && significant < upper)
+}
+
+fn scalar_below_or_equal(value: &[u8], upper: &[u8; 32]) -> bool {
+    let significant = value.strip_prefix(&[0]).unwrap_or(value);
+    significant.len() < 32 || (significant.len() == 32 && significant <= upper)
 }
 
 fn signature_profile(algorithm: &str, encoding: &str) -> bool {
@@ -745,5 +760,19 @@ mod tests {
             0x7e, 0x31, 0x92, 0xa9,
         ]);
         assert!(validate_der_signature(&high_s).is_err());
+
+        let order = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let mut bad_r = vec![0x30, 0x26, 0x02, 0x21, 0x00];
+        bad_r.extend_from_slice(&order);
+        bad_r.extend_from_slice(&[0x02, 0x01, 0x01]);
+        assert!(validate_der_signature(&bad_r).is_err());
+
+        let mut bad_s = vec![0x30, 0x26, 0x02, 0x01, 0x01, 0x02, 0x21, 0x00];
+        bad_s.extend_from_slice(&order);
+        assert!(validate_der_signature(&bad_s).is_err());
     }
 }
