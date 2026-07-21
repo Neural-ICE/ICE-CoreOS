@@ -383,9 +383,11 @@ fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
                             && peer.predecessor_key_id.as_deref()
                                 == Some(key.key_id.as_str())))
                     && key.rotation_overlap.valid_from.as_deref()
-                        .is_some_and(|from| from <= peer.revoked_at.as_str())
+                        .is_some_and(|from| key.valid_from.as_str() <= from
+                            && from <= peer.revoked_at.as_str())
                     && key.rotation_overlap.valid_until.as_deref()
-                        .is_some_and(|until| peer.revoked_at.as_str() < until)) => {}
+                        .is_some_and(|until| peer.revoked_at.as_str() < until
+                            && until <= key.valid_until.as_str())) => {}
             [peer]
                 if key.rotation_overlap.mode == "bounded"
                     && key.rotation_overlap.with_key_id.as_deref()
@@ -424,6 +426,41 @@ fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
             {
                 return Err("overlapping authority lacks an exact mutual rotation peer".into());
             }
+        }
+    }
+    validate_successor_graph_acyclic(snapshot)?;
+    Ok(())
+}
+
+fn validate_successor_graph_acyclic(snapshot: &Snapshot) -> Result<(), String> {
+    let successor = |candidate: &str| {
+        snapshot
+            .keys
+            .iter()
+            .find(|key| key.key_id == candidate)
+            .and_then(|key| key.successor_key_id.as_deref())
+            .or_else(|| {
+                snapshot
+                    .tombstones
+                    .iter()
+                    .find(|tombstone| tombstone.key_id == candidate)
+                    .and_then(|tombstone| tombstone.successor_key_id.as_deref())
+            })
+    };
+    for start in snapshot.keys.iter().map(|key| key.key_id.as_str()).chain(
+        snapshot
+            .tombstones
+            .iter()
+            .map(|tombstone| tombstone.key_id.as_str()),
+    ) {
+        let mut seen = HashSet::new();
+        seen.insert(start);
+        let mut current = start;
+        while let Some(next) = successor(current) {
+            if !seen.insert(next) {
+                return Err("delegation successor lineage contains a cycle".into());
+            }
+            current = next;
         }
     }
     Ok(())
@@ -467,10 +504,7 @@ pub(crate) fn validate_chain(
                 || next.valid_from < key.valid_from
                 || next.valid_until > key.valid_until
                 || (key.status == "retiring" && next.status != "retiring")
-                || key
-                    .predecessor_key_id
-                    .as_ref()
-                    .is_some_and(|old| next.predecessor_key_id.as_ref() != Some(old))
+                || next.predecessor_key_id != key.predecessor_key_id
                 || key
                     .successor_key_id
                     .as_ref()
@@ -995,6 +1029,48 @@ mod tests {
         let unilateral: Snapshot = parse_canonical(&canonical(&unilateral), "snapshot").unwrap();
         assert!(validate_snapshot(&unilateral).is_err());
     }
+
+    #[test]
+    fn snapshot_refuses_closed_tombstone_successor_cycle() {
+        let mut snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        for (key_id, predecessor, successor, pin) in [
+            (
+                "release-beta-cycle-a",
+                "release-beta-cycle-c",
+                "release-beta-cycle-b",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "release-beta-cycle-b",
+                "release-beta-cycle-a",
+                "release-beta-cycle-c",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            (
+                "release-beta-cycle-c",
+                "release-beta-cycle-b",
+                "release-beta-cycle-a",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        ] {
+            snapshot.tombstones.push(Tombstone {
+                key_id: key_id.into(),
+                predecessor_key_id: Some(predecessor.into()),
+                reason: "key-compromise".into(),
+                revocation_seq: 1,
+                revoked_at: "2026-07-21T00:00:00Z".into(),
+                role: "release-beta".into(),
+                spki_sha256: pin.into(),
+                successor_key_id: Some(successor.into()),
+                terminal_status: "revoked".into(),
+            });
+        }
+        snapshot
+            .tombstones
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        assert!(validate_snapshot(&snapshot).is_err());
+    }
+
     #[test]
     fn chain_preserves_reciprocal_lineage_and_overlap_after_peer_revocation() {
         let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
@@ -1037,6 +1113,15 @@ mod tests {
         });
         validate_snapshot(&new).unwrap();
         validate_chain(&old, &new, &old_hash).unwrap();
+
+        let mut narrowed_past_overlap = new.clone();
+        narrowed_past_overlap
+            .keys
+            .iter_mut()
+            .find(|key| key.key_id == "release-beta-v2")
+            .unwrap()
+            .valid_from = "2026-08-02T00:00:00Z".into();
+        assert!(validate_snapshot(&narrowed_past_overlap).is_err());
 
         let mut cleared = new.clone();
         cleared.keys[1].predecessor_key_id = None;
@@ -1115,6 +1200,53 @@ mod tests {
             &reversed_next,
             &reversed_snapshot
         ));
+    }
+
+    #[test]
+    fn chain_refuses_backdated_predecessor_for_retained_key() {
+        let old: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let old_hash = canonical_hash(SNAPSHOT).unwrap();
+        let mut new = old.clone();
+        new.delegation_seq = 2;
+        new.previous_snapshot_sha256 = Some(old_hash.clone());
+        new.issued_at = "2026-08-01T00:45:00Z".into();
+        new.valid_from = "2026-08-01T01:00:00Z".into();
+
+        let accepted = new
+            .keys
+            .iter_mut()
+            .find(|key| key.key_id == "release-beta-v1")
+            .unwrap();
+        let mut predecessor = accepted.clone();
+        predecessor.key_id = "release-beta-v0".into();
+        predecessor.predecessor_key_id = None;
+        predecessor.successor_key_id = Some(accepted.key_id.clone());
+        let mut der = P256_SPKI_PREFIX.to_vec();
+        der.extend_from_slice(&hex_bytes(
+            "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1",
+        ));
+        predecessor.public_key.spki_der_base64 = encode_base64(&der);
+        predecessor.public_key.spki_sha256 = hash_bytes(&der).unwrap();
+        let overlap = RotationOverlap {
+            mode: "bounded".into(),
+            with_key_id: Some(accepted.key_id.clone()),
+            valid_from: Some(accepted.valid_from.clone()),
+            valid_until: Some(accepted.valid_until.clone()),
+        };
+        predecessor.rotation_overlap = overlap;
+        accepted.predecessor_key_id = Some(predecessor.key_id.clone());
+        accepted.rotation_overlap = RotationOverlap {
+            mode: "bounded".into(),
+            with_key_id: Some(predecessor.key_id.clone()),
+            valid_from: Some(accepted.valid_from.clone()),
+            valid_until: Some(accepted.valid_until.clone()),
+        };
+        new.keys.push(predecessor);
+        new.keys
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
+
+        validate_snapshot(&new).unwrap();
+        assert!(validate_chain(&old, &new, &old_hash).is_err());
     }
 
     fn hex_bytes(value: &str) -> Vec<u8> {
