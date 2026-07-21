@@ -35,6 +35,14 @@ COMPRESS="${COMPRESS:-zstd-fast}"
 [ -d "$SEED_IMAGES" ] || { echo "missing SEED_IMAGES $SEED_IMAGES" >&2; exit 1; }
 [ -d "$SEED_MODELS" ] || { echo "missing SEED_MODELS $SEED_MODELS" >&2; exit 1; }
 [ -z "$SEED_PAYLOAD" ] || [ -x "$SEED_PAYLOAD/apply.sh" ] || { echo "SEED_PAYLOAD set but $SEED_PAYLOAD/apply.sh missing/not executable" >&2; exit 1; }
+# The qualified cache is commonly exposed through a stable symlink. Resolve
+# each root once so `du` sizes the actual tree rather than the tiny symlink
+# inode, and the later copy consumes the same namespace that was sized.
+SEED_IMAGES="$(cd -- "$SEED_IMAGES" && pwd -P)"
+SEED_MODELS="$(cd -- "$SEED_MODELS" && pwd -P)"
+if [ -n "$SEED_PAYLOAD" ]; then
+  SEED_PAYLOAD="$(cd -- "$SEED_PAYLOAD" && pwd -P)"
+fi
 
 echo "==> 1. build the base installer raw FROM ${BASE_IMAGE}  (uncompressed)"
 # OUT means "output NAME" here but "bib output DIR" in build-installer-usb.sh —
