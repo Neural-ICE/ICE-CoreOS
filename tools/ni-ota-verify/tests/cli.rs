@@ -2141,6 +2141,11 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(verdict["bom_sha256"], bom_hash);
     assert!(!fx.path("state/applied.json").exists());
 
+    fs::write(fx.path("attestation.sig"), []).unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("usb-attestation-signature must be a non-empty regular"));
+
     fs::write(fx.path("attestation.sig"), b"not-a-der-signature").unwrap();
     let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
     assert_eq!(code, 1, "{stderr}");

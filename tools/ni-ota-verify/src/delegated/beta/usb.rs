@@ -91,15 +91,22 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let scratch = FileStateStore {
         path: state_dir.join("applied.json"),
     };
-    let artifact = |flag: &str, label: &str| freeze(&scratch, Path::new(required(flag)?), label);
-    let snapshot_file = artifact("snapshot", "usb-delegation-snapshot")?;
-    let snapshot_sig = artifact("snapshot-sig", "usb-delegation-signature")?;
-    let release_file = artifact("release", "usb-beta-release")?;
-    let release_sig = artifact("release-sig", "usb-beta-release-signature")?;
-    let bom_file = artifact("bom", "usb-bom")?;
-    let record_file = artifact("record", "usb-channel-record")?;
-    let attestation_file = artifact("attestation", "usb-attestation-set")?;
-    let attestation_sig = artifact("attestation-sig", "usb-attestation-signature")?;
+    macro_rules! artifact {
+        ($flag:literal, $label:literal) => {
+            match super::super::freeze_authority(&scratch, Path::new(required($flag)?), $label)? {
+                Ok(file) => file,
+                Err(reason) => return refusal(reason),
+            }
+        };
+    }
+    let snapshot_file = artifact!("snapshot", "usb-delegation-snapshot");
+    let snapshot_sig = artifact!("snapshot-sig", "usb-delegation-signature");
+    let release_file = artifact!("release", "usb-beta-release");
+    let release_sig = artifact!("release-sig", "usb-beta-release-signature");
+    let bom_file = artifact!("bom", "usb-bom");
+    let record_file = artifact!("record", "usb-channel-record");
+    let attestation_file = artifact!("attestation", "usb-attestation-set");
+    let attestation_sig = artifact!("attestation-sig", "usb-attestation-signature");
 
     let snapshot_bytes = snapshot_file.read()?;
     let release_bytes = release_file.read()?;
