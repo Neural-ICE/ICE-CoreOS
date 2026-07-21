@@ -241,6 +241,12 @@ fn validate_bootstrap(
         || !timestamp(&value.valid_until)
         || value.issued_at >= value.valid_until
         || lifetime_seconds(&value.issued_at, &value.valid_until).is_none_or(|value| value > 600)
+        || !consumption_precedes_expiry(
+            &value.issued_at,
+            &value.valid_until,
+            value.tpm_clock,
+            expected.current_tpm.tpm_clock,
+        )
         || !value.tpm_safe
         || value.baseline.bootstrap_delegation_seq != snapshot.delegation_seq
         || value.baseline.bootstrap_snapshot_sha256 != snapshot_sha256
@@ -427,6 +433,26 @@ fn is_nonce(value: &str) -> bool {
 
 fn lifetime_seconds(issued_at: &str, valid_until: &str) -> Option<u64> {
     utc_seconds(valid_until)?.checked_sub(utc_seconds(issued_at)?)
+}
+
+fn consumption_precedes_expiry(
+    issued_at: &str,
+    valid_until: &str,
+    challenge_tpm_clock: u64,
+    consumption_tpm_clock: u64,
+) -> bool {
+    let Some(elapsed_ms) = consumption_tpm_clock.checked_sub(challenge_tpm_clock) else {
+        return false;
+    };
+    let Some(elapsed_seconds) = elapsed_ms.checked_add(999).map(|value| value / 1_000) else {
+        return false;
+    };
+    let Some(consumption_time) =
+        utc_seconds(issued_at).and_then(|value| value.checked_add(elapsed_seconds))
+    else {
+        return false;
+    };
+    utc_seconds(valid_until).is_some_and(|expiry| consumption_time < expiry)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -646,6 +672,12 @@ fn validate_root_recovery(
         || !timestamp(&value.valid_until)
         || value.issued_at >= value.valid_until
         || lifetime_seconds(&value.issued_at, &value.valid_until).is_none_or(|value| value > 600)
+        || !consumption_precedes_expiry(
+            &value.issued_at,
+            &value.valid_until,
+            value.tpm_clock,
+            expected.current_tpm.tpm_clock,
+        )
         || value.acknowledgement_authority.schema != "ota-recovery-ack-authority-v1"
         || value.acknowledgement_authority.signing_role != "licensing-bootstrap"
         || value.acknowledgement_authority.artifact_types != ["ota-licensing-recovery-ack-v1"]
@@ -776,6 +808,12 @@ where
         || !timestamp(&value.valid_until)
         || value.issued_at >= value.valid_until
         || lifetime_seconds(&value.issued_at, &value.valid_until).is_none_or(|value| value > 600)
+        || !consumption_precedes_expiry(
+            &value.issued_at,
+            &value.valid_until,
+            value.tpm_clock,
+            expected.current_tpm.tpm_clock,
+        )
         || value.key_id != authority.acknowledgement_key_id
         || value.licence_record_id != expected.licence_record_id
         || value.device_serial != expected.device_serial

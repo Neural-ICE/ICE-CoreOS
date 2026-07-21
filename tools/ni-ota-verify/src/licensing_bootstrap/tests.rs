@@ -148,7 +148,7 @@ fn expected<'a>(value: &'a LicensingBootstrapAuthorization) -> ExpectedBootstrap
         baseline: &value.baseline,
         bootstrap_seq: value.bootstrap_seq,
         current_tpm: CurrentTpmState {
-            tpm_clock: value.tpm_clock + 600_000,
+            tpm_clock: value.tpm_clock + 599_000,
             tpm_reset_count: value.tpm_reset_count,
             tpm_restart_count: value.tpm_restart_count,
             tpm_safe: true,
@@ -377,6 +377,7 @@ fn bootstrap_refuses_wrong_role_schema_key_signature_and_freshness() {
         "schema",
         "key",
         "long-window",
+        "signed-expiry",
         "clock",
         "reset",
         "unsafe",
@@ -388,6 +389,7 @@ fn bootstrap_refuses_wrong_role_schema_key_signature_and_freshness() {
             "schema" => hostile.schema = "trusted-time-assertion".into(),
             "key" => hostile.key_id = "trusted-time-v1".into(),
             "long-window" => hostile.valid_until = "2026-07-21T12:10:01Z".into(),
+            "signed-expiry" => hostile.valid_until = "2026-07-21T12:00:01Z".into(),
             "clock" => expectation.current_tpm.tpm_clock += 1,
             "reset" => expectation.current_tpm.tpm_reset_count += 1,
             "unsafe" => expectation.current_tpm.tpm_safe = false,
@@ -496,7 +498,7 @@ fn acknowledgement(
 fn expected_ack<'a>(value: &'a LicensingRecoveryAck) -> ExpectedRecoveryAck<'a> {
     ExpectedRecoveryAck {
         current_tpm: CurrentTpmState {
-            tpm_clock: value.tpm_clock + 600_000,
+            tpm_clock: value.tpm_clock + 599_000,
             tpm_reset_count: value.tpm_reset_count,
             tpm_restart_count: value.tpm_restart_count,
             tpm_safe: true,
@@ -529,7 +531,7 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
         baseline: &current.baseline,
         current_state: &current,
         current_tpm: CurrentTpmState {
-            tpm_clock: root.tpm_clock + 600_000,
+            tpm_clock: root.tpm_clock + 599_000,
             tpm_reset_count: root.tpm_reset_count,
             tpm_restart_count: root.tpm_restart_count,
             tpm_safe: true,
@@ -565,6 +567,15 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
         .push("ota-licensing-bootstrap-v1".into());
     assert!(verify_root_recovery_authority_with(
         &canonical(&widened),
+        DER,
+        &expected_root,
+        |_key, _domain, _payload, _signature| Ok(()),
+    )
+    .is_err());
+    let mut expired_root = root.clone();
+    expired_root.valid_until = "2026-07-21T12:00:01Z".into();
+    assert!(verify_root_recovery_authority_with(
+        &canonical(&expired_root),
         DER,
         &expected_root,
         |_key, _domain, _payload, _signature| Ok(()),
@@ -608,7 +619,9 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
     )
     .is_err());
 
-    for case in ["key", "nonce", "recovery", "state", "role", "schema"] {
+    for case in [
+        "key", "nonce", "recovery", "state", "role", "schema", "expired",
+    ] {
         let mut hostile = value.clone();
         match case {
             "key" => hostile.key_id = "other-bootstrap-key".into(),
@@ -617,6 +630,7 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
             "state" => hostile.resulting_state.bundle_seq += 1,
             "role" => hostile.signing_role = "trusted-time".into(),
             "schema" => hostile.schema = "ota-licensing-bootstrap-v1".into(),
+            "expired" => hostile.valid_until = "2026-07-21T12:00:01Z".into(),
             _ => unreachable!(),
         }
         assert!(
