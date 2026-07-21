@@ -128,6 +128,18 @@ response must treat `features` as a closed set, require `bundle-digest-v1`, and
 use the atomic pre-apply and post-health flow whenever `atomic-state-v1` is
 present. Older controllers continue to reject that response fail-closed.
 
+The persistent atomic-state layout is closed. Under `${state_dir}/state-v1`,
+`current` is exactly `generation-NNNNNNNNNNNNNNNN\n`, and
+`enforce-ready.json` binds the current manifest and TPM anchor. Each
+`generations/generation-NNNNNNNNNNNNNNNN` directory contains exactly the ten
+manifest, state, signed-authority, release, and trusted-time files enumerated
+by ADR-0012; no extra entry is accepted. JSON uses canonical encoding with one
+final LF, signatures retain their exact bytes, and all entries are root-owned
+with modes `0700` for directories and `0600` for files. Recovery and commit
+share `.transaction.json.lock`, reread repaired pointers and the TPM before
+success, and never lower a floor. An N-1 deployment may keep serving the
+retained workload but cannot update or repair this state.
+
 The immediate prior bootc deployment predates this command. A one-version OS
 rollback therefore keeps the appliance running but intentionally disables new
 registry-backed OTA checks: a non-zero capability probe remains fail-closed.

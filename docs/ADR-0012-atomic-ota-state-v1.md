@@ -76,6 +76,44 @@ anchor. The verifier stages and fsyncs all files, extends the TPM with the
 manifest hash, reads the expected anchor back, then publishes and rereads the
 current pointer and enforcement marker. No success receipt is emitted earlier.
 
+### Persistent disk contract
+
+The canonical root is `${state_dir}/state-v1` (normally
+`/var/lib/neural-ice/ota/state-v1`), owned by root with mode `0700`. Recovery
+and commit serialize through the persistent inode
+`.transaction.json.lock`; the inode contains no authority and a process crash
+releases its kernel lock.
+
+`current` is a root-owned `0600` regular file containing exactly
+`generation-NNNNNNNNNNNNNNNN\n`. `enforce-ready.json` is canonical JSON with
+one final LF and the closed fields `schema`, `manifest_sha256`, and
+`nv_anchor`. It is authoritative only when its two hashes reproduce the
+current complete generation and the TPM value under the same transaction
+lock.
+
+Every committed directory is named
+`generations/generation-NNNNNNNNNNNNNNNN`, is root-owned mode `0700`, and has
+this exact closed inventory of root-owned `0600` regular files:
+
+- `manifest.json`, `applied.json`, `authority.json`, `trusted-time.json`;
+- `delegation-snapshot.json` and `delegation-snapshot.sig`;
+- `release-authorization.json` and `release-authorization.sig`;
+- `trusted-time-assertion.json` and `trusted-time-assertion.sig`.
+
+JSON artifacts are canonical UTF-8 JSON with one final LF. Signature files are
+the exact signed bytes. The manifest binds the raw SHA-256 of every file; its
+separate canonical JSON hashes follow the delegation contract and exclude the
+single framing LF. Missing, additional, non-regular, symlinked, insecurely
+owned, or mode-incompatible entries refuse the complete generation.
+
+`current` and `enforce-ready.json` are derived repairable pointers, not
+independent authority. Recovery holds the transaction lock while observing
+the TPM, validating the complete chain, publishing and rereading both files,
+then rereads the TPM before success. N-1 may ignore this new directory and run
+the retained workload, but it must not mutate, delete, or lower the state-v1
+chain; only the state-v1-capable retained deployment or root-signed recovery
+may repair it.
+
 Trusted time is a short-lived signed artifact obtained by the controller from
 the allowlisted licensing service; the verifier itself remains networkless.
 The v2 assertion is valid for at most ten minutes and binds:
