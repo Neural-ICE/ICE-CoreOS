@@ -194,6 +194,14 @@ where
         &authorization.issued_at,
         &authorization.baseline.hardware_target,
     )?;
+    if !key_authority_live_at_consumption(
+        key,
+        &authorization.issued_at,
+        authorization.tpm_clock,
+        expected.current_tpm.tpm_clock,
+    ) {
+        return Err("licensing authority expired before proof consumption".into());
+    }
     let public_key = public_key_pem(&key.public_key)?;
     signature_verifier(
         &public_key,
@@ -207,6 +215,17 @@ where
         key_id: authorization.key_id,
         licence_record_id: authorization.licence_record_id,
         reason: authorization.reason,
+    })
+}
+
+fn key_authority_live_at_consumption(
+    key: &crate::delegated::contract::DelegatedKey,
+    issued_at: &str,
+    signed_tpm_clock: u64,
+    current_tpm_clock: u64,
+) -> bool {
+    key.authorization_deadline().is_some_and(|deadline| {
+        consumption_precedes_expiry(issued_at, deadline, signed_tpm_clock, current_tpm_clock)
     })
 }
 

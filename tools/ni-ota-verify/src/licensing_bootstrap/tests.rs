@@ -277,13 +277,25 @@ fn retiring_licensing_key_remains_authorized_only_inside_bounded_overlap() {
         "with_key_id": "licensing-bootstrap-v2"
     });
     let retiring: Snapshot = parse_canonical(&canonical(&value), "retiring snapshot").unwrap();
-    assert!(unique_snapshot_key(
+    let key = unique_snapshot_key(
         &retiring,
         "licensing-bootstrap-v1",
         "2026-07-21T12:00:00Z",
         "nvidia-gb10-arm64",
     )
-    .is_ok());
+    .unwrap();
+    assert!(key_authority_live_at_consumption(
+        key,
+        "2026-07-21T12:00:00Z",
+        1_000,
+        3_600_000,
+    ));
+    assert!(!key_authority_live_at_consumption(
+        key,
+        "2026-07-21T12:00:00Z",
+        1_000,
+        3_601_000,
+    ));
     assert!(unique_snapshot_key(
         &retiring,
         "licensing-bootstrap-v1",
