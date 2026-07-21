@@ -28,6 +28,7 @@ class SeedTreeManifestTests(unittest.TestCase):
     def setUp(self) -> None:
         # Unit fixtures exercise serialization semantics independently of the
         # runner's backing filesystem. Btrfs refusal has its own explicit test.
+        self.original_linux_filesystem_magic = MANIFEST_MODULE.linux_filesystem_magic
         self.filesystem_magic = mock.patch.object(
             MANIFEST_MODULE,
             "linux_filesystem_magic",
@@ -217,13 +218,28 @@ class SeedTreeManifestTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=False,
         )
+        actual_btrfs = False
+        if sys.platform == "linux":
+            descriptor = os.open(self.source / "models", os.O_RDONLY)
+            try:
+                actual_btrfs = (
+                    self.original_linux_filesystem_magic(descriptor)
+                    == MANIFEST_MODULE.BTRFS_SUPER_MAGIC
+                )
+            finally:
+                os.close(descriptor)
         try:
             MANIFEST_MODULE.require_complete_xattr_visibility()
-        except MANIFEST_MODULE.ManifestError:
+        except MANIFEST_MODULE.ManifestError as error:
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("complete xattr visibility", result.stderr)
+            self.assertIn(str(error), result.stderr)
             self.assertFalse(output.exists())
         else:
+            if actual_btrfs:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Btrfs input is unsupported", result.stderr)
+                self.assertFalse(output.exists())
+                return
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(output.is_file())
 
@@ -586,6 +602,10 @@ class SeedTreeManifestTests(unittest.TestCase):
             mock.patch.object(MANIFEST_MODULE.os, "geteuid", return_value=0),
             mock.patch.object(
                 MANIFEST_MODULE,
+                "require_initial_linux_user_namespace",
+            ),
+            mock.patch.object(
+                MANIFEST_MODULE,
                 "linux_effective_capabilities",
                 return_value=0,
             ),
@@ -601,11 +621,30 @@ class SeedTreeManifestTests(unittest.TestCase):
             mock.patch.object(MANIFEST_MODULE.os, "geteuid", return_value=0),
             mock.patch.object(
                 MANIFEST_MODULE,
+                "require_initial_linux_user_namespace",
+            ),
+            mock.patch.object(
+                MANIFEST_MODULE,
                 "linux_effective_capabilities",
                 return_value=1 << MANIFEST_MODULE.CAP_SYS_ADMIN,
             ),
         ):
             MANIFEST_MODULE.require_complete_xattr_visibility()
+
+    def test_linux_authoritative_cli_rejects_nested_user_namespace(self) -> None:
+        nested_map = ((0, 100000, 65536),)
+        with (
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "linux_id_map",
+                return_value=nested_map,
+            ),
+            self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "initial host user namespace",
+            ),
+        ):
+            MANIFEST_MODULE.require_initial_linux_user_namespace()
 
     def test_maximum_length_output_basename_is_supported(self) -> None:
         output = self.root / ("m" * 255)

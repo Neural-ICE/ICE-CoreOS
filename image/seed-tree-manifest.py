@@ -35,6 +35,7 @@ from typing import Any
 MAX_PREFLIGHT_DIRECTORIES = 1_000_000
 CAP_SYS_ADMIN = 21
 BTRFS_SUPER_MAGIC = 0x9123683E
+INITIAL_ID_MAP = ((0, 0, 4294967295),)
 
 
 class ManifestError(RuntimeError):
@@ -52,6 +53,38 @@ def linux_effective_capabilities() -> int:
     raise ManifestError("cannot determine Linux effective capabilities: CapEff is absent")
 
 
+def linux_id_map(name: str) -> tuple[tuple[int, int, int], ...]:
+    try:
+        rows = []
+        for line in Path(f"/proc/self/{name}_map").read_text(encoding="ascii").splitlines():
+            fields = line.split()
+            if len(fields) != 3:
+                raise ValueError(f"invalid {name}_map row")
+            rows.append(tuple(int(field) for field in fields))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ManifestError(f"cannot determine Linux {name} namespace: {error}") from error
+    return tuple(rows)
+
+
+def require_initial_linux_user_namespace() -> None:
+    if linux_id_map("uid") != INITIAL_ID_MAP or linux_id_map("gid") != INITIAL_ID_MAP:
+        raise ManifestError(
+            "authoritative Linux manifests require the initial host user namespace"
+        )
+    try:
+        current_namespace = os.stat("/proc/self/ns/user")
+        init_namespace = os.stat("/proc/1/ns/user")
+    except OSError as error:
+        raise ManifestError(f"cannot verify the Linux host user namespace: {error}") from error
+    if (current_namespace.st_dev, current_namespace.st_ino) != (
+        init_namespace.st_dev,
+        init_namespace.st_ino,
+    ):
+        raise ManifestError(
+            "authoritative Linux manifests require the initial host user namespace"
+        )
+
+
 def require_complete_xattr_visibility() -> None:
     if sys.platform != "linux":
         return
@@ -59,6 +92,7 @@ def require_complete_xattr_visibility() -> None:
         raise ManifestError(
             "authoritative Linux manifests require host root for complete xattr visibility"
         )
+    require_initial_linux_user_namespace()
     capabilities = linux_effective_capabilities()
     if not capabilities & (1 << CAP_SYS_ADMIN):
         raise ManifestError(
