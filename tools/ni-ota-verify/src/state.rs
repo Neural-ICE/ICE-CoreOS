@@ -909,6 +909,7 @@ fn openat_directory(parent: &File, name: &OsStr) -> std::io::Result<File> {
             parent.as_raw_fd(),
             name.as_ptr(),
             O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            0 as std::os::raw::c_uint,
         )
     };
     if fd < 0 {
