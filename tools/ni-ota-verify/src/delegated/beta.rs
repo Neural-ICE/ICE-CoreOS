@@ -6,10 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use super::contract::{
     canonical_hash, ident, parse_canonical, public_key_pem, safe_uint, sha256, signature_profile,
-    target, timestamp, DelegatedKey, Snapshot,
+    target, timestamp, ContractError, DelegatedKey, Snapshot,
 };
 use super::{freeze, refusal, validate_candidate, verify_root_binding, verify_signature};
-use crate::config::{immutable_hardware_target, immutable_minimum_delegation_seq, Config};
+use crate::config::{
+    immutable_appliance_variant, immutable_hardware_target, immutable_minimum_delegation_seq,
+    Config,
+};
 use crate::state::{ensure_secure_state_directory, FileStateStore};
 use crate::{parse_flags, InternalError, DEFAULT_CONFIG, EXIT_PASS};
 
@@ -112,10 +115,30 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let release_sig = artifact("release-sig", "beta-release-signature")?;
     let receipt_file = artifact("receipt", "beta-receipt")?;
     let receipt_sig = artifact("receipt-sig", "beta-receipt-signature")?;
-    let root = config
-        .root_pubkey
-        .as_deref()
-        .ok_or_else(|| InternalError("root_pubkey is required".into()))?;
+    let Some(root) = config.root_pubkey.as_deref() else {
+        return refusal("no root_pubkey configured in ota.conf".into());
+    };
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+        Ok(_) => {
+            return refusal(format!(
+                "OTA root pubkey missing or empty: {}",
+                root.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refusal(format!(
+                "OTA root pubkey missing or empty: {}",
+                root.display()
+            ))
+        }
+        Err(error) => {
+            return Err(InternalError(format!(
+                "cannot inspect OTA root pubkey {}: {error}",
+                root.display()
+            )))
+        }
+    }
     let root = freeze(&scratch, root, "root-public-key")?;
     let snapshot_bytes = snapshot_file.read()?;
     let release_bytes = release_file.read()?;
@@ -141,9 +164,11 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         scratch: &scratch,
     };
     let target = immutable_hardware_target()?;
+    let variant = immutable_appliance_variant()?;
     let snapshot_hash = match validate_candidate(&snapshot, &context) {
         Ok(hash) => hash,
-        Err(reason) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Internal(error)) => return Err(error),
     };
     let root_bytes = root.read()?;
     if let Err(reason) = verify_root_binding(&snapshot, &root_bytes) {
@@ -161,13 +186,22 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     if let Err(reason) = validate_release(&release, &snapshot, &snapshot_hash, now, &target) {
         return refusal(reason);
     }
+    if config.device_channel.as_deref() != Some("beta") {
+        return refusal("delegated beta release requires device_channel=beta".into());
+    }
+    if release.variant != variant {
+        return refusal(format!(
+            "release variant '{}' does not match immutable host variant '{variant}'",
+            release.variant
+        ));
+    }
     if let Err(reason) = device_compatibility(&release, config.device_compat) {
         if config.enforce {
             return refusal(reason);
         }
         eprintln!("ni-ota-verify: beta compatibility WARNING: {reason}");
     }
-    if let Err(reason) = validate_receipt(
+    if let Err(error) = validate_receipt(
         &receipt,
         &release,
         &release_bytes,
@@ -176,7 +210,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         now,
         &target,
     ) {
-        return refusal(reason);
+        match error {
+            ContractError::Refusal(reason) => return refusal(reason),
+            ContractError::Internal(error) => return Err(error),
+        }
     }
     let release_key = match authorized_key(
         &snapshot,
@@ -191,7 +228,8 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     let release_pem = match public_key_pem(&release_key.public_key) {
         Ok(pem) => pem,
-        Err(reason) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Internal(error)) => return Err(error),
     };
     if let Err(reason) = verify_signature(
         &release_pem,
@@ -215,7 +253,8 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     let receipt_pem = match public_key_pem(&receipt_key.public_key) {
         Ok(pem) => pem,
-        Err(reason) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Internal(error)) => return Err(error),
     };
     if let Err(reason) = verify_signature(
         &receipt_pem,
@@ -228,7 +267,8 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
     let receipt_hash = match canonical_hash(&receipt_bytes) {
         Ok(hash) => hash,
-        Err(reason) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Internal(error)) => return Err(error),
     };
     println!(
         "{{\"verdict\":\"pass\",\"ring\":\"beta\",\"bundle_seq\":{},\"receipt_sha256\":\"{}\",\"manifest_digest\":\"{}\"}}",
@@ -317,7 +357,7 @@ fn validate_receipt(
     snapshot_hash: &str,
     now: &str,
     immutable_target: &str,
-) -> Result<(), String> {
+) -> Result<(), ContractError> {
     if value.schema != "neural-ice-ota-beta-publication-receipt-v1"
         || value.signing_role != "release-beta"
         || value.ring != "beta"
@@ -356,7 +396,9 @@ fn validate_receipt(
         || now < value.issued_at.as_str()
         || now >= value.valid_until.as_str()
     {
-        return Err("beta publication receipt contract or binding is invalid".into());
+        return Err(ContractError::Refusal(
+            "beta publication receipt contract or binding is invalid".into(),
+        ));
     }
     authorized_key(
         snapshot,
@@ -365,7 +407,8 @@ fn validate_receipt(
         immutable_target,
         &value.issued_at,
         now,
-    )?;
+    )
+    .map_err(ContractError::Refusal)?;
     let release_hash = canonical_hash(release_bytes)?;
     if value.beta_envelope_sha256 != release_hash
         || value.beta_variant != release.variant
@@ -382,7 +425,9 @@ fn validate_receipt(
         || value.observed_at < release.valid_from
         || value.observed_at >= release.valid_until
     {
-        return Err("beta receipt does not bind the exact beta release".into());
+        return Err(ContractError::Refusal(
+            "beta receipt does not bind the exact beta release".into(),
+        ));
     }
     Ok(())
 }

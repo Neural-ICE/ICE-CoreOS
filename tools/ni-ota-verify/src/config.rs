@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::InternalError;
 
 const DEFAULT_HARDWARE_TARGET_FILE: &str = "/usr/lib/neural-ice/hardware-target";
+const DEFAULT_APPLIANCE_VARIANT_FILE: &str = "/usr/lib/neural-ice/appliance-variant";
 const DEFAULT_MIN_DELEGATION_SEQ_FILE: &str = "/usr/lib/neural-ice/ota-min-delegation-seq";
 
 pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
@@ -47,6 +48,29 @@ pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
         )));
     }
     Ok(target.to_string())
+}
+
+pub(crate) fn immutable_appliance_variant() -> Result<String, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let path = std::env::var_os("NI_OTA_APPLIANCE_VARIANT_FILE").map_or_else(
+        || PathBuf::from(DEFAULT_APPLIANCE_VARIANT_FILE),
+        PathBuf::from,
+    );
+    #[cfg(not(feature = "test-path-overrides"))]
+    let path = PathBuf::from(DEFAULT_APPLIANCE_VARIANT_FILE);
+    let variant = std::fs::read_to_string(&path).map_err(|error| {
+        InternalError(format!(
+            "unreadable immutable appliance variant {}: {error}",
+            path.display()
+        ))
+    })?;
+    match variant.trim() {
+        "debug" | "prod" => Ok(variant.trim().to_owned()),
+        _ => Err(InternalError(format!(
+            "invalid immutable appliance variant in {}",
+            path.display()
+        ))),
+    }
 }
 
 pub(crate) fn immutable_minimum_delegation_seq() -> Result<u64, InternalError> {

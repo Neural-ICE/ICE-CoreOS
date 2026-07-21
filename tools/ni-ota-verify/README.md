@@ -187,6 +187,13 @@ scoped to this immutable target and beta artifact. Tags remain
 non-authoritative; this command returns the signed resolved manifest digest and
 does not move a channel or persist state.
 
+The device must explicitly carry `device_channel=beta`; an absent or different
+channel is an authority refusal in every mode. The signed release variant must
+also equal immutable `/usr/lib/neural-ice/appliance-variant`, written from the
+validated `debug|prod` build argument. This prevents a signed debug release
+from entering a sealed production host. A missing or malformed immutable marker
+is broken image tooling (exit `2`), never a shadow-mode bypass.
+
 The device compatibility range is compared with the signed release range.
 Unknown or disjoint compatibility refuses when `enforce=1`; during an explicit
 shadow rollout (`enforce=0`) it emits a warning while all authority, signature,

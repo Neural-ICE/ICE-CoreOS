@@ -80,6 +80,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(dir.join("hardware-target"), "nvidia-gb10-arm64\n").unwrap();
+        fs::write(dir.join("appliance-variant"), "prod\n").unwrap();
         fs::write(dir.join("min-delegation-seq"), "1\n").unwrap();
         Fixture { dir }
     }
@@ -1897,6 +1898,10 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
             .env("NI_OTA_COSIGN", fx.path("cosign-stub.sh"))
             .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
             .env(
+                "NI_OTA_APPLIANCE_VARIANT_FILE",
+                fx.path("appliance-variant"),
+            )
+            .env(
                 "NI_OTA_MIN_DELEGATION_SEQ_FILE",
                 fx.path("min-delegation-seq"),
             )
@@ -1914,7 +1919,10 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
             .args(["--config".as_ref(), cfg.as_os_str()]);
         run(&mut command)
     };
-    let cfg = fx.write_config(1, "device_compat_min=5\ndevice_compat_max=5\n");
+    let cfg = fx.write_config(
+        1,
+        "device_channel=beta\ndevice_compat_min=5\ndevice_compat_max=5\n",
+    );
     let (code, verdict, stderr) = command(&cfg);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(verdict["ring"], "beta");
@@ -1928,14 +1936,37 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
         "sha256:9999999999999999999999999999999999999999999999999999999999999999"
     );
 
-    let incompatible = fx.write_config(1, "device_compat_min=6\ndevice_compat_max=6\n");
+    let incompatible = fx.write_config(
+        1,
+        "device_channel=beta\ndevice_compat_min=6\ndevice_compat_max=6\n",
+    );
     let (code, _, stderr) = command(&incompatible);
     assert_eq!(code, 1);
     assert!(stderr.contains("does not overlap device"), "{stderr}");
 
-    let shadow = fx.write_config(0, "device_compat_min=6\ndevice_compat_max=6\n");
+    let shadow = fx.write_config(
+        0,
+        "device_channel=beta\ndevice_compat_min=6\ndevice_compat_max=6\n",
+    );
     let (code, verdict, stderr) = command(&shadow);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(verdict["verdict"], "pass");
     assert!(stderr.contains("compatibility WARNING"), "{stderr}");
+
+    let stable = fx.write_config(
+        1,
+        "device_channel=stable\ndevice_compat_min=5\ndevice_compat_max=5\n",
+    );
+    let (code, _, stderr) = command(&stable);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("device_channel=beta"), "{stderr}");
+
+    let cfg = fx.write_config(
+        1,
+        "device_channel=beta\ndevice_compat_min=5\ndevice_compat_max=5\n",
+    );
+    fs::write(fx.path("appliance-variant"), "debug\n").unwrap();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("immutable host variant"), "{stderr}");
 }

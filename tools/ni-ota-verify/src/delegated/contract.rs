@@ -610,7 +610,7 @@ fn validate_public_key(key: &PublicKey) -> Result<(), ContractError> {
     Ok(())
 }
 
-pub(crate) fn public_key_pem(key: &PublicKey) -> Result<Vec<u8>, String> {
+pub(crate) fn public_key_pem(key: &PublicKey) -> Result<Vec<u8>, ContractError> {
     validate_public_key(key)?;
     let mut pem = b"-----BEGIN PUBLIC KEY-----\n".to_vec();
     for chunk in key.spki_der_base64.as_bytes().chunks(64) {
