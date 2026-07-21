@@ -11,7 +11,7 @@ if [[ $EUID -ne 0 ]]; then
   exec sudo --non-interactive --preserve-env=PATH bash "$0" "$@"
 fi
 
-for command in blockdev findmnt losetup lsblk mkfs.xfs mount python3 sgdisk truncate udevadm umount unshare; do
+for command in blockdev findmnt losetup lsblk mkfs.xfs mknod mount python3 sgdisk truncate udevadm umount unshare; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "missing integration-test command: $command" >&2
     exit 1
@@ -30,6 +30,7 @@ trap cleanup EXIT
 
 mkdir -p "$work/source/store/overlay" "$work/source/models/model-a" "$work/source/payload" "$mountpoint"
 printf 'layer' > "$work/source/store/overlay/layer"
+mknod "$work/source/store/overlay/.wh.removed" c 0 0
 printf 'weights' > "$work/source/models/model-a/weights"
 ln "$work/source/models/model-a/weights" "$work/source/models/model-a/weights-hardlink"
 ln -s weights "$work/source/models/model-a/current"

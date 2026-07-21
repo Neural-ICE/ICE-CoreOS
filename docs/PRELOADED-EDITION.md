@@ -26,8 +26,9 @@ expensive work happens **once on the build host, never on the target device**:
 4. After the writable build loop is detached, a Linux-only final-media gate reopens the exact raw
    with a read-only loop, selects the `ni-seed` child partition from that loop (never from a global
    label link), mounts XFS `ro,nosuid,nodev,noexec`, and recreates the complete namespace manifest.
-   The build refuses unless every file digest, directory, symlink, hard-link relation, owner, mode
-   and xattr matches the approved source manifest and the raw SHA-256 is unchanged before/after.
+   The build refuses unless every file digest, directory, symlink, hard-link relation, OCI overlay
+   whiteout (`c 0:0` only), owner, mode and xattr matches the approved source manifest and the raw
+   SHA-256 is unchanged before/after. Other device nodes, FIFOs and sockets are rejected.
    A `*.img.final-media.json` receipt binds the accepted raw digest, size, seed manifest and
    `PARTUUID`; the raw is hashed again after compression to close the gate-to-artifact interval.
 5. **`ota/neural-ice-autoinstall.sh`** (seed step, only when `/dev/disk/by-partlabel/ni-seed`
