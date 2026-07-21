@@ -1911,6 +1911,12 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
                 "--snapshot-sig".as_ref(),
                 fx.path("snapshot.sig").as_os_str(),
             ])
+            .args(["--accepted-snapshot".as_ref(), snapshot.as_os_str()])
+            .args(["--accepted-delegation-seq", "1"])
+            .args([
+                "--accepted-delegation-sha256",
+                "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+            ])
             .args(["--release".as_ref(), release.as_os_str()])
             .args(["--release-sig".as_ref(), fx.path("release.sig").as_os_str()])
             .args(["--receipt".as_ref(), receipt.as_os_str()])

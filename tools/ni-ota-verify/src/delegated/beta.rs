@@ -146,6 +146,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         flags: &flags,
         snapshot_file: &snapshot_file,
         scratch: &scratch,
+        allow_unseeded_bootstrap: false,
     };
     let target = immutable_hardware_target()?;
     let variant = immutable_appliance_variant()?;
