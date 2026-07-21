@@ -192,11 +192,62 @@ class SeedTreeManifestTests(unittest.TestCase):
                 )
         self.assertFalse(output.exists())
 
+    def test_earlier_file_mutation_during_later_hash_is_refused(self) -> None:
+        first = self.source / "models" / "model-a" / "weights"
+        later = self.source / "models" / "model-a" / "weights-hardlink"
+        later.unlink()
+        later.write_bytes(b"later")
+        original_digest = MANIFEST_MODULE.file_digest
+
+        def mutate_earlier(path: Path, metadata: os.stat_result) -> str:
+            if path == later:
+                first.write_bytes(b"changed after its initial validation")
+            return original_digest(path, metadata)
+
+        output = self.root / "retained-mutation.json"
+        with mock.patch.object(
+            MANIFEST_MODULE,
+            "file_digest",
+            side_effect=mutate_earlier,
+        ):
+            with self.assertRaisesRegex(MANIFEST_MODULE.ManifestError, "changed while walking"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+
     def test_output_inside_input_tree_is_refused_before_walk(self) -> None:
         output = self.source / "models" / "manifest.json"
         result = self.generate(self.source, output)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("output path is inside input tree", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_output_parent_identity_detects_an_aliased_tree_directory(self) -> None:
+        models = self.source / "models"
+        alias = self.root / "models-alias"
+        alias.symlink_to(models, target_is_directory=True)
+        metadata = models.lstat()
+        self.assertTrue(
+            MANIFEST_MODULE.output_parent_is_manifested_directory(
+                alias / "manifest.json",
+                [(models, metadata, "directory")],
+            )
+        )
+
+    def test_failed_manifest_write_removes_partial_output(self) -> None:
+        output = self.root / "partial.json"
+        with mock.patch.object(
+            MANIFEST_MODULE.os,
+            "write",
+            side_effect=OSError("simulated full filesystem"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated full filesystem"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
         self.assertFalse(output.exists())
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
@@ -220,6 +271,27 @@ class SeedTreeManifestTests(unittest.TestCase):
         self.assertTrue(MANIFEST_MODULE.is_overlay_whiteout(whiteout))
         self.assertFalse(MANIFEST_MODULE.is_overlay_whiteout(host_device))
         self.assertFalse(MANIFEST_MODULE.is_overlay_whiteout(regular))
+        self.assertTrue(
+            MANIFEST_MODULE.is_allowed_overlay_whiteout(
+                "store",
+                MANIFEST_MODULE.PurePosixPath("overlay/layer/diff/.wh.deleted"),
+                whiteout,
+            )
+        )
+        self.assertFalse(
+            MANIFEST_MODULE.is_allowed_overlay_whiteout(
+                "models",
+                MANIFEST_MODULE.PurePosixPath("overlay/.wh.hostile"),
+                whiteout,
+            )
+        )
+        self.assertFalse(
+            MANIFEST_MODULE.is_allowed_overlay_whiteout(
+                "store",
+                MANIFEST_MODULE.PurePosixPath("overlay-images/.wh.hostile"),
+                whiteout,
+            )
+        )
 
 
 if __name__ == "__main__":

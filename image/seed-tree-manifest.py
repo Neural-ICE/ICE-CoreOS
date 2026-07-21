@@ -136,6 +136,19 @@ def is_overlay_whiteout(metadata: os.stat_result) -> bool:
     )
 
 
+def is_allowed_overlay_whiteout(
+    name: str,
+    relative: PurePosixPath | None,
+    metadata: os.stat_result,
+) -> bool:
+    return (
+        name == "store"
+        and relative is not None
+        and relative.parts[:1] == ("overlay",)
+        and is_overlay_whiteout(metadata)
+    )
+
+
 def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
     try:
         after = path.lstat()
@@ -149,6 +162,7 @@ def walk_tree(
     name: str,
     root: Path,
     hardlink_candidates: dict[tuple[int, int], list[str]],
+    retained_identities: list[tuple[Path, os.stat_result, str]],
 ) -> list[dict[str, Any]]:
     try:
         root_metadata = root.lstat()
@@ -166,6 +180,7 @@ def walk_tree(
         if operation == "revalidate-directory":
             assert before is not None
             revalidate(path, before, "directory")
+            retained_identities.append((path, before, "directory"))
             continue
 
         try:
@@ -205,6 +220,7 @@ def walk_tree(
             )
             entries.append(item)
             revalidate(path, metadata, "regular file")
+            retained_identities.append((path, metadata, "regular file"))
             hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
                 manifest_path
             )
@@ -224,6 +240,7 @@ def walk_tree(
             )
             entries.append(item)
             revalidate(path, metadata, "symlink")
+            retained_identities.append((path, metadata, "symlink"))
             hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
                 manifest_path
             )
@@ -234,7 +251,7 @@ def walk_tree(
         # They are required for a faithful offline image store. No other device
         # node is accepted in a preload tree.
         if stat.S_ISCHR(metadata.st_mode):
-            if not is_overlay_whiteout(metadata):
+            if not is_allowed_overlay_whiteout(name, relative, metadata):
                 raise ManifestError(f"unsupported character device at {path}")
             item.update(
                 {
@@ -245,6 +262,7 @@ def walk_tree(
             )
             entries.append(item)
             revalidate(path, metadata, "overlay whiteout")
+            retained_identities.append((path, metadata, "overlay whiteout"))
             hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
                 manifest_path
             )
@@ -264,6 +282,42 @@ def output_is_within_tree(output: Path, root: Path) -> bool:
     return True
 
 
+def output_parent_is_manifested_directory(
+    output: Path,
+    retained_identities: list[tuple[Path, os.stat_result, str]],
+) -> bool:
+    try:
+        parent = output.parent.resolve(strict=True)
+        metadata = parent.lstat()
+    except OSError as error:
+        raise ManifestError(f"cannot stat output directory for {output}: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ManifestError(f"output parent is not a directory: {parent}")
+    parent_identity = (metadata.st_dev, metadata.st_ino)
+    return any(
+        kind == "directory" and (before.st_dev, before.st_ino) == parent_identity
+        for _, before, kind in retained_identities
+    )
+
+
+def revalidate_retained(
+    retained_identities: list[tuple[Path, os.stat_result, str]],
+) -> None:
+    for path, before, kind in retained_identities:
+        revalidate(path, before, kind)
+
+
+def remove_failed_output(output: Path, original_error: BaseException) -> None:
+    try:
+        output.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as cleanup_error:
+        raise ManifestError(
+            f"cannot remove failed manifest {output}: {cleanup_error}"
+        ) from original_error
+
+
 def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
     names = [name for name, _ in trees]
     if not trees or len(names) != len(set(names)):
@@ -274,8 +328,13 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
 
     entries: list[dict[str, Any]] = []
     hardlink_candidates: dict[tuple[int, int], list[str]] = {}
+    retained_identities: list[tuple[Path, os.stat_result, str]] = []
     for name, root in sorted(trees):
-        entries.extend(walk_tree(name, root, hardlink_candidates))
+        entries.extend(
+            walk_tree(name, root, hardlink_candidates, retained_identities)
+        )
+    if output_parent_is_manifested_directory(output, retained_identities):
+        raise ManifestError(f"output path is inside input tree: {output}")
     # A depth-first walk is deterministic but not globally lexicographic.  For
     # example, "tree/bucket-archive" sorts before "tree/bucket/child" even
     # though DFS visits the child before returning to the sibling.  Canonical
@@ -300,6 +359,7 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
         "trees": sorted(names),
     }
     encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    revalidate_retained(retained_identities)
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(output, flags, 0o600)
@@ -311,8 +371,19 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
                 raise ManifestError(f"short write while creating manifest: {output}")
             view = view[written:]
         os.fsync(descriptor)
-    finally:
+        revalidate_retained(retained_identities)
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        remove_failed_output(output, error)
+        raise
+    try:
         os.close(descriptor)
+    except BaseException as error:
+        remove_failed_output(output, error)
+        raise
 
 
 def main() -> int:
