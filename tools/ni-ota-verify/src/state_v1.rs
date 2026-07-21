@@ -13,7 +13,8 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::delegated::contract::{
-    canonical_hash, parse_canonical, safe_uint, sha256, timestamp, ContractError,
+    canonical_hash, parse_canonical, safe_nonnegative_uint, safe_uint, sha256, timestamp,
+    ContractError,
 };
 use crate::runner;
 use crate::state::{
@@ -690,7 +691,7 @@ fn verify_generation(dir: &Path, value: &StateManifest) -> Result<TrustedTimeSta
         || trusted.trusted_time != value.trusted_time_floor
         || !safe_uint(trusted.assertion_seq)
         || !safe_uint(trusted.delegation_seq)
-        || !safe_uint(trusted.tpm_clock)
+        || !safe_nonnegative_uint(trusted.tpm_clock)
         || !sha256(&trusted.assertion_sha256)
         || !sha256(&trusted.signature_sha256)
         || !sha256(&trusted.challenge_sha256)
@@ -1600,6 +1601,12 @@ mod tests {
 
     #[test]
     fn parses_only_safe_tpm_clock() {
+        assert_eq!(
+            parse_clock("clock: 0\nreset_count: 0\nrestart_count: 0\nsafe: yes\n")
+                .unwrap()
+                .clock,
+            0
+        );
         let value =
             parse_clock("clock: 42\nreset_count: 3\nrestart_count: 4\nsafe: yes\n").unwrap();
         assert_eq!(

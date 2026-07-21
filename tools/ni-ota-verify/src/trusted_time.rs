@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::delegated::contract::{
-    canonical_hash, ident, parse_canonical, public_key_pem, safe_uint, sha256, signature_profile,
-    timestamp, ContractError, Snapshot,
+    canonical_hash, ident, parse_canonical, public_key_pem, safe_nonnegative_uint, safe_uint,
+    sha256, signature_profile, timestamp, ContractError, Snapshot,
 };
 use crate::delegated::{verify_signature, AuthenticatedSnapshot};
 use crate::licensing_bootstrap::VerifiedBootstrap;
@@ -168,8 +168,8 @@ fn validate(
         || value.signing_role != "trusted-time"
         || !signature_profile(&value.signature_algorithm, &value.signature_encoding)
         || !safe_uint(value.assertion_seq)
-        || !safe_uint(value.tpm_clock)
-        || !safe_uint(expected.consumption_tpm_clock)
+        || !safe_nonnegative_uint(value.tpm_clock)
+        || !safe_nonnegative_uint(expected.consumption_tpm_clock)
         || !ident(&value.issuance_id)
         || !ident(&value.key_id)
         || !is_lower_hex_32(&value.nonce)
@@ -392,6 +392,8 @@ mod tests {
         let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
         let mut value = assertion();
         let snapshot_sha256 = canonical_hash(SNAPSHOT).unwrap();
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &expected(&value)).is_ok());
+        value.tpm_clock = 0;
         assert!(validate(&value, &snapshot, &snapshot_sha256, &expected(&value)).is_ok());
 
         for field in [

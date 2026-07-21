@@ -869,7 +869,10 @@ fn distinct_lineage(predecessor: &Option<String>, successor: &Option<String>) ->
     predecessor.is_none() || successor.is_none() || predecessor != successor
 }
 pub(crate) fn safe_uint(value: u64) -> bool {
-    (1..=9_007_199_254_740_991).contains(&value)
+    value != 0 && safe_nonnegative_uint(value)
+}
+pub(crate) fn safe_nonnegative_uint(value: u64) -> bool {
+    value <= 9_007_199_254_740_991
 }
 pub(crate) fn timestamp(v: &str) -> bool {
     let b = v.as_bytes();

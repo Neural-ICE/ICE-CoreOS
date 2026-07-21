@@ -9,9 +9,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::delegated::contract::{
-    canonical_hash, ident, parse_canonical, public_key_pem, safe_uint, sha256, signature_profile,
-    target, timestamp, validate_der_signature, validate_snapshot, ContractError, PublicKey,
-    Snapshot,
+    canonical_hash, ident, parse_canonical, public_key_pem, safe_nonnegative_uint, safe_uint,
+    sha256, signature_profile, target, timestamp, validate_der_signature, validate_snapshot,
+    ContractError, PublicKey, Snapshot,
 };
 use crate::delegated::verify_signature;
 use crate::state::FileStateStore;
@@ -237,6 +237,8 @@ fn validate_bootstrap(
         || !valid_device_root(&value.device_root)
         || !valid_baseline(&value.baseline)
         || !safe_uint(value.bootstrap_seq)
+        || !safe_nonnegative_uint(value.tpm_clock)
+        || !safe_nonnegative_uint(expected.current_tpm.tpm_clock)
         || !timestamp(&value.issued_at)
         || !timestamp(&value.valid_until)
         || value.issued_at >= value.valid_until
@@ -413,7 +415,7 @@ fn valid_release_authorizations(value: &AuthoritativeState) -> bool {
         previous = &authorization.ring;
         highest = highest.max(authorization.bundle_seq);
     }
-    highest == value.bundle_seq
+    highest <= value.bundle_seq
 }
 
 fn optional_hash_for_sequence(sequence: u64, value: &Option<String>) -> bool {
@@ -651,6 +653,8 @@ fn validate_root_recovery(
         || value.device_serial != expected.device_serial
         || value.recovery_nonce != expected.pending.nonce
         || !is_nonce(&value.recovery_nonce)
+        || !safe_nonnegative_uint(value.tpm_clock)
+        || !safe_nonnegative_uint(expected.current_tpm.tpm_clock)
         || value.tpm_clock != expected.pending.tpm_clock
         || value.tpm_reset_count != expected.pending.tpm_reset_count
         || value.tpm_restart_count != expected.pending.tpm_restart_count
@@ -820,6 +824,8 @@ where
         || value.root_recovery_sha256 != authority.root_recovery_sha256
         || value.resulting_state != *expected.resulting_state
         || value.resulting_state != authority.resulting_state
+        || !safe_nonnegative_uint(value.tpm_clock)
+        || !safe_nonnegative_uint(expected.current_tpm.tpm_clock)
         || value.tpm_clock != expected.pending.tpm_clock
         || value.tpm_clock != authority.tpm_clock
         || value.tpm_reset_count != expected.pending.tpm_reset_count

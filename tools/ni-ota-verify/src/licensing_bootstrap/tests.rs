@@ -225,6 +225,18 @@ fn initial_authorization_binds_every_local_input_and_terminal_nul_domain() {
     .unwrap();
     assert_eq!(verified.bootstrap_seq, 1);
     assert_eq!(verified.reason, "initial_activation");
+
+    let mut zero_clock = value.clone();
+    zero_clock.tpm_clock = 0;
+    assert!(verify_bootstrap_with(
+        &snapshot,
+        &snapshot_bytes(&snapshot),
+        &canonical(&zero_clock),
+        DER,
+        &expected(&zero_clock),
+        accept_expected_domain,
+    )
+    .is_ok());
 }
 
 #[test]
@@ -383,7 +395,7 @@ fn recovery_floors_and_release_high_water_are_closed_and_baseline_bounded() {
     for case in [
         "zero-floor",
         "below-baseline",
-        "release-gap",
+        "release-above-floor",
         "release-order",
     ] {
         let mut hostile = value.clone();
@@ -394,7 +406,7 @@ fn recovery_floors_and_release_high_water_are_closed_and_baseline_bounded() {
                 state.baseline.minimum_bundle_seq = 10;
                 state.bundle_seq = 9;
             }
-            "release-gap" => state.release_authorizations[0].bundle_seq = 8,
+            "release-above-floor" => state.release_authorizations[0].bundle_seq = 10,
             "release-order" => {
                 state.release_authorizations = vec![
                     ReleaseAuthorizationHighWater {
@@ -424,6 +436,22 @@ fn recovery_floors_and_release_high_water_are_closed_and_baseline_bounded() {
             "{case}"
         );
     }
+
+    let mut advanced_floor = value.clone();
+    advanced_floor
+        .authoritative_state
+        .as_mut()
+        .unwrap()
+        .bundle_seq = 10;
+    assert!(verify_bootstrap_with(
+        &snapshot,
+        &snapshot_bytes(&snapshot),
+        &canonical(&advanced_floor),
+        DER,
+        &expected(&advanced_floor),
+        accept_expected_domain,
+    )
+    .is_ok());
 }
 
 #[test]
