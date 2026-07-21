@@ -82,8 +82,6 @@ const USAGE: &str = "usage:
                        --bundle-digest <sha256:...>
                        --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
                        --trusted-now <UTC-seconds>
-                       [--accepted-snapshot <path>]
-                       [--accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>]
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify capabilities
   ni-ota-verify --version";
