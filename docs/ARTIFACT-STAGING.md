@@ -109,16 +109,26 @@ OCI labels. After LAB finalization, request the default-branch CI producer rathe
 image manually:
 
 ```sh
+# Simple Owner-operated LAB path: input-free, forced debug, main only.
+gh workflow run build-image.yml --ref main
+
+# Automation path: explicit variant, default branch selected by GitHub.
 gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
   -f event_type=build-coreos \
   -F 'client_payload[variant]=debug'
 ```
 
-There is no push/merge trigger and no implicit variant. A production dispatch remains unavailable
-until both the reviewed production policy executable and a generation finalized by that exact policy
-exist. A successful dispatch publishes one immutable GHCR source artifact only. Central mirroring
-and signed release-train promotion remain ICE-Fabric responsibilities; this dispatch never moves a
-product channel.
+There is no push/merge trigger. The UI dispatch is deliberately input-free, forces `debug`, rejects
+any ref other than `main`, keeps the image keyless and publishes one run-unique immutable GHCR tag.
+The repository-dispatch automation path retains its explicit variant. A production dispatch remains
+unavailable until both the reviewed production policy executable and a generation finalized by that
+exact policy exist. Central mirroring and signed release-train promotion remain ICE-Fabric
+responsibilities; neither dispatch moves a product channel or writes the sovereign registry.
+
+**Rollback / abort:** because the manual build moves no pointer, rejecting it requires no registry or
+device rollback. Do not feed its digest into an ICE-Fabric train; retain the immutable artifact and
+its finalized generation for audit. If a later signed beta train has already consumed the digest,
+use the train's forward-only rollback procedure instead—never retag or delete a fielded digest.
 
 To roll the CI staging pointer back, reactivate a retained generation; it is fully revalidated before
 the atomic switch:

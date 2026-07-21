@@ -4,6 +4,10 @@ name: build-image
 # ICE-Fabric alone mirrors its approved digest to the sovereign registry, and
 # only a signed release train moves beta/stable product pointers.
 on:
+  # Owner-operated LAB path. It is deliberately input-free: a manual run is
+  # always a keyless debug build from main and still publishes only the
+  # run-unique immutable GHCR tag produced below.
+  workflow_dispatch:
   # repository_dispatch executes the workflow from the default branch. Requiring
   # an explicit variant prevents a merge from silently producing a prod artifact
   # from a LAB-finalized runner-local generation.
@@ -22,22 +26,32 @@ permissions:
 
 jobs:
   build:
+    # Reject an accidental workflow_dispatch branch selection before a
+    # self-hosted runner or package-write token is allocated. The step-level
+    # check below remains as defense in depth.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, ARM64, spark]
     timeout-minutes: 120
     env:
       REGISTRY: ghcr.io/neural-ice
       IMAGE: neural-ice-coreos
-      VARIANT: ${{ github.event.client_payload.variant }}
+      VARIANT: ${{ github.event_name == 'workflow_dispatch' && 'debug' || github.event.client_payload.variant }}
       BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
       SOURCE_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Validate the explicit build request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUEST_REF: ${{ github.ref }}
         run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUEST_REF" != refs/heads/main ]; then
+            echo "::error::manual debug builds must run from refs/heads/main"; exit 2
+          fi
           case "$VARIANT" in
             debug|prod) ;;
-            *) echo "::error::client_payload.variant must be exactly debug or prod"; exit 2 ;;
+            *) echo "::error::the requested variant must be exactly debug or prod"; exit 2 ;;
           esac
 
       - name: Materialize verified GB10 artifact generation
