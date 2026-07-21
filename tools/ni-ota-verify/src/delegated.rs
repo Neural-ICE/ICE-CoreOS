@@ -1,8 +1,9 @@
 //! ADR-0039 delegation-snapshot command and secure Cosign transport.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use crate::config::{immutable_minimum_delegation_seq, Config};
@@ -19,6 +20,10 @@ use contract::{
 
 const SNAPSHOT_DOMAIN: &[u8] = b"neural-ice:ota:delegation-snapshot:v1\0";
 const MAX_ARTIFACT: usize = 128 * 1024;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0x800;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x4;
 
 pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let flags = parse_flags(
@@ -48,16 +53,22 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let scratch = FileStateStore {
         path: state_dir.join("applied.json"),
     };
-    let snapshot = freeze(
+    let snapshot = match freeze_authority(
         &scratch,
         Path::new(required("snapshot")?),
         "delegation-snapshot",
-    )?;
-    let signature = freeze(
+    )? {
+        Ok(file) => file,
+        Err(reason) => return refusal(reason),
+    };
+    let signature = match freeze_authority(
         &scratch,
         Path::new(required("snapshot-sig")?),
         "delegation-signature",
-    )?;
+    )? {
+        Ok(file) => file,
+        Err(reason) => return refusal(reason),
+    };
     let Some(root) = config.root_pubkey.as_deref() else {
         return refusal("no root_pubkey configured in ota.conf".into());
     };
@@ -134,8 +145,10 @@ fn validate_candidate(
             if !safe_uint(sequence) || !sha256(state_hash) {
                 return Err("accepted delegation authority is invalid".into());
             }
-            let previous = freeze(context.scratch, Path::new(previous), "accepted-snapshot")
-                .map_err(ContractError::Internal)?;
+            let previous =
+                freeze_authority(context.scratch, Path::new(previous), "accepted-snapshot")
+                    .map_err(ContractError::Internal)?
+                    .map_err(ContractError::Refusal)?;
             let previous_bytes = previous.read().map_err(ContractError::Internal)?;
             let old: Snapshot = parse_canonical(&previous_bytes, "accepted snapshot")
                 .map_err(ContractError::Refusal)?;
@@ -162,7 +175,10 @@ fn freeze(
     source: &Path,
     label: &str,
 ) -> Result<SecureTempFile, InternalError> {
-    let file = std::fs::File::open(source)
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(source)
         .map_err(|e| InternalError(format!("cannot open {}: {e}", source.display())))?;
     let opened = file
         .metadata()
@@ -186,6 +202,77 @@ fn freeze(
         return Err(InternalError(format!("{label} size is invalid")));
     }
     store.secure_temp_bytes(label, &bytes)
+}
+
+fn freeze_authority(
+    store: &FileStateStore,
+    source: &Path,
+    label: &str,
+) -> Result<Result<SecureTempFile, String>, InternalError> {
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.len() > 0
+                && metadata.len() <= MAX_ARTIFACT as u64 => {}
+        Ok(_) => {
+            return Ok(Err(format!(
+                "{label} must be a non-empty regular non-symlink file no larger than {MAX_ARTIFACT} bytes"
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Err(format!("{label} is missing")))
+        }
+        Err(error) => {
+            return Err(InternalError(format!(
+                "cannot inspect authority artifact {}: {error}",
+                source.display()
+            )))
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(source)
+        .map_err(|error| {
+            InternalError(format!(
+                "cannot open authority artifact {}: {error}",
+                source.display()
+            ))
+        })?;
+    let opened = file.metadata().map_err(|error| {
+        InternalError(format!(
+            "cannot inspect opened authority artifact {}: {error}",
+            source.display()
+        ))
+    })?;
+    let named = std::fs::symlink_metadata(source).map_err(|error| {
+        InternalError(format!(
+            "cannot re-inspect authority artifact {}: {error}",
+            source.display()
+        ))
+    })?;
+    if !opened.file_type().is_file()
+        || !named.file_type().is_file()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Ok(Err(format!(
+            "{label} source must remain a stable regular non-symlink file"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_ARTIFACT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            InternalError(format!(
+                "cannot read authority artifact {}: {error}",
+                source.display()
+            ))
+        })?;
+    if bytes.is_empty() || bytes.len() > MAX_ARTIFACT {
+        return Ok(Err(format!("{label} size is invalid")));
+    }
+    store.secure_temp_bytes(label, &bytes).map(Ok)
 }
 
 fn freeze_root(
@@ -245,4 +332,43 @@ fn verify_signature(
 fn refusal(reason: String) -> Result<u8, InternalError> {
     eprintln!("ni-ota-verify: delegation snapshot REFUSED: {reason}");
     Ok(EXIT_REFUSE)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn authority_freeze_refuses_fifo_and_oversize_before_opening() {
+        let root =
+            std::env::temp_dir().join(format!("ni-ota-authority-freeze-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = FileStateStore {
+            path: root.join("applied.json"),
+        };
+
+        let fifo = root.join("authority.fifo");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(freeze_authority(&store, &fifo, "authority")
+            .unwrap()
+            .is_err());
+
+        let oversize = root.join("authority.oversize");
+        fs::write(&oversize, vec![0_u8; MAX_ARTIFACT + 1]).unwrap();
+        assert!(freeze_authority(&store, &oversize, "authority")
+            .unwrap()
+            .is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
