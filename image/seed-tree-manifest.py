@@ -5,11 +5,11 @@ The manifest deliberately excludes timestamps and inode numbers, which change
 when a seed is copied to XFS. It includes every namespace entry, file digest,
 mode, owner, symlink target, hard-link relationship and extended attribute.
 
-This is an unprivileged serialization primitive. Its caller must supply stable
-input trees (normally immutable build outputs or read-only snapshots). The
-output directory must be caller-owned and exclusive for the invocation. The
-final-media gate owns mount isolation, topology, workspace exclusivity and
-capacity enforcement.
+Its caller must supply stable input trees (normally immutable build outputs or
+read-only snapshots) and a caller-owned exclusive output directory. On Linux,
+the authoritative CLI requires host root with CAP_SYS_ADMIN so trusted.*
+attributes cannot be silently hidden. The final-media gate owns mount
+isolation, topology, workspace exclusivity and capacity enforcement.
 Identity rechecks detect some accidental changes but are defense in depth, not
 a substitute for that caller-provided stable snapshot.
 """
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -32,10 +33,62 @@ from typing import Any
 
 
 MAX_PREFLIGHT_DIRECTORIES = 1_000_000
+CAP_SYS_ADMIN = 21
+BTRFS_SUPER_MAGIC = 0x9123683E
 
 
 class ManifestError(RuntimeError):
     pass
+
+
+def linux_effective_capabilities() -> int:
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines():
+            name, separator, value = line.partition(":")
+            if separator and name == "CapEff":
+                return int(value.strip(), 16)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ManifestError(f"cannot determine Linux effective capabilities: {error}") from error
+    raise ManifestError("cannot determine Linux effective capabilities: CapEff is absent")
+
+
+def require_complete_xattr_visibility() -> None:
+    if sys.platform != "linux":
+        return
+    if os.geteuid() != 0:
+        raise ManifestError(
+            "authoritative Linux manifests require host root for complete xattr visibility"
+        )
+    capabilities = linux_effective_capabilities()
+    if not capabilities & (1 << CAP_SYS_ADMIN):
+        raise ManifestError(
+            "authoritative Linux manifests require CAP_SYS_ADMIN for complete xattr visibility"
+        )
+
+
+def linux_filesystem_magic(descriptor: int) -> int:
+    # fstatfs(2) starts with a native long f_type on every supported Linux ABI.
+    import ctypes
+
+    buffer = ctypes.create_string_buffer(256)
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.fstatfs(descriptor, ctypes.byref(buffer))
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise ManifestError(
+            f"cannot identify input filesystem: {os.strerror(error_number)}"
+        )
+    return ctypes.c_ulong.from_buffer(buffer).value
+
+
+def reject_ambiguous_inode_namespace(descriptor: int, location: str) -> None:
+    if sys.platform != "linux":
+        return
+    if linux_filesystem_magic(descriptor) == BTRFS_SUPER_MAGIC:
+        raise ManifestError(
+            "Btrfs input is unsupported because subvolumes can reuse inode identities: "
+            f"{location}"
+        )
 
 
 def parse_tree(value: str) -> tuple[str, Path]:
@@ -360,6 +413,7 @@ def linux_descriptor_path(descriptor: int, name: str | None = None) -> Path | st
 def walk_tree_by_descriptor(name: str, root: Path, spool: sqlite3.Connection):
     root_descriptor = open_tree_directory(root, None)
     try:
+        reject_ambiguous_inode_namespace(root_descriptor, os.fspath(root))
         root_metadata = os.fstat(root_descriptor)
     finally:
         os.close(root_descriptor)
@@ -476,10 +530,18 @@ def open_preflight_queue(parent_descriptor: int):
         try:
             descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
         except OSError as error:
-            raise ManifestError(
-                f"cannot create anonymous directory preflight storage: {error}"
-            ) from error
-        return os.fdopen(descriptor, "w+b", buffering=0)
+            if error.errno not in {
+                errno.EINVAL,
+                errno.EISDIR,
+                errno.ENOENT,
+                errno.EOPNOTSUPP,
+                errno.EPERM,
+            }:
+                raise ManifestError(
+                    f"cannot create anonymous directory preflight storage: {error}"
+                ) from error
+        else:
+            return os.fdopen(descriptor, "w+b", buffering=0)
 
     temporary_name = f".seed-manifest-preflight-{os.urandom(16).hex()}"
     flags = (
@@ -540,6 +602,10 @@ def output_parent_aliases_input(
                 raise ManifestError("directory preflight queue has an invalid tree") from error
             descriptor = open_tree_directory(root, relative)
             try:
+                reject_ambiguous_inode_namespace(
+                    descriptor,
+                    stable_path(trees[tree_index][0], relative),
+                )
                 metadata = os.fstat(descriptor)
                 directory_identity = (metadata.st_dev, metadata.st_ino)
                 if directory_identity == target_identity:
@@ -1056,6 +1122,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     arguments = parser.parse_args()
     try:
+        require_complete_xattr_visibility()
         write_manifest(
             arguments.tree,
             arguments.output,

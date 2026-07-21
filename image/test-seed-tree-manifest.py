@@ -192,7 +192,7 @@ class SeedTreeManifestTests(unittest.TestCase):
             # the platform utility before TemporaryDirectory tears down.
             subprocess.run(("rm", "-rf", str(deep_root)), check=True)
 
-    def test_cli_accepts_a_stable_unprivileged_input_tree(self) -> None:
+    def test_cli_requires_complete_xattr_visibility_on_linux(self) -> None:
         output = self.root / "unprivileged.json"
         result = subprocess.run(
             (
@@ -208,8 +208,15 @@ class SeedTreeManifestTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=False,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(output.is_file())
+        try:
+            MANIFEST_MODULE.require_complete_xattr_visibility()
+        except MANIFEST_MODULE.ManifestError:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("complete xattr visibility", result.stderr)
+            self.assertFalse(output.exists())
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(output.is_file())
 
     def test_output_inside_input_tree_is_refused_before_walk(self) -> None:
         output = self.source / "models" / "manifest.json"
@@ -403,6 +410,10 @@ class SeedTreeManifestTests(unittest.TestCase):
         with (
             mock.patch.object(
                 MANIFEST_MODULE,
+                "require_complete_xattr_visibility",
+            ),
+            mock.patch.object(
+                MANIFEST_MODULE,
                 "write_manifest",
                 side_effect=MANIFEST_MODULE.sqlite3.OperationalError("simulated sqlite failure"),
             ),
@@ -503,6 +514,89 @@ class SeedTreeManifestTests(unittest.TestCase):
         finally:
             os.close(parent_descriptor)
         self.assertEqual(list(self.root.glob(".seed-manifest-preflight-*")), [])
+
+    @unittest.skipUnless(sys.platform == "linux", "O_TMPFILE is Linux-specific")
+    def test_preflight_queue_falls_back_when_otmpfile_is_unsupported(self) -> None:
+        parent_descriptor = os.open(self.root, os.O_RDONLY)
+        original_open = os.open
+
+        def reject_otmpfile(path, flags, *args, **kwargs):
+            if flags & getattr(os, "O_TMPFILE", 0):
+                raise OSError(MANIFEST_MODULE.errno.EOPNOTSUPP, "unsupported")
+            return original_open(path, flags, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                MANIFEST_MODULE.os,
+                "open",
+                side_effect=reject_otmpfile,
+            ):
+                with MANIFEST_MODULE.open_preflight_queue(parent_descriptor) as queue:
+                    queue.write(b"fallback")
+                    queue.seek(0)
+                    self.assertEqual(queue.read(), b"fallback")
+        finally:
+            os.close(parent_descriptor)
+        self.assertEqual(list(self.root.glob(".seed-manifest-preflight-*")), [])
+
+    def test_btrfs_inode_namespace_is_refused(self) -> None:
+        parent_descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(MANIFEST_MODULE.sys, "platform", "linux"),
+                mock.patch.object(
+                    MANIFEST_MODULE,
+                    "linux_filesystem_magic",
+                    return_value=MANIFEST_MODULE.BTRFS_SUPER_MAGIC,
+                ),
+                self.assertRaisesRegex(
+                    MANIFEST_MODULE.ManifestError,
+                    "Btrfs input is unsupported",
+                ),
+            ):
+                MANIFEST_MODULE.reject_ambiguous_inode_namespace(
+                    parent_descriptor,
+                    "models",
+                )
+        finally:
+            os.close(parent_descriptor)
+
+    def test_linux_authoritative_cli_requires_root_and_cap_sys_admin(self) -> None:
+        with (
+            mock.patch.object(MANIFEST_MODULE.sys, "platform", "linux"),
+            mock.patch.object(MANIFEST_MODULE.os, "geteuid", return_value=1000),
+            self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "require host root",
+            ),
+        ):
+            MANIFEST_MODULE.require_complete_xattr_visibility()
+
+        with (
+            mock.patch.object(MANIFEST_MODULE.sys, "platform", "linux"),
+            mock.patch.object(MANIFEST_MODULE.os, "geteuid", return_value=0),
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "linux_effective_capabilities",
+                return_value=0,
+            ),
+            self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "require CAP_SYS_ADMIN",
+            ),
+        ):
+            MANIFEST_MODULE.require_complete_xattr_visibility()
+
+        with (
+            mock.patch.object(MANIFEST_MODULE.sys, "platform", "linux"),
+            mock.patch.object(MANIFEST_MODULE.os, "geteuid", return_value=0),
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "linux_effective_capabilities",
+                return_value=1 << MANIFEST_MODULE.CAP_SYS_ADMIN,
+            ),
+        ):
+            MANIFEST_MODULE.require_complete_xattr_visibility()
 
     def test_maximum_length_output_basename_is_supported(self) -> None:
         output = self.root / ("m" * 255)
