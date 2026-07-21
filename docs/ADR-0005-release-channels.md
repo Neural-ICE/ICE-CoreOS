@@ -21,6 +21,11 @@
 > unavailable until its reviewed policy exists. The resulting OCI image records the policy ID/hash;
 > this producer still moves no release channel or product alias.
 
+> **LAB operator path (Owner GO, 2026-07-21):** `workflow_dispatch` is also available as an
+> input-free convenience path. It is forced to the `debug` variant, refuses any selected ref other
+> than `main`, remains keyless, and publishes the same single immutable GHCR tag. It neither mirrors
+> to the sovereign registry nor moves `beta`, `stable`, `*-debug` or any product alias.
+
 > **Ring set superseded (2026-07-11)**: the three-ring `alpha|beta|prod` set decided below
 > is reduced to **two rings: `beta|stable`**, unified with the appliance-bundle channels —
 > see ICE-Fabric. `beta` = validation ring (every push to `main`, runs on the
