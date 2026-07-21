@@ -478,13 +478,8 @@ fn authorized_key<'a>(
                 && key.artifact_types.iter().any(|value| value == artifact)
                 && key.rings.iter().any(|value| value == "beta")
                 && key.hardware_targets.iter().any(|value| value == target)
-                // `retiring` is never broad-key-valid by itself.  Its bounded
-                // rotation interval is authority at issuance, while `now`
-                // still checks that the snapshot itself has not selected a
-                // key outside its wider declared lifetime.
                 && key.authorizes_at(issued_at)
-                && key.valid_from.as_str() <= now
-                && now < key.valid_until.as_str()
+                && key.authorizes_at(now)
         })
         .collect();
     if matches.len() != 1 {
@@ -589,6 +584,36 @@ mod tests {
             &snapshot_hash,
             "nvidia-gb10-arm64",
             "debug",
+        )
+        .is_err());
+
+        let mut rotated_snapshot: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        let key = rotated_snapshot["keys"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|key| key["key_id"] == "release-beta-v1")
+            .unwrap();
+        key["status"] = "retiring".into();
+        key["rotation_overlap"] = serde_json::json!({
+            "mode": "bounded",
+            "with_key_id": "release-beta-v2",
+            "valid_from": "2026-07-21T01:00:00Z",
+            "valid_until": "2026-07-21T01:30:00Z"
+        });
+        let rotated_bytes =
+            format!("{}\n", serde_json::to_string(&rotated_snapshot).unwrap()).into_bytes();
+        let rotated: Snapshot = parse_canonical(&rotated_bytes, "rotated snapshot").unwrap();
+        let rotated_hash = canonical_hash(&rotated_bytes).unwrap();
+        let mut rotated_release: ReleaseAuthorization =
+            parse_canonical(RELEASE, "release").unwrap();
+        rotated_release.delegation_snapshot_sha256 = rotated_hash.clone();
+        assert!(validate_release_for_time_challenge(
+            &rotated_release,
+            &rotated,
+            &rotated_hash,
+            "nvidia-gb10-arm64",
+            "prod",
         )
         .is_err());
 
