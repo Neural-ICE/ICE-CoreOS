@@ -56,6 +56,11 @@ pub(crate) struct ExpectedTrustedTime<'a> {
     pub(crate) tpm_clock: u64,
     pub(crate) tpm_reset_count: u32,
     pub(crate) tpm_restart_count: u32,
+    pub(crate) tpm_safe: bool,
+    pub(crate) consumption_tpm_clock: u64,
+    pub(crate) consumption_tpm_reset_count: u32,
+    pub(crate) consumption_tpm_restart_count: u32,
+    pub(crate) consumption_tpm_safe: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,38 +76,19 @@ pub(crate) struct VerifiedTrustedTime {
 }
 
 pub(crate) fn verify(
-    snapshot: &Snapshot,
+    snapshot_bytes: &[u8],
     assertion_bytes: &[u8],
     signature_bytes: &[u8],
     expected: &ExpectedTrustedTime<'_>,
     scratch: &FileStateStore,
 ) -> Result<VerifiedTrustedTime, ContractError> {
+    let snapshot: Snapshot = parse_canonical(snapshot_bytes, "delegation snapshot")?;
+    let snapshot_sha256 = canonical_hash(snapshot_bytes)?;
     let assertion: TrustedTimeAssertion =
         parse_canonical(assertion_bytes, "trusted-time assertion")?;
-    validate(&assertion, snapshot, expected)?;
-    let keys: Vec<_> = snapshot
-        .keys
-        .iter()
-        .filter(|key| {
-            key.key_id == assertion.key_id
-                && key.role == "trusted-time"
-                && key.status == "active"
-                && key.artifact_types == ["trusted-time-assertion"]
-                && key
-                    .hardware_targets
-                    .iter()
-                    .any(|value| value == expected.hardware_target)
-                && key.rings.iter().any(|value| value == expected.ring)
-                && key.valid_from <= assertion.issued_at
-                && assertion.issued_at < key.valid_until
-                && key.valid_from <= assertion.trusted_time
-                && assertion.trusted_time < key.valid_until
-        })
-        .collect();
-    if keys.len() != 1 {
-        return Err("trusted-time assertion has no unique active scoped authority".into());
-    }
-    let key = public_key_pem(&keys[0].public_key)?;
+    validate(&assertion, &snapshot, &snapshot_sha256, expected)?;
+    let key = authority(&snapshot, &assertion, expected)?;
+    let key = public_key_pem(&key.public_key)?;
     match verify_signature(&key, TIME_DOMAIN, assertion_bytes, signature_bytes, scratch)
         .map_err(ContractError::Internal)?
     {
@@ -121,9 +107,40 @@ pub(crate) fn verify(
     })
 }
 
+fn authority<'a>(
+    snapshot: &'a Snapshot,
+    assertion: &TrustedTimeAssertion,
+    expected: &ExpectedTrustedTime<'_>,
+) -> Result<&'a crate::delegated::contract::DelegatedKey, ContractError> {
+    let keys: Vec<_> = snapshot
+        .keys
+        .iter()
+        .filter(|key| {
+            key.key_id == assertion.key_id
+                && key.role == "trusted-time"
+                && matches!(key.status.as_str(), "active" | "retiring")
+                && key.artifact_types == ["trusted-time-assertion"]
+                && key
+                    .hardware_targets
+                    .iter()
+                    .any(|value| value == expected.hardware_target)
+                && key.rings.iter().any(|value| value == expected.ring)
+                && key.valid_from <= assertion.issued_at
+                && assertion.issued_at < key.valid_until
+                && key.valid_from <= assertion.trusted_time
+                && assertion.trusted_time < key.valid_until
+        })
+        .collect();
+    if keys.len() != 1 {
+        return Err("trusted-time assertion has no unique live scoped authority".into());
+    }
+    Ok(keys[0])
+}
+
 fn validate(
     value: &TrustedTimeAssertion,
     snapshot: &Snapshot,
+    snapshot_sha256: &str,
     expected: &ExpectedTrustedTime<'_>,
 ) -> Result<(), ContractError> {
     if value.schema != "neural-ice-ota-trusted-time-v2"
@@ -132,24 +149,31 @@ fn validate(
         || !signature_profile(&value.signature_algorithm, &value.signature_encoding)
         || !safe_uint(value.assertion_seq)
         || !safe_uint(value.tpm_clock)
+        || !safe_uint(expected.consumption_tpm_clock)
         || !ident(&value.issuance_id)
         || !ident(&value.key_id)
         || !is_lower_hex_32(&value.nonce)
         || !sha256(&value.device_fingerprint)
         || !sha256(&value.state_nv_anchor)
         || !value.tpm_safe
+        || !expected.tpm_safe
+        || value.tpm_safe != expected.tpm_safe
+        || !expected.consumption_tpm_safe
         || value.nonce != expected.nonce
         || value.device_fingerprint != expected.device_fingerprint
         || value.state_nv_anchor != expected.state_nv_anchor
         || value.tpm_clock != expected.tpm_clock
         || value.tpm_reset_count != expected.tpm_reset_count
         || value.tpm_restart_count != expected.tpm_restart_count
+        || expected.consumption_tpm_reset_count != expected.tpm_reset_count
+        || expected.consumption_tpm_restart_count != expected.tpm_restart_count
         || value.hardware_target != expected.hardware_target
         || value.ring != expected.ring
         || !matches!(expected.ring, "beta" | "stable")
         || value.release_authorization_sha256 != expected.release_authorization_sha256
         || !sha256(&value.release_authorization_sha256)
         || value.delegation_snapshot_sha256 != expected.delegation_snapshot_sha256
+        || value.delegation_snapshot_sha256 != snapshot_sha256
         || !sha256(&value.delegation_snapshot_sha256)
         || value.delegation_seq != snapshot.delegation_seq
         || !timestamp(&value.issued_at)
@@ -157,6 +181,7 @@ fn validate(
         || !timestamp(&value.valid_until)
         || value.issued_at > value.trusted_time
         || value.trusted_time >= value.valid_until
+        || !consumption_precedes_expiry(value, expected)
         || !assertion_lifetime_seconds(&value.issued_at, &value.valid_until)
             .is_some_and(|seconds| seconds <= 600)
         || value.issued_at < snapshot.valid_from
@@ -167,6 +192,27 @@ fn validate(
         return Err("trusted-time v2 assertion scope, challenge or time is invalid".into());
     }
     Ok(())
+}
+
+fn consumption_precedes_expiry(
+    value: &TrustedTimeAssertion,
+    expected: &ExpectedTrustedTime<'_>,
+) -> bool {
+    let Some(elapsed_ms) = expected
+        .consumption_tpm_clock
+        .checked_sub(expected.tpm_clock)
+    else {
+        return false;
+    };
+    let Some(elapsed_seconds) = elapsed_ms.checked_add(999).map(|value| value / 1_000) else {
+        return false;
+    };
+    let Some(consumption_time) =
+        utc_seconds(&value.trusted_time).and_then(|value| value.checked_add(elapsed_seconds))
+    else {
+        return false;
+    };
+    utc_seconds(&value.valid_until).is_some_and(|valid_until| consumption_time < valid_until)
 }
 
 fn is_lower_hex_32(value: &str) -> bool {
@@ -263,6 +309,11 @@ mod tests {
             tpm_clock: value.tpm_clock,
             tpm_reset_count: value.tpm_reset_count,
             tpm_restart_count: value.tpm_restart_count,
+            tpm_safe: value.tpm_safe,
+            consumption_tpm_clock: value.tpm_clock,
+            consumption_tpm_reset_count: value.tpm_reset_count,
+            consumption_tpm_restart_count: value.tpm_restart_count,
+            consumption_tpm_safe: value.tpm_safe,
         }
     }
 
@@ -270,7 +321,8 @@ mod tests {
     fn v2_binds_nonce_device_release_ring_snapshot_and_complete_tpm_state() {
         let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
         let mut value = assertion();
-        assert!(validate(&value, &snapshot, &expected(&value)).is_ok());
+        let snapshot_sha256 = canonical_hash(SNAPSHOT).unwrap();
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &expected(&value)).is_ok());
 
         for field in [
             "nonce", "device", "release", "ring", "snapshot", "anchor", "clock",
@@ -288,7 +340,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                validate(&value, &snapshot, &expected(&baseline)).is_err(),
+                validate(&value, &snapshot, &snapshot_sha256, &expected(&baseline)).is_err(),
                 "{field}"
             );
         }
@@ -300,13 +352,71 @@ mod tests {
         let baseline = assertion();
         let mut value = baseline.clone();
         value.valid_until = "2026-07-22T00:10:01Z".into();
-        assert!(validate(&value, &snapshot, &expected(&baseline)).is_err());
+        let snapshot_sha256 = canonical_hash(SNAPSHOT).unwrap();
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &expected(&baseline)).is_err());
         value = baseline.clone();
         value.tpm_safe = false;
-        assert!(validate(&value, &snapshot, &expected(&baseline)).is_err());
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &expected(&baseline)).is_err());
         value = baseline.clone();
         value.nonce = "A".repeat(64);
-        assert!(validate(&value, &snapshot, &expected(&baseline)).is_err());
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &expected(&baseline)).is_err());
+    }
+
+    #[test]
+    fn v2_consumption_uses_the_live_safe_monotonic_tpm_tuple() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let snapshot_sha256 = canonical_hash(SNAPSHOT).unwrap();
+        let value = assertion();
+
+        let mut observed = expected(&value);
+        observed.tpm_safe = false;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+
+        let mut observed = expected(&value);
+        observed.consumption_tpm_safe = false;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+
+        let mut observed = expected(&value);
+        observed.consumption_tpm_reset_count += 1;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+
+        let mut observed = expected(&value);
+        observed.consumption_tpm_restart_count += 1;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+
+        let mut observed = expected(&value);
+        observed.consumption_tpm_clock -= 1;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+
+        let mut observed = expected(&value);
+        observed.consumption_tpm_clock += 298_000;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_ok());
+        observed.consumption_tpm_clock += 1;
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+    }
+
+    #[test]
+    fn v2_binds_the_actual_snapshot_and_accepts_a_retiring_authority() {
+        let mut snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let value = assertion();
+        let expected = expected(&value);
+        assert!(validate(&value, &snapshot, &"f".repeat(64), &expected).is_err());
+
+        let key = snapshot
+            .keys
+            .iter_mut()
+            .find(|key| key.key_id == value.key_id)
+            .unwrap();
+        key.status = "retiring".into();
+        assert!(authority(&snapshot, &value, &expected).is_ok());
+
+        let key = snapshot
+            .keys
+            .iter_mut()
+            .find(|key| key.key_id == value.key_id)
+            .unwrap();
+        key.status = "revoked".into();
+        assert!(authority(&snapshot, &value, &expected).is_err());
     }
 
     #[test]
