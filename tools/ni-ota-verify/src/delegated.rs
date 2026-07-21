@@ -61,28 +61,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let Some(root) = config.root_pubkey.as_deref() else {
         return refusal("no root_pubkey configured in ota.conf".into());
     };
-    match std::fs::metadata(root) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
-        Ok(_) => {
-            return refusal(format!(
-                "OTA root pubkey missing or empty: {}",
-                root.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return refusal(format!(
-                "OTA root pubkey missing or empty: {}",
-                root.display()
-            ))
-        }
-        Err(error) => {
-            return Err(InternalError(format!(
-                "cannot inspect OTA root pubkey {}: {error}",
-                root.display()
-            )))
-        }
-    }
-    let root = freeze(&scratch, root, "root-public-key")?;
+    let root = match freeze_root(&scratch, root, "root-public-key")? {
+        Ok(root) => root,
+        Err(reason) => return refusal(reason),
+    };
     let snapshot_bytes = snapshot.read()?;
     let candidate = match parse_canonical(&snapshot_bytes, "delegation snapshot") {
         Ok(candidate) => candidate,
@@ -204,6 +186,38 @@ fn freeze(
         return Err(InternalError(format!("{label} size is invalid")));
     }
     store.secure_temp_bytes(label, &bytes)
+}
+
+fn freeze_root(
+    store: &FileStateStore,
+    source: &Path,
+    label: &str,
+) -> Result<Result<SecureTempFile, String>, InternalError> {
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.len() > 0
+                && metadata.len() <= MAX_ARTIFACT as u64 => {}
+        Ok(_) => {
+            return Ok(Err(format!(
+                "OTA root pubkey must be a non-empty regular non-symlink file no larger than {MAX_ARTIFACT} bytes: {}",
+                source.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Err(format!(
+                "OTA root pubkey missing or empty: {}",
+                source.display()
+            )))
+        }
+        Err(error) => {
+            return Err(InternalError(format!(
+                "cannot inspect OTA root pubkey {}: {error}",
+                source.display()
+            )))
+        }
+    }
+    freeze(store, source, label).map(Ok)
 }
 
 fn verify_signature(

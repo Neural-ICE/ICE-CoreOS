@@ -1776,6 +1776,16 @@ fn delegated_snapshot_keeps_anchor_refusals_distinct_from_broken_hashing() {
     let (code, _, stderr) = run(&mut command(&config));
     assert_eq!(code, 1, "{stderr}");
 
+    fs::write(fx.path("ota-root-target.pub"), &root).unwrap();
+    fs::remove_file(fx.path("ota-root.pub")).unwrap();
+    std::os::unix::fs::symlink(fx.path("ota-root-target.pub"), fx.path("ota-root.pub")).unwrap();
+    let (code, _, stderr) = run(&mut command(&config));
+    assert_eq!(code, 1, "{stderr}");
+    fs::remove_file(fx.path("ota-root.pub")).unwrap();
+    fs::write(fx.path("ota-root.pub"), vec![b'x'; 128 * 1024 + 1]).unwrap();
+    let (code, _, stderr) = run(&mut command(&config));
+    assert_eq!(code, 1, "{stderr}");
+
     fs::write(fx.path("ota-root.pub"), root).unwrap();
     let empty_path = fx.path("empty-path");
     fs::create_dir(&empty_path).unwrap();
