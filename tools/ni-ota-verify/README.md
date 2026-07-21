@@ -204,6 +204,12 @@ authority, applied-bundle or time floors. The atomic persistence and one-time
 freshness mechanism are implemented in the stacked state-v1 change, not by this
 contract-only slice.
 
+The separate `licensing-bootstrap` role is closed to
+`ota-licensing-bootstrap-v1` and `ota-licensing-recovery-ack-v1`, for both
+release rings and every supported hardware target. Snapshot acceptance records
+that scoped recovery authority only; it grants no image, release, receipt, or
+channel authority.
+
 Recovery is fail-closed but does not stop the installed release. An unavailable,
 expired, malformed or rollback snapshot leaves the last accepted snapshot and
 the running bootc deployment untouched and denies only the candidate update.

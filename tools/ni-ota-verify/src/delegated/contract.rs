@@ -42,6 +42,11 @@ const P256_SPKI_PREFIX: &[u8] = &[
 const ALL_HARDWARE_TARGETS: &[&str] =
     &["amd-rocm-x86_64", "nvidia-cuda-x86_64", "nvidia-gb10-arm64"];
 
+const LICENSING_BOOTSTRAP_ARTIFACT_TYPES: &[&str] = &[
+    "ota-licensing-bootstrap-v1",
+    "ota-licensing-recovery-ack-v1",
+];
+
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PublicKey {
@@ -222,7 +227,11 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), ContractError
             || !ident(&tombstone.key_id)
             || !matches!(
                 tombstone.role.as_str(),
-                "image-ci" | "release-beta" | "release-stable" | "trusted-time"
+                "image-ci"
+                    | "licensing-bootstrap"
+                    | "release-beta"
+                    | "release-stable"
+                    | "trusted-time"
             )
             || !sha256(&tombstone.spki_sha256)
             || tombstone.terminal_status != "revoked"
@@ -281,6 +290,7 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
         ),
         "release-stable" => (&["stable-release-authorization"][..], &["stable"][..]),
         "trusted-time" => (&["trusted-time-assertion"][..], &["beta", "stable"][..]),
+        "licensing-bootstrap" => (LICENSING_BOOTSTRAP_ARTIFACT_TYPES, &["beta", "stable"][..]),
         _ => return Err("unknown delegated role".into()),
     };
     if key
@@ -296,14 +306,14 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
     {
         return Err("delegated role scope differs from closed policy".into());
     }
-    if key.role == "trusted-time"
+    if matches!(key.role.as_str(), "licensing-bootstrap" | "trusted-time")
         && key
             .hardware_targets
             .iter()
             .map(String::as_str)
             .ne(ALL_HARDWARE_TARGETS.iter().copied())
     {
-        return Err("trusted-time must cover every supported hardware target".into());
+        return Err("global delegated role must cover every supported hardware target".into());
     }
     match key.rotation_overlap.mode.as_str() {
         "none"
@@ -962,6 +972,136 @@ mod tests {
                 "accepted without {omitted}"
             );
         }
+    }
+
+    fn five_role_snapshot() -> Snapshot {
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        let licensing_key = serde_json::json!({
+            "artifact_types": [
+                "ota-licensing-bootstrap-v1",
+                "ota-licensing-recovery-ack-v1"
+            ],
+            "hardware_targets": ALL_HARDWARE_TARGETS,
+            "key_id": "licensing-bootstrap-v1",
+            "predecessor_key_id": null,
+            "public_key": {
+                "algorithm": "ecdsa-p256-sha256",
+                "encoding": "spki-der-base64",
+                "spki_der_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIN6E5zzNN2LQFAGIXAMNpukLDm9u78/WlBdOAem48g8u8ztL/gfz9xhWEmvloxwAPQglx7wSkZX2ll4K+mrgsA==",
+                "spki_sha256": "d713cd2843947ad027c7e5cd9fe0235501d784a113a87d26922260d21f3c7b0d"
+            },
+            "rings": ["beta", "stable"],
+            "role": "licensing-bootstrap",
+            "rotation_overlap": {
+                "mode": "none",
+                "valid_from": null,
+                "valid_until": null,
+                "with_key_id": null
+            },
+            "signature_algorithm": "ecdsa-p256-sha256",
+            "signature_encoding": "asn1-der",
+            "status": "active",
+            "successor_key_id": null,
+            "valid_from": "2026-07-21T01:00:00Z",
+            "valid_until": "2027-07-21T01:00:00Z"
+        });
+        value["keys"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, licensing_key);
+        let five_role: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        validate_snapshot(&five_role).unwrap();
+        five_role
+    }
+
+    #[test]
+    fn licensing_bootstrap_five_role_snapshot_is_closed_to_its_recovery_scope() {
+        let five_role = five_role_snapshot();
+        let licensing_index = five_role
+            .keys
+            .iter()
+            .position(|key| key.role == "licensing-bootstrap")
+            .unwrap();
+        for omitted in ALL_HARDWARE_TARGETS {
+            let mut narrowed = five_role.clone();
+            narrowed.keys[licensing_index]
+                .hardware_targets
+                .retain(|target| target != omitted);
+            assert!(
+                validate_snapshot(&narrowed).is_err(),
+                "accepted licensing bootstrap without {omitted}"
+            );
+        }
+
+        let mut widened_artifact = five_role.clone();
+        widened_artifact.keys[licensing_index]
+            .artifact_types
+            .push("stable-release-authorization".into());
+        assert!(validate_snapshot(&widened_artifact).is_err());
+
+        let mut changed_artifact = five_role.clone();
+        changed_artifact.keys[licensing_index].artifact_types[0] = "oci-image-signature".into();
+        assert!(validate_snapshot(&changed_artifact).is_err());
+
+        let mut wrong_rings = five_role.clone();
+        wrong_rings.keys[licensing_index].rings = vec!["beta".into()];
+        assert!(validate_snapshot(&wrong_rings).is_err());
+
+        let mut duplicate_key = five_role.clone();
+        duplicate_key.keys[licensing_index].public_key = duplicate_key.keys[0].public_key.clone();
+        assert!(validate_snapshot(&duplicate_key).is_err());
+    }
+
+    #[test]
+    fn licensing_bootstrap_refuses_cross_role_live_and_tombstone_lineage() {
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        value["keys"][1]["role"] = serde_json::json!("licensing-bootstrap");
+        value["keys"][1]["artifact_types"] = serde_json::json!(LICENSING_BOOTSTRAP_ARTIFACT_TYPES);
+        value["keys"][1]["rings"] = serde_json::json!(["beta", "stable"]);
+        value["keys"][1]["hardware_targets"] = serde_json::json!(ALL_HARDWARE_TARGETS);
+        value["keys"][1]["predecessor_key_id"] = serde_json::json!("image-ci-v1");
+        value["keys"][0]["successor_key_id"] = serde_json::json!("release-beta-v1");
+        value["keys"][1]["rotation_overlap"] = serde_json::json!({
+            "mode": "bounded",
+            "with_key_id": "image-ci-v1",
+            "valid_from": "2026-07-21T01:00:00Z",
+            "valid_until": "2027-07-21T01:00:00Z"
+        });
+        let live: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        assert!(validate_snapshot(&live).is_err());
+
+        let old = five_role_snapshot();
+        let old_bytes = canonical(&serde_json::to_value(&old).unwrap());
+        let old_hash = canonical_hash(&old_bytes).unwrap();
+        let mut tombstone = old.clone();
+        tombstone.delegation_seq = 2;
+        tombstone.previous_snapshot_sha256 = Some(old_hash.clone());
+        tombstone.issued_at = "2026-08-01T00:45:00Z".into();
+        tombstone.valid_from = "2026-08-01T01:00:00Z".into();
+        let licensing = tombstone
+            .keys
+            .iter()
+            .find(|key| key.role == "licensing-bootstrap")
+            .unwrap()
+            .clone();
+        tombstone.keys.retain(|key| key.key_id != licensing.key_id);
+        tombstone.tombstones.push(Tombstone {
+            key_id: licensing.key_id,
+            predecessor_key_id: None,
+            reason: "key-compromise".into(),
+            revocation_seq: 2,
+            revoked_at: "2026-08-01T00:30:00Z".into(),
+            role: licensing.role.clone(),
+            spki_sha256: licensing.public_key.spki_sha256,
+            successor_key_id: None,
+            terminal_status: "revoked".into(),
+        });
+        validate_snapshot(&tombstone).unwrap();
+        validate_chain(&old, &tombstone, &old_hash).unwrap();
+
+        tombstone.tombstones[0].role = "image-ci".into();
+        validate_snapshot(&tombstone).unwrap();
+        assert!(validate_chain(&old, &tombstone, &old_hash).is_err());
     }
 
     #[test]
