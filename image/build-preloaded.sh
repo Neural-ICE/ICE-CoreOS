@@ -23,6 +23,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
 # shellcheck source=image/lib/preloaded-sizing.sh
 source "$REPO_ROOT/image/lib/preloaded-sizing.sh"
+# shellcheck source=image/lib/preloaded-output-set.sh
+source "$REPO_ROOT/image/lib/preloaded-output-set.sh"
 
 SEED_IMAGES="${SEED_IMAGES:-${HOME}/ice-seed/images}"
 SEED_MODELS="${SEED_MODELS:-${HOME}/ice-seed/models}"
@@ -34,6 +36,10 @@ SEED_PAYLOAD="${SEED_PAYLOAD:-}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
+
+# Refuse a reused OUT before bootc-image-builder replaces the raw or any large seed work starts.
+# Failed builds remain evidence; retries use a fresh output name after diagnosis.
+preloaded_require_fresh_output_set "$REPO_ROOT" "$OUT" "$COMPRESS"
 
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "BASE_IMAGE is required as the signed train's digest-pinned appliance ref" >&2; exit 1; }

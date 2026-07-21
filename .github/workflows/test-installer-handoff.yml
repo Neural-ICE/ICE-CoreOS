@@ -10,6 +10,7 @@ on:
       - "image/Containerfile.installer"
       - "image/build-preloaded.sh"
       - "image/lib/preloaded-sizing.sh"
+      - "image/lib/preloaded-output-set.sh"
       - "docs/PRELOADED-EDITION.md"
       - ".github/workflows/test-installer-handoff.yml"
   workflow_dispatch:
@@ -35,7 +36,8 @@ jobs:
             ota/neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-lab-baseline-handoff.sh \
             image/build-preloaded.sh \
-            image/lib/preloaded-sizing.sh
+            image/lib/preloaded-sizing.sh \
+            image/lib/preloaded-output-set.sh
       - name: Test ESP handoff and non-root refusal
         run: ./ota/test-neural-ice-lab-baseline-handoff.sh
 

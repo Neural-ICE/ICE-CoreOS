@@ -10,9 +10,11 @@ on:
       - 'image/build-installer-usb.sh'
       - 'image/lib/debug-ssh-key.sh'
       - 'image/lib/preloaded-sizing.sh'
+      - 'image/lib/preloaded-output-set.sh'
       - 'image/payload/neural-ice-payload-apply.service'
       - 'image/seed-tree-manifest.py'
       - 'image/test-preloaded-sizing.sh'
+      - 'image/test-preloaded-output-set.sh'
       - 'image/test-debug-ssh-key.sh'
       - 'image/verify-preloaded-media.py'
       - 'image/test-seed-tree-manifest.py'
@@ -43,14 +45,17 @@ jobs:
             image/verify-preloaded-media.py
           python3 image/test-seed-tree-manifest.py
           bash image/test-preloaded-sizing.sh
+          bash image/test-preloaded-output-set.sh
           bash image/test-debug-ssh-key.sh
           shellcheck \
             image/build-installer-usb.sh \
             image/build-preloaded.sh \
             image/lib/debug-ssh-key.sh \
             image/lib/preloaded-sizing.sh \
+            image/lib/preloaded-output-set.sh \
             image/test-debug-ssh-key.sh \
             image/test-preloaded-sizing.sh \
+            image/test-preloaded-output-set.sh \
             image/test-verify-preloaded-media.sh
   linux-arm64:
     if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
@@ -67,14 +72,17 @@ jobs:
             image/verify-preloaded-media.py
           python3 image/test-seed-tree-manifest.py
           bash image/test-preloaded-sizing.sh
+          bash image/test-preloaded-output-set.sh
           bash image/test-debug-ssh-key.sh
           shellcheck \
             image/build-installer-usb.sh \
             image/build-preloaded.sh \
             image/lib/debug-ssh-key.sh \
             image/lib/preloaded-sizing.sh \
+            image/lib/preloaded-output-set.sh \
             image/test-debug-ssh-key.sh \
             image/test-preloaded-sizing.sh \
+            image/test-preloaded-output-set.sh \
             image/test-verify-preloaded-media.sh
       - name: Final raw-media integration
         if: github.event_name == 'push'

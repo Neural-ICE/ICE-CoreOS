@@ -9,6 +9,11 @@ trap 'rm -rf "$work"' EXIT
 ssh-keygen -q -t ed25519 -N '' -f "$work/operator" </dev/null
 key="$work/operator.pub"
 digest="$(sha256sum "$key" | awk '{print $1}')"
+if [[ "${digest:0:1}" == 0 ]]; then
+  bad_digest="1${digest:1}"
+else
+  bad_digest="0${digest:1}"
+fi
 
 bash "$HELPER" validate '' ''
 if bash "$HELPER" validate '' "$digest" >/dev/null 2>&1; then
@@ -19,7 +24,7 @@ if bash "$HELPER" validate "$key" '' >/dev/null 2>&1; then
   echo "key-only debug SSH input was accepted" >&2
   exit 1
 fi
-if bash "$HELPER" validate "$key" "${digest%?}0" >/dev/null 2>&1; then
+if bash "$HELPER" validate "$key" "$bad_digest" >/dev/null 2>&1; then
   echo "mismatched debug SSH key hash was accepted" >&2
   exit 1
 fi
