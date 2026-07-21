@@ -115,6 +115,13 @@ case "$COMPRESS" in
   xz)        xz -T0 -1 -c "$RAW" > "${OUT}.img.xz"; ART="${OUT}.img.xz" ;;
   *) echo "invalid COMPRESS"; exit 2 ;;
 esac
+# Compressed outputs above are repo-relative while the uncompressed RAW is
+# already absolute. Normalize once so the success proof cannot accidentally
+# prefix REPO_ROOT twice in COMPRESS=none builds.
+case "$ART" in
+  /*) ;;
+  *) ART="${REPO_ROOT}/${ART}" ;;
+esac
 [ "$COMPRESS" = none ] || sha256sum "$ART" > "${ART}.sha256"
-echo "==> PRELOADED installer ready: ${REPO_ROOT}/${ART}"
-ls -lh "${REPO_ROOT}/${ART}"
+echo "==> PRELOADED installer ready: ${ART}"
+ls -lh "${ART}"
