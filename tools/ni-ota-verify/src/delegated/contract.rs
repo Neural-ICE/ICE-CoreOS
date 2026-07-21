@@ -5,7 +5,33 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::runner;
+use crate::{runner, InternalError};
+
+#[derive(Debug)]
+pub(crate) enum ContractError {
+    Refusal(String),
+    Internal(InternalError),
+}
+
+impl From<String> for ContractError {
+    fn from(reason: String) -> Self {
+        Self::Refusal(reason)
+    }
+}
+
+impl From<&str> for ContractError {
+    fn from(reason: &str) -> Self {
+        Self::Refusal(reason.to_owned())
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> Result<String, ContractError> {
+    classify_hash(runner::sha256_bytes(bytes))
+}
+
+fn classify_hash(result: Result<String, InternalError>) -> Result<String, ContractError> {
+    result.map_err(ContractError::Internal)
+}
 
 const P256_SPKI_PREFIX: &[u8] = &[
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
@@ -105,7 +131,7 @@ where
     Ok(parsed)
 }
 
-pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
+pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), ContractError> {
     if snapshot.schema != "neural-ice-ota-delegation-snapshot-v1"
         || snapshot.signing_role != "ota-root"
         || !signature_profile(&snapshot.signature_algorithm, &snapshot.signature_encoding)
@@ -182,7 +208,7 @@ pub(crate) fn validate_snapshot_time(snapshot: &Snapshot, now: &str) -> Result<(
     Ok(())
 }
 
-fn validate_key(key: &DelegatedKey) -> Result<(), String> {
+fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
     validate_public_key(&key.public_key)?;
     if !ident(&key.key_id)
         || !signature_profile(&key.signature_algorithm, &key.signature_encoding)
@@ -345,7 +371,11 @@ fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn validate_chain(old: &Snapshot, new: &Snapshot, old_hash: &str) -> Result<(), String> {
+pub(crate) fn validate_chain(
+    old: &Snapshot,
+    new: &Snapshot,
+    old_hash: &str,
+) -> Result<(), ContractError> {
     if new.delegation_seq != old.delegation_seq + 1
         || new.previous_snapshot_sha256.as_deref() != Some(old_hash)
         || new.root_key != old.root_key
@@ -389,11 +419,11 @@ pub(crate) fn validate_chain(old: &Snapshot, new: &Snapshot, old_hash: &str) -> 
     Ok(())
 }
 
-pub(crate) fn canonical_hash(canonical: &[u8]) -> Result<String, String> {
+pub(crate) fn canonical_hash(canonical: &[u8]) -> Result<String, ContractError> {
     let compact = canonical
         .strip_suffix(b"\n")
-        .ok_or("canonical artifact lacks its single LF")?;
-    runner::sha256_bytes(compact).map_err(|e| e.0)
+        .ok_or_else(|| ContractError::Refusal("canonical artifact lacks its single LF".into()))?;
+    hash_bytes(compact)
 }
 
 pub(crate) fn verify_root_binding(snapshot: &Snapshot, root_pem: &[u8]) -> Result<(), String> {
@@ -405,18 +435,18 @@ pub(crate) fn verify_root_binding(snapshot: &Snapshot, root_pem: &[u8]) -> Resul
     Ok(())
 }
 
-fn validate_public_key(key: &PublicKey) -> Result<(), String> {
+fn validate_public_key(key: &PublicKey) -> Result<(), ContractError> {
     if key.algorithm != "ecdsa-p256-sha256"
         || key.encoding != "spki-der-base64"
         || !sha256(&key.spki_sha256)
     {
         return Err("public-key profile is invalid".into());
     }
-    let der = decode_base64(&key.spki_der_base64)?;
+    let der = decode_base64(&key.spki_der_base64).map_err(ContractError::Refusal)?;
     if der.len() != 91 || !der.starts_with(P256_SPKI_PREFIX) {
         return Err("public key is not canonical uncompressed P-256 SPKI DER".into());
     }
-    if runner::sha256_bytes(&der).map_err(|e| e.0)? != key.spki_sha256 {
+    if hash_bytes(&der)? != key.spki_sha256 {
         return Err("public-key SPKI pin mismatch".into());
     }
     if encode_base64(&der) != key.spki_der_base64 {
@@ -746,6 +776,17 @@ mod tests {
         }
         assert!(decode_base64("YR==").is_err());
     }
+
+    #[test]
+    fn hashing_failures_remain_typed_internal_errors() {
+        let error = classify_hash(Err(InternalError("sha256sum unavailable".into()))).unwrap_err();
+        assert!(matches!(error, ContractError::Internal(_)));
+        assert!(matches!(
+            canonical_hash(b"{}"),
+            Err(ContractError::Refusal(_))
+        ));
+    }
+
     #[test]
     fn der_rejects_trailing_and_high_s() {
         let ok = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
