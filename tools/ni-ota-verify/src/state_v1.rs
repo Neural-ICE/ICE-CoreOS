@@ -384,6 +384,7 @@ impl CommandTpm {
             .secure_temp_bytes("device-root-public", b"pending")?;
         let status = Command::new(tool("tpm2_readpublic"))
             .args([
+                "-Q",
                 "-c",
                 &format!("0x{DEVICE_ROOT_HANDLE:08x}"),
                 "-f",
