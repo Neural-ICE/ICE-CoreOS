@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::InternalError;
 
 const DEFAULT_HARDWARE_TARGET_FILE: &str = "/usr/lib/neural-ice/hardware-target";
+const DEFAULT_MIN_DELEGATION_SEQ_FILE: &str = "/usr/lib/neural-ice/ota-min-delegation-seq";
 
 pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
     #[cfg(feature = "test-path-overrides")]
@@ -46,6 +47,35 @@ pub(crate) fn immutable_hardware_target() -> Result<String, InternalError> {
         )));
     }
     Ok(target.to_string())
+}
+
+pub(crate) fn immutable_minimum_delegation_seq() -> Result<u64, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let path = std::env::var_os("NI_OTA_MIN_DELEGATION_SEQ_FILE").map_or_else(
+        || PathBuf::from(DEFAULT_MIN_DELEGATION_SEQ_FILE),
+        PathBuf::from,
+    );
+    #[cfg(not(feature = "test-path-overrides"))]
+    let path = PathBuf::from(DEFAULT_MIN_DELEGATION_SEQ_FILE);
+    let value = std::fs::read_to_string(&path).map_err(|error| {
+        InternalError(format!(
+            "unreadable immutable minimum delegation sequence {}: {error}",
+            path.display()
+        ))
+    })?;
+    let sequence = value.trim().parse::<u64>().map_err(|_| {
+        InternalError(format!(
+            "invalid immutable minimum delegation sequence in {}",
+            path.display()
+        ))
+    })?;
+    if !(1..=9_007_199_254_740_991).contains(&sequence) {
+        return Err(InternalError(format!(
+            "invalid immutable minimum delegation sequence in {}",
+            path.display()
+        )));
+    }
+    Ok(sequence)
 }
 
 pub(crate) struct Config {

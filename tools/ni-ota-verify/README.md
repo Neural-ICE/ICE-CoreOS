@@ -94,6 +94,12 @@ ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>
                         [--config …] [--device-compat <min,max>]
                         [--applied-state <path>]
 ni-ota-verify commit --bom <path> [--config …] [--applied-state <path>]
+ni-ota-verify verify-delegation-snapshot \
+  --snapshot <path> --snapshot-sig <binary-DER-path> \
+  --trusted-now <YYYY-MM-DDTHH:MM:SSZ> \
+  [--accepted-snapshot <path> --accepted-delegation-seq <n> \
+   --accepted-delegation-sha256 <64hex>] [--config …]
+ni-ota-verify capabilities
 ```
 
 Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
@@ -101,6 +107,73 @@ Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 `device_compat_max`; flags override. A missing `enforce` key defaults to
 **enforce** (an incomplete config leans strict, never silently log-only). The
 hardware target comes from the immutable image marker, not a CLI override.
+
+`capabilities` emits the bounded canonical JSON object
+`{"schema":1,"features":["bundle-digest-v1"]}`. The appliance controller uses
+this public compatibility handshake before any registry access; unknown output,
+missing `bundle-digest-v1`, extra top-level keys or a non-zero exit must fail
+closed. The feature states that `verify` requires and authorizes the signed OCI
+bundle manifest digest rather than a mutable tag.
+
+The immediate prior bootc deployment predates this command. A one-version OS
+rollback therefore keeps the appliance running but intentionally disables new
+registry-backed OTA checks: a non-zero capability probe remains fail-closed.
+Recovery is to boot the retained newer deployment or use the separately signed
+offline recovery path; a controller must not infer support by scraping usage
+text or retry without the digest gate.
+
+### ADR-0039 delegation-snapshot trust gate
+
+`verify-delegation-snapshot` is the first device-side delegated-signing gate.
+It accepts the exact closed Fabric v1 snapshot bytes only:
+unknown or duplicate fields, non-canonical JSON, invalid P-256 SPKI pins,
+non-minimal/high-S DER signatures, scope widening, cross-role/cross-ring use,
+stale trusted time, snapshot split views and rollback all refuse in both shadow
+and enforce modes.
+
+The OTA root verifies only the domain-separated complete delegation snapshot.
+Cosign receives protected root-only snapshots of the message, public key and
+base64 transport form of the contract's binary DER signature; the authority
+signature remains the binary low-S DER artifact.
+
+`verify-delegation-snapshot` always requires the accepted complete snapshot
+plus the sequence and canonical hash read from the trusted state
+backend are required; this slice deliberately defines no new persisted schema:
+the verifier permits an identical retry or exactly `N+1`, checks the previous
+canonical hash, preserves tombstones, and prevents retained keys from widening
+scope or validity. Multi-snapshot offline catch-up and atomic TPM-backed
+delegation-state persistence are deliberately subsequent slices; this command
+does not authorize a release, publish a channel, or mutate accepted state.
+
+The sole unseeded exception belongs to the distinct physical
+`verify-delegated-usb` path. It is explicitly floor-bound to the immutable
+`/usr/lib/neural-ice/ota-min-delegation-seq` and additionally requires the
+signed debug target/release/media bindings. Omitting accepted state from the
+generic or network verifier is always an authority refusal.
+
+Owner authorization for this gate is recorded in the 2026-07-20/21 task by
+the explicit decisions `GO signed-boot LAB debug ... gate LAB/PROD #37`,
+`GO ADR délégation OTA v2 — racine offline uniquement pour
+délégation/révocation/secours`, and `GO parcours opérateur simplifié —
+cérémonie root-only, bootstrap KMS automatisé`. These approvals cover the
+delegated trust model and its local verifier only; they authorize no channel
+movement.
+
+Recovery is fail-closed but does not stop the installed release. An unavailable,
+expired, malformed or rollback snapshot leaves the last accepted snapshot and
+the running bootc deployment untouched and denies only the candidate update.
+The offline root recovers by signing exactly the next snapshot, chained to the
+last accepted canonical hash; compromise recovery tombstones the affected key
+in that successor and installs a separately scoped replacement. Sequence floors
+are never lowered and accepted history is never deleted. For a one-version OS
+rollback, this slice adds no persisted schema and mutates no delegation state,
+so the retained prior deployment remains bootable with the existing state. Its
+verifier predates the capability handshake, so new OTA remains blocked until
+the newer deployment or signed offline recovery path is restored. Recovery of
+a newer candidate resumes only after a valid root-signed successor satisfies
+both that history and the image-baked minimum. Root-anchor rotation itself is
+outside this gate and requires a separately approved image/trust-anchor
+transition; accepted snapshot chains keep the immutable root unchanged.
 
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An
