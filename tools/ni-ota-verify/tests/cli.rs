@@ -1699,3 +1699,21 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
     assert_eq!(code, 1);
     assert!(stderr.contains("delegation snapshot REFUSED"));
 }
+
+#[test]
+fn capabilities_are_canonical_bounded_and_argument_free() {
+    let output = Command::new(BIN).arg("capabilities").output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        b"{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}\n"
+    );
+    assert!(output.stdout.len() < 4096);
+
+    let output = Command::new(BIN)
+        .args(["capabilities", "unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}

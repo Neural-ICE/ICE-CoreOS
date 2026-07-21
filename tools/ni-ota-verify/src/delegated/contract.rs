@@ -282,13 +282,41 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
 }
 
 fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
-    let known = |candidate: &str| {
-        snapshot.keys.iter().any(|key| key.key_id == candidate)
-            || snapshot
-                .tombstones
-                .iter()
-                .any(|tombstone| tombstone.key_id == candidate)
+    let live = |candidate: &str| snapshot.keys.iter().find(|key| key.key_id == candidate);
+    let dead = |candidate: &str| {
+        snapshot
+            .tombstones
+            .iter()
+            .find(|tombstone| tombstone.key_id == candidate)
     };
+    for tombstone in &snapshot.tombstones {
+        for (predecessor, reference) in [
+            (true, tombstone.predecessor_key_id.as_deref()),
+            (false, tombstone.successor_key_id.as_deref()),
+        ] {
+            let Some(reference) = reference else {
+                continue;
+            };
+            let valid = live(reference).is_some_and(|peer| {
+                peer.role == tombstone.role
+                    && if predecessor {
+                        peer.valid_from <= tombstone.revoked_at
+                    } else {
+                        tombstone.revoked_at < peer.valid_until
+                    }
+            }) || dead(reference).is_some_and(|peer| {
+                peer.role == tombstone.role
+                    && if predecessor {
+                        peer.revoked_at <= tombstone.revoked_at
+                    } else {
+                        tombstone.revoked_at <= peer.revoked_at
+                    }
+            });
+            if reference == tombstone.key_id || !valid {
+                return Err("tombstone lineage role or temporal order is invalid".into());
+            }
+        }
+    }
     for key in &snapshot.keys {
         for reference in [
             key.predecessor_key_id.as_deref(),
@@ -298,74 +326,75 @@ fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
         .into_iter()
         .flatten()
         {
-            if reference == key.key_id || !known(reference) {
+            if reference == key.key_id || (live(reference).is_none() && dead(reference).is_none()) {
                 return Err(
                     "delegated rotation reference is unresolved or self-referential".into(),
                 );
             }
         }
-        if key.rotation_overlap.mode == "bounded" {
-            let from = key
-                .rotation_overlap
-                .valid_from
-                .as_deref()
-                .unwrap_or_default();
-            let until = key
-                .rotation_overlap
-                .valid_until
-                .as_deref()
-                .unwrap_or_default();
-            let peer = key
-                .rotation_overlap
-                .with_key_id
-                .as_deref()
-                .unwrap_or_default();
-            if from < key.valid_from.as_str()
-                || until > key.valid_until.as_str()
-                || !snapshot.keys.iter().any(|candidate| {
-                    candidate.key_id == peer
-                        && candidate.role == key.role
-                        && ((key.predecessor_key_id.as_deref() == Some(peer)
-                            && candidate.successor_key_id.as_deref() == Some(key.key_id.as_str()))
-                            || (key.successor_key_id.as_deref() == Some(peer)
-                                && candidate.predecessor_key_id.as_deref()
-                                    == Some(key.key_id.as_str())))
-                        && candidate.rotation_overlap.mode == "bounded"
-                        && candidate.rotation_overlap.with_key_id.as_deref()
-                            == Some(key.key_id.as_str())
-                        && candidate.rotation_overlap.valid_from.as_deref() == Some(from)
-                        && candidate.rotation_overlap.valid_until.as_deref() == Some(until)
-                        && candidate.valid_from.as_str() <= from
-                        && until <= candidate.valid_until.as_str()
-                })
-            {
-                return Err("bounded overlap is not contained by both live key windows".into());
+        for (predecessor, reference) in [
+            (true, key.predecessor_key_id.as_deref()),
+            (false, key.successor_key_id.as_deref()),
+        ] {
+            if let Some(peer) = reference.and_then(dead) {
+                let valid = peer.role == key.role
+                    && if predecessor {
+                        peer.revoked_at < key.valid_until
+                    } else {
+                        key.valid_from <= peer.revoked_at
+                    };
+                if !valid {
+                    return Err("live/tombstone lineage role or temporal order is invalid".into());
+                }
             }
-        } else if [
+        }
+        let live_peers: Vec<_> = [
             key.predecessor_key_id.as_deref(),
             key.successor_key_id.as_deref(),
         ]
         .into_iter()
         .flatten()
-        .any(|reference| {
-            snapshot
-                .keys
-                .iter()
-                .any(|candidate| candidate.key_id == reference)
-        }) {
-            return Err("live rotation pair lacks mutual bounded overlap".into());
+        .filter_map(live)
+        .collect();
+        match live_peers.as_slice() {
+            [] if key.rotation_overlap.mode == "none" => {}
+            [peer]
+                if key.rotation_overlap.mode == "bounded"
+                    && key.rotation_overlap.with_key_id.as_deref()
+                        == Some(peer.key_id.as_str())
+                    && peer.role == key.role
+                    && ((key.predecessor_key_id.as_deref() == Some(peer.key_id.as_str())
+                        && peer.successor_key_id.as_deref() == Some(key.key_id.as_str()))
+                        || (key.successor_key_id.as_deref() == Some(peer.key_id.as_str())
+                            && peer.predecessor_key_id.as_deref()
+                                == Some(key.key_id.as_str())))
+                    && peer.rotation_overlap.mode == "bounded"
+                    && peer.rotation_overlap.with_key_id.as_deref()
+                        == Some(key.key_id.as_str())
+                    && peer.rotation_overlap.valid_from == key.rotation_overlap.valid_from
+                    && peer.rotation_overlap.valid_until == key.rotation_overlap.valid_until
+                    && key.rotation_overlap.valid_from.as_deref()
+                        == Some(key.valid_from.as_str().max(peer.valid_from.as_str()))
+                    && key.rotation_overlap.valid_until.as_deref()
+                        == Some(key.valid_until.as_str().min(peer.valid_until.as_str())) => {}
+            _ => return Err("live rotation lineage or exact mutual overlap is invalid".into()),
         }
     }
-    for tombstone in &snapshot.tombstones {
-        for reference in [
-            tombstone.predecessor_key_id.as_deref(),
-            tombstone.successor_key_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !ident(reference) || reference == tombstone.key_id || !known(reference) {
-                return Err("tombstone reference is unresolved or self-referential".into());
+    for (index, left) in snapshot.keys.iter().enumerate() {
+        for right in &snapshot.keys[index + 1..] {
+            let shared_target = left
+                .hardware_targets
+                .iter()
+                .any(|target| right.hardware_targets.contains(target));
+            let time_overlap =
+                left.valid_from < right.valid_until && right.valid_from < left.valid_until;
+            if left.role == right.role
+                && shared_target
+                && time_overlap
+                && !(left.rotation_overlap.with_key_id.as_deref() == Some(right.key_id.as_str())
+                    && right.rotation_overlap.with_key_id.as_deref() == Some(left.key_id.as_str()))
+            {
+                return Err("overlapping authority lacks an exact mutual rotation peer".into());
             }
         }
     }
@@ -412,6 +441,8 @@ pub(crate) fn validate_chain(
             if dead.role != key.role
                 || dead.spki_sha256 != key.public_key.spki_sha256
                 || dead.revocation_seq != new.delegation_seq
+                || dead.predecessor_key_id != key.predecessor_key_id
+                || dead.successor_key_id != key.successor_key_id
             {
                 return Err("revocation tombstone does not bind removed key".into());
             }
@@ -666,7 +697,7 @@ fn timestamp(v: &str) -> bool {
         30,
         31,
     ];
-    m > 0 && m <= 12 && d > 0 && d <= days[m as usize] && h < 24 && mi < 60 && s < 60
+    y > 0 && m > 0 && m <= 12 && d > 0 && d <= days[m as usize] && h < 24 && mi < 60 && s < 60
 }
 
 #[cfg(test)]
@@ -680,6 +711,29 @@ mod tests {
         let mut bytes = serde_json::to_vec(value).unwrap();
         bytes.push(b'\n');
         bytes
+    }
+
+    fn revoked_snapshot() -> (Snapshot, String) {
+        let old_hash = canonical_hash(SNAPSHOT).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        value["delegation_seq"] = serde_json::json!(2);
+        value["previous_snapshot_sha256"] = serde_json::json!(old_hash);
+        value["issued_at"] = serde_json::json!("2026-08-01T00:45:00Z");
+        value["valid_from"] = serde_json::json!("2026-08-01T01:00:00Z");
+        value["keys"].as_array_mut().unwrap().remove(1);
+        value["tombstones"] = serde_json::json!([{
+            "key_id": "release-beta-v1",
+            "predecessor_key_id": null,
+            "reason": "key-compromise",
+            "revocation_seq": 2,
+            "revoked_at": "2026-08-01T00:30:00Z",
+            "role": "release-beta",
+            "spki_sha256": "162e3c389da5d687742928c8ee4719279706d18b15db81031702bb9d077349e8",
+            "successor_key_id": null,
+            "terminal_status": "revoked"
+        }]);
+        let snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        (snapshot, old_hash)
     }
 
     #[test]
@@ -771,9 +825,58 @@ mod tests {
         let snapshot: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
         assert!(validate_snapshot(&snapshot).is_err());
     }
+
+    #[test]
+    fn snapshot_requires_exact_mutual_overlap_for_duplicate_authority() {
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        value["keys"][2]["role"] = serde_json::json!("release-beta");
+        value["keys"][2]["artifact_types"] =
+            serde_json::json!(["beta-publication-receipt", "beta-release-authorization"]);
+        value["keys"][2]["rings"] = serde_json::json!(["beta"]);
+        let duplicate: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        assert!(validate_snapshot(&duplicate).is_err());
+
+        value["keys"][1]["successor_key_id"] = serde_json::json!("release-stable-v1");
+        value["keys"][2]["predecessor_key_id"] = serde_json::json!("release-beta-v1");
+        for index in [1, 2] {
+            let peer = if index == 1 {
+                "release-stable-v1"
+            } else {
+                "release-beta-v1"
+            };
+            value["keys"][index]["rotation_overlap"] = serde_json::json!({
+                "mode": "bounded",
+                "with_key_id": peer,
+                "valid_from": "2026-07-21T01:00:00Z",
+                "valid_until": "2027-07-21T01:00:00Z"
+            });
+        }
+        let exact: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        validate_snapshot(&exact).unwrap();
+        value["keys"][1]["rotation_overlap"]["valid_until"] =
+            serde_json::json!("2027-01-01T00:00:00Z");
+        value["keys"][2]["rotation_overlap"]["valid_until"] =
+            serde_json::json!("2027-01-01T00:00:00Z");
+        let shortened: Snapshot = parse_canonical(&canonical(&value), "snapshot").unwrap();
+        assert!(validate_snapshot(&shortened).is_err());
+    }
+
+    #[test]
+    fn tombstone_lineage_preserves_role_time_and_live_conversion() {
+        let old: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let (new, old_hash) = revoked_snapshot();
+        validate_snapshot(&new).unwrap();
+        validate_chain(&old, &new, &old_hash).unwrap();
+
+        let mut invalid = new.clone();
+        invalid.tombstones[0].successor_key_id = Some("image-ci-v1".into());
+        assert!(validate_snapshot(&invalid).is_err());
+        assert!(validate_chain(&old, &invalid, &old_hash).is_err());
+    }
     #[test]
     fn timestamp_rejects_impossible_dates() {
         assert!(timestamp("2026-07-21T01:02:03Z"));
+        assert!(!timestamp("0000-01-01T00:00:00Z"));
         assert!(!timestamp("2026-02-30T01:02:03Z"));
     }
     #[test]
