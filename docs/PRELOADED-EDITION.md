@@ -18,7 +18,9 @@ expensive work happens **once on the build host, never on the target device**:
    store** (untar + sha256 done here). Refs are preserved so Quadlets resolve them offline.
 2. **Base models** — copied from `SEED_MODELS` (a local Hugging Face hub staging directory) into
    the seed. Only openly redistributable model files belong in the seed; anything gated or
-   restricted must be pulled post-install through its own channel.
+   restricted must be pulled post-install through its own channel. `SEED_MODELS` may be a stable
+   symlink; the builder resolves it once before sizing and copying so partition capacity is based
+   on the real model tree, not on the symlink inode.
 3. The script grows the light raw, appends a **`ni-seed` GPT partition** (xfs, sized from the
    EXTRACTED store + models + headroom) and copies both payloads in.
 4. **`ota/neural-ice-autoinstall.sh`** (seed step, only when `/dev/disk/by-partlabel/ni-seed`
