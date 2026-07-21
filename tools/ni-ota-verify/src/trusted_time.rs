@@ -73,6 +73,7 @@ pub(crate) struct VerifiedTrustedTime {
     pub(crate) nonce_sha256: String,
     pub(crate) signature_sha256: String,
     pub(crate) trusted_time: String,
+    pub(crate) valid_until: String,
 }
 
 pub(crate) fn verify(
@@ -104,6 +105,7 @@ pub(crate) fn verify(
         nonce_sha256: hash(assertion.nonce.as_bytes())?,
         signature_sha256: hash(signature_bytes)?,
         trusted_time: assertion.trusted_time,
+        valid_until: assertion.valid_until,
     })
 }
 

@@ -9,11 +9,8 @@ use crate::config::{
 use crate::delegated::beta::{
     authorized_key, device_compatibility, validate_release, ReleaseAuthorization, RELEASE_DOMAIN,
 };
-use crate::delegated::contract::{
-    canonical_hash, parse_canonical, public_key_pem, validate_snapshot, verify_root_binding,
-    ContractError, Snapshot,
-};
-use crate::delegated::{freeze, freeze_root, verify_signature, SNAPSHOT_DOMAIN};
+use crate::delegated::contract::{canonical_hash, parse_canonical, public_key_pem, ContractError};
+use crate::delegated::{authenticate_snapshot, freeze, freeze_root, verify_signature};
 use crate::state_v1::{
     AppliedStateV1, AuthorityState, Candidate, CommandTpm, NvAnchor, PreapplyCandidate, Store,
     TimeChallenge, TrustedTimeState, STATE_NV_INDEX,
@@ -93,33 +90,17 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
 
     let snapshot_bytes = snapshot_file.read()?;
     let snapshot_signature = snapshot_sig.read()?;
-    let snapshot: Snapshot = match parse_canonical(&snapshot_bytes, "delegation snapshot") {
-        Ok(value) => value,
-        Err(reason) => return refusal(reason),
-    };
-    if let Err(error) = validate_snapshot(&snapshot) {
-        return contract_refusal(error);
-    }
+    let root_bytes = root.read()?;
+    let authenticated_snapshot =
+        match authenticate_snapshot(&snapshot_bytes, &snapshot_signature, &root_bytes, &scratch) {
+            Ok(value) => value,
+            Err(error) => return contract_refusal(error),
+        };
+    let snapshot = authenticated_snapshot.snapshot();
     if snapshot.delegation_seq < immutable_minimum_delegation_seq()? {
         return refusal("snapshot is below immutable delegation sequence floor".into());
     }
-    let snapshot_hash = match canonical_hash(&snapshot_bytes) {
-        Ok(value) => value,
-        Err(error) => return contract_refusal(error),
-    };
-    let root_bytes = root.read()?;
-    if let Err(reason) = verify_root_binding(&snapshot, &root_bytes) {
-        return refusal(reason);
-    }
-    if let Err(reason) = verify_signature(
-        &root_bytes,
-        SNAPSHOT_DOMAIN,
-        &snapshot_bytes,
-        &snapshot_signature,
-        &scratch,
-    )? {
-        return refusal(reason);
-    }
+    let snapshot_hash = authenticated_snapshot.canonical_sha256();
 
     let release_bytes = release_file.read()?;
     let release_signature = release_sig.read()?;
@@ -169,8 +150,22 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
                 )))
             }
         };
+    let tpm = CommandTpm {
+        index: STATE_NV_INDEX,
+        scratch: crate::state::FileStateStore {
+            path: scratch.path.clone(),
+        },
+    };
+    let now_clock = tpm.clock()?;
+    if !now_clock.safe
+        || now_clock.reset_count != challenge.tpm_reset_count
+        || now_clock.restart_count != challenge.tpm_restart_count
+        || now_clock.clock < challenge.tpm_clock
+    {
+        return refusal("TPM continuity changed after challenge issuance".into());
+    }
     let expected = ExpectedTrustedTime {
-        delegation_snapshot_sha256: &snapshot_hash,
+        delegation_snapshot_sha256: snapshot_hash,
         device_fingerprint: &challenge.device_fingerprint,
         hardware_target: &target,
         nonce: &challenge.nonce,
@@ -180,10 +175,15 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         tpm_clock: challenge.tpm_clock,
         tpm_reset_count: challenge.tpm_reset_count,
         tpm_restart_count: challenge.tpm_restart_count,
+        tpm_safe: challenge.tpm_safe,
+        consumption_tpm_clock: now_clock.clock,
+        consumption_tpm_reset_count: now_clock.reset_count,
+        consumption_tpm_restart_count: now_clock.restart_count,
+        consumption_tpm_safe: now_clock.safe,
     };
     let assertion_signature = assertion_sig.read()?;
     let trusted = match trusted_time::verify(
-        &snapshot,
+        &authenticated_snapshot,
         &assertion_bytes,
         &assertion_signature,
         &expected,
@@ -194,8 +194,8 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     };
     if let Err(reason) = validate_release(
         &release,
-        &snapshot,
-        &snapshot_hash,
+        snapshot,
+        snapshot_hash,
         &trusted.trusted_time,
         &target,
     ) {
@@ -205,7 +205,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         return refusal(reason);
     }
     let release_key = match authorized_key(
-        &snapshot,
+        snapshot,
         &release.key_id,
         "beta-release-authorization",
         &target,
@@ -243,31 +243,43 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     ) {
         return refusal(reason);
     }
-    let tpm = CommandTpm {
-        index: STATE_NV_INDEX,
-        scratch,
+    let trusted_state = TrustedTimeState {
+        assertion_seq: trusted.assertion_seq,
+        assertion_sha256: trusted.assertion_sha256.clone(),
+        challenge_sha256: trusted.nonce_sha256.clone(),
+        delegation_seq: trusted.delegation_seq,
+        device_fingerprint: trusted.device_fingerprint.clone(),
+        key_id: trusted.key_id.clone(),
+        schema: "neural-ice-ota-trusted-time-state-v2".into(),
+        signature_sha256: trusted.signature_sha256.clone(),
+        tpm_clock: expected.tpm_clock,
+        tpm_reset_count: expected.tpm_reset_count,
+        tpm_restart_count: expected.tpm_restart_count,
+        tpm_safe: true,
+        trusted_time: trusted.trusted_time.clone(),
     };
-    let now_clock = tpm.clock()?;
-    if !now_clock.safe
-        || now_clock.reset_count != challenge.tpm_reset_count
-        || now_clock.restart_count != challenge.tpm_restart_count
-        || now_clock.clock < challenge.tpm_clock
-    {
-        return refusal("TPM continuity changed after challenge issuance".into());
-    }
     let preapply = PreapplyCandidate {
         bom_sha256: &bom_hash,
         bundle_seq: bom.bundle_seq,
         challenge: &challenge,
-        snapshot: &snapshot,
-        snapshot_sha256: &snapshot_hash,
-        trusted_now: &trusted.trusted_time,
+        snapshot,
+        snapshot_sha256: snapshot_hash,
+        snapshot_signature: &snapshot_signature,
+        trusted: &trusted_state,
+        trusted_assertion: &assertion_bytes,
     };
-    if !commit {
-        match store.guard_preapply(&tpm, &preapply)? {
+    // A zero anchor has no authoritative prior generation to chain against.
+    // `Store::commit` handles that fresh-install path and its one exact
+    // pre-extend generation retry itself. For every anchored transaction,
+    // rerun the complete preapply gate immediately before mutation rather
+    // than trusting a controller to have called guard-state-v2 beforehand.
+    if pending_challenge && tpm.read_initial()? != [0; 32] {
+        match store.guard_preapply_locked(&tpm, &preapply)? {
             Ok(()) => {}
             Err(reason) => return refusal(reason),
         }
+    }
+    if !commit {
         println!(
             "{{\"bundle_seq\":{},\"release_authorization_sha256\":\"{}\",\"schema\":\"neural-ice-ota-state-preapply-receipt-v2\",\"verdict\":\"pass\"}}",
             bom.bundle_seq, release_hash
@@ -283,7 +295,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         authority: AuthorityState {
             delegation_seq: snapshot.delegation_seq,
             schema: "neural-ice-ota-authority-state-v1".into(),
-            snapshot_sha256: snapshot_hash.clone(),
+            snapshot_sha256: snapshot_hash.to_owned(),
             snapshot_signature_sha256: runner::sha256_bytes(&snapshot_signature)?,
         },
         challenge: challenge.clone(),
@@ -291,28 +303,14 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         release_signature: &release_signature,
         snapshot: &snapshot_bytes,
         snapshot_signature: &snapshot_signature,
-        trusted: TrustedTimeState {
-            assertion_seq: trusted.assertion_seq,
-            assertion_sha256: trusted.assertion_sha256,
-            challenge_sha256: trusted.nonce_sha256,
-            delegation_seq: trusted.delegation_seq,
-            device_fingerprint: trusted.device_fingerprint,
-            key_id: trusted.key_id,
-            schema: "neural-ice-ota-trusted-time-state-v2".into(),
-            signature_sha256: trusted.signature_sha256,
-            tpm_clock: expected.tpm_clock,
-            tpm_reset_count: expected.tpm_reset_count,
-            tpm_restart_count: expected.tpm_restart_count,
-            tpm_safe: true,
-            trusted_time: trusted.trusted_time,
-        },
+        trusted: trusted_state,
         trusted_assertion: &assertion_bytes,
         trusted_signature: &assertion_signature,
     };
     let receipt = if pending_challenge {
-        store.commit(&candidate, &tpm)?
+        store.commit_locked(&candidate, &tpm)?
     } else {
-        store.exact_receipt(&candidate, &tpm)?
+        store.exact_receipt_locked(&candidate, &tpm)?
     };
     match receipt {
         Ok(receipt) => {
