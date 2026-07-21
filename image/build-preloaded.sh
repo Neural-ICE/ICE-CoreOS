@@ -18,6 +18,10 @@
 #   BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<digest> \
 #   SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
 #   SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
+#   LAB_BASELINE_BOM_FILE=/path/to/<train>.bom.json \
+#   LAB_BASELINE_BOM_SHA256=<approved-bom-sha256> \
+#   LAB_BASELINE_SIGNATURE_FILE=/path/to/<train>.bom.sig \
+#   LAB_BASELINE_SIGNATURE_SHA256=<approved-signature-sha256> \
 #   COMPRESS=zstd-fast ./image/build-preloaded.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
@@ -36,6 +40,8 @@ SEED_PAYLOAD="${SEED_PAYLOAD:-}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
+LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
+LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
 
 # Refuse a reused OUT before bootc-image-builder replaces the raw or any large seed work starts.
 # Failed builds remain evidence; retries use a fresh output name after diagnosis.
@@ -204,6 +210,16 @@ FINAL_MEDIA_RECEIPT="${RAW}.final-media.json"
 FINAL_MEDIA_RECEIPT_CHECKSUM="${FINAL_MEDIA_RECEIPT}.sha256"
 
 echo "==> 5. accept the exact raw and build the digest-bound release artifact"
+final_media_baseline_args=()
+if [[ -n "$LAB_BASELINE_BOM_SHA256" || -n "$LAB_BASELINE_SIGNATURE_SHA256" ]]; then
+  [[ "$LAB_BASELINE_BOM_SHA256" =~ ^[0-9a-f]{64}$ \
+     && "$LAB_BASELINE_SIGNATURE_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "invalid or incomplete LAB baseline SHA-256 inputs" >&2; exit 1; }
+  final_media_baseline_args=(
+    --lab-baseline-bom-sha256 "$LAB_BASELINE_BOM_SHA256"
+    --lab-baseline-signature-sha256 "$LAB_BASELINE_SIGNATURE_SHA256"
+  )
+fi
 sudo python3 image/verify-preloaded-media.py \
   --raw "$RAW" \
   --expected-manifest "$EXPECTED_SEED_MANIFEST" \
@@ -211,7 +227,8 @@ sudo python3 image/verify-preloaded-media.py \
   --artifact-checksum "$ART_CHECKSUM" \
   --compression "$COMPRESS" \
   --receipt "$FINAL_MEDIA_RECEIPT" \
-  --receipt-checksum "$FINAL_MEDIA_RECEIPT_CHECKSUM"
+  --receipt-checksum "$FINAL_MEDIA_RECEIPT_CHECKSUM" \
+  "${final_media_baseline_args[@]}"
 storecleanup; trap - EXIT
 
 echo "==> PRELOADED installer ready: ${ART}"

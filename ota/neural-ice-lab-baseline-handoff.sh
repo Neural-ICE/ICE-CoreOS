@@ -33,7 +33,12 @@ owner_group_mode() {
 
 copy_checked() {
   local source="$1" destination="$2" max_bytes="$3" label="$4"
-  local fd_path source_identity fd_identity final_identity size
+  local expected_sha256="${5:-}"
+  local fd_path source_identity fd_identity final_identity size source_sha256 destination_sha256
+
+  if [[ -n "$expected_sha256" && ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    fail "$label expected SHA-256 is invalid"
+  fi
 
   [[ ! -L "$source" && -f "$source" ]] \
     || fail "$label must be a regular, non-symlink file"
@@ -51,18 +56,82 @@ copy_checked() {
   size="${fd_identity##*:}"
   [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 && "$size" -le "$max_bytes" ]] \
     || fail "$label must be non-empty and at most $max_bytes bytes"
+  if [[ -n "$expected_sha256" ]]; then
+    source_sha256="$(sha256sum <&9 | awk '{print $1}')" \
+      || fail "cannot hash the open $label"
+    [[ "$source_sha256" == "$expected_sha256" ]] \
+      || fail "$label differs from its approved SHA-256"
+    # Hashing consumes the shared descriptor offset. Reopen the pathname and
+    # prove that it still denotes the exact identity accepted above before
+    # copying from the fresh descriptor.
+    exec 9<&-
+    exec 9<"$source" || fail "cannot reopen $label"
+    fd_identity="$(file_identity "$fd_path")" || fail "cannot stat the reopened $label"
+    source_identity="$(file_identity "$source")" || fail "cannot re-stat $label"
+    [[ ! -L "$source" && -f "$source" && "$source_identity" == "$fd_identity" ]] \
+      || fail "$label changed after it was hashed"
+  fi
 
   umask 077
   [[ ! -e "$destination" && ! -L "$destination" ]] \
     || fail "refusing to overwrite handoff staging file"
-  cat -- "$fd_path" >"$destination" || fail "cannot copy $label"
+  cat <&9 >"$destination" || fail "cannot copy $label"
   chmod 0600 "$destination" || fail "cannot protect the copied $label"
+  exec 9<&-
+  exec 9<"$source" || fail "cannot reopen the copied $label source"
+  fd_identity="$(file_identity "$fd_path")" || fail "cannot stat the copied $label source"
+  source_identity="$(file_identity "$source")" || fail "cannot re-stat $label"
+  [[ ! -L "$source" && -f "$source" && "$source_identity" == "$fd_identity" ]] \
+    || fail "$label changed while it was copied"
   cmp -s -- "$fd_path" "$destination" || fail "$label copy differs from its source"
+  if [[ -n "$expected_sha256" ]]; then
+    destination_sha256="$(sha256sum "$destination" | awk '{print $1}')" \
+      || fail "cannot hash the copied $label"
+    [[ "$destination_sha256" == "$expected_sha256" ]] \
+      || fail "$label changed while it was copied"
+  fi
 
   final_identity="$(file_identity "$source")" || fail "cannot re-stat $label"
   [[ ! -L "$source" && -f "$source" && "$final_identity" == "$fd_identity" ]] \
     || fail "$label changed while it was copied"
   exec 9<&-
+}
+
+stage_media_pair() {
+  local receipt="$1" receipt_sha256="$2" signature="$3" signature_sha256="$4"
+  local esp_root="$5" namespace="$5/ice-coreos" receipt_stage signature_stage
+
+  [[ -d "$esp_root" && ! -L "$esp_root" ]] \
+    || fail "ESP root must be an existing, non-symlink directory"
+  [[ "$receipt_sha256" =~ ^[0-9a-f]{64}$ \
+     && "$signature_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "media staging requires both exact lowercase SHA-256 values"
+  if exists_or_symlink "$namespace"; then
+    [[ -d "$namespace" && ! -L "$namespace" ]] \
+      || fail "ESP ice-coreos namespace must be a real directory"
+  else
+    install -d -m 0700 -- "$namespace"
+  fi
+  [[ ! -e "$namespace/$RECEIPT_NAME" && ! -L "$namespace/$RECEIPT_NAME" \
+     && ! -e "$namespace/$SIGNATURE_NAME" && ! -L "$namespace/$SIGNATURE_NAME" ]] \
+    || fail "refusing to overwrite an existing LAB baseline media path"
+  receipt_stage="$namespace/.$RECEIPT_NAME.$$.new"
+  signature_stage="$namespace/.$SIGNATURE_NAME.$$.new"
+
+  copy_checked "$receipt" "$receipt_stage" \
+    "$RECEIPT_MAX_BYTES" "$RECEIPT_NAME" "$receipt_sha256"
+  copy_checked "$signature" "$signature_stage" \
+    "$SIGNATURE_MAX_BYTES" "$SIGNATURE_NAME" "$signature_sha256"
+  sync -f "$receipt_stage" "$signature_stage"
+  mv -n -- "$receipt_stage" "$namespace/$RECEIPT_NAME"
+  mv -n -- "$signature_stage" "$namespace/$SIGNATURE_NAME"
+  [[ ! -e "$receipt_stage" && ! -L "$receipt_stage" \
+     && ! -e "$signature_stage" && ! -L "$signature_stage" ]] \
+    || fail "LAB baseline media paths changed during publication"
+  [[ ! -L "$namespace/$RECEIPT_NAME" && -f "$namespace/$RECEIPT_NAME" \
+     && ! -L "$namespace/$SIGNATURE_NAME" && -f "$namespace/$SIGNATURE_NAME" ]] \
+    || fail "published LAB baseline media paths are unsafe"
+  sync -f "$namespace/$RECEIPT_NAME" "$namespace/$SIGNATURE_NAME" "$namespace"
 }
 
 snapshot_pair() {
@@ -152,12 +221,19 @@ install_pair() {
 usage() {
   printf 'usage: %s snapshot <esp-root> <snapshot-dir>\n' "$0" >&2
   printf '       %s install <snapshot-dir> <target-var>\n' "$0" >&2
+  printf '       %s stage-media <bom> <bom-sha256> <signature> <signature-sha256> <esp-root>\n' "$0" >&2
   exit 2
 }
 
-[[ "$#" -eq 3 ]] || usage
-case "$1" in
+operation="${1:-}"
+case "$operation" in
+  snapshot|install) [[ "$#" -eq 3 ]] || usage ;;
+  stage-media) [[ "$#" -eq 6 ]] || usage ;;
+  *) usage ;;
+esac
+case "$operation" in
   snapshot) snapshot_pair "$2" "$3" ;;
   install) install_pair "$2" "$3" ;;
+  stage-media) stage_media_pair "$2" "$3" "$4" "$5" "$6" ;;
   *) usage ;;
 esac

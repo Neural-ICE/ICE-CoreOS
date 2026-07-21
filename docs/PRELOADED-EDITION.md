@@ -66,6 +66,10 @@ SEED_MODELS=$HOME/ice-seed/models \
 BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<train-digest> \
 SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
 SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
+LAB_BASELINE_BOM_FILE=/release/train.bom.json \
+LAB_BASELINE_BOM_SHA256=<approved-bom-sha256> \
+LAB_BASELINE_SIGNATURE_FILE=/release/train.bom.sig \
+LAB_BASELINE_SIGNATURE_SHA256=<approved-signature-sha256> \
 COMPRESS=zstd-fast ./image/build-preloaded.sh
 ```
 
@@ -108,9 +112,26 @@ A LAB installer may carry this exact pair on its EFI System Partition:
 /ice-coreos/ota-lab-baseline.sig
 ```
 
-The pair is optional. If both files are absent, installation behaves exactly as before. If only
-one exists, either path is a symlink/non-regular file, either file is empty, the JSON exceeds
-16 KiB, or the signature exceeds 4 KiB, autoinstall fails closed **before wiping the target**.
+The pair is optional. To include it, the preloaded builder requires the two source files and their
+two exact lowercase SHA-256 values as one complete input set. It snapshots those bytes into a
+private mode-0700 staging directory before the expensive image build, refuses symlinks,
+non-regular/empty/oversized inputs and hash drift, and never overwrites an existing fixed ESP path.
+LAB injection is restricted to a debug image where `BASE_IMAGE` and the installed target are the
+same digest-pinned reference.
+
+After `ni-seed` has been added, the final-media gate independently opens the finalized raw,
+selects exactly one `EFI-SYSTEM` vfat child of its retained read-only loop, mounts it
+`ro,nosuid,nodev,noexec`, and re-hashes both fixed paths. The receipt binds the approved file paths,
+sizes and SHA-256 values plus the ESP `PARTUUID`. A missing, partial, unexpected or changed pair
+refuses the complete output set before an archive, checksum or receipt is published. The accepted
+raw must not be modified afterward: every delivered USB is produced only from the archive digest
+and raw digest already bound by that receipt.
+
+If all four builder inputs are absent, installation behaves exactly as before and the receipt
+records `lab_baseline: null`. If only one file or hash is supplied, the build refuses before doing
+expensive work. Independently, if only one fixed ESP path exists, either path is a
+symlink/non-regular file, either file is empty, the JSON exceeds 16 KiB, or the signature exceeds
+4 KiB, autoinstall fails closed **before wiping the target**.
 
 CoreOS does not parse the record and does not verify or interpret its signature. It snapshots
 the two byte streams before touching the target, then atomically installs them on the encrypted
@@ -149,6 +170,10 @@ Failure before the atomic directory rename leaves no final `lab-baseline` direct
 install. Diagnose or replace the USB media and rerun the complete installer; do not boot or repair
 the partially installed target in place. Failure after publication leaves the complete, flushed
 pair, so the same signed bootstrap can be retried safely.
+
+A LAB-baseline refusal occurs before any final artifact, checksum or receipt is published. Keep the
+failed raw as evidence, correct the approved input, and rebuild under a fresh `OUT`; never patch the
+ESP after acceptance or reuse an old final-media receipt.
 
 If post-boot verification refuses, preserve the receipt and diagnostic output. Roll back to the
 previous healthy bootc deployment when one exists; that deployment either ignores the pair or
