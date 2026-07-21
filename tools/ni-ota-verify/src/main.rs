@@ -50,6 +50,11 @@ const USAGE: &str = "usage:
                           [--config /etc/neural-ice/ota.conf]
                           [--device-compat <min,max>] [--applied-state <path>]
   ni-ota-verify commit --bom <path> [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
+  ni-ota-verify verify-delegation-snapshot --snapshot <path> --snapshot-sig <path>
+                       --trusted-now <UTC-seconds>
+                       [--accepted-snapshot <path>]
+                       [--accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>]
+                       [--config /etc/neural-ice/ota.conf]
   ni-ota-verify --version";
 
 /// Environment/tooling failure — never a verification verdict. Always mapped
@@ -68,6 +73,7 @@ fn run() -> u8 {
         Some("verify") => verify::run(&args[1..]),
         Some("bootstrap") => bootstrap::run(&args[1..]),
         Some("commit") => commit::run(&args[1..]),
+        Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("--version" | "version") => {
             println!("ni-ota-verify {}", env!("CARGO_PKG_VERSION"));
             return EXIT_PASS;

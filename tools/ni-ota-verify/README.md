@@ -94,6 +94,11 @@ ni-ota-verify bootstrap --bom <path> --bom-sig <path> --expected-train <train>
                         [--config …] [--device-compat <min,max>]
                         [--applied-state <path>]
 ni-ota-verify commit --bom <path> [--config …] [--applied-state <path>]
+ni-ota-verify verify-delegation-snapshot \
+  --snapshot <path> --snapshot-sig <binary-DER-path> \
+  --trusted-now <YYYY-MM-DDTHH:MM:SSZ> \
+  [--accepted-snapshot <path> --accepted-delegation-seq <n> \
+   --accepted-delegation-sha256 <64hex>] [--config …]
 ```
 
 Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
@@ -101,6 +106,31 @@ Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 `device_compat_max`; flags override. A missing `enforce` key defaults to
 **enforce** (an incomplete config leans strict, never silently log-only). The
 hardware target comes from the immutable image marker, not a CLI override.
+
+### ADR-0039 delegation-snapshot trust gate
+
+`verify-delegation-snapshot` is the first device-side delegated-signing gate.
+It accepts the exact closed Fabric v1 snapshot bytes only:
+unknown or duplicate fields, non-canonical JSON, invalid P-256 SPKI pins,
+non-minimal/high-S DER signatures, scope widening, cross-role/cross-ring use,
+stale trusted time, snapshot split views and rollback all refuse in both shadow
+and enforce modes.
+
+The OTA root verifies only the domain-separated complete delegation snapshot.
+Cosign receives protected root-only snapshots of the message, public key and
+base64 transport form of the contract's binary DER signature; the authority
+signature remains the binary low-S DER artifact.
+
+Without accepted delegation state, the candidate sequence must meet the
+minimum baked into immutable `/usr/lib/neural-ice/ota-min-delegation-seq`.
+With state, the accepted complete
+snapshot plus the sequence and canonical hash read from the trusted state
+backend are required; this slice deliberately defines no new persisted schema:
+the verifier permits an identical retry or exactly `N+1`, checks the previous
+canonical hash, preserves tombstones, and prevents retained keys from widening
+scope or validity. Multi-snapshot offline catch-up and atomic TPM-backed
+delegation-state persistence are deliberately subsequent slices; this command
+does not authorize a release, publish a channel, or mutate accepted state.
 
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An

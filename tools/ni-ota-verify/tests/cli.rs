@@ -37,7 +37,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$sig" ] || { echo "stub: no --signature flag" >&2; exit 2; }
-if ! grep -q '^GOOD' "$sig" 2>/dev/null; then
+if grep -qx 'MAYCAQECAQE=' "$sig" 2>/dev/null; then
+  message_hex="$(od -An -tx1 -v "$blob" | tr -d ' \n')" || exit 2
+  case "$message_hex" in
+    6e657572616c2d6963653a6f74613a64656c65676174696f6e2d736e617073686f743a763100*) ;;
+    *) echo "stub: missing delegated signature domain" >&2; exit 1 ;;
+  esac
+elif ! grep -q '^GOOD' "$sig" 2>/dev/null; then
   expected="$(sed -n 's/^SHA256://p' "$sig")"
   [ -n "$expected" ] && [ -n "$blob" ] || { echo "stub: signature rejected" >&2; exit 1; }
   actual="$(sha256sum "$blob" | awk '{print $1}')" || exit 2
@@ -72,6 +78,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(dir.join("hardware-target"), "nvidia-gb10-arm64\n").unwrap();
+        fs::write(dir.join("min-delegation-seq"), "1\n").unwrap();
         Fixture { dir }
     }
 
@@ -1634,4 +1641,61 @@ fn commit_refuses_malformed_bom_as_internal_error() {
         .args(["--config".as_ref(), cfg.as_os_str()]));
     assert_eq!(code, 2);
     assert!(stderr.contains("malformed BOM"));
+}
+
+#[test]
+fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
+    let fx = Fixture::new("delegation-snapshot");
+    let snapshot = fx.path("delegation-snapshot.json");
+    fs::write(
+        &snapshot,
+        include_bytes!("fixtures/delegated-v1/delegation-snapshot.json"),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    let encoded = value["root_key"]["public_key"]["spki_der_base64"]
+        .as_str()
+        .unwrap();
+    fs::write(
+        fx.path("ota-root.pub"),
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &encoded[..64],
+            &encoded[64..]
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fx.path("snapshot.sig"),
+        [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+    )
+    .unwrap();
+    let cfg = fx.write_config(1, "");
+    let command = |minimum: &str| {
+        fs::write(fx.path("min-delegation-seq"), format!("{minimum}\n")).unwrap();
+        let mut command = Command::new(BIN);
+        command
+            .env("NI_OTA_COSIGN", fx.path("cosign-stub.sh"))
+            .env(
+                "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+                fx.path("min-delegation-seq"),
+            )
+            .arg("verify-delegation-snapshot")
+            .args(["--snapshot".as_ref(), snapshot.as_os_str()])
+            .args([
+                "--snapshot-sig".as_ref(),
+                fx.path("snapshot.sig").as_os_str(),
+            ])
+            .args(["--trusted-now", "2026-07-22T00:00:00Z"])
+            .args(["--config".as_ref(), cfg.as_os_str()]);
+        run(&mut command)
+    };
+    let (code, verdict, stderr) = command("1");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(verdict["verdict"], "pass");
+    assert!(verdict.get("ring").is_none());
+
+    let (code, _, stderr) = command("2");
+    assert_eq!(code, 1);
+    assert!(stderr.contains("delegation snapshot REFUSED"));
 }
