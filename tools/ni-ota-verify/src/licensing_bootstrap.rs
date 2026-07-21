@@ -348,7 +348,7 @@ fn valid_baseline(value: &BaselineIdentity) -> bool {
         && safe_uint(value.compatibility_version)
         && safe_uint(value.minimum_bundle_seq)
         && safe_uint(value.minimum_delegation_seq)
-        && safe_uint(value.minimum_recovery_seq)
+        && value.minimum_recovery_seq <= MAX_SAFE_INTEGER
         && safe_uint(value.minimum_trusted_time_seq)
         && safe_uint(value.ota_root_version)
         && sha256(&value.ota_root_spki_sha256)
@@ -379,7 +379,7 @@ fn valid_authoritative_state(value: &AuthoritativeState) -> bool {
         && timestamp(&value.trusted_time_recovery_floor)
         && value.trusted_time < value.trusted_time_recovery_floor
         && sha256(&value.last_trusted_time_assertion_sha256)
-        && safe_uint(value.recovery_seq)
+        && value.recovery_seq <= MAX_SAFE_INTEGER
         && optional_hash_for_sequence(value.recovery_seq, &value.recovery_sha256)
         && valid_release_authorizations(value)
         && value.root_version >= value.baseline.ota_root_version
@@ -513,7 +513,7 @@ struct StateRecoveryAuthorization {
     issuance_id: String,
     issued_at: String,
     key_id: String,
-    previous_recovery_sha256: String,
+    previous_recovery_sha256: Option<String>,
     reason: String,
     recovery_nonce: String,
     recovery_seq: u64,
@@ -641,12 +641,7 @@ fn validate_root_recovery(
         || value.recovery_seq != expected_recovery_seq.unwrap_or(0)
         || expected.resulting_state.recovery_seq != value.recovery_seq
         || expected.resulting_state.recovery_sha256.as_deref() != Some(root_recovery_sha256)
-        || value.previous_recovery_sha256
-            != expected
-                .current_state
-                .recovery_sha256
-                .as_deref()
-                .unwrap_or_default()
+        || value.previous_recovery_sha256 != expected.current_state.recovery_sha256
         || value.release_authorization_sha256.as_deref() != expected.release_authorization_sha256
         || value
             .release_authorization_sha256

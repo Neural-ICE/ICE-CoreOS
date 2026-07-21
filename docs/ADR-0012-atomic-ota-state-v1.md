@@ -146,10 +146,12 @@ one-use challenge, the exact immutable image/baseline/root/snapshot identity,
 and either `initial_activation` or the complete server-held forward-only state
 for `state_loss_recovery`. A simultaneous disk and TPM loss therefore always
 requires the signed online recovery proof; there is no local fallback.
-The immutable baseline carries non-zero numeric minimums for bundle,
-delegation, recovery and trusted-time sequences. Recovered floors are validated
-at `max(baseline minimum, server high-water)` and zero cannot silently mean
-"unknown". The server state also carries an ordered, closed beta/stable set of
+The immutable baseline carries numeric minimums for bundle, delegation,
+recovery and trusted-time sequences. Bundle, delegation and trusted-time
+minimums are non-zero. Recovery sequence zero is permitted only for an exact
+baseline with no recovery history and a null recovery hash; it cannot silently
+mean "unknown". Recovered floors are validated at
+`max(baseline minimum, server high-water)`. The server state also carries an ordered, closed beta/stable set of
 release-authorization sequence/hash identities. A retained ring at the same
 sequence must retain the identical hash.
 

@@ -153,8 +153,9 @@ verifiers for the next atomic bootstrap layer. They require canonical JSON,
 exact P-256 low-S signatures, distinct terminal-NUL domains, an opaque licence
 record, the dedicated device-root TPM Name/SPKI, a fresh pending nonce, the
 complete immutable baseline and the expected monotonic server chain/floors.
-The baseline includes exact non-zero minimum bundle/delegation/recovery/time
-sequences, while recovery carries an ordered closed beta/stable inventory of
+The baseline includes exact minimum bundle/delegation/recovery/time sequences;
+only an explicitly empty recovery history may use sequence zero with a null
+hash. Recovery carries an ordered closed beta/stable inventory of
 release-authorization sequence/hash identities. Same-sequence identities must
 be byte-identical.
 
