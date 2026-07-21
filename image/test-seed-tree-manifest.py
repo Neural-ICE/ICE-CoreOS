@@ -26,7 +26,7 @@ SPEC.loader.exec_module(MANIFEST_MODULE)
 class SeedTreeManifestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "source"
         (self.source / "store" / "overlay").mkdir(parents=True)
         (self.source / "models" / "model-a").mkdir(parents=True)
@@ -220,7 +220,7 @@ class SeedTreeManifestTests(unittest.TestCase):
                     output,
                 )
         self.assertFalse(output.exists())
-        self.assertEqual(list(self.root.glob(".partial.json.tmp-*")), [])
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
 
     def test_failed_atomic_publish_removes_private_temporary_output(self) -> None:
         output = self.root / "link-failure.json"
@@ -235,7 +235,35 @@ class SeedTreeManifestTests(unittest.TestCase):
                     output,
                 )
         self.assertFalse(output.exists())
-        self.assertEqual(list(self.root.glob(".link-failure.json.tmp-*")), [])
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
+
+    def test_spool_teardown_failure_does_not_publish_output(self) -> None:
+        output = self.root / "spool-teardown.json"
+        original_temporary_directory = tempfile.TemporaryDirectory
+
+        class FailingTemporaryDirectory:
+            def __init__(self, *args, **kwargs) -> None:
+                self.inner = original_temporary_directory(*args, **kwargs)
+
+            def __enter__(self):
+                return self.inner.__enter__()
+
+            def __exit__(self, exception_type, exception, traceback) -> None:
+                self.inner.__exit__(exception_type, exception, traceback)
+                raise OSError("simulated spool teardown failure")
+
+        with mock.patch.object(
+            MANIFEST_MODULE.tempfile,
+            "TemporaryDirectory",
+            FailingTemporaryDirectory,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated spool teardown failure"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
 
     def test_output_parent_change_removes_the_published_inode(self) -> None:
         output = self.root / "parent-change.json"
@@ -253,7 +281,100 @@ class SeedTreeManifestTests(unittest.TestCase):
                     output,
                 )
         self.assertFalse(output.exists())
-        self.assertEqual(list(self.root.glob(".parent-change.json.tmp-*")), [])
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
+
+    def test_temporary_directory_inside_input_tree_is_refused(self) -> None:
+        output = self.root / "unsafe-spool.json"
+        with mock.patch.object(
+            MANIFEST_MODULE.tempfile,
+            "gettempdir",
+            return_value=str(self.source / "models"),
+        ):
+            with self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "temporary directory is inside input tree",
+            ):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+
+    def test_output_symlink_ancestor_is_refused(self) -> None:
+        alias = self.root / "output-alias"
+        destination = self.root / "output-destination"
+        destination.mkdir()
+        alias.symlink_to(destination, target_is_directory=True)
+        output = alias / "manifest.json"
+        with self.assertRaisesRegex(
+            MANIFEST_MODULE.ManifestError,
+            "cannot open output directory",
+        ):
+            MANIFEST_MODULE.write_manifest(
+                [("models", self.source / "models")],
+                output,
+            )
+        self.assertFalse((destination / "manifest.json").exists())
+
+    def test_output_mode_is_0600_under_restrictive_umask(self) -> None:
+        output = self.root / "mode.json"
+        previous_umask = os.umask(0o777)
+        try:
+            MANIFEST_MODULE.write_manifest(
+                [("models", self.source / "models")],
+                output,
+            )
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+
+    def test_failed_mode_enforcement_removes_private_output(self) -> None:
+        output = self.root / "mode-failure.json"
+        with mock.patch.object(
+            MANIFEST_MODULE.os,
+            "fchmod",
+            side_effect=OSError("simulated chmod failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated chmod failure"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
+
+    def test_maximum_length_output_basename_is_supported(self) -> None:
+        output = self.root / ("m" * 255)
+        MANIFEST_MODULE.write_manifest(
+            [("models", self.source / "models")],
+            output,
+        )
+        self.assertTrue(output.is_file())
+
+    def test_cleanup_attempts_every_owned_name(self) -> None:
+        attempted: list[str] = []
+
+        def remove(
+            _parent_descriptor: int,
+            name: str,
+            _created_identity: tuple[int, int],
+            _original_error: BaseException,
+        ) -> None:
+            attempted.append(name)
+            if name == "published":
+                raise MANIFEST_MODULE.ManifestError("simulated replacement")
+
+        with mock.patch.object(MANIFEST_MODULE, "remove_owned_name", side_effect=remove):
+            with self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "one or more owned manifest files",
+            ):
+                MANIFEST_MODULE.remove_owned_names(
+                    1,
+                    [("published", (1, 1)), ("temporary", (1, 1))],
+                    OSError("original"),
+                )
+        self.assertEqual(attempted, ["published", "temporary"])
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
     def test_fifo_is_rejected_without_reading_it(self) -> None:
