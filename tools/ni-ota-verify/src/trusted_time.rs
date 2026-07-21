@@ -192,6 +192,7 @@ fn validate(
         || value.issued_at >= snapshot.valid_until
         || value.trusted_time < snapshot.valid_from
         || value.trusted_time >= snapshot.valid_until
+        || !consumption_precedes_deadline(value, expected, &snapshot.valid_until)
     {
         return Err("trusted-time v2 assertion scope, challenge or time is invalid".into());
     }
@@ -202,8 +203,16 @@ fn consumption_precedes_expiry(
     value: &TrustedTimeAssertion,
     expected: &ExpectedTrustedTime<'_>,
 ) -> bool {
+    consumption_precedes_deadline(value, expected, &value.valid_until)
+}
+
+fn consumption_precedes_deadline(
+    value: &TrustedTimeAssertion,
+    expected: &ExpectedTrustedTime<'_>,
+    deadline: &str,
+) -> bool {
     consumption_utc_seconds(value, expected)
-        .zip(utc_seconds(&value.valid_until))
+        .zip(utc_seconds(deadline))
         .is_some_and(|(consumption, valid_until)| consumption < valid_until)
 }
 
@@ -396,6 +405,14 @@ mod tests {
         assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_ok());
         observed.consumption_tpm_clock += 1;
         assert!(validate(&value, &snapshot, &snapshot_sha256, &observed).is_err());
+
+        let mut expiring_snapshot = snapshot.clone();
+        expiring_snapshot.valid_until = "2026-07-22T00:04:00Z".into();
+        let mut observed = expected(&value);
+        observed.consumption_tpm_clock += 238_000;
+        assert!(validate(&value, &expiring_snapshot, &snapshot_sha256, &observed).is_ok());
+        observed.consumption_tpm_clock += 1;
+        assert!(validate(&value, &expiring_snapshot, &snapshot_sha256, &observed).is_err());
     }
 
     #[test]
