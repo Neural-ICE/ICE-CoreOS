@@ -23,6 +23,15 @@ use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
 pub(crate) const LEGACY_NV_INDEX: u32 = 0x0150_0001;
+// ADR-0013 reserves 0x81010004 for the appliance PKI. The installer-owned,
+// non-exportable OTA/licensing device root is provisioned at this separate
+// handle before trusted-time preparation is available on a clean install.
+const DEVICE_ROOT_HANDLE: u32 = 0x8101_0005;
+const DEVICE_ROOT_HELPER: &str = "/usr/libexec/neural-ice-device-root";
+const DEVICE_ROOT_IDENTITY: &str = "/var/lib/neural-ice/ota/device-root-v1.json";
+const DEVICE_ROOT_SCHEMA: &str = "neural-ice-device-root-tpm-v1";
+const DEVICE_ROOT_ATTRIBUTES: &str =
+    "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign|noda";
 const STATE_NV_ATTRIBUTES: &str =
     "authread|authwrite|no_da|nt=0x1|ownerread|platformcreate|policydelete";
 const STATE_NV_DELETE_AUTH_POLICY: &str =
@@ -112,6 +121,39 @@ struct LoadedGeneration {
     manifest_sha256: String,
     nv_anchor: String,
     trusted: TrustedTimeState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimeChallenge {
+    pub(crate) delegation_snapshot_sha256: String,
+    pub(crate) device_fingerprint: String,
+    pub(crate) hardware_target: String,
+    pub(crate) nonce: String,
+    pub(crate) release_authorization_sha256: String,
+    pub(crate) ring: String,
+    pub(crate) schema: String,
+    pub(crate) state_nv_anchor: String,
+    pub(crate) tpm_clock: u64,
+    pub(crate) tpm_reset_count: u32,
+    pub(crate) tpm_restart_count: u32,
+    pub(crate) tpm_safe: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceRootReceipt {
+    attributes: String,
+    curve: String,
+    handle: String,
+    hierarchy: String,
+    name: String,
+    name_algorithm: String,
+    public_area_sha256: String,
+    qualified_name: String,
+    schema: String,
+    scheme: String,
+    spki_sha256: String,
 }
 
 #[derive(Default)]
@@ -292,6 +334,19 @@ fn continuity_ready(tpm: &impl NvAnchor) -> Result<bool, InternalError> {
 }
 
 impl CommandTpm {
+    fn index_present(&self) -> Result<bool, InternalError> {
+        let handles = Command::new(tool("tpm2_getcap"))
+            .arg("handles-nv-index")
+            .output()
+            .map_err(|error| InternalError(format!("cannot enumerate TPM NV handles: {error}")))?;
+        if !handles.status.success() {
+            return Err(InternalError("cannot enumerate TPM NV handles".into()));
+        }
+        let handles = String::from_utf8(handles.stdout)
+            .map_err(|_| InternalError("TPM NV handle list is not UTF-8".into()))?;
+        Ok(contains_nv_handle(&handles, self.index))
+    }
+
     fn inspect(&self) -> Result<bool, InternalError> {
         let output = Command::new(tool("tpm2_nvreadpublic"))
             .arg(format!("0x{:08x}", self.index))
@@ -309,6 +364,93 @@ impl CommandTpm {
             self.index,
         )
     }
+
+    fn initial_or_existing_anchor(&self) -> Result<String, InternalError> {
+        if !self.index_present()? {
+            return Ok(ZERO_ANCHOR.to_owned());
+        }
+        if !self.inspect()? {
+            // An exact EXTEND index is unreadable until its first extend.
+            // Treat its attested unwritten state as the logical zero anchor.
+            return Ok(ZERO_ANCHOR.to_owned());
+        }
+        self.read().map(hex)
+    }
+
+    fn device_fingerprint(&self) -> Result<String, InternalError> {
+        let receipt = self.attested_device_root_receipt()?;
+        let output = self
+            .scratch
+            .secure_temp_bytes("device-root-public", b"pending")?;
+        let status = Command::new(tool("tpm2_readpublic"))
+            .args([
+                "-Q",
+                "-c",
+                &format!("0x{DEVICE_ROOT_HANDLE:08x}"),
+                "-f",
+                "der",
+                "-o",
+            ])
+            .arg(output.path())
+            .status()
+            .map_err(|error| InternalError(format!("cannot read TPM device root: {error}")))?;
+        if !status.success() {
+            return Err(InternalError(format!(
+                "cannot read TPM device root handle 0x{DEVICE_ROOT_HANDLE:08x}"
+            )));
+        }
+        let observed_spki_sha256 = runner::sha256_file(output.path())?;
+        if observed_spki_sha256 != receipt.spki_sha256 {
+            return Err(InternalError(
+                "TPM device root changed after ADR-0013 attestation".into(),
+            ));
+        }
+        runner::sha256_bytes(format!("tpm-pub-v1:{}", receipt.spki_sha256).as_bytes())
+    }
+
+    fn attested_device_root_receipt(&self) -> Result<DeviceRootReceipt, InternalError> {
+        let output = Command::new(DEVICE_ROOT_HELPER)
+            .args(["attest", "--identity", DEVICE_ROOT_IDENTITY])
+            .output()
+            .map_err(|error| {
+                InternalError(format!("cannot execute ADR-0013 device-root gate: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(InternalError(
+                "ADR-0013 device-root attestation/receipt gate refused trusted-time preparation"
+                    .into(),
+            ));
+        }
+        let receipt: DeviceRootReceipt = parse_canonical(&output.stdout, "device-root receipt")
+            .map_err(|reason| {
+                InternalError(format!("invalid attested device-root receipt: {reason}"))
+            })?;
+        validate_device_root_receipt(&receipt)?;
+        Ok(receipt)
+    }
+}
+
+fn validate_device_root_receipt(receipt: &DeviceRootReceipt) -> Result<(), InternalError> {
+    let closed_name =
+        |value: &str| value.len() == 68 && value.starts_with("000b") && sha256(&value[4..]);
+    if receipt.attributes != DEVICE_ROOT_ATTRIBUTES
+        || receipt.curve != "nist-p256"
+        || receipt.handle != format!("0x{DEVICE_ROOT_HANDLE:08x}")
+        || receipt.hierarchy != "endorsement"
+        || receipt.name_algorithm != "sha256"
+        || receipt.schema != DEVICE_ROOT_SCHEMA
+        || receipt.scheme != "ecdsa-sha256"
+        || !sha256(&receipt.public_area_sha256)
+        || !sha256(&receipt.spki_sha256)
+        || receipt.name != format!("000b{}", receipt.public_area_sha256)
+        || !closed_name(&receipt.name)
+        || !closed_name(&receipt.qualified_name)
+    {
+        return Err(InternalError(
+            "attested device-root receipt is outside the ADR-0013 closed contract".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Store {
@@ -316,6 +458,109 @@ impl Store {
         FileStateStore {
             path: self.root.join("transaction.json"),
         }
+    }
+
+    pub(crate) fn issue_time_challenge(
+        &self,
+        tpm: &CommandTpm,
+        delegation_snapshot_sha256: &str,
+        release_authorization_sha256: &str,
+        hardware_target: &str,
+        ring: &str,
+    ) -> Result<TimeChallenge, InternalError> {
+        ensure_secure_state_directory(&self.root)?;
+        let anchor = tpm.initial_or_existing_anchor()?;
+        self.validate_challenge_continuity(tpm, &anchor)?;
+        let clock = tpm.clock()?;
+        if !clock.safe {
+            return Err(InternalError("TPM clock is not safe".into()));
+        }
+        let challenge = TimeChallenge {
+            delegation_snapshot_sha256: delegation_snapshot_sha256.to_owned(),
+            device_fingerprint: tpm.device_fingerprint()?,
+            hardware_target: hardware_target.to_owned(),
+            nonce: fresh_nonce()?,
+            release_authorization_sha256: release_authorization_sha256.to_owned(),
+            ring: ring.to_owned(),
+            schema: "neural-ice-ota-time-challenge-v2".into(),
+            state_nv_anchor: anchor,
+            tpm_clock: clock.clock,
+            tpm_reset_count: clock.reset_count,
+            tpm_restart_count: clock.restart_count,
+            tpm_safe: clock.safe,
+        };
+        validate_time_challenge(&challenge)?;
+        atomic_replace(
+            &self.root,
+            "pending-time-challenge.json",
+            &canonical(&challenge)?,
+        )?;
+        let readback = self.pending_time_challenge()?;
+        if readback != challenge {
+            return Err(InternalError(
+                "trusted-time challenge readback differs after publication".into(),
+            ));
+        }
+        Ok(challenge)
+    }
+
+    fn validate_challenge_continuity(
+        &self,
+        nv: &dyn NvAnchor,
+        anchor: &str,
+    ) -> Result<(), InternalError> {
+        let legacy_floor = nv
+            .legacy_bundle_floor()?
+            .ok_or_else(|| InternalError("legacy TPM bundle floor is absent".into()))?;
+        if anchor == ZERO_ANCHOR {
+            if self.has_prior_state_evidence()? {
+                return Err(InternalError(
+                    "zero TPM anchor with existing state history requires signed recovery".into(),
+                ));
+            }
+        } else {
+            let current = self.read_current_locked(nv)?.ok_or_else(|| {
+                InternalError("nonzero TPM anchor has no complete state-v1 generation".into())
+            })?;
+            if current.manifest.legacy_bundle_floor != Some(legacy_floor) {
+                return Err(InternalError(
+                    "legacy floor differs from TPM-anchored state-v1 manifest".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn has_prior_state_evidence(&self) -> Result<bool, InternalError> {
+        if self.scan_generations()?.has_evidence {
+            return Ok(true);
+        }
+        for entry in std::fs::read_dir(&self.root).map_err(|error| {
+            InternalError(format!("cannot enumerate {}: {error}", self.root.display()))
+        })? {
+            let entry = entry
+                .map_err(|error| InternalError(format!("cannot enumerate state-v1: {error}")))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(true);
+            };
+            if name == "generations"
+                || name == "pending-time-challenge.json"
+                || name == ".transaction.json.lock"
+                || (name.starts_with(".transaction.json.") && name.ends_with(".tmp"))
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn pending_time_challenge(&self) -> Result<TimeChallenge, InternalError> {
+        let bytes = read_regular(&self.root.join("pending-time-challenge.json"), 0o600)?;
+        let challenge: TimeChallenge =
+            parse_canonical(&bytes, "trusted-time v2 challenge").map_err(InternalError)?;
+        validate_time_challenge(&challenge)?;
+        Ok(challenge)
     }
 
     #[cfg(test)]
@@ -837,6 +1082,28 @@ fn safe_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
+fn validate_time_challenge(value: &TimeChallenge) -> Result<(), InternalError> {
+    if value.schema != "neural-ice-ota-time-challenge-v2"
+        || !sha256(&value.delegation_snapshot_sha256)
+        || !sha256(&value.device_fingerprint)
+        || !sha256(&value.release_authorization_sha256)
+        || !sha256(&value.state_nv_anchor)
+        || value.nonce.len() != 64
+        || !value
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !matches!(value.ring.as_str(), "beta" | "stable")
+        || !value.tpm_safe
+        || !safe_uint(value.tpm_clock)
+    {
+        return Err(InternalError(
+            "trusted-time v2 challenge contract is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_pointer(bytes: &[u8]) -> Result<u64, InternalError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| InternalError("state-v1 CURRENT is not UTF-8".into()))?;
@@ -1058,6 +1325,28 @@ fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, InternalError> {
         .map_err(|error| InternalError(format!("cannot encode state-v1 value: {error}")))?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+fn fresh_nonce() -> Result<String, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let source = std::env::var_os("NI_OTA_RANDOM_SOURCE")
+        .map_or_else(|| PathBuf::from("/dev/urandom"), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let source = PathBuf::from("/dev/urandom");
+    nonce_from(&source)
+}
+
+fn nonce_from(source: &Path) -> Result<String, InternalError> {
+    let mut bytes = [0_u8; 32];
+    File::open(source)
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| {
+            InternalError(format!(
+                "cannot read 32-byte trusted-time nonce from {}: {error}",
+                source.display()
+            ))
+        })?;
+    Ok(hex(bytes))
 }
 
 fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> {
@@ -2157,6 +2446,140 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn time_challenge_is_closed_and_nonce_is_exact() {
+        let value = TimeChallenge {
+            delegation_snapshot_sha256: "a".repeat(64),
+            device_fingerprint: "b".repeat(64),
+            hardware_target: "nvidia-gb10-arm64".into(),
+            nonce: "c".repeat(64),
+            release_authorization_sha256: "d".repeat(64),
+            ring: "beta".into(),
+            schema: "neural-ice-ota-time-challenge-v2".into(),
+            state_nv_anchor: ZERO_ANCHOR.into(),
+            tpm_clock: 42,
+            tpm_reset_count: 3,
+            tpm_restart_count: 4,
+            tpm_safe: true,
+        };
+        assert!(validate_time_challenge(&value).is_ok());
+        let mut unsafe_value = value.clone();
+        unsafe_value.tpm_safe = false;
+        assert!(validate_time_challenge(&unsafe_value).is_err());
+        let mut noncanonical_nonce = value;
+        noncanonical_nonce.nonce = "C".repeat(64);
+        assert!(validate_time_challenge(&noncanonical_nonce).is_err());
+        assert_eq!(nonce_from(Path::new("/dev/zero")).unwrap(), "0".repeat(64));
+    }
+
+    #[test]
+    fn trusted_time_fingerprint_uses_the_dedicated_device_root() {
+        // 0x81010004 is the appliance PKI root. A future handle regression
+        // would silently couple OTA identity to that unrelated lifecycle.
+        assert_eq!(DEVICE_ROOT_HANDLE, 0x8101_0005);
+        assert_ne!(DEVICE_ROOT_HANDLE, 0x8101_0004);
+    }
+
+    #[test]
+    fn device_root_receipt_is_closed_before_trusted_time_fingerprinting() {
+        let public_area_sha256 = "a".repeat(64);
+        let receipt = DeviceRootReceipt {
+            attributes: DEVICE_ROOT_ATTRIBUTES.into(),
+            curve: "nist-p256".into(),
+            handle: "0x81010005".into(),
+            hierarchy: "endorsement".into(),
+            name: format!("000b{public_area_sha256}"),
+            name_algorithm: "sha256".into(),
+            public_area_sha256,
+            qualified_name: format!("000b{}", "b".repeat(64)),
+            schema: DEVICE_ROOT_SCHEMA.into(),
+            scheme: "ecdsa-sha256".into(),
+            spki_sha256: "c".repeat(64),
+        };
+        assert!(validate_device_root_receipt(&receipt).is_ok());
+
+        let mut substituted = receipt;
+        substituted.handle = "0x81010004".into();
+        assert!(validate_device_root_receipt(&substituted).is_err());
+    }
+
+    #[test]
+    fn challenge_continuity_ignores_lock_scratch_but_refuses_orphaned_anchor() {
+        let (store, root) = test_store();
+        write_file(
+            &store
+                .root
+                .join(".transaction.json.time-v2-snapshot.1.1.tmp"),
+            b"scratch",
+        );
+        let fresh = TestAnchor {
+            anchor: [0; 32],
+            initialized: false,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        assert!(store
+            .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
+            .is_ok());
+
+        for marker in ["current", "enforce-ready.json", "unexpected-state"] {
+            write_file(&store.root.join(marker), b"retained");
+            let error = store
+                .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
+                .unwrap_err();
+            assert!(error.0.contains("requires signed recovery"), "{marker}");
+            std::fs::remove_file(store.root.join(marker)).unwrap();
+        }
+        write_file(
+            &store.root.join("pending-time-challenge.json"),
+            b"replaceable",
+        );
+        assert!(store
+            .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
+            .is_ok());
+        std::fs::remove_file(store.root.join("pending-time-challenge.json")).unwrap();
+
+        let (_, anchored) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        store.publish_current(1).unwrap();
+        let mismatched_legacy = TestAnchor {
+            anchor: decode_hash(&anchored).unwrap(),
+            initialized: true,
+            legacy_floor: Some(2),
+            ..fresh
+        };
+        let error = store
+            .validate_challenge_continuity(&mismatched_legacy, &anchored)
+            .unwrap_err();
+        assert!(error.0.contains("legacy floor differs"));
+        std::fs::remove_dir_all(store.root.join("generations")).unwrap();
+        ensure_secure_state_directory(&store.root.join("generations")).unwrap();
+        std::fs::remove_file(store.root.join("current")).unwrap();
+
+        let orphaned = TestAnchor {
+            anchor: [7; 32],
+            initialized: true,
+            ..fresh
+        };
+        let error = store
+            .validate_challenge_continuity(&orphaned, &hex(orphaned.anchor))
+            .unwrap_err();
+        assert!(error.0.contains("no complete state-v1 generation"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

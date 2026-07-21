@@ -251,10 +251,13 @@ freeze_recovery_input() {
     || die "cannot freeze recovery input"
   [[ -f "$destination" && ! -L "$destination" ]] \
     || die "cannot freeze recovery input"
-  actual_bytes="$(stat -c '%s' -- "$destination")"
+  actual_bytes="$(wc -c < "$destination" | tr -d '[:space:]')"
   [[ "$actual_bytes" =~ ^[0-9]+$ && "$actual_bytes" -le "$maximum_bytes" ]] \
     || die "recovery input exceeds the maximum protocol size"
-  chmod 0600 -- "$destination" || die "cannot protect recovery input"
+  # destination is a fresh mktemp path below our root-only workspace; omitting
+  # GNU's `--` keeps the helper testable on the supported macOS development
+  # host as well as on the CentOS appliance.
+  chmod 0600 "$destination" || die "cannot protect recovery input"
 }
 
 create_challenge() {

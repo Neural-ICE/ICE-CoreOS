@@ -138,10 +138,36 @@ authority on failure. A TPM-state recovery is a distinct root-signed artifact
 bound to a new one-use appliance challenge and the complete replacement state.
 Ordinary trusted-time assertions can never reset or lower a floor.
 
+`ni-ota-verify prepare-trusted-time-v2` is the controller's local,
+networkless preparation gate. It first freezes the four caller-supplied
+authority artifacts, then verifies the complete root-signed snapshot and the
+beta release signature. Both `active` and `retiring` release keys are accepted
+during their bounded overlap; revoked, expired, wrong-role, wrong-target,
+wrong-ring and wrong immutable appliance-variant releases refuse. A nonzero
+TPM state anchor must resolve to exactly one complete durable generation before
+the command can issue anything.
+
+On success the command atomically replaces
+`state-v1/pending-time-challenge.json` with a canonical mode-`0600` challenge
+and prints that same object for the controller to submit to the allowlisted
+trusted-time service. Replacement deliberately invalidates an earlier pending
+attempt; no release has been applied at this point. The later atomic commit
+must bind and consume the exact pending challenge. A malformed candidate exits
+as a refusal, while local I/O, TPM or verifier failures remain internal errors.
+The challenge fingerprints only the separate, installer-provisioned,
+non-exportable device root at persistent handle `0x81010005` (ADR-0013); the
+appliance PKI handle `0x81010004` is never read or reused. Thus a clean install
+must complete the ADR-0013 device-root gate before trusted-time preparation;
+failure denies only the candidate update and cannot create substitute identity.
+
 ## Crash recovery and rollback
 
 - A crash before NV EXTEND leaves a non-authoritative staged generation which
   an exact retry may replace.
+- A crash after challenge publication but before commit leaves only a pending
+  request. The controller may retry the exact request or replace it by running
+  preparation again; neither path advances a floor or authorizes payload
+  application by itself.
 - A crash after NV EXTEND recovers only the unique complete generation chain
   whose derived anchor equals the observed TPM value.
 - An equal sequence is accepted only for byte-identical retry; a split view
@@ -157,6 +183,9 @@ Ordinary trusted-time assertions can never reset or lower a floor.
 An N-1 verifier without `atomic-state-v1` may boot the retained deployment but
 cannot authorize a new atomic-state update. Operators must boot the retained
 newer deployment or signed recovery media before changing update state.
+The pending challenge is therefore forward-compatible state, not rollback
+authority: an N-1 deployment ignores it, cannot consume it, and cannot lower
+any state already anchored by the newer verifier.
 
 ## Delivery
 

@@ -23,34 +23,34 @@ mod usb;
 
 pub(crate) use usb::run as run_usb;
 
-const RELEASE_DOMAIN: &[u8] = b"neural-ice:ota:release-authorization:v1\0";
+pub(crate) const RELEASE_DOMAIN: &[u8] = b"neural-ice:ota:release-authorization:v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"neural-ice:ota:beta-publication-receipt:v1\0";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseAuthorization {
-    attestation_set_sha256: String,
-    beta_publication_receipt_sha256: Option<String>,
-    bom_sha256: String,
-    bundle_seq: u64,
-    channel_record_sha256: String,
-    compat_max: u64,
-    compat_min: u64,
-    delegation_seq: u64,
-    delegation_snapshot_sha256: String,
-    hardware_target: String,
-    issuance_id: String,
-    issued_at: String,
-    key_id: String,
-    ring: String,
-    schema: String,
-    signature_algorithm: String,
-    signature_encoding: String,
-    signing_role: String,
-    train: String,
-    valid_from: String,
-    valid_until: String,
-    variant: String,
+pub(crate) struct ReleaseAuthorization {
+    pub(crate) attestation_set_sha256: String,
+    pub(crate) beta_publication_receipt_sha256: Option<String>,
+    pub(crate) bom_sha256: String,
+    pub(crate) bundle_seq: u64,
+    pub(crate) channel_record_sha256: String,
+    pub(crate) compat_max: u64,
+    pub(crate) compat_min: u64,
+    pub(crate) delegation_seq: u64,
+    pub(crate) delegation_snapshot_sha256: String,
+    pub(crate) hardware_target: String,
+    pub(crate) issuance_id: String,
+    pub(crate) issued_at: String,
+    pub(crate) key_id: String,
+    pub(crate) ring: String,
+    pub(crate) schema: String,
+    pub(crate) signature_algorithm: String,
+    pub(crate) signature_encoding: String,
+    pub(crate) signing_role: String,
+    pub(crate) train: String,
+    pub(crate) valid_from: String,
+    pub(crate) valid_until: String,
+    pub(crate) variant: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -298,6 +298,48 @@ fn validate_release(
     now: &str,
     immutable_target: &str,
 ) -> Result<(), String> {
+    validate_release_contract(value, snapshot, snapshot_hash, immutable_target)?;
+    if now < value.valid_from.as_str() || now >= value.valid_until.as_str() {
+        return Err("beta release authorization is not live at trusted time".into());
+    }
+    authorized_key(
+        snapshot,
+        &value.key_id,
+        "beta-release-authorization",
+        immutable_target,
+        &value.issued_at,
+        now,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_release_for_time_challenge<'a>(
+    value: &ReleaseAuthorization,
+    snapshot: &'a Snapshot,
+    snapshot_hash: &str,
+    immutable_target: &str,
+    immutable_variant: &str,
+) -> Result<&'a DelegatedKey, String> {
+    validate_release_contract(value, snapshot, snapshot_hash, immutable_target)?;
+    if value.variant != immutable_variant || !matches!(immutable_variant, "debug" | "prod") {
+        return Err("release variant differs from immutable host variant".into());
+    }
+    authorized_key(
+        snapshot,
+        &value.key_id,
+        "beta-release-authorization",
+        immutable_target,
+        &value.issued_at,
+        &value.issued_at,
+    )
+}
+
+fn validate_release_contract(
+    value: &ReleaseAuthorization,
+    snapshot: &Snapshot,
+    snapshot_hash: &str,
+    immutable_target: &str,
+) -> Result<(), String> {
     if value.schema != "neural-ice-ota-release-authorization-v1"
         || value.signing_role != "release-beta"
         || value.ring != "beta"
@@ -330,19 +372,9 @@ fn validate_release(
         || value.valid_from >= value.valid_until
         || value.issued_at < snapshot.valid_from
         || value.issued_at >= snapshot.valid_until
-        || now < value.valid_from.as_str()
-        || now >= value.valid_until.as_str()
     {
         return Err("beta release authorization contract or binding is invalid".into());
     }
-    authorized_key(
-        snapshot,
-        &value.key_id,
-        "beta-release-authorization",
-        immutable_target,
-        &value.issued_at,
-        now,
-    )?;
     Ok(())
 }
 
@@ -446,9 +478,11 @@ fn authorized_key<'a>(
                 && key.artifact_types.iter().any(|value| value == artifact)
                 && key.rings.iter().any(|value| value == "beta")
                 && key.hardware_targets.iter().any(|value| value == target)
-                && matches!(key.status.as_str(), "active" | "retiring")
-                && key.valid_from.as_str() <= issued_at
-                && issued_at < key.valid_until.as_str()
+                // `retiring` is never broad-key-valid by itself.  Its bounded
+                // rotation interval is authority at issuance, while `now`
+                // still checks that the snapshot itself has not selected a
+                // key outside its wider declared lifetime.
+                && key.authorizes_at(issued_at)
                 && key.valid_from.as_str() <= now
                 && now < key.valid_until.as_str()
         })
@@ -532,6 +566,83 @@ mod tests {
             &snapshot_hash,
             "2026-07-22T01:00:00Z",
             "nvidia-gb10-arm64",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn time_challenge_reuses_the_complete_release_contract() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let snapshot_hash = canonical_hash(SNAPSHOT).unwrap();
+        let release: ReleaseAuthorization = parse_canonical(RELEASE, "release").unwrap();
+        validate_release_for_time_challenge(
+            &release,
+            &snapshot,
+            &snapshot_hash,
+            "nvidia-gb10-arm64",
+            "prod",
+        )
+        .unwrap();
+        assert!(validate_release_for_time_challenge(
+            &release,
+            &snapshot,
+            &snapshot_hash,
+            "nvidia-gb10-arm64",
+            "debug",
+        )
+        .is_err());
+
+        for case in [
+            "attestation",
+            "compat",
+            "identity",
+            "receipt",
+            "snapshot-time",
+        ] {
+            let mut json: serde_json::Value = serde_json::from_slice(RELEASE).unwrap();
+            match case {
+                "attestation" => json["attestation_set_sha256"] = "not-a-hash".into(),
+                "compat" => json["compat_min"] = 6.into(),
+                "identity" => json["issuance_id"] = "contains spaces".into(),
+                "receipt" => json["beta_publication_receipt_sha256"] = Some("a".repeat(64)).into(),
+                "snapshot-time" => json["issued_at"] = "2026-07-20T02:00:00Z".into(),
+                _ => unreachable!(),
+            }
+            let bytes = format!("{}\n", serde_json::to_string(&json).unwrap()).into_bytes();
+            let hostile: ReleaseAuthorization = parse_canonical(&bytes, "release").unwrap();
+            assert!(
+                validate_release_for_time_challenge(
+                    &hostile,
+                    &snapshot,
+                    &snapshot_hash,
+                    "nvidia-gb10-arm64",
+                    "prod",
+                )
+                .is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn retiring_beta_key_cannot_authorize_after_its_bounded_overlap() {
+        let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
+        let key = &mut value["keys"][1];
+        key["status"] = "retiring".into();
+        key["rotation_overlap"] = serde_json::json!({
+            "mode": "bounded",
+            "with_key_id": "release-beta-v2",
+            "valid_from": "2026-07-21T01:00:00Z",
+            "valid_until": "2026-07-22T01:00:00Z"
+        });
+        let snapshot: Snapshot = serde_json::from_value(value).unwrap();
+        assert!(authorized_key(
+            &snapshot,
+            "release-beta-v1",
+            "beta-release-authorization",
+            "nvidia-gb10-arm64",
+            "2026-07-22T01:00:00Z",
+            "2026-07-22T01:00:00Z",
         )
         .is_err());
     }
