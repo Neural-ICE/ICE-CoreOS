@@ -47,6 +47,10 @@ fn serialized_fields<T: Serialize>(value: &T) -> Vec<String> {
         .collect()
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn snapshot() -> Snapshot {
     let mut value: serde_json::Value = serde_json::from_slice(SNAPSHOT).unwrap();
     let key = &mut value["keys"][0];
@@ -763,6 +767,21 @@ fn exported_machine_contract_matches_every_closed_licensing_artifact() {
         serialized_fields(&acknowledgement),
         contract_fields("ota-licensing-recovery-ack-v1")
     );
+    let contract: serde_json::Value = serde_json::from_slice(CONTRACT).unwrap();
+    for (schema, domain) in [
+        ("ota-licensing-bootstrap-v1", BOOTSTRAP_DOMAIN),
+        ("ota-state-recovery-v1", STATE_RECOVERY_DOMAIN),
+        ("ota-licensing-recovery-ack-v1", RECOVERY_ACK_DOMAIN),
+    ] {
+        let artifact = contract["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["schema"] == schema)
+            .unwrap();
+        assert_eq!(artifact["domain_hex"], hex(domain));
+        assert_eq!(artifact["terminal_nul"], true);
+    }
     for (name, fields) in [
         (
             "acknowledgement_authority",

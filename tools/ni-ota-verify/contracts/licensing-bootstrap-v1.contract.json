@@ -1,7 +1,8 @@
 {
   "artifacts": [
     {
-      "domain": "neural-ice:ota:licensing-bootstrap:v1\\0",
+      "domain": "neural-ice:ota:licensing-bootstrap:v1",
+      "domain_hex": "6e657572616c2d6963653a6f74613a6c6963656e73696e672d626f6f7473747261703a763100",
       "fields": [
         "active_product",
         "authoritative_state",
@@ -28,10 +29,12 @@
         "tpm_safe",
         "valid_until"
       ],
-      "schema": "ota-licensing-bootstrap-v1"
+      "schema": "ota-licensing-bootstrap-v1",
+      "terminal_nul": true
     },
     {
-      "domain": "neural-ice:ota:state-recovery:v1\\0",
+      "domain": "neural-ice:ota:state-recovery:v1",
+      "domain_hex": "6e657572616c2d6963653a6f74613a73746174652d7265636f766572793a763100",
       "fields": [
         "acknowledgement_authority",
         "baseline",
@@ -60,10 +63,12 @@
         "tpm_safe",
         "valid_until"
       ],
-      "schema": "ota-state-recovery-v1"
+      "schema": "ota-state-recovery-v1",
+      "terminal_nul": true
     },
     {
-      "domain": "neural-ice:ota:licensing-recovery-ack:v1\\0",
+      "domain": "neural-ice:ota:licensing-recovery-ack:v1",
+      "domain_hex": "6e657572616c2d6963653a6f74613a6c6963656e73696e672d7265636f766572792d61636b3a763100",
       "fields": [
         "device_root",
         "device_serial",
@@ -84,10 +89,12 @@
         "tpm_safe",
         "valid_until"
       ],
-      "schema": "ota-licensing-recovery-ack-v1"
+      "schema": "ota-licensing-recovery-ack-v1",
+      "terminal_nul": true
     },
     {
-      "domain": "neural-ice:ota:trusted-time:v2\\0",
+      "domain": "neural-ice:ota:trusted-time:v2",
+      "domain_hex": "6e657572616c2d6963653a6f74613a747275737465642d74696d653a763200",
       "fields": [
         "assertion_seq",
         "bootstrap_authorization_sha256",
@@ -114,7 +121,8 @@
         "trusted_time",
         "valid_until"
       ],
-      "schema": "neural-ice-ota-trusted-time-v2"
+      "schema": "neural-ice-ota-trusted-time-v2",
+      "terminal_nul": true
     }
   ],
   "authoritative_state": {
