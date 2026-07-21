@@ -58,6 +58,15 @@ const USAGE: &str = "usage:
   ni-ota-verify verify-delegated-beta --snapshot <path> --snapshot-sig <path>
                        --release <path> --release-sig <path>
                        --receipt <path> --receipt-sig <path> --trusted-now <UTC-seconds>
+                       --accepted-snapshot <path>
+                       --accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>
+                       [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify verify-delegated-usb --snapshot <path> --snapshot-sig <path>
+                       --release <path> --release-sig <path> --bom <path>
+                       --record <path> --attestation <path> --attestation-sig <path>
+                       --bundle-digest <sha256:...>
+                       --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
+                       --trusted-now <UTC-seconds>
                        [--accepted-snapshot <path>]
                        [--accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>]
                        [--config /etc/neural-ice/ota.conf]
@@ -82,6 +91,7 @@ fn run() -> u8 {
         Some("commit") => commit::run(&args[1..]),
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
+        Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
         Some("capabilities") if args.len() == 1 => {
             println!("{{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}}");
             return EXIT_PASS;

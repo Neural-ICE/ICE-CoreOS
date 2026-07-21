@@ -42,6 +42,7 @@ if grep -qx 'MAYCAQECAQE=' "$sig" 2>/dev/null; then
   case "$message_hex" in
     6e657572616c2d6963653a6f74613a64656c65676174696f6e2d736e617073686f743a763100*|\
     6e657572616c2d6963653a6f74613a72656c656173652d617574686f72697a6174696f6e3a763100*|\
+    6e657572616c2d6963653a6f74613a696d6167652d6174746573746174696f6e2d7365743a763100*|\
     6e657572616c2d6963653a6f74613a626574612d7075626c69636174696f6e2d726563656970743a763100*) ;;
     *) echo "stub: missing delegated signature domain" >&2; exit 1 ;;
   esac
@@ -1982,4 +1983,209 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
     let (code, _, stderr) = command(&cfg);
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("immutable host variant"), "{stderr}");
+}
+
+#[test]
+fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
+    let fx = Fixture::new("delegated-usb");
+    fs::write(fx.path("appliance-variant"), "debug\n").unwrap();
+    let snapshot = fx.path("delegation-snapshot.json");
+    fs::write(
+        &snapshot,
+        include_bytes!("fixtures/delegated-v1/delegation-snapshot.json"),
+    )
+    .unwrap();
+    let snapshot_value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    let encoded = snapshot_value["root_key"]["public_key"]["spki_der_base64"]
+        .as_str()
+        .unwrap();
+    fs::write(
+        fx.path("ota-root.pub"),
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &encoded[..64],
+            &encoded[64..]
+        ),
+    )
+    .unwrap();
+    let signature = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+    fs::write(fx.path("snapshot.sig"), signature).unwrap();
+    fs::write(fx.path("release.sig"), signature).unwrap();
+    fs::write(fx.path("attestation.sig"), signature).unwrap();
+
+    let bom = fx.path("bom.json");
+    let mut bom_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "appliance": {"os_base": {"digest": format!("sha256:{TEST_OS_DIGEST}"), "image": "registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},
+        "bundle_seq": 19,
+        "compat_min": 5,
+        "compat_version": 5,
+        "hardware_target": "nvidia-gb10-arm64",
+        "sources": {"seed": {"ref": TEST_SEED_REF}},
+        "train": "0.44.19"
+    }))
+    .unwrap();
+    bom_bytes.push(b'\n');
+    fs::write(&bom, bom_bytes).unwrap();
+    let bom_hash = sha256_of(&bom);
+
+    let record = fx.path("record.json");
+    let mut record_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "assigned_at": "2026-07-21T02:00:00Z",
+        "bundle_digest": TEST_BUNDLE_DIGEST,
+        "bundle_seq": 19,
+        "channel": "beta",
+        "hardware_target": "nvidia-gb10-arm64",
+        "key_version": 1,
+        "schema_version": 2,
+        "train": "0.44.19"
+    }))
+    .unwrap();
+    record_bytes.push(b'\n');
+    fs::write(&record, record_bytes).unwrap();
+    let record_hash = sha256_of(&record);
+
+    let attestation = fx.path("attestation.json");
+    let attestation_value = serde_json::json!({
+        "bom_sha256": bom_hash.clone(),
+        "bundle_seq": 19,
+        "delegation_seq": 1,
+        "delegation_snapshot_sha256": "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+        "generated_at": "2026-07-21T02:00:00Z",
+        "hardware_target": "nvidia-gb10-arm64",
+        "images": [
+            {
+                "authority": "image-ci",
+                "image_ci_key_id": "image-ci-v1",
+                "image_name": "ice-ac1",
+                "image_signature_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "oci_repository": "neural-ice/ice-ac1",
+                "provenance_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "sbom_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            {
+                "authority": "bom-digest-only",
+                "image_ci_key_id": null,
+                "image_name": "qdrant",
+                "image_signature_digest": null,
+                "manifest_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "oci_repository": "vendor/qdrant",
+                "provenance_digest": null,
+                "sbom_digest": null
+            }
+        ],
+        "schema": "neural-ice-ota-image-attestation-set-v1",
+        "train": "0.44.19"
+    });
+    let mut attestation_bytes = serde_json::to_vec(&attestation_value).unwrap();
+    let compact = fx.path("attestation.compact");
+    fs::write(&compact, &attestation_bytes).unwrap();
+    let attestation_hash = sha256_of(&compact);
+    attestation_bytes.push(b'\n');
+    fs::write(&attestation, attestation_bytes).unwrap();
+
+    let release = fx.path("release.json");
+    let mut release_value: Value = serde_json::from_slice(include_bytes!(
+        "fixtures/delegated-v1/release-authorization.json"
+    ))
+    .unwrap();
+    release_value["variant"] = Value::String("debug".into());
+    release_value["bom_sha256"] = Value::String(bom_hash.clone());
+    release_value["channel_record_sha256"] = Value::String(record_hash);
+    release_value["attestation_set_sha256"] = Value::String(attestation_hash);
+    let mut release_bytes = serde_json::to_vec(&release_value).unwrap();
+    release_bytes.push(b'\n');
+    fs::write(&release, release_bytes).unwrap();
+
+    let config = fx.write_config(
+        1,
+        "device_channel=beta\ndevice_compat_min=5\ndevice_compat_max=5\n",
+    );
+    let command = |os: &str, seed: &str, digest: &str| {
+        let mut cmd = Command::new(BIN);
+        cmd.env("NI_OTA_COSIGN", fx.path("cosign-stub.sh"))
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .env(
+                "NI_OTA_APPLIANCE_VARIANT_FILE",
+                fx.path("appliance-variant"),
+            )
+            .env(
+                "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+                fx.path("min-delegation-seq"),
+            )
+            .arg("verify-delegated-usb")
+            .args(["--snapshot".as_ref(), snapshot.as_os_str()])
+            .args([
+                "--snapshot-sig".as_ref(),
+                fx.path("snapshot.sig").as_os_str(),
+            ])
+            .args(["--release".as_ref(), release.as_os_str()])
+            .args(["--release-sig".as_ref(), fx.path("release.sig").as_os_str()])
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--record".as_ref(), record.as_os_str()])
+            .args(["--attestation".as_ref(), attestation.as_os_str()])
+            .args([
+                "--attestation-sig".as_ref(),
+                fx.path("attestation.sig").as_os_str(),
+            ])
+            .args(["--bundle-digest", digest])
+            .args(["--current-os-ref", os])
+            .args(["--current-seed-ref", seed])
+            .args(["--trusted-now", "2026-07-22T01:00:00Z"])
+            .args(["--config".as_ref(), config.as_os_str()]);
+        cmd
+    };
+    let (code, verdict, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(verdict["mode"], "delegated-usb-beta");
+    assert_eq!(verdict["bom_sha256"], bom_hash);
+    assert!(!fx.path("state/applied.json").exists());
+
+    fs::write(fx.path("attestation.sig"), []).unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("usb-attestation-signature must be a non-empty regular"));
+
+    fs::write(fx.path("attestation.sig"), b"not-a-der-signature").unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("DER"), "{stderr}");
+    fs::write(fx.path("attestation.sig"), signature).unwrap();
+
+    let wrong_os = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let (code, _, stderr) = run(&mut command(wrong_os, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("booted OS ref"), "{stderr}");
+    let (code, _, stderr) = run(&mut command(
+        TEST_OS_REF,
+        "cccccccccccccccccccccccccccccccccccccccc",
+        TEST_BUNDLE_DIGEST,
+    ));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("PAYLOAD_ID"), "{stderr}");
+
+    let incompatible = fx.write_config(
+        1,
+        "device_channel=beta\ndevice_compat_min=6\ndevice_compat_max=6\n",
+    );
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("does not overlap device"), "{stderr}");
+    assert_eq!(incompatible, config);
+    fx.write_config(
+        1,
+        "device_channel=beta\ndevice_compat_min=5\ndevice_compat_max=5\n",
+    );
+
+    let mut changed: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    changed["bundle_digest"] = Value::String(
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+    );
+    let mut changed_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+    changed_bytes.push(b'\n');
+    fs::write(&record, changed_bytes).unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("binding mismatch"), "{stderr}");
+    assert!(!fx.path("state/applied.json").exists());
 }

@@ -19,6 +19,10 @@ use crate::config::{
 use crate::state::{ensure_secure_state_directory, FileStateStore};
 use crate::{parse_flags, InternalError, DEFAULT_CONFIG, EXIT_PASS};
 
+mod usb;
+
+pub(crate) use usb::run as run_usb;
+
 const RELEASE_DOMAIN: &[u8] = b"neural-ice:ota:release-authorization:v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"neural-ice:ota:beta-publication-receipt:v1\0";
 

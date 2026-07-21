@@ -215,6 +215,44 @@ expired receipt as new authorization. This command persists no state, so the
 prior verifier/state format remains usable and rollback cannot erase accepted
 delegation history.
 
+`verify-delegated-usb` is the local, receipt-free verification surface for the
+physically delivered debug installer. It accepts no URL, channel tag or shell
+hook. It verifies the exact root-signed delegation snapshot, exact release-beta
+signature, and detached image-ci signature over the canonical image-attestation
+set, then binds the release to the raw BOM and channel record bytes, observed
+OCI bundle digest, immutable hardware target, immutable `debug` variant,
+booted OS digest ref, installed `PAYLOAD_ID`, beta channel, compatibility
+range, train and bundle sequence. The channel record is evidence carried inside
+the immutable USB bundle; the command cannot fetch or repoint it. Missing receipt evidence is
+intentional for this physical bootstrap only and is never accepted by the
+network beta verifier.
+
+The image-ci signature uses the domain
+`neural-ice:ota:image-attestation-set:v1` over the complete canonical set. All
+first-party rows in one set must name the same authorized image-ci key. This
+turns their exact image-signature, provenance and SBOM digests into one
+independently authenticated envelope: a compromised release-beta key cannot
+fabricate those proof identities. Mixed image-ci authorities, an absent
+first-party row, or a missing/invalid detached signature fails closed.
+
+The command is verification-only. A pass prints the complete facts needed by
+the future bootstrap transaction, but does not write `applied.json`, accept a
+delegation snapshot or establish trusted time. Initial bootstrap remains
+blocked until the Owner approves one atomic contract with three distinct
+records: accepted authority (complete canonical snapshot + sequence + hash),
+applied bundle (sequence + exact BOM hash), and trusted-time continuity for new
+updates. A crash may never expose applied state without its authority and time
+anchors; a one-version rollback must read the prior applied record without
+discarding either new anchor. Until that schema is approved, callers must treat
+this verdict as diagnostics, not installation authorization.
+
+The installer assembly pipeline has a separate final-image boundary: after all
+payload copies complete, it must mount the final raw image read-only and compare
+the exact model manifest, model symlink targets, seed image inventory and
+`PAYLOAD_ID` with the signed source inputs before signing the installer. This
+post-build hook belongs after `build-preloaded.sh`, never before its copy step;
+it changes no OTA schema or channel.
+
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An
 existing directory must already be a real mode-`0700` directory; `verify`
