@@ -6,14 +6,15 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use crate::delegated::contract::{
-    canonical_hash, parse_canonical, safe_uint, sha256, timestamp, ContractError,
+    canonical_hash, parse_canonical, safe_uint, sha256, timestamp, validate_chain, ContractError,
+    Snapshot,
 };
 use crate::runner;
 use crate::state::{
@@ -56,37 +57,37 @@ const GENERATION_ARTIFACTS: &[&str] = &[
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AuthorityState {
-    delegation_seq: u64,
-    schema: String,
-    snapshot_sha256: String,
-    snapshot_signature_sha256: String,
+pub(crate) struct AuthorityState {
+    pub(crate) delegation_seq: u64,
+    pub(crate) schema: String,
+    pub(crate) snapshot_sha256: String,
+    pub(crate) snapshot_signature_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AppliedStateV1 {
-    bom_sha256: String,
-    bundle_seq: u64,
-    schema: String,
+pub(crate) struct AppliedStateV1 {
+    pub(crate) bom_sha256: String,
+    pub(crate) bundle_seq: u64,
+    pub(crate) schema: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TrustedTimeState {
-    assertion_seq: u64,
-    assertion_sha256: String,
-    challenge_sha256: String,
-    delegation_seq: u64,
-    device_fingerprint: String,
-    key_id: String,
-    schema: String,
-    signature_sha256: String,
-    tpm_clock: u64,
-    tpm_reset_count: u32,
-    tpm_restart_count: u32,
-    tpm_safe: bool,
-    trusted_time: String,
+pub(crate) struct TrustedTimeState {
+    pub(crate) assertion_seq: u64,
+    pub(crate) assertion_sha256: String,
+    pub(crate) challenge_sha256: String,
+    pub(crate) delegation_seq: u64,
+    pub(crate) device_fingerprint: String,
+    pub(crate) key_id: String,
+    pub(crate) schema: String,
+    pub(crate) signature_sha256: String,
+    pub(crate) tpm_clock: u64,
+    pub(crate) tpm_reset_count: u32,
+    pub(crate) tpm_restart_count: u32,
+    pub(crate) tpm_safe: bool,
+    pub(crate) trusted_time: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -162,6 +163,40 @@ struct GenerationScan {
     numbers: Vec<u64>,
 }
 
+#[allow(dead_code, reason = "constructed by the next stacked command layer")]
+pub(crate) struct Candidate<'a> {
+    pub(crate) applied: AppliedStateV1,
+    pub(crate) authority: AuthorityState,
+    pub(crate) challenge: TimeChallenge,
+    pub(crate) release: &'a [u8],
+    pub(crate) release_signature: &'a [u8],
+    pub(crate) snapshot: &'a [u8],
+    pub(crate) snapshot_signature: &'a [u8],
+    pub(crate) trusted: TrustedTimeState,
+    pub(crate) trusted_assertion: &'a [u8],
+    pub(crate) trusted_signature: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitReceipt {
+    pub(crate) generation: u64,
+    pub(crate) manifest_sha256: String,
+    pub(crate) nv_anchor: String,
+}
+
+#[allow(
+    dead_code,
+    reason = "constructed by the next stacked verifier integration"
+)]
+pub(crate) struct PreapplyCandidate<'a> {
+    pub(crate) bom_sha256: &'a str,
+    pub(crate) bundle_seq: u64,
+    pub(crate) challenge: &'a TimeChallenge,
+    pub(crate) snapshot: &'a Snapshot,
+    pub(crate) snapshot_sha256: &'a str,
+    pub(crate) trusted_now: &'a str,
+}
+
 pub(crate) struct Store {
     pub(crate) root: PathBuf,
 }
@@ -218,6 +253,9 @@ pub(crate) trait NvAnchor {
     fn read(&self) -> Result<[u8; 32], InternalError>;
     fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError>;
     fn clock(&self) -> Result<TpmClockState, InternalError>;
+    fn read_initial(&self) -> Result<[u8; 32], InternalError>;
+    fn provision_initial(&self) -> Result<(), InternalError>;
+    fn extend(&self, digest: [u8; 32]) -> Result<(), InternalError>;
 }
 
 pub(crate) struct CommandTpm {
@@ -316,6 +354,60 @@ impl NvAnchor for CommandTpm {
             &String::from_utf8(output.stdout)
                 .map_err(|_| InternalError("tpm2_readclock returned non-UTF-8 output".into()))?,
         )
+    }
+
+    fn read_initial(&self) -> Result<[u8; 32], InternalError> {
+        self.initial_or_existing_anchor()
+            .and_then(|value| decode_hash(&value))
+    }
+
+    fn provision_initial(&self) -> Result<(), InternalError> {
+        if self.inspect().is_ok() {
+            return Err(InternalError(
+                "state-v1 index already exists; automatic reseeding is forbidden".into(),
+            ));
+        }
+        let status = Command::new(tool("tpm2_nvdefine"))
+            .args([
+                format!("0x{:08x}", self.index),
+                "-C".into(),
+                "o".into(),
+                "-s".into(),
+                "32".into(),
+                "-a".into(),
+                STATE_NV_ATTRIBUTES.into(),
+            ])
+            .status()
+            .map_err(|error| InternalError(format!("cannot execute tpm2_nvdefine: {error}")))?;
+        if !status.success() {
+            return Err(InternalError(format!(
+                "cannot provision TPM NV 0x{:08x}",
+                self.index
+            )));
+        }
+        self.attest()
+    }
+
+    fn extend(&self, digest: [u8; 32]) -> Result<(), InternalError> {
+        let input = self.scratch.secure_temp_bytes("nv-extend", &digest)?;
+        let status = Command::new(tool("tpm2_nvextend"))
+            .args([
+                format!("0x{:08x}", self.index),
+                "-C".into(),
+                format!("0x{:08x}", self.index),
+                "-i".into(),
+            ])
+            .arg(input.path())
+            .status()
+            .map_err(|error| InternalError(format!("cannot execute tpm2_nvextend: {error}")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(InternalError(format!(
+                "tpm2_nvextend failed for 0x{:08x}",
+                self.index
+            )))
+        }
     }
 }
 
@@ -563,7 +655,321 @@ impl Store {
         Ok(challenge)
     }
 
-    #[cfg(test)]
+    #[allow(dead_code, reason = "called by the next stacked verifier integration")]
+    pub(crate) fn guard_preapply(
+        &self,
+        nv: &dyn NvAnchor,
+        candidate: &PreapplyCandidate<'_>,
+    ) -> Result<Result<(), String>, InternalError> {
+        if self.pending_time_challenge()? != *candidate.challenge {
+            return Ok(Err("pending trusted-time challenge differs".into()));
+        }
+        let anchor = hex(nv.read_initial()?);
+        if candidate.challenge.state_nv_anchor != anchor {
+            return Ok(Err("trusted-time challenge anchor is stale".into()));
+        }
+        let legacy = nv.legacy_bundle_floor()?.unwrap_or(0);
+        if candidate.bundle_seq < legacy {
+            return Ok(Err("candidate bundle is below legacy TPM floor".into()));
+        }
+        if anchor == ZERO_ANCHOR {
+            return if self.scan_generations()?.has_evidence {
+                Ok(Err("zero TPM anchor has existing state history".into()))
+            } else {
+                Ok(Ok(()))
+            };
+        }
+        let current = self
+            .read_current(nv)?
+            .ok_or_else(|| InternalError("TPM-anchored state is unavailable".into()))?;
+        self.verify_enforce_ready(nv)?;
+        if candidate.bundle_seq < current.manifest.bundle_seq_floor
+            || (candidate.bundle_seq == current.manifest.bundle_seq_floor
+                && candidate.bom_sha256 != current.manifest.applied_bom_sha256)
+            || candidate.trusted_now < current.manifest.trusted_time_floor.as_str()
+            || candidate.snapshot.delegation_seq < current.manifest.delegation_seq_floor
+        {
+            return Ok(Err(
+                "candidate is below a TPM-anchored pre-apply floor".into()
+            ));
+        }
+        if candidate.snapshot.delegation_seq == current.manifest.delegation_seq_floor {
+            if candidate.snapshot_sha256 != current.manifest.delegation_snapshot_canonical_sha256 {
+                return Ok(Err(
+                    "equal delegation sequence has a different snapshot".into()
+                ));
+            }
+        } else {
+            let dir = self
+                .root
+                .join("generations")
+                .join(format!("generation-{:016}", current.manifest.generation));
+            let previous: Snapshot = parse_canonical(
+                &read_regular(&dir.join("delegation-snapshot.json"), 0o600)?,
+                "accepted snapshot",
+            )
+            .map_err(InternalError)?;
+            if let Err(error) = validate_chain(
+                &previous,
+                candidate.snapshot,
+                &current.manifest.delegation_snapshot_canonical_sha256,
+            ) {
+                return match error {
+                    ContractError::Refusal(reason) => Ok(Err(reason)),
+                    ContractError::Internal(error) => Err(error),
+                };
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    #[allow(dead_code, reason = "called by the next stacked command layer")]
+    pub(crate) fn commit(
+        &self,
+        candidate: &Candidate<'_>,
+        nv: &dyn NvAnchor,
+    ) -> Result<Result<CommitReceipt, String>, InternalError> {
+        ensure_secure_state_directory(&self.root)?;
+        ensure_secure_state_directory(&self.root.join("generations"))?;
+        validate_candidate(candidate)?;
+        let initial_anchor = hex(nv.read_initial()?);
+        let state_index_ready = nv.attest().is_ok();
+        let current = if initial_anchor == ZERO_ANCHOR {
+            if self.scan_generations()?.has_evidence {
+                return Ok(Err(
+                    "zero TPM anchor with existing state history requires signed recovery".into(),
+                ));
+            }
+            None
+        } else {
+            nv.attest()?;
+            self.read_current(nv)?
+        };
+        let legacy_floor = nv.legacy_bundle_floor()?;
+        if current
+            .as_ref()
+            .is_some_and(|value| value.manifest.legacy_bundle_floor.is_some())
+            && legacy_floor.is_none()
+        {
+            return Ok(Err(
+                "legacy TPM floor disappeared after state-v1 seeding".into()
+            ));
+        }
+        let observed_floor = legacy_floor.unwrap_or(0);
+        let persisted_floor = current
+            .as_ref()
+            .and_then(|value| value.manifest.legacy_bundle_floor)
+            .unwrap_or(0);
+        if observed_floor < persisted_floor {
+            return Ok(Err(
+                "legacy TPM floor regressed after state-v1 seeding".into()
+            ));
+        }
+        if candidate.applied.bundle_seq < observed_floor.max(persisted_floor) {
+            return Ok(Err("bundle sequence is below legacy TPM floor".into()));
+        }
+        if let Some(loaded) = &current {
+            if let Err(reason) = monotonic(&loaded.manifest, &loaded.trusted, candidate) {
+                return Ok(Err(reason));
+            }
+            if same_candidate(&loaded.manifest, candidate)? {
+                self.publish_current(loaded.manifest.generation)?;
+                self.publish_enforce_ready(&loaded.manifest_sha256, &loaded.nv_anchor)?;
+                self.consume_challenge_if_present(&candidate.challenge)?;
+                self.verify_enforce_ready(nv)?;
+                return Ok(Ok(CommitReceipt {
+                    generation: loaded.manifest.generation,
+                    manifest_sha256: loaded.manifest_sha256.clone(),
+                    nv_anchor: loaded.nv_anchor.clone(),
+                }));
+            }
+        }
+        if self.pending_time_challenge()? != candidate.challenge {
+            return Ok(Err(
+                "trusted-time assertion does not consume the pending challenge".into(),
+            ));
+        }
+        if candidate.challenge.state_nv_anchor != initial_anchor {
+            return Ok(Err(
+                "trusted-time challenge does not bind the current TPM anchor".into(),
+            ));
+        }
+        let generation = current
+            .as_ref()
+            .map_or(1, |value| value.manifest.generation + 1);
+        if !safe_uint(generation) {
+            return Ok(Err("state generation overflow".into()));
+        }
+        if current.is_none() && !state_index_ready {
+            // Provision before staging any generation. A crash after define
+            // therefore leaves a zero index and no disk authority; retry can
+            // continue. Staging first would strand evidence beside a zero
+            // anchor and correctly trigger the no-auto-reseed refusal.
+            nv.provision_initial()?;
+            if hex(nv.read()?) != ZERO_ANCHOR {
+                return Ok(Err("new state-v1 index did not read back zero".into()));
+            }
+        }
+        let manifest = self.stage_generation(
+            generation,
+            candidate,
+            current.as_ref().map(|value| value.manifest_sha256.clone()),
+            initial_anchor.clone(),
+            legacy_floor.or_else(|| {
+                current
+                    .as_ref()
+                    .and_then(|value| value.manifest.legacy_bundle_floor)
+            }),
+        )?;
+        let manifest_sha256 = hash(&canonical(&manifest)?)?;
+        let expected = extend_value(&initial_anchor, &manifest_sha256)?;
+        nv.extend(decode_hash(&manifest_sha256)?)?;
+        if hex(nv.read()?) != expected {
+            return Ok(Err("TPM NV readback differs after extend".into()));
+        }
+        self.publish_current(generation)?;
+        let readback = self.read_current(nv)?;
+        if !readback.as_ref().is_some_and(|value| {
+            value.manifest == manifest
+                && value.manifest_sha256 == manifest_sha256
+                && value.nv_anchor == expected
+        }) {
+            return Ok(Err(
+                "complete state readback differs after publication".into()
+            ));
+        }
+        self.publish_enforce_ready(&manifest_sha256, &expected)?;
+        self.consume_challenge_if_present(&candidate.challenge)?;
+        self.verify_enforce_ready(nv)?;
+        Ok(Ok(CommitReceipt {
+            generation,
+            manifest_sha256,
+            nv_anchor: expected,
+        }))
+    }
+
+    fn stage_generation(
+        &self,
+        generation: u64,
+        value: &Candidate<'_>,
+        previous_manifest_sha256: Option<String>,
+        previous_nv_anchor: String,
+        legacy_bundle_floor: Option<u64>,
+    ) -> Result<StateManifest, InternalError> {
+        let generations = self.root.join("generations");
+        let final_name = format!("generation-{generation:016}");
+        let final_dir = generations.join(&final_name);
+        if final_dir.exists() {
+            secure_existing_dir(&final_dir)?;
+            std::fs::remove_dir_all(&final_dir).map_err(|error| {
+                InternalError(format!("cannot replace unanchored {final_name}: {error}"))
+            })?;
+            sync_dir(&generations)?;
+        }
+        self.remove_temporary_generation(&final_name)?;
+        let temp = generations.join(format!(".{final_name}.{}.tmp", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&temp)
+            .map_err(|error| InternalError(format!("cannot create state generation: {error}")))?;
+        let authority = canonical(&value.authority)?;
+        let applied = canonical(&value.applied)?;
+        let trusted = canonical(&value.trusted)?;
+        for (name, bytes) in [
+            ("applied.json", applied.as_slice()),
+            ("authority.json", authority.as_slice()),
+            ("delegation-snapshot.json", value.snapshot),
+            ("delegation-snapshot.sig", value.snapshot_signature),
+            ("release-authorization.json", value.release),
+            ("release-authorization.sig", value.release_signature),
+            ("trusted-time-assertion.json", value.trusted_assertion),
+            ("trusted-time-assertion.sig", value.trusted_signature),
+            ("trusted-time.json", trusted.as_slice()),
+        ] {
+            write_new(&temp.join(name), bytes)?;
+        }
+        let manifest = StateManifest {
+            applied_sha256: hash(&applied)?,
+            applied_bom_sha256: value.applied.bom_sha256.clone(),
+            authority_sha256: hash(&authority)?,
+            bundle_seq_floor: value.applied.bundle_seq,
+            delegation_seq_floor: value.authority.delegation_seq,
+            delegation_snapshot_canonical_sha256: value.authority.snapshot_sha256.clone(),
+            delegation_snapshot_sha256: hash(value.snapshot)?,
+            delegation_snapshot_signature_sha256: hash(value.snapshot_signature)?,
+            generation,
+            legacy_bundle_floor,
+            previous_manifest_sha256,
+            previous_nv_anchor,
+            release_authorization_sha256: hash(value.release)?,
+            release_authorization_signature_sha256: hash(value.release_signature)?,
+            schema: "neural-ice-ota-state-manifest-v1".into(),
+            trusted_time_assertion_canonical_sha256: value.trusted.assertion_sha256.clone(),
+            trusted_time_assertion_sha256: hash(value.trusted_assertion)?,
+            trusted_time_assertion_signature_sha256: hash(value.trusted_signature)?,
+            trusted_time_floor: value.trusted.trusted_time.clone(),
+            trusted_time_seq_floor: value.trusted.assertion_seq,
+            trusted_time_sha256: hash(&trusted)?,
+        };
+        write_new(&temp.join("manifest.json"), &canonical(&manifest)?)?;
+        sync_dir(&temp)?;
+        std::fs::rename(&temp, &final_dir)
+            .map_err(|error| InternalError(format!("cannot publish {final_name}: {error}")))?;
+        sync_dir(&generations)?;
+        Ok(manifest)
+    }
+
+    fn remove_temporary_generation(&self, final_name: &str) -> Result<(), InternalError> {
+        let generations = self.root.join("generations");
+        let prefix = format!(".{final_name}.");
+        for entry in std::fs::read_dir(&generations)
+            .map_err(|error| InternalError(format!("cannot enumerate generations: {error}")))?
+        {
+            let entry = entry
+                .map_err(|error| InternalError(format!("cannot enumerate generation: {error}")))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                secure_existing_dir(&entry.path())?;
+                std::fs::remove_dir_all(entry.path()).map_err(|error| {
+                    InternalError(format!("cannot remove abandoned generation: {error}"))
+                })?;
+            }
+        }
+        sync_dir(&generations)
+    }
+
+    fn publish_enforce_ready(&self, manifest: &str, anchor: &str) -> Result<(), InternalError> {
+        atomic_replace(
+            &self.root,
+            "enforce-ready.json",
+            &canonical(&serde_json::json!({
+                "manifest_sha256": manifest,
+                "nv_anchor": anchor,
+                "schema": "neural-ice-ota-enforce-ready-v1"
+            }))?,
+        )
+    }
+
+    fn consume_challenge_if_present(&self, expected: &TimeChallenge) -> Result<(), InternalError> {
+        let path = self.root.join("pending-time-challenge.json");
+        match self.pending_time_challenge() {
+            Ok(value) if &value == expected => {
+                std::fs::remove_file(&path).map_err(|error| {
+                    InternalError(format!("cannot consume trusted-time challenge: {error}"))
+                })?;
+                sync_dir(&self.root)
+            }
+            Ok(_) => Err(InternalError(
+                "pending trusted-time challenge differs during consumption".into(),
+            )),
+            Err(_) if !path.exists() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn read_current(&self, nv: &dyn NvAnchor) -> Result<Option<LoadedGeneration>, InternalError> {
         let _lock = self.lock_store().lock_commit()?;
         self.read_current_locked(nv)
@@ -1104,6 +1510,107 @@ fn validate_time_challenge(value: &TimeChallenge) -> Result<(), InternalError> {
     Ok(())
 }
 
+fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
+    validate_time_challenge(&value.challenge)?;
+    if value.authority.schema != "neural-ice-ota-authority-state-v1"
+        || value.applied.schema != "neural-ice-ota-applied-state-v1"
+        || value.trusted.schema != "neural-ice-ota-trusted-time-state-v2"
+        || !safe_uint(value.authority.delegation_seq)
+        || !safe_uint(value.applied.bundle_seq)
+        || !safe_uint(value.trusted.assertion_seq)
+        || value.trusted.delegation_seq != value.authority.delegation_seq
+        || !timestamp(&value.trusted.trusted_time)
+        || !sha256(&value.authority.snapshot_sha256)
+        || !sha256(&value.authority.snapshot_signature_sha256)
+        || !sha256(&value.applied.bom_sha256)
+        || !sha256(&value.trusted.assertion_sha256)
+        || !sha256(&value.trusted.signature_sha256)
+        || !sha256(&value.trusted.challenge_sha256)
+        || !sha256(&value.trusted.device_fingerprint)
+        || value.trusted.device_fingerprint != value.challenge.device_fingerprint
+        || value.trusted.challenge_sha256 != hash(value.challenge.nonce.as_bytes())?
+        || value.trusted.tpm_clock != value.challenge.tpm_clock
+        || value.trusted.tpm_reset_count != value.challenge.tpm_reset_count
+        || value.trusted.tpm_restart_count != value.challenge.tpm_restart_count
+        || !value.trusted.tpm_safe
+        || !value.challenge.tpm_safe
+    {
+        return Err(InternalError("invalid state-v1 candidate".into()));
+    }
+    Ok(())
+}
+
+fn monotonic(
+    old: &StateManifest,
+    old_time: &TrustedTimeState,
+    new: &Candidate<'_>,
+) -> Result<(), String> {
+    if new.authority.delegation_seq < old.delegation_seq_floor
+        || new.applied.bundle_seq < old.bundle_seq_floor
+        || new.trusted.assertion_seq < old.trusted_time_seq_floor
+        || new.trusted.trusted_time < old.trusted_time_floor
+    {
+        return Err("state-v1 monotonic floor would decrease".into());
+    }
+    if new.authority.delegation_seq == old.delegation_seq_floor
+        && new.authority.snapshot_sha256 != old.delegation_snapshot_canonical_sha256
+    {
+        return Err("equal delegation sequence has a different snapshot".into());
+    }
+    if new.applied.bundle_seq == old.bundle_seq_floor
+        && new.applied.bom_sha256 != old.applied_bom_sha256
+    {
+        return Err("equal bundle sequence has a different BOM".into());
+    }
+    if new.trusted.assertion_seq == old.trusted_time_seq_floor
+        && (new.trusted.assertion_sha256 != old.trusted_time_assertion_canonical_sha256
+            || new.trusted.trusted_time != old.trusted_time_floor)
+    {
+        return Err("equal trusted-time sequence has different evidence".into());
+    }
+    if new.trusted.device_fingerprint != old_time.device_fingerprint {
+        return Err("trusted-time device identity changed".into());
+    }
+    if new.trusted.tpm_reset_count == old_time.tpm_reset_count {
+        if new.trusted.tpm_clock < old_time.tpm_clock
+            || new.trusted.tpm_restart_count < old_time.tpm_restart_count
+        {
+            return Err("TPM clock continuity regressed".into());
+        }
+    } else if new.trusted.assertion_seq <= old.trusted_time_seq_floor
+        || new.trusted.trusted_time <= old.trusted_time_floor
+    {
+        return Err("TPM reset requires strictly newer trusted-time evidence".into());
+    }
+    let old_seconds = crate::trusted_time::utc_seconds(&old_time.trusted_time)
+        .ok_or_else(|| "persisted trusted time is invalid".to_string())?;
+    let new_seconds = crate::trusted_time::utc_seconds(&new.trusted.trusted_time)
+        .ok_or_else(|| "candidate trusted time is invalid".to_string())?;
+    let elapsed = if new.trusted.tpm_reset_count == old_time.tpm_reset_count {
+        new.trusted.tpm_clock.saturating_sub(old_time.tpm_clock) / 1000
+    } else {
+        0
+    };
+    if new_seconds > old_seconds.saturating_add(elapsed).saturating_add(600) {
+        return Err("trusted-time advance exceeds TPM elapsed plus ten minutes".into());
+    }
+    Ok(())
+}
+
+fn same_candidate(old: &StateManifest, new: &Candidate<'_>) -> Result<bool, InternalError> {
+    Ok(old.delegation_seq_floor == new.authority.delegation_seq
+        && old.bundle_seq_floor == new.applied.bundle_seq
+        && old.trusted_time_seq_floor == new.trusted.assertion_seq
+        && old.applied_bom_sha256 == new.applied.bom_sha256
+        && old.delegation_snapshot_canonical_sha256 == new.authority.snapshot_sha256
+        && old.trusted_time_assertion_canonical_sha256 == new.trusted.assertion_sha256
+        && old.release_authorization_sha256 == hash(new.release)?
+        && old.release_authorization_signature_sha256 == hash(new.release_signature)?
+        && old.delegation_snapshot_sha256 == hash(new.snapshot)?
+        && old.delegation_snapshot_signature_sha256 == hash(new.snapshot_signature)?
+        && old.trusted_time_assertion_sha256 == hash(new.trusted_assertion)?
+        && old.trusted_time_assertion_signature_sha256 == hash(new.trusted_signature)?)
+}
 fn parse_pointer(bytes: &[u8]) -> Result<u64, InternalError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| InternalError("state-v1 CURRENT is not UTF-8".into()))?;
@@ -1224,6 +1731,14 @@ fn new_file(path: &Path) -> std::io::Result<File> {
         .create_new(true)
         .mode(0o600)
         .open(path)
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), InternalError> {
+    let mut file = new_file(path)
+        .map_err(|error| InternalError(format!("cannot create {}: {error}", path.display())))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| InternalError(format!("cannot sync {}: {error}", path.display())))
 }
 
 fn read_optional_regular(path: &Path, mode: u32) -> Result<Option<Vec<u8>>, InternalError> {
@@ -1607,6 +2122,18 @@ mod tests {
                 safe: self.safe_clock,
             })
         }
+
+        fn read_initial(&self) -> Result<[u8; 32], InternalError> {
+            self.read()
+        }
+
+        fn provision_initial(&self) -> Result<(), InternalError> {
+            Err(InternalError("test anchor cannot be provisioned".into()))
+        }
+
+        fn extend(&self, _digest: [u8; 32]) -> Result<(), InternalError> {
+            Err(InternalError("test anchor cannot be extended".into()))
+        }
     }
 
     struct ChangingAnchor {
@@ -1667,6 +2194,107 @@ mod tests {
                 release_json: 0,
                 variant: 0,
             }
+        }
+    }
+
+    struct MemoryNv {
+        anchor: Cell<[u8; 32]>,
+        exists: Cell<bool>,
+    }
+
+    impl NvAnchor for MemoryNv {
+        fn attest(&self) -> Result<(), InternalError> {
+            self.exists
+                .get()
+                .then_some(())
+                .ok_or_else(|| InternalError("absent".into()))
+        }
+
+        fn read(&self) -> Result<[u8; 32], InternalError> {
+            self.attest().map(|()| self.anchor.get())
+        }
+
+        fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+            Ok(Some(1))
+        }
+
+        fn clock(&self) -> Result<TpmClockState, InternalError> {
+            Ok(TpmClockState {
+                clock: 1_000,
+                reset_count: 1,
+                restart_count: 1,
+                safe: true,
+            })
+        }
+
+        fn read_initial(&self) -> Result<[u8; 32], InternalError> {
+            Ok(self.anchor.get())
+        }
+
+        fn provision_initial(&self) -> Result<(), InternalError> {
+            if self.exists.replace(true) {
+                return Err(InternalError("reseed".into()));
+            }
+            Ok(())
+        }
+
+        fn extend(&self, digest: [u8; 32]) -> Result<(), InternalError> {
+            self.attest()?;
+            let next = extend_value(&hex(self.anchor.get()), &hex(digest))?;
+            self.anchor.set(decode_hash(&next)?);
+            Ok(())
+        }
+    }
+
+    fn candidate() -> Candidate<'static> {
+        let challenge = TimeChallenge {
+            delegation_snapshot_sha256: hash(b"{}\n").unwrap(),
+            device_fingerprint: "b".repeat(64),
+            hardware_target: "nvidia-gb10-arm64".into(),
+            nonce: "c".repeat(64),
+            release_authorization_sha256: hash(b"{}\n").unwrap(),
+            ring: "beta".into(),
+            schema: "neural-ice-ota-time-challenge-v2".into(),
+            state_nv_anchor: ZERO_ANCHOR.into(),
+            tpm_clock: 1_000,
+            tpm_reset_count: 1,
+            tpm_restart_count: 1,
+            tpm_safe: true,
+        };
+        Candidate {
+            applied: AppliedStateV1 {
+                bom_sha256: "e".repeat(64),
+                bundle_seq: 1,
+                schema: "neural-ice-ota-applied-state-v1".into(),
+            },
+            authority: AuthorityState {
+                delegation_seq: 1,
+                schema: "neural-ice-ota-authority-state-v1".into(),
+                snapshot_sha256: challenge.delegation_snapshot_sha256.clone(),
+                snapshot_signature_sha256: hash(b"sig").unwrap(),
+            },
+            challenge: challenge.clone(),
+            release: b"{}\n",
+            release_signature: b"sig",
+            snapshot: b"{}\n",
+            snapshot_signature: b"sig",
+            trusted: TrustedTimeState {
+                assertion_seq: 1,
+                assertion_sha256: hash(b"{}\n").unwrap(),
+                challenge_sha256: hash(challenge.nonce.as_bytes()).unwrap(),
+                delegation_seq: 1,
+                device_fingerprint: challenge.device_fingerprint.clone(),
+                key_id: "trusted-time-v1".into(),
+                schema: "neural-ice-ota-trusted-time-state-v2".into(),
+                signature_sha256: hash(b"sig").unwrap(),
+                tpm_clock: challenge.tpm_clock,
+                tpm_reset_count: challenge.tpm_reset_count,
+                tpm_restart_count: challenge.tpm_restart_count,
+                tpm_safe: true,
+                trusted_time: "2026-07-22T00:00:01Z".into(),
+            },
+            trusted_assertion: b"{}\n",
+            trusted_signature: b"sig",
         }
     }
 
@@ -2581,5 +3209,66 @@ mod tests {
             .unwrap_err();
         assert!(error.0.contains("no complete state-v1 generation"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn complete_commit_is_anchored_consumes_nonce_and_retries_exactly() {
+        let (store, root) = test_store();
+        ensure_secure_state_directory(&store.root).unwrap();
+        let candidate = candidate();
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&candidate.challenge).unwrap(),
+        )
+        .unwrap();
+        let nv = MemoryNv {
+            anchor: Cell::new([0; 32]),
+            exists: Cell::new(false),
+        };
+        let first = store.commit(&candidate, &nv).unwrap().unwrap();
+        assert_eq!(first.generation, 1);
+        assert!(nv.exists.get());
+        assert!(!store.root.join("pending-time-challenge.json").exists());
+        assert_eq!(store.commit(&candidate, &nv).unwrap().unwrap(), first);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_views_and_unbounded_time_advance_refuse() {
+        let baseline = candidate();
+        let manifest = StateManifest {
+            applied_sha256: "0".repeat(64),
+            applied_bom_sha256: baseline.applied.bom_sha256.clone(),
+            authority_sha256: "0".repeat(64),
+            bundle_seq_floor: 1,
+            delegation_seq_floor: 1,
+            delegation_snapshot_canonical_sha256: baseline.authority.snapshot_sha256.clone(),
+            delegation_snapshot_sha256: "0".repeat(64),
+            delegation_snapshot_signature_sha256: "0".repeat(64),
+            generation: 1,
+            legacy_bundle_floor: None,
+            previous_manifest_sha256: None,
+            previous_nv_anchor: ZERO_ANCHOR.into(),
+            release_authorization_sha256: "0".repeat(64),
+            release_authorization_signature_sha256: "0".repeat(64),
+            schema: "neural-ice-ota-state-manifest-v1".into(),
+            trusted_time_assertion_canonical_sha256: baseline.trusted.assertion_sha256.clone(),
+            trusted_time_assertion_sha256: "0".repeat(64),
+            trusted_time_assertion_signature_sha256: "0".repeat(64),
+            trusted_time_floor: baseline.trusted.trusted_time.clone(),
+            trusted_time_seq_floor: 1,
+            trusted_time_sha256: "0".repeat(64),
+        };
+        let mut split = candidate();
+        split.applied.bom_sha256 = "9".repeat(64);
+        assert!(monotonic(&manifest, &baseline.trusted, &split).is_err());
+        let mut jump = candidate();
+        jump.applied.bundle_seq = 2;
+        jump.trusted.assertion_seq = 2;
+        jump.trusted.tpm_clock = 2_000;
+        jump.trusted.trusted_time = "2026-07-22T00:10:03Z".into();
+        assert!(monotonic(&manifest, &baseline.trusted, &jump).is_err());
+        jump.trusted.trusted_time = "2026-07-22T00:10:02Z".into();
+        assert!(monotonic(&manifest, &baseline.trusted, &jump).is_ok());
     }
 }
