@@ -72,6 +72,10 @@ pub(crate) struct VerifiedTrustedTime {
     pub(crate) key_id: String,
     pub(crate) nonce_sha256: String,
     pub(crate) signature_sha256: String,
+    /// The conservatively rounded-up instant at which this assertion is
+    /// consumed.  Release and delegated-key liveness must use this rather
+    /// than the (necessarily older) asserted trusted time.
+    pub(crate) effective_time: String,
     pub(crate) trusted_time: String,
     pub(crate) valid_until: String,
 }
@@ -96,6 +100,9 @@ pub(crate) fn verify(
         Ok(()) => {}
         Err(reason) => return Err(reason.into()),
     }
+    let effective_time = consumption_timestamp(&assertion, expected).ok_or_else(|| {
+        ContractError::Refusal("trusted-time TPM consumption tuple is invalid".into())
+    })?;
     Ok(VerifiedTrustedTime {
         assertion_seq: assertion.assertion_seq,
         assertion_sha256: canonical_hash(assertion_bytes)?,
@@ -104,6 +111,31 @@ pub(crate) fn verify(
         key_id: assertion.key_id,
         nonce_sha256: hash(assertion.nonce.as_bytes())?,
         signature_sha256: hash(signature_bytes)?,
+        effective_time,
+        trusted_time: assertion.trusted_time,
+        valid_until: assertion.valid_until,
+    })
+}
+
+/// Decode evidence solely to reconstruct an already committed receipt after
+/// the pending challenge was durably consumed.  It deliberately performs no
+/// liveness or signature authorization: `exact_receipt_locked` accepts it
+/// only if all supplied bytes match the previously verified generation.
+pub(crate) fn receipt_evidence(
+    assertion_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> Result<VerifiedTrustedTime, ContractError> {
+    let assertion: TrustedTimeAssertion =
+        parse_canonical(assertion_bytes, "trusted-time assertion")?;
+    Ok(VerifiedTrustedTime {
+        assertion_seq: assertion.assertion_seq,
+        assertion_sha256: canonical_hash(assertion_bytes)?,
+        delegation_seq: assertion.delegation_seq,
+        device_fingerprint: assertion.device_fingerprint,
+        key_id: assertion.key_id,
+        nonce_sha256: hash(assertion.nonce.as_bytes())?,
+        signature_sha256: hash(signature_bytes)?,
+        effective_time: assertion.trusted_time.clone(),
         trusted_time: assertion.trusted_time,
         valid_until: assertion.valid_until,
     })
@@ -229,6 +261,13 @@ fn consumption_utc_seconds(
     utc_seconds(&value.trusted_time)?.checked_add(elapsed_seconds)
 }
 
+fn consumption_timestamp(
+    value: &TrustedTimeAssertion,
+    expected: &ExpectedTrustedTime<'_>,
+) -> Option<String> {
+    utc_timestamp(consumption_utc_seconds(value, expected)?)
+}
+
 fn is_lower_hex_32(value: &str) -> bool {
     value.len() == 64
         && value
@@ -268,6 +307,44 @@ pub(crate) fn utc_seconds(value: &str) -> Option<u64> {
     let months =
         month_days[..(month - 1) as usize].iter().sum::<u64>() + u64::from(month > 2 && leap(year));
     Some((((years + months + day - 1) * 24 + hour) * 60 + minute) * 60 + second)
+}
+
+fn utc_timestamp(mut seconds: u64) -> Option<String> {
+    let leap = |year: u64| {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    };
+    let mut year = 1970_u64;
+    loop {
+        let year_seconds = (365 + u64::from(leap(year))).checked_mul(86_400)?;
+        if seconds < year_seconds {
+            break;
+        }
+        seconds -= year_seconds;
+        year = year.checked_add(1)?;
+        if year > 9_999 {
+            return None;
+        }
+    }
+    let month_days = [31_u64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1_u64;
+    for (offset, days) in month_days.into_iter().enumerate() {
+        let days = days + u64::from(offset == 1 && leap(year));
+        let month_seconds = days.checked_mul(86_400)?;
+        if seconds < month_seconds {
+            month = offset as u64 + 1;
+            break;
+        }
+        seconds -= month_seconds;
+    }
+    let day = seconds / 86_400 + 1;
+    seconds %= 86_400;
+    let hour = seconds / 3_600;
+    seconds %= 3_600;
+    let minute = seconds / 60;
+    let second = seconds % 60;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
 }
 
 fn hash(bytes: &[u8]) -> Result<String, ContractError> {
@@ -484,6 +561,21 @@ mod tests {
         assert!(parse_canonical::<TrustedTimeAssertion>(&bytes, "assertion").is_err());
         assert_eq!(utc_seconds("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(utc_seconds("2023-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn effective_consumption_time_rounds_tpm_milliseconds_up() {
+        let value = assertion();
+        let mut observed = expected(&value);
+        observed.consumption_tpm_clock += 1_001;
+        assert_eq!(
+            consumption_timestamp(&value, &observed).as_deref(),
+            Some("2026-07-22T00:00:03Z")
+        );
+        assert_eq!(
+            utc_timestamp(utc_seconds("2024-02-29T23:59:59Z").unwrap() + 1).as_deref(),
+            Some("2024-03-01T00:00:00Z")
+        );
     }
 
     #[test]

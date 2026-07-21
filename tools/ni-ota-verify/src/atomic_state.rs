@@ -156,78 +156,90 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
             path: scratch.path.clone(),
         },
     };
-    let now_clock = tpm.clock()?;
-    if !now_clock.safe
-        || now_clock.reset_count != challenge.tpm_reset_count
-        || now_clock.restart_count != challenge.tpm_restart_count
-        || now_clock.clock < challenge.tpm_clock
-    {
-        return refusal("TPM continuity changed after challenge issuance".into());
-    }
-    let expected = ExpectedTrustedTime {
-        delegation_snapshot_sha256: snapshot_hash,
-        device_fingerprint: &challenge.device_fingerprint,
-        hardware_target: &target,
-        nonce: &challenge.nonce,
-        release_authorization_sha256: &release_hash,
-        ring,
-        state_nv_anchor: &challenge.state_nv_anchor,
-        tpm_clock: challenge.tpm_clock,
-        tpm_reset_count: challenge.tpm_reset_count,
-        tpm_restart_count: challenge.tpm_restart_count,
-        tpm_safe: challenge.tpm_safe,
-        consumption_tpm_clock: now_clock.clock,
-        consumption_tpm_reset_count: now_clock.reset_count,
-        consumption_tpm_restart_count: now_clock.restart_count,
-        consumption_tpm_safe: now_clock.safe,
-    };
     let assertion_signature = assertion_sig.read()?;
-    let trusted = match trusted_time::verify(
-        &authenticated_snapshot,
-        &assertion_bytes,
-        &assertion_signature,
-        &expected,
-        &scratch,
-    ) {
-        Ok(value) => value,
-        Err(error) => return contract_refusal(error),
+    let trusted = if pending_challenge {
+        let now_clock = tpm.clock()?;
+        if !now_clock.safe
+            || now_clock.reset_count != challenge.tpm_reset_count
+            || now_clock.restart_count != challenge.tpm_restart_count
+            || now_clock.clock < challenge.tpm_clock
+        {
+            return refusal("TPM continuity changed after challenge issuance".into());
+        }
+        let expected = ExpectedTrustedTime {
+            delegation_snapshot_sha256: snapshot_hash,
+            device_fingerprint: &challenge.device_fingerprint,
+            hardware_target: &target,
+            nonce: &challenge.nonce,
+            release_authorization_sha256: &release_hash,
+            ring,
+            state_nv_anchor: &challenge.state_nv_anchor,
+            tpm_clock: challenge.tpm_clock,
+            tpm_reset_count: challenge.tpm_reset_count,
+            tpm_restart_count: challenge.tpm_restart_count,
+            tpm_safe: challenge.tpm_safe,
+            consumption_tpm_clock: now_clock.clock,
+            consumption_tpm_reset_count: now_clock.reset_count,
+            consumption_tpm_restart_count: now_clock.restart_count,
+            consumption_tpm_safe: now_clock.safe,
+        };
+        let trusted = match trusted_time::verify(
+            &authenticated_snapshot,
+            &assertion_bytes,
+            &assertion_signature,
+            &expected,
+            &scratch,
+        ) {
+            Ok(value) => value,
+            Err(error) => return contract_refusal(error),
+        };
+        if let Err(reason) = validate_release(
+            &release,
+            snapshot,
+            snapshot_hash,
+            &trusted.effective_time,
+            &target,
+        ) {
+            return refusal(reason);
+        }
+        if let Err(reason) = device_compatibility(&release, config.device_compat) {
+            return refusal(reason);
+        }
+        let release_key = match authorized_key(
+            snapshot,
+            &release.key_id,
+            "beta-release-authorization",
+            &target,
+            &release.issued_at,
+            &trusted.effective_time,
+        ) {
+            Ok(value) => value,
+            Err(reason) => return refusal(reason),
+        };
+        let release_key = match public_key_pem(&release_key.public_key) {
+            Ok(value) => value,
+            Err(error) => return contract_refusal(error),
+        };
+        if let Err(reason) = verify_signature(
+            &release_key,
+            RELEASE_DOMAIN,
+            &release_bytes,
+            &release_signature,
+            &scratch,
+        )? {
+            return refusal(reason);
+        }
+        trusted
+    } else {
+        // A commit that already consumed its challenge can only recover an
+        // exact durable receipt.  TPM restart counters may legitimately have
+        // advanced before stdout was observed, so do not re-run live evidence
+        // checks here; `exact_receipt_locked` compares every artifact byte.
+        match trusted_time::receipt_evidence(&assertion_bytes, &assertion_signature) {
+            Ok(value) => value,
+            Err(error) => return contract_refusal(error),
+        }
     };
-    if let Err(reason) = validate_release(
-        &release,
-        snapshot,
-        snapshot_hash,
-        &trusted.trusted_time,
-        &target,
-    ) {
-        return refusal(reason);
-    }
-    if let Err(reason) = device_compatibility(&release, config.device_compat) {
-        return refusal(reason);
-    }
-    let release_key = match authorized_key(
-        snapshot,
-        &release.key_id,
-        "beta-release-authorization",
-        &target,
-        &release.issued_at,
-        &trusted.trusted_time,
-    ) {
-        Ok(value) => value,
-        Err(reason) => return refusal(reason),
-    };
-    let release_key = match public_key_pem(&release_key.public_key) {
-        Ok(value) => value,
-        Err(error) => return contract_refusal(error),
-    };
-    if let Err(reason) = verify_signature(
-        &release_key,
-        RELEASE_DOMAIN,
-        &release_bytes,
-        &release_signature,
-        &scratch,
-    )? {
-        return refusal(reason);
-    }
 
     let bom_bytes = bom_file.read()?;
     let bom: BomCore = serde_json::from_slice(&bom_bytes)
@@ -252,9 +264,9 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         key_id: trusted.key_id.clone(),
         schema: "neural-ice-ota-trusted-time-state-v2".into(),
         signature_sha256: trusted.signature_sha256.clone(),
-        tpm_clock: expected.tpm_clock,
-        tpm_reset_count: expected.tpm_reset_count,
-        tpm_restart_count: expected.tpm_restart_count,
+        tpm_clock: challenge.tpm_clock,
+        tpm_reset_count: challenge.tpm_reset_count,
+        tpm_restart_count: challenge.tpm_restart_count,
         tpm_safe: true,
         trusted_time: trusted.trusted_time.clone(),
     };
@@ -268,12 +280,10 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         trusted: &trusted_state,
         trusted_assertion: &assertion_bytes,
     };
-    // A zero anchor has no authoritative prior generation to chain against.
-    // `Store::commit` handles that fresh-install path and its one exact
-    // pre-extend generation retry itself. For every anchored transaction,
-    // rerun the complete preapply gate immediately before mutation rather
-    // than trusting a controller to have called guard-state-v2 beforehand.
-    if pending_challenge && tpm.read_initial()? != [0; 32] {
+    // Rerun the complete preapply gate immediately before every mutation,
+    // including initial state-v1 seeding.  The guard owns the explicit
+    // zero-anchor/legacy-floor rules; no controller ordering is trusted.
+    if pending_challenge {
         match store.guard_preapply_locked(&tpm, &preapply)? {
             Ok(()) => {}
             Err(reason) => return refusal(reason),
