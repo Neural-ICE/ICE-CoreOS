@@ -17,12 +17,14 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -297,6 +299,80 @@ def path_sort_key(path: str) -> bytes:
     return path.encode("utf-8", errors="surrogatepass")
 
 
+def append_path(queue, path: Path) -> None:
+    encoded = os.fsencode(path)
+    if len(encoded) > 0xFFFFFFFF:
+        raise ManifestError(f"filesystem path is too long to queue: {path}")
+    queue.seek(0, os.SEEK_END)
+    queue.write(struct.pack(">I", len(encoded)))
+    queue.write(encoded)
+
+
+def read_path(queue, offset: int) -> tuple[Path | None, int]:
+    queue.seek(offset)
+    length_bytes = queue.read(4)
+    if not length_bytes:
+        return None, offset
+    if len(length_bytes) != 4:
+        raise ManifestError("directory preflight queue is truncated")
+    length = struct.unpack(">I", length_bytes)[0]
+    encoded = queue.read(length)
+    if len(encoded) != length:
+        raise ManifestError("directory preflight queue is truncated")
+    return Path(os.fsdecode(encoded)), queue.tell()
+
+
+def open_preflight_queue(parent_descriptor: int):
+    if sys.platform != "linux":
+        return io.BytesIO()
+    temporary_flag = getattr(os, "O_TMPFILE", 0)
+    if not temporary_flag:
+        raise ManifestError("anonymous directory preflight storage is unavailable")
+    flags = os.O_RDWR | temporary_flag | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise ManifestError(
+            f"cannot create anonymous directory preflight storage: {error}"
+        ) from error
+    return os.fdopen(descriptor, "w+b", buffering=0)
+
+
+def output_parent_aliases_input(
+    trees: list[tuple[str, Path]],
+    parent_descriptor: int,
+    parent_metadata: os.stat_result,
+) -> bool:
+    target_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+    with open_preflight_queue(parent_descriptor) as queue:
+        for _, root in trees:
+            append_path(queue, root)
+        offset = 0
+        while True:
+            path, offset = read_path(queue, offset)
+            if path is None:
+                return False
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                raise ManifestError(
+                    f"cannot stat directory preflight path {path}: {error}"
+                ) from error
+            if not stat.S_ISDIR(metadata.st_mode):
+                continue
+            if (metadata.st_dev, metadata.st_ino) == target_identity:
+                return True
+            try:
+                with os.scandir(path) as iterator:
+                    for child in iterator:
+                        if child.is_dir(follow_symlinks=False):
+                            append_path(queue, Path(child.path))
+            except OSError as error:
+                raise ManifestError(
+                    f"cannot scan directory preflight path {path}: {error}"
+                ) from error
+
+
 def output_is_within_tree(output: Path, root: Path) -> bool:
     resolved_output = output.resolve(strict=False)
     resolved_root = root.resolve(strict=True)
@@ -342,7 +418,7 @@ def remove_owned_name(
     name: str,
     created_identity: tuple[int, int],
     original_error: BaseException,
-) -> None:
+) -> bool:
     try:
         metadata = os.stat(
             name,
@@ -350,7 +426,7 @@ def remove_owned_name(
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        return
+        return False
     except OSError as cleanup_error:
         raise ManifestError(
             f"cannot inspect failed manifest file {name}: {cleanup_error}"
@@ -365,6 +441,7 @@ def remove_owned_name(
         raise ManifestError(
             f"cannot remove failed manifest file {name}: {cleanup_error}"
         ) from original_error
+    return True
 
 
 def remove_owned_names(
@@ -373,15 +450,24 @@ def remove_owned_names(
     original_error: BaseException,
 ) -> None:
     cleanup_errors: list[BaseException] = []
+    removed = False
     for name, created_identity in owned_names:
         try:
-            remove_owned_name(
-                parent_descriptor,
-                name,
-                created_identity,
-                original_error,
+            removed = (
+                remove_owned_name(
+                    parent_descriptor,
+                    name,
+                    created_identity,
+                    original_error,
+                )
+                or removed
             )
         except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+    if removed:
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as cleanup_error:
             cleanup_errors.append(cleanup_error)
     if cleanup_errors:
         raise ManifestError(
@@ -433,23 +519,16 @@ def write_manifest(
     )
     temporary_name = f".seed-manifest-{os.urandom(16).hex()}"
     temporary_identity: tuple[int, int] | None = None
-    published = False
     descriptor: int | None = None
     try:
-        try:
-            spool_base = Path(tempfile.gettempdir()).resolve(strict=True)
-            spool_base_metadata = spool_base.lstat()
-        except OSError as error:
-            raise ManifestError(f"cannot inspect temporary directory: {error}") from error
-        if not stat.S_ISDIR(spool_base_metadata.st_mode):
-            raise ManifestError(f"temporary path is not a directory: {spool_base}")
-        for _, root in trees:
-            if output_is_within_tree(spool_base / "seed-manifest-spool", root):
-                raise ManifestError(f"temporary directory is inside input tree: {spool_base}")
+        if output_parent_aliases_input(trees, parent_descriptor, parent_metadata):
+            raise ManifestError(f"output path is inside input tree: {output}")
+        if not secure_parent_is_unchanged(supplied_parent, parent_metadata):
+            raise ManifestError(f"output directory changed before traversal: {output}")
 
         with tempfile.TemporaryDirectory(
             prefix=".seed-manifest-spool-",
-            dir=spool_base,
+            dir=supplied_parent,
         ) as spool_directory:
             os.chmod(spool_directory, 0o700)
             database_path = Path(spool_directory) / "entries.sqlite3"
@@ -513,10 +592,6 @@ def write_manifest(
 
                 if directory_was_manifested(spool, parent_metadata):
                     raise ManifestError(f"output path is inside input tree: {output}")
-                if directory_was_manifested(spool, spool_base_metadata):
-                    raise ManifestError(
-                        f"temporary directory aliases an input tree: {spool_base}"
-                    )
 
                 flags = (
                     os.O_WRONLY
@@ -592,7 +667,6 @@ def write_manifest(
             dst_dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        published = True
         final_metadata = os.stat(
             output_name,
             dir_fd=parent_descriptor,
@@ -613,7 +687,7 @@ def write_manifest(
             except OSError:
                 pass
         owned_names: list[tuple[str, tuple[int, int]]] = []
-        if published and temporary_identity is not None:
+        if temporary_identity is not None:
             owned_names.append((output_name, temporary_identity))
         if temporary_identity is not None:
             owned_names.append((temporary_name, temporary_identity))

@@ -237,6 +237,53 @@ class SeedTreeManifestTests(unittest.TestCase):
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
 
+    def test_ambiguous_link_failure_removes_the_final_name(self) -> None:
+        output = self.root / "ambiguous-link.json"
+        original_link = os.link
+
+        def link_then_raise(*args, **kwargs) -> None:
+            original_link(*args, **kwargs)
+            raise OSError("simulated post-link interruption")
+
+        with mock.patch.object(
+            MANIFEST_MODULE.os,
+            "link",
+            side_effect=link_then_raise,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated post-link interruption"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
+
+    def test_cleanup_is_synced_after_post_publish_sync_failure(self) -> None:
+        output = self.root / "post-publish-sync.json"
+        original_fsync = os.fsync
+        calls = 0
+
+        def fail_second_parent_sync(descriptor: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("simulated post-unlink sync failure")
+            original_fsync(descriptor)
+
+        with mock.patch.object(
+            MANIFEST_MODULE.os,
+            "fsync",
+            side_effect=fail_second_parent_sync,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated post-unlink sync failure"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertGreaterEqual(calls, 4)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
+
     def test_spool_teardown_failure_does_not_publish_output(self) -> None:
         output = self.root / "spool-teardown.json"
         original_temporary_directory = tempfile.TemporaryDirectory
@@ -283,22 +330,18 @@ class SeedTreeManifestTests(unittest.TestCase):
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
 
-    def test_temporary_directory_inside_input_tree_is_refused(self) -> None:
-        output = self.root / "unsafe-spool.json"
+    def test_caller_tmpdir_is_not_used_for_the_spool(self) -> None:
+        output = self.root / "safe-spool.json"
         with mock.patch.object(
             MANIFEST_MODULE.tempfile,
             "gettempdir",
             return_value=str(self.source / "models"),
         ):
-            with self.assertRaisesRegex(
-                MANIFEST_MODULE.ManifestError,
-                "temporary directory is inside input tree",
-            ):
-                MANIFEST_MODULE.write_manifest(
-                    [("models", self.source / "models")],
-                    output,
-                )
-        self.assertFalse(output.exists())
+            MANIFEST_MODULE.write_manifest(
+                [("models", self.source / "models")],
+                output,
+            )
+        self.assertTrue(output.is_file())
 
     def test_output_symlink_ancestor_is_refused(self) -> None:
         alias = self.root / "output-alias"
@@ -375,6 +418,23 @@ class SeedTreeManifestTests(unittest.TestCase):
                     OSError("original"),
                 )
         self.assertEqual(attempted, ["published", "temporary"])
+
+    def test_cleanup_syncs_the_parent_after_removal(self) -> None:
+        owned = self.root / "owned"
+        owned.write_bytes(b"owned")
+        metadata = owned.stat()
+        parent_descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            with mock.patch.object(MANIFEST_MODULE.os, "fsync") as synced:
+                MANIFEST_MODULE.remove_owned_names(
+                    parent_descriptor,
+                    [(owned.name, (metadata.st_dev, metadata.st_ino))],
+                    OSError("original"),
+                )
+            synced.assert_called_once_with(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+        self.assertFalse(owned.exists())
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
     def test_fifo_is_rejected_without_reading_it(self) -> None:
