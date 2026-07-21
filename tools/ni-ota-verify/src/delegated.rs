@@ -325,7 +325,7 @@ fn freeze_root(
     freeze(store, source, label).map(Ok)
 }
 
-fn verify_signature(
+pub(crate) fn verify_signature(
     public_key: &[u8],
     domain: &[u8],
     payload: &[u8],
