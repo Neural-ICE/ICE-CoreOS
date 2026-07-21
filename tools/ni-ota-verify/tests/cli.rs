@@ -1694,7 +1694,7 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
             .args(["--accepted-delegation-seq", "1"])
             .args([
                 "--accepted-delegation-sha256",
-                "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+                "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
             ])
             .args(["--trusted-now", "2026-07-22T00:00:00Z"])
             .args(["--config".as_ref(), cfg.as_os_str()]);
@@ -1741,7 +1741,7 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
         .args(["--accepted-delegation-seq", "1"])
         .args([
             "--accepted-delegation-sha256",
-            "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+            "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
         ])
         .args(["--trusted-now", "2026-07-22T00:00:00Z"])
         .args(["--config".as_ref(), cfg.as_os_str()]);
@@ -1796,7 +1796,7 @@ fn delegated_snapshot_keeps_anchor_refusals_distinct_from_broken_hashing() {
             .args(["--accepted-delegation-seq", "1"])
             .args([
                 "--accepted-delegation-sha256",
-                "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+                "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
             ])
             .args(["--trusted-now", "2026-07-22T00:00:00Z"])
             .args(["--config".as_ref(), config.as_os_str()]);
@@ -1916,7 +1916,7 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
             .args(["--accepted-delegation-seq", "1"])
             .args([
                 "--accepted-delegation-sha256",
-                "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+                "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
             ])
             .args(["--release".as_ref(), release.as_os_str()])
             .args(["--release-sig".as_ref(), fx.path("release.sig").as_os_str()])
