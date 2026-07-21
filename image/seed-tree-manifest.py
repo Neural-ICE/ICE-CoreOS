@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -69,7 +68,7 @@ def identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def xattrs(path: Path, *, follow_symlinks: bool) -> dict[str, str]:
+def xattrs(path: Path | str, *, follow_symlinks: bool) -> dict[str, str]:
     if not hasattr(os, "listxattr"):
         if sys.platform != "darwin" or shutil.which("xattr") is None:
             raise ManifestError("extended-attribute enumeration is unavailable")
@@ -118,7 +117,7 @@ def xattrs(path: Path, *, follow_symlinks: bool) -> dict[str, str]:
     return values
 
 
-def file_digest(path: Path, before: os.stat_result) -> str:
+def file_digest(path: Path | str, before: os.stat_result) -> str:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags)
     try:
@@ -169,9 +168,9 @@ def is_allowed_overlay_whiteout(
     )
 
 
-def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
+def revalidate(path: Path | str, before: os.stat_result, kind: str) -> None:
     try:
-        after = path.lstat()
+        after = os.lstat(path)
     except OSError as error:
         raise ManifestError(f"cannot re-stat {kind} {path}: {error}") from error
     if identity(after) != identity(before):
@@ -180,12 +179,13 @@ def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
 
 def inspect_entry(
     name: str,
-    path: Path,
+    path: Path | str,
     relative: PurePosixPath | None,
     expected: os.stat_result | None,
+    spool: sqlite3.Connection,
 ) -> tuple[dict[str, Any], os.stat_result]:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(path)
     except OSError as error:
         raise ManifestError(f"cannot stat {path}: {error}") from error
     if expected is not None and identity(metadata) != identity(expected):
@@ -197,9 +197,25 @@ def inspect_entry(
         item["type"] = "directory"
         item["xattrs"] = xattrs(path, follow_symlinks=False)
     elif stat.S_ISREG(metadata.st_mode):
+        digest: str | None = None
+        linked_identity = inode_key(metadata)
+        if metadata.st_nlink > 1:
+            cached = spool.execute(
+                "SELECT sha256 FROM file_digests WHERE identity = ?",
+                (linked_identity,),
+            ).fetchone()
+            if cached is not None:
+                digest = cached[0]
+        if digest is None:
+            digest = file_digest(path, metadata)
+            if metadata.st_nlink > 1:
+                spool.execute(
+                    "INSERT OR IGNORE INTO file_digests(identity, sha256) VALUES (?, ?)",
+                    (linked_identity, digest),
+                )
         item.update(
             {
-                "sha256": file_digest(path, metadata),
+                "sha256": digest,
                 "size": metadata.st_size,
                 "type": "file",
                 "xattrs": xattrs(path, follow_symlinks=False),
@@ -252,7 +268,7 @@ def decode_relative(encoded: bytes | None) -> PurePosixPath | None:
     return PurePosixPath(encoded.decode("utf-8", errors="surrogatepass"))
 
 
-def walk_tree(name: str, root: Path, spool: sqlite3.Connection):
+def walk_tree_by_path(name: str, root: Path, spool: sqlite3.Connection):
     try:
         root_metadata = root.lstat()
     except OSError as error:
@@ -278,7 +294,7 @@ def walk_tree(name: str, root: Path, spool: sqlite3.Connection):
         relative = decode_relative(encoded_relative_path)
         expected = root_metadata if first else None
         first = False
-        item, metadata = inspect_entry(name, path, relative, expected)
+        item, metadata = inspect_entry(name, path, relative, expected, spool)
         yield item, metadata
         if not stat.S_ISDIR(metadata.st_mode):
             continue
@@ -299,43 +315,199 @@ def walk_tree(name: str, root: Path, spool: sqlite3.Connection):
         revalidate(path, metadata, "seed directory")
 
 
+def directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def open_tree_directory(root: Path, relative: PurePosixPath | None) -> int:
+    absolute_root = Path(os.path.abspath(root))
+    flags = directory_open_flags()
+    try:
+        descriptor = os.open(Path(absolute_root.anchor), flags)
+        try:
+            for component in absolute_root.parts[1:]:
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            if relative is not None:
+                for component in relative.parts:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                    os.close(descriptor)
+                    descriptor = child
+        except BaseException:
+            os.close(descriptor)
+            raise
+    except OSError as error:
+        location = stable_path(os.fspath(root), relative)
+        raise ManifestError(f"cannot open tree directory {location}: {error}") from error
+    return descriptor
+
+
+def linux_descriptor_path(descriptor: int, name: str | None = None) -> Path | str:
+    if name is None:
+        # The trailing slash forces the procfs descriptor symlink to resolve to
+        # the retained directory itself. pathlib would normalize a final "."
+        # away and lstat the procfs symlink instead.
+        return f"/proc/self/fd/{descriptor}/"
+    return Path(f"/proc/self/fd/{descriptor}") / name
+
+
+def walk_tree_by_descriptor(name: str, root: Path, spool: sqlite3.Connection):
+    root_descriptor = open_tree_directory(root, None)
+    try:
+        root_metadata = os.fstat(root_descriptor)
+    finally:
+        os.close(root_descriptor)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ManifestError(f"tree root is not a real directory: {root}")
+
+    spool.execute("DELETE FROM pending")
+    spool.execute(
+        "INSERT INTO pending(path, relative_path) VALUES (?, ?)",
+        (b"", None),
+    )
+    first = True
+    while True:
+        pending = spool.execute(
+            "SELECT id, relative_path FROM pending ORDER BY id LIMIT 1"
+        ).fetchone()
+        if pending is None:
+            break
+        row_id, encoded_relative_path = pending
+        spool.execute("DELETE FROM pending WHERE id = ?", (row_id,))
+        relative = decode_relative(encoded_relative_path)
+        descriptor = open_tree_directory(root, relative)
+        directory_path = linux_descriptor_path(descriptor)
+        try:
+            expected = root_metadata if first else None
+            first = False
+            item, metadata = inspect_entry(
+                name,
+                directory_path,
+                relative,
+                expected,
+                spool,
+            )
+            yield item, metadata
+            try:
+                with os.scandir(descriptor) as iterator:
+                    for child in iterator:
+                        child_relative = (
+                            PurePosixPath(child.name)
+                            if relative is None
+                            else relative / child.name
+                        )
+                        if child.is_dir(follow_symlinks=False):
+                            spool.execute(
+                                "INSERT INTO pending(path, relative_path) VALUES (?, ?)",
+                                (b"", encode_relative(child_relative)),
+                            )
+                            continue
+                        child_path = linux_descriptor_path(descriptor, child.name)
+                        child_item, child_metadata = inspect_entry(
+                            name,
+                            child_path,
+                            child_relative,
+                            None,
+                            spool,
+                        )
+                        yield child_item, child_metadata
+            except OSError as error:
+                raise ManifestError(
+                    f"cannot scan directory {stable_path(name, relative)}: {error}"
+                ) from error
+            revalidate(directory_path, metadata, "seed directory")
+        finally:
+            os.close(descriptor)
+
+
+def walk_tree(name: str, root: Path, spool: sqlite3.Connection):
+    if sys.platform == "linux":
+        yield from walk_tree_by_descriptor(name, root, spool)
+    else:
+        yield from walk_tree_by_path(name, root, spool)
+
+
 def path_sort_key(path: str) -> bytes:
     return path.encode("utf-8", errors="surrogatepass")
 
 
-def append_path(queue, path: Path) -> None:
-    encoded = os.fsencode(path)
+def append_locator(
+    queue,
+    tree_index: int,
+    relative: PurePosixPath | None,
+) -> None:
+    encoded = encode_relative(relative) or b""
     if len(encoded) > 0xFFFFFFFF:
-        raise ManifestError(f"filesystem path is too long to queue: {path}")
+        raise ManifestError("relative filesystem path is too long to queue")
     queue.seek(0, os.SEEK_END)
-    queue.write(struct.pack(">I", len(encoded)))
+    queue.write(struct.pack(">II", tree_index, len(encoded)))
     queue.write(encoded)
 
 
-def read_path(queue, offset: int) -> tuple[Path | None, int]:
+def read_locator(
+    queue,
+    offset: int,
+) -> tuple[tuple[int, PurePosixPath | None] | None, int]:
     queue.seek(offset)
-    length_bytes = queue.read(4)
-    if not length_bytes:
+    header = queue.read(8)
+    if not header:
         return None, offset
-    if len(length_bytes) != 4:
+    if len(header) != 8:
         raise ManifestError("directory preflight queue is truncated")
-    length = struct.unpack(">I", length_bytes)[0]
+    tree_index, length = struct.unpack(">II", header)
     encoded = queue.read(length)
     if len(encoded) != length:
         raise ManifestError("directory preflight queue is truncated")
-    return Path(os.fsdecode(encoded)), queue.tell()
+    relative = decode_relative(encoded) if encoded else None
+    return (tree_index, relative), queue.tell()
 
 
 def open_preflight_queue(parent_descriptor: int):
-    if sys.platform != "linux":
-        return io.BytesIO()
-    temporary_flag = getattr(os, "O_TMPFILE", 0)
-    if not temporary_flag:
-        raise ManifestError("anonymous directory preflight storage is unavailable")
-    flags = os.O_RDWR | temporary_flag | getattr(os, "O_CLOEXEC", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    temporary_flag = getattr(os, "O_TMPFILE", 0) if sys.platform == "linux" else 0
+    if temporary_flag:
+        flags = os.O_RDWR | temporary_flag | close_on_exec
+        try:
+            descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise ManifestError(
+                f"cannot create anonymous directory preflight storage: {error}"
+            ) from error
+        return os.fdopen(descriptor, "w+b", buffering=0)
+
+    temporary_name = f".seed-manifest-preflight-{os.urandom(16).hex()}"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | close_on_exec
+    )
+    descriptor: int | None = None
     try:
-        descriptor = os.open(".", flags, 0o600, dir_fd=parent_descriptor)
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
     except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
         raise ManifestError(
             f"cannot create anonymous directory preflight storage: {error}"
         ) from error
@@ -351,44 +523,54 @@ def output_parent_aliases_input(
     visited: set[tuple[int, int]] = set()
     with open_preflight_queue(parent_descriptor) as queue:
         enqueued = 0
-        for _, root in trees:
+        for tree_index, _ in enumerate(trees):
             enqueued += 1
             if enqueued > MAX_PREFLIGHT_DIRECTORIES:
                 raise ManifestError("directory preflight limit exceeded")
-            append_path(queue, root)
+            append_locator(queue, tree_index, None)
         offset = 0
         while True:
-            path, offset = read_path(queue, offset)
-            if path is None:
+            locator, offset = read_locator(queue, offset)
+            if locator is None:
                 return False
+            tree_index, relative = locator
             try:
-                metadata = path.lstat()
-            except OSError as error:
-                raise ManifestError(
-                    f"cannot stat directory preflight path {path}: {error}"
-                ) from error
-            if not stat.S_ISDIR(metadata.st_mode):
-                continue
-            directory_identity = (metadata.st_dev, metadata.st_ino)
-            if directory_identity == target_identity:
-                return True
-            if directory_identity in visited:
-                raise ManifestError(f"directory identity revisited during preflight: {path}")
-            visited.add(directory_identity)
-            if len(visited) > MAX_PREFLIGHT_DIRECTORIES:
-                raise ManifestError("directory preflight limit exceeded")
+                _, root = trees[tree_index]
+            except IndexError as error:
+                raise ManifestError("directory preflight queue has an invalid tree") from error
+            descriptor = open_tree_directory(root, relative)
             try:
-                with os.scandir(path) as iterator:
+                metadata = os.fstat(descriptor)
+                directory_identity = (metadata.st_dev, metadata.st_ino)
+                if directory_identity == target_identity:
+                    return True
+                if directory_identity in visited:
+                    raise ManifestError(
+                        "directory identity revisited during preflight: "
+                        f"{stable_path(trees[tree_index][0], relative)}"
+                    )
+                visited.add(directory_identity)
+                if len(visited) > MAX_PREFLIGHT_DIRECTORIES:
+                    raise ManifestError("directory preflight limit exceeded")
+                with os.scandir(descriptor) as iterator:
                     for child in iterator:
                         if child.is_dir(follow_symlinks=False):
                             enqueued += 1
                             if enqueued > MAX_PREFLIGHT_DIRECTORIES:
                                 raise ManifestError("directory preflight limit exceeded")
-                            append_path(queue, Path(child.path))
+                            child_relative = (
+                                PurePosixPath(child.name)
+                                if relative is None
+                                else relative / child.name
+                            )
+                            append_locator(queue, tree_index, child_relative)
             except OSError as error:
                 raise ManifestError(
-                    f"cannot scan directory preflight path {path}: {error}"
+                    "cannot scan directory preflight path "
+                    f"{stable_path(trees[tree_index][0], relative)}: {error}"
                 ) from error
+            finally:
+                os.close(descriptor)
 
 
 def output_is_within_tree(output: Path, root: Path) -> bool:
@@ -642,6 +824,9 @@ def write_manifest(
         )
         spool.execute(
             "CREATE TABLE hardlinks (path_key BLOB PRIMARY KEY, identity BLOB NOT NULL)"
+        )
+        spool.execute(
+            "CREATE TABLE file_digests (identity BLOB PRIMARY KEY, sha256 TEXT NOT NULL)"
         )
         spool.execute(
             """

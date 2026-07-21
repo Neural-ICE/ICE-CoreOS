@@ -164,19 +164,29 @@ class SeedTreeManifestTests(unittest.TestCase):
         )
 
     @unittest.skipIf(sys.platform == "darwin", "macOS PATH_MAX is below recursion limit")
-    def test_deep_tree_does_not_depend_on_python_recursion(self) -> None:
+    def test_deep_tree_exceeding_path_max_is_descriptor_relative(self) -> None:
         deep_root = self.source / "models" / "deep"
-        current = deep_root
-        current.mkdir()
+        deep_root.mkdir()
+        descriptor = os.open(deep_root, os.O_RDONLY)
         try:
-            for _ in range(1050):
-                current /= "d"
-                current.mkdir()
-            (current / "leaf").write_bytes(b"deep")
+            for _ in range(2100):
+                os.mkdir("d", dir_fd=descriptor)
+                child = os.open("d", os.O_RDONLY, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            leaf = os.open(
+                "leaf",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=descriptor,
+            )
+            os.write(leaf, b"deep")
+            os.close(leaf)
 
             result = self.generate(self.source, self.root / "deep.json")
             self.assertEqual(result.returncode, 0, result.stderr)
         finally:
+            os.close(descriptor)
             # tempfile/shutil cleanup is itself recursive on some Python
             # versions, so remove this deliberate stress tree iteratively in
             # the platform utility before TemporaryDirectory tears down.
@@ -264,24 +274,26 @@ class SeedTreeManifestTests(unittest.TestCase):
         original_fsync = os.fsync
         calls = 0
 
-        def fail_second_parent_sync(descriptor: int) -> None:
+        failure_call = 4 if sys.platform == "linux" else 5
+
+        def fail_post_unlink_parent_sync(descriptor: int) -> None:
             nonlocal calls
             calls += 1
-            if calls == 3:
+            if calls == failure_call:
                 raise OSError("simulated post-unlink sync failure")
             original_fsync(descriptor)
 
         with mock.patch.object(
             MANIFEST_MODULE.os,
             "fsync",
-            side_effect=fail_second_parent_sync,
+            side_effect=fail_post_unlink_parent_sync,
         ):
             with self.assertRaisesRegex(OSError, "simulated post-unlink sync failure"):
                 MANIFEST_MODULE.write_manifest(
                     [("models", self.source / "models")],
                     output,
                 )
-        self.assertGreaterEqual(calls, 4)
+        self.assertGreaterEqual(calls, failure_call + 1)
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
 
@@ -434,10 +446,21 @@ class SeedTreeManifestTests(unittest.TestCase):
 
     def test_failed_mode_enforcement_removes_private_output(self) -> None:
         output = self.root / "mode-failure.json"
+        original_fchmod = os.fchmod
+        calls = 0
+
+        def fail_manifest_mode(descriptor: int, mode: int) -> None:
+            nonlocal calls
+            calls += 1
+            output_call = 1 if sys.platform == "linux" else 2
+            if calls == output_call:
+                raise OSError("simulated chmod failure")
+            original_fchmod(descriptor, mode)
+
         with mock.patch.object(
             MANIFEST_MODULE.os,
             "fchmod",
-            side_effect=OSError("simulated chmod failure"),
+            side_effect=fail_manifest_mode,
         ):
             with self.assertRaisesRegex(OSError, "simulated chmod failure"):
                 MANIFEST_MODULE.write_manifest(
@@ -446,6 +469,40 @@ class SeedTreeManifestTests(unittest.TestCase):
                 )
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".seed-manifest-*")), [])
+
+    def test_hard_linked_regular_file_is_hashed_once(self) -> None:
+        output = self.root / "hardlink-cache.json"
+        original_digest = MANIFEST_MODULE.file_digest
+        calls = 0
+
+        def count_digest(path: Path, metadata: os.stat_result) -> str:
+            nonlocal calls
+            calls += 1
+            return original_digest(path, metadata)
+
+        with mock.patch.object(
+            MANIFEST_MODULE,
+            "file_digest",
+            side_effect=count_digest,
+        ):
+            MANIFEST_MODULE.write_manifest(
+                [("models", self.source / "models")],
+                output,
+            )
+        # model-a has one two-name hard-link group and no other regular file.
+        self.assertEqual(calls, 1)
+
+    def test_preflight_queue_is_disk_backed(self) -> None:
+        parent_descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            with MANIFEST_MODULE.open_preflight_queue(parent_descriptor) as queue:
+                self.assertFalse(isinstance(queue, io.BytesIO))
+                queue.write(b"bounded-on-disk")
+                queue.seek(0)
+                self.assertEqual(queue.read(), b"bounded-on-disk")
+        finally:
+            os.close(parent_descriptor)
+        self.assertEqual(list(self.root.glob(".seed-manifest-preflight-*")), [])
 
     def test_maximum_length_output_basename_is_supported(self) -> None:
         output = self.root / ("m" * 255)
