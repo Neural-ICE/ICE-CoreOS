@@ -23,34 +23,34 @@ mod usb;
 
 pub(crate) use usb::run as run_usb;
 
-const RELEASE_DOMAIN: &[u8] = b"neural-ice:ota:release-authorization:v1\0";
+pub(crate) const RELEASE_DOMAIN: &[u8] = b"neural-ice:ota:release-authorization:v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"neural-ice:ota:beta-publication-receipt:v1\0";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseAuthorization {
-    attestation_set_sha256: String,
-    beta_publication_receipt_sha256: Option<String>,
-    bom_sha256: String,
-    bundle_seq: u64,
-    channel_record_sha256: String,
-    compat_max: u64,
-    compat_min: u64,
-    delegation_seq: u64,
-    delegation_snapshot_sha256: String,
-    hardware_target: String,
-    issuance_id: String,
-    issued_at: String,
-    key_id: String,
-    ring: String,
-    schema: String,
-    signature_algorithm: String,
-    signature_encoding: String,
-    signing_role: String,
-    train: String,
-    valid_from: String,
-    valid_until: String,
-    variant: String,
+pub(crate) struct ReleaseAuthorization {
+    pub(crate) attestation_set_sha256: String,
+    pub(crate) beta_publication_receipt_sha256: Option<String>,
+    pub(crate) bom_sha256: String,
+    pub(crate) bundle_seq: u64,
+    pub(crate) channel_record_sha256: String,
+    pub(crate) compat_max: u64,
+    pub(crate) compat_min: u64,
+    pub(crate) delegation_seq: u64,
+    pub(crate) delegation_snapshot_sha256: String,
+    pub(crate) hardware_target: String,
+    pub(crate) issuance_id: String,
+    pub(crate) issued_at: String,
+    pub(crate) key_id: String,
+    pub(crate) ring: String,
+    pub(crate) schema: String,
+    pub(crate) signature_algorithm: String,
+    pub(crate) signature_encoding: String,
+    pub(crate) signing_role: String,
+    pub(crate) train: String,
+    pub(crate) valid_from: String,
+    pub(crate) valid_until: String,
+    pub(crate) variant: String,
 }
 
 #[derive(Deserialize, Serialize)]

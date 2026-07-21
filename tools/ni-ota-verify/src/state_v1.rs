@@ -23,6 +23,7 @@ use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
 pub(crate) const LEGACY_NV_INDEX: u32 = 0x0150_0001;
+const DEVICE_ROOT_HANDLE: u32 = 0x8101_0004;
 const STATE_NV_ATTRIBUTES: &str =
     "authread|authwrite|no_da|nt=0x1|ownerread|platformcreate|policydelete";
 const STATE_NV_DELETE_AUTH_POLICY: &str =
@@ -112,6 +113,23 @@ struct LoadedGeneration {
     manifest_sha256: String,
     nv_anchor: String,
     trusted: TrustedTimeState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimeChallenge {
+    pub(crate) delegation_snapshot_sha256: String,
+    pub(crate) device_fingerprint: String,
+    pub(crate) hardware_target: String,
+    pub(crate) nonce: String,
+    pub(crate) release_authorization_sha256: String,
+    pub(crate) ring: String,
+    pub(crate) schema: String,
+    pub(crate) state_nv_anchor: String,
+    pub(crate) tpm_clock: u64,
+    pub(crate) tpm_reset_count: u32,
+    pub(crate) tpm_restart_count: u32,
+    pub(crate) tpm_safe: bool,
 }
 
 #[derive(Default)]
@@ -292,6 +310,19 @@ fn continuity_ready(tpm: &impl NvAnchor) -> Result<bool, InternalError> {
 }
 
 impl CommandTpm {
+    fn index_present(&self) -> Result<bool, InternalError> {
+        let handles = Command::new(tool("tpm2_getcap"))
+            .arg("handles-nv-index")
+            .output()
+            .map_err(|error| InternalError(format!("cannot enumerate TPM NV handles: {error}")))?;
+        if !handles.status.success() {
+            return Err(InternalError("cannot enumerate TPM NV handles".into()));
+        }
+        let handles = String::from_utf8(handles.stdout)
+            .map_err(|_| InternalError("TPM NV handle list is not UTF-8".into()))?;
+        Ok(contains_nv_handle(&handles, self.index))
+    }
+
     fn inspect(&self) -> Result<bool, InternalError> {
         let output = Command::new(tool("tpm2_nvreadpublic"))
             .arg(format!("0x{:08x}", self.index))
@@ -309,6 +340,51 @@ impl CommandTpm {
             self.index,
         )
     }
+
+    fn initial_or_existing_anchor(&self) -> Result<String, InternalError> {
+        if !self.index_present()? {
+            return Ok(ZERO_ANCHOR.to_owned());
+        }
+        if !self.inspect()? {
+            // An exact EXTEND index is unreadable until its first extend.
+            // Treat its attested unwritten state as the logical zero anchor.
+            return Ok(ZERO_ANCHOR.to_owned());
+        }
+        self.read().map(hex)
+    }
+
+    fn device_fingerprint(&self) -> Result<String, InternalError> {
+        let output = self
+            .scratch
+            .secure_temp_bytes("device-root-public", b"pending")?;
+        let status = Command::new(tool("tpm2_readpublic"))
+            .args([
+                "-c",
+                &format!("0x{DEVICE_ROOT_HANDLE:08x}"),
+                "-f",
+                "pem",
+                "-o",
+            ])
+            .arg(output.path())
+            .status()
+            .map_err(|error| InternalError(format!("cannot read TPM device root: {error}")))?;
+        if !status.success() {
+            return Err(InternalError(format!(
+                "cannot read TPM device root handle 0x{DEVICE_ROOT_HANDLE:08x}"
+            )));
+        }
+        let pem = String::from_utf8(output.read()?)
+            .map_err(|_| InternalError("TPM device root PEM is not UTF-8".into()))?;
+        let pem = pem.trim();
+        if !pem.starts_with("-----BEGIN PUBLIC KEY-----")
+            || !pem.ends_with("-----END PUBLIC KEY-----")
+        {
+            return Err(InternalError(
+                "TPM device root is not a public-key PEM".into(),
+            ));
+        }
+        runner::sha256_bytes(format!("tpm-pub-v1:{pem}").as_bytes())
+    }
 }
 
 impl Store {
@@ -318,7 +394,62 @@ impl Store {
         }
     }
 
-    #[cfg(test)]
+    pub(crate) fn issue_time_challenge(
+        &self,
+        tpm: &CommandTpm,
+        delegation_snapshot_sha256: &str,
+        release_authorization_sha256: &str,
+        hardware_target: &str,
+        ring: &str,
+    ) -> Result<TimeChallenge, InternalError> {
+        ensure_secure_state_directory(&self.root)?;
+        let anchor = tpm.initial_or_existing_anchor()?;
+        if anchor == ZERO_ANCHOR && self.scan_generations()?.has_evidence {
+            return Err(InternalError(
+                "zero TPM anchor with existing state history requires signed recovery".into(),
+            ));
+        }
+        let clock = tpm.clock()?;
+        if !clock.safe {
+            return Err(InternalError("TPM clock is not safe".into()));
+        }
+        let challenge = TimeChallenge {
+            delegation_snapshot_sha256: delegation_snapshot_sha256.to_owned(),
+            device_fingerprint: tpm.device_fingerprint()?,
+            hardware_target: hardware_target.to_owned(),
+            nonce: fresh_nonce()?,
+            release_authorization_sha256: release_authorization_sha256.to_owned(),
+            ring: ring.to_owned(),
+            schema: "neural-ice-ota-time-challenge-v2".into(),
+            state_nv_anchor: anchor,
+            tpm_clock: clock.clock,
+            tpm_reset_count: clock.reset_count,
+            tpm_restart_count: clock.restart_count,
+            tpm_safe: clock.safe,
+        };
+        validate_time_challenge(&challenge)?;
+        atomic_replace(
+            &self.root,
+            "pending-time-challenge.json",
+            &canonical(&challenge)?,
+        )?;
+        let readback = self.pending_time_challenge()?;
+        if readback != challenge {
+            return Err(InternalError(
+                "trusted-time challenge readback differs after publication".into(),
+            ));
+        }
+        Ok(challenge)
+    }
+
+    pub(crate) fn pending_time_challenge(&self) -> Result<TimeChallenge, InternalError> {
+        let bytes = read_regular(&self.root.join("pending-time-challenge.json"), 0o600)?;
+        let challenge: TimeChallenge =
+            parse_canonical(&bytes, "trusted-time v2 challenge").map_err(InternalError)?;
+        validate_time_challenge(&challenge)?;
+        Ok(challenge)
+    }
+
     fn read_current(&self, nv: &dyn NvAnchor) -> Result<Option<LoadedGeneration>, InternalError> {
         let _lock = self.lock_store().lock_commit()?;
         self.read_current_locked(nv)
@@ -837,6 +968,28 @@ fn safe_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
+fn validate_time_challenge(value: &TimeChallenge) -> Result<(), InternalError> {
+    if value.schema != "neural-ice-ota-time-challenge-v2"
+        || !sha256(&value.delegation_snapshot_sha256)
+        || !sha256(&value.device_fingerprint)
+        || !sha256(&value.release_authorization_sha256)
+        || !sha256(&value.state_nv_anchor)
+        || value.nonce.len() != 64
+        || !value
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !matches!(value.ring.as_str(), "beta" | "stable")
+        || !value.tpm_safe
+        || !safe_uint(value.tpm_clock)
+    {
+        return Err(InternalError(
+            "trusted-time v2 challenge contract is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_pointer(bytes: &[u8]) -> Result<u64, InternalError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| InternalError("state-v1 CURRENT is not UTF-8".into()))?;
@@ -1058,6 +1211,28 @@ fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, InternalError> {
         .map_err(|error| InternalError(format!("cannot encode state-v1 value: {error}")))?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+fn fresh_nonce() -> Result<String, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let source = std::env::var_os("NI_OTA_RANDOM_SOURCE")
+        .map_or_else(|| PathBuf::from("/dev/urandom"), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let source = PathBuf::from("/dev/urandom");
+    nonce_from(&source)
+}
+
+fn nonce_from(source: &Path) -> Result<String, InternalError> {
+    let mut bytes = [0_u8; 32];
+    File::open(source)
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| {
+            InternalError(format!(
+                "cannot read 32-byte trusted-time nonce from {}: {error}",
+                source.display()
+            ))
+        })?;
+    Ok(hex(bytes))
 }
 
 fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> {
@@ -2158,5 +2333,31 @@ mod tests {
             .file_type()
             .is_symlink());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn time_challenge_is_closed_and_nonce_is_exact() {
+        let value = TimeChallenge {
+            delegation_snapshot_sha256: "a".repeat(64),
+            device_fingerprint: "b".repeat(64),
+            hardware_target: "nvidia-gb10-arm64".into(),
+            nonce: "c".repeat(64),
+            release_authorization_sha256: "d".repeat(64),
+            ring: "beta".into(),
+            schema: "neural-ice-ota-time-challenge-v2".into(),
+            state_nv_anchor: ZERO_ANCHOR.into(),
+            tpm_clock: 42,
+            tpm_reset_count: 3,
+            tpm_restart_count: 4,
+            tpm_safe: true,
+        };
+        assert!(validate_time_challenge(&value).is_ok());
+        let mut unsafe_value = value.clone();
+        unsafe_value.tpm_safe = false;
+        assert!(validate_time_challenge(&unsafe_value).is_err());
+        let mut noncanonical_nonce = value;
+        noncanonical_nonce.nonce = "C".repeat(64);
+        assert!(validate_time_challenge(&noncanonical_nonce).is_err());
+        assert_eq!(nonce_from(Path::new("/dev/zero")).unwrap(), "0".repeat(64));
     }
 }
