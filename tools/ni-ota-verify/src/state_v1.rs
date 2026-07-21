@@ -24,6 +24,7 @@ use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
 pub(crate) const LEGACY_NV_INDEX: u32 = 0x0150_0001;
+const TRUSTED_TIME_MAX_ELAPSED_MS: u64 = 600_000;
 // ADR-0013 reserves 0x81010004 for the appliance PKI. The installer-owned,
 // non-exportable OTA/licensing device root is provisioned at this separate
 // handle before trusted-time preparation is available on a clean install.
@@ -194,7 +195,7 @@ pub(crate) struct PreapplyCandidate<'a> {
     pub(crate) challenge: &'a TimeChallenge,
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) snapshot_sha256: &'a str,
-    pub(crate) trusted_now: &'a str,
+    pub(crate) trusted: &'a TrustedTimeState,
 }
 
 pub(crate) struct Store {
@@ -240,7 +241,7 @@ fn capability_ready_for(
     Ok(true)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TpmClockState {
     pub(crate) clock: u64,
     pub(crate) reset_count: u32,
@@ -661,37 +662,58 @@ impl Store {
         nv: &dyn NvAnchor,
         candidate: &PreapplyCandidate<'_>,
     ) -> Result<Result<(), String>, InternalError> {
+        validate_preapply_candidate(candidate)?;
         if self.pending_time_challenge()? != *candidate.challenge {
             return Ok(Err("pending trusted-time challenge differs".into()));
+        }
+        if let Err(reason) = self.challenge_is_live(nv, candidate.challenge)? {
+            return Ok(Err(reason));
         }
         let anchor = hex(nv.read_initial()?);
         if candidate.challenge.state_nv_anchor != anchor {
             return Ok(Err("trusted-time challenge anchor is stale".into()));
         }
-        let legacy = nv.legacy_bundle_floor()?.unwrap_or(0);
-        if candidate.bundle_seq < legacy {
-            return Ok(Err("candidate bundle is below legacy TPM floor".into()));
-        }
         if anchor == ZERO_ANCHOR {
-            return if self.scan_generations()?.has_evidence {
+            return if self.has_prior_state_evidence()? {
                 Ok(Err("zero TPM anchor has existing state history".into()))
             } else {
+                if candidate.bundle_seq < nv.legacy_bundle_floor()?.unwrap_or(0) {
+                    return Ok(Err("candidate bundle is below legacy TPM floor".into()));
+                }
                 Ok(Ok(()))
             };
         }
         let current = self
             .read_current(nv)?
             .ok_or_else(|| InternalError("TPM-anchored state is unavailable".into()))?;
+        let legacy_floor = nv.legacy_bundle_floor()?;
+        if current.manifest.legacy_bundle_floor.is_some() && legacy_floor.is_none() {
+            return Ok(Err(
+                "legacy TPM floor disappeared after state-v1 seeding".into()
+            ));
+        }
+        let observed_floor = legacy_floor.unwrap_or(0);
+        let persisted_floor = current.manifest.legacy_bundle_floor.unwrap_or(0);
+        if observed_floor < persisted_floor {
+            return Ok(Err(
+                "legacy TPM floor regressed after state-v1 seeding".into()
+            ));
+        }
         self.verify_enforce_ready(nv)?;
-        if candidate.bundle_seq < current.manifest.bundle_seq_floor
+        if candidate.bundle_seq < observed_floor.max(persisted_floor)
+            || candidate.bundle_seq < current.manifest.bundle_seq_floor
             || (candidate.bundle_seq == current.manifest.bundle_seq_floor
                 && candidate.bom_sha256 != current.manifest.applied_bom_sha256)
-            || candidate.trusted_now < current.manifest.trusted_time_floor.as_str()
             || candidate.snapshot.delegation_seq < current.manifest.delegation_seq_floor
         {
             return Ok(Err(
                 "candidate is below a TPM-anchored pre-apply floor".into()
             ));
+        }
+        if let Err(reason) =
+            monotonic_trusted(&current.manifest, &current.trusted, candidate.trusted)
+        {
+            return Ok(Err(reason));
         }
         if candidate.snapshot.delegation_seq == current.manifest.delegation_seq_floor {
             if candidate.snapshot_sha256 != current.manifest.delegation_snapshot_canonical_sha256 {
@@ -729,13 +751,26 @@ impl Store {
         candidate: &Candidate<'_>,
         nv: &dyn NvAnchor,
     ) -> Result<Result<CommitReceipt, String>, InternalError> {
+        let prior_history = self.has_durable_state_history()?;
         ensure_secure_state_directory(&self.root)?;
         ensure_secure_state_directory(&self.root.join("generations"))?;
         validate_candidate(candidate)?;
+        if let Err(reason) = self.challenge_is_live(nv, &candidate.challenge)? {
+            return Ok(Err(reason));
+        }
         let initial_anchor = hex(nv.read_initial()?);
         let state_index_ready = nv.attest().is_ok();
+        let scan = self.scan_generations()?;
         let current = if initial_anchor == ZERO_ANCHOR {
-            if self.scan_generations()?.has_evidence {
+            if prior_history {
+                return Ok(Err(
+                    "zero TPM anchor with existing durable state history requires signed recovery"
+                        .into(),
+                ));
+            }
+            if scan.has_evidence
+                && !self.exact_unanchored_generation(candidate, nv.legacy_bundle_floor()?)?
+            {
                 return Ok(Err(
                     "zero TPM anchor with existing state history requires signed recovery".into(),
                 ));
@@ -889,7 +924,33 @@ impl Store {
         ] {
             write_new(&temp.join(name), bytes)?;
         }
-        let manifest = StateManifest {
+        let manifest = self.manifest_for(
+            generation,
+            value,
+            previous_manifest_sha256,
+            previous_nv_anchor,
+            legacy_bundle_floor,
+        )?;
+        write_new(&temp.join("manifest.json"), &canonical(&manifest)?)?;
+        sync_dir(&temp)?;
+        std::fs::rename(&temp, &final_dir)
+            .map_err(|error| InternalError(format!("cannot publish {final_name}: {error}")))?;
+        sync_dir(&generations)?;
+        Ok(manifest)
+    }
+
+    fn manifest_for(
+        &self,
+        generation: u64,
+        value: &Candidate<'_>,
+        previous_manifest_sha256: Option<String>,
+        previous_nv_anchor: String,
+        legacy_bundle_floor: Option<u64>,
+    ) -> Result<StateManifest, InternalError> {
+        let applied = canonical(&value.applied)?;
+        let authority = canonical(&value.authority)?;
+        let trusted = canonical(&value.trusted)?;
+        Ok(StateManifest {
             applied_sha256: hash(&applied)?,
             applied_bom_sha256: value.applied.bom_sha256.clone(),
             authority_sha256: hash(&authority)?,
@@ -911,13 +972,7 @@ impl Store {
             trusted_time_floor: value.trusted.trusted_time.clone(),
             trusted_time_seq_floor: value.trusted.assertion_seq,
             trusted_time_sha256: hash(&trusted)?,
-        };
-        write_new(&temp.join("manifest.json"), &canonical(&manifest)?)?;
-        sync_dir(&temp)?;
-        std::fs::rename(&temp, &final_dir)
-            .map_err(|error| InternalError(format!("cannot publish {final_name}: {error}")))?;
-        sync_dir(&generations)?;
-        Ok(manifest)
+        })
     }
 
     fn remove_temporary_generation(&self, final_name: &str) -> Result<(), InternalError> {
@@ -968,6 +1023,108 @@ impl Store {
             Err(_) if !path.exists() => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    fn challenge_is_live(
+        &self,
+        nv: &dyn NvAnchor,
+        challenge: &TimeChallenge,
+    ) -> Result<Result<(), String>, InternalError> {
+        let live = nv.clock()?;
+        if !live.safe {
+            return Ok(Err(
+                "TPM clock is not safe while consuming trusted-time challenge".into(),
+            ));
+        }
+        if live.reset_count != challenge.tpm_reset_count
+            || live.restart_count != challenge.tpm_restart_count
+        {
+            return Ok(Err(
+                "TPM reset or restart count changed since trusted-time challenge".into(),
+            ));
+        }
+        let Some(elapsed) = live.clock.checked_sub(challenge.tpm_clock) else {
+            return Ok(Err(
+                "TPM clock regressed since trusted-time challenge".into()
+            ));
+        };
+        if elapsed > TRUSTED_TIME_MAX_ELAPSED_MS {
+            return Ok(Err(
+                "trusted-time challenge exceeded its freshness window".into()
+            ));
+        }
+        Ok(Ok(()))
+    }
+
+    fn has_durable_state_history(&self) -> Result<bool, InternalError> {
+        let root = match std::fs::read_dir(&self.root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(InternalError(format!(
+                    "cannot enumerate {}: {error}",
+                    self.root.display()
+                )))
+            }
+        };
+        secure_existing_dir(&self.root)?;
+        for entry in root {
+            let entry = entry.map_err(|error| {
+                InternalError(format!("cannot enumerate state-v1 entry: {error}"))
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(true);
+            };
+            if matches!(name.as_str(), "current" | "enforce-ready.json") {
+                return Ok(true);
+            }
+            if matches!(name.as_str(), "generations" | "pending-time-challenge.json")
+                || name == ".transaction.json.lock"
+                || (name.starts_with(".transaction.json.") && name.ends_with(".tmp"))
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn exact_unanchored_generation(
+        &self,
+        candidate: &Candidate<'_>,
+        legacy_bundle_floor: Option<u64>,
+    ) -> Result<bool, InternalError> {
+        let scan = self.scan_generations()?;
+        if scan.numbers != [1] || scan.numbers.len() != 1 {
+            return Ok(false);
+        }
+        let dir = self.root.join("generations/generation-0000000000000001");
+        let entries = std::fs::read_dir(self.root.join("generations"))
+            .map_err(|error| InternalError(format!("cannot enumerate staged generation: {error}")))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| {
+                        InternalError(format!("cannot enumerate staged entry: {error}"))
+                    })?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| InternalError("staged generation name is not UTF-8".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries.as_slice() != ["generation-0000000000000001"] {
+            return Ok(false);
+        }
+        let observed: StateManifest = parse_canonical(
+            &read_regular(&dir.join("manifest.json"), 0o600)?,
+            "unanchored state-v1 manifest",
+        )
+        .map_err(InternalError)?;
+        let expected =
+            self.manifest_for(1, candidate, None, ZERO_ANCHOR.into(), legacy_bundle_floor)?;
+        if observed != expected {
+            return Ok(false);
+        }
+        Ok(verify_generation(&dir, &observed).is_ok())
     }
 
     fn read_current(&self, nv: &dyn NvAnchor) -> Result<Option<LoadedGeneration>, InternalError> {
@@ -1512,6 +1669,17 @@ fn validate_time_challenge(value: &TimeChallenge) -> Result<(), InternalError> {
 
 fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
     validate_time_challenge(&value.challenge)?;
+    if state_canonical_hash(value.release, "release authorization")?
+        != value.challenge.release_authorization_sha256
+        || state_canonical_hash(value.snapshot, "delegation snapshot")?
+            != value.challenge.delegation_snapshot_sha256
+        || value.authority.snapshot_sha256 != value.challenge.delegation_snapshot_sha256
+    {
+        return Err(InternalError(
+            "trusted-time challenge does not bind the candidate release and snapshot".into(),
+        ));
+    }
+    validate_trusted_challenge(&value.trusted, &value.challenge)?;
     if value.authority.schema != "neural-ice-ota-authority-state-v1"
         || value.applied.schema != "neural-ice-ota-applied-state-v1"
         || value.trusted.schema != "neural-ice-ota-trusted-time-state-v2"
@@ -1527,15 +1695,46 @@ fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
         || !sha256(&value.trusted.signature_sha256)
         || !sha256(&value.trusted.challenge_sha256)
         || !sha256(&value.trusted.device_fingerprint)
-        || value.trusted.device_fingerprint != value.challenge.device_fingerprint
-        || value.trusted.challenge_sha256 != hash(value.challenge.nonce.as_bytes())?
-        || value.trusted.tpm_clock != value.challenge.tpm_clock
-        || value.trusted.tpm_reset_count != value.challenge.tpm_reset_count
-        || value.trusted.tpm_restart_count != value.challenge.tpm_restart_count
-        || !value.trusted.tpm_safe
-        || !value.challenge.tpm_safe
     {
         return Err(InternalError("invalid state-v1 candidate".into()));
+    }
+    Ok(())
+}
+
+fn validate_preapply_candidate(value: &PreapplyCandidate<'_>) -> Result<(), InternalError> {
+    validate_time_challenge(value.challenge)?;
+    if !safe_uint(value.bundle_seq)
+        || !safe_uint(value.snapshot.delegation_seq)
+        || value.snapshot.delegation_seq != value.trusted.delegation_seq
+        || value.snapshot_sha256 != value.challenge.delegation_snapshot_sha256
+    {
+        return Err(InternalError("invalid state-v1 pre-apply candidate".into()));
+    }
+    validate_trusted_challenge(value.trusted, value.challenge)
+}
+
+fn validate_trusted_challenge(
+    trusted: &TrustedTimeState,
+    challenge: &TimeChallenge,
+) -> Result<(), InternalError> {
+    if trusted.schema != "neural-ice-ota-trusted-time-state-v2"
+        || !safe_uint(trusted.assertion_seq)
+        || !timestamp(&trusted.trusted_time)
+        || !sha256(&trusted.assertion_sha256)
+        || !sha256(&trusted.signature_sha256)
+        || !sha256(&trusted.challenge_sha256)
+        || !sha256(&trusted.device_fingerprint)
+        || trusted.device_fingerprint != challenge.device_fingerprint
+        || trusted.challenge_sha256 != hash(challenge.nonce.as_bytes())?
+        || trusted.tpm_clock != challenge.tpm_clock
+        || trusted.tpm_reset_count != challenge.tpm_reset_count
+        || trusted.tpm_restart_count != challenge.tpm_restart_count
+        || !trusted.tpm_safe
+        || !challenge.tpm_safe
+    {
+        return Err(InternalError(
+            "invalid trusted-time challenge binding".into(),
+        ));
     }
     Ok(())
 }
@@ -1562,32 +1761,42 @@ fn monotonic(
     {
         return Err("equal bundle sequence has a different BOM".into());
     }
-    if new.trusted.assertion_seq == old.trusted_time_seq_floor
-        && (new.trusted.assertion_sha256 != old.trusted_time_assertion_canonical_sha256
-            || new.trusted.trusted_time != old.trusted_time_floor)
+    monotonic_trusted(old, old_time, &new.trusted)
+}
+
+fn monotonic_trusted(
+    old: &StateManifest,
+    old_time: &TrustedTimeState,
+    new: &TrustedTimeState,
+) -> Result<(), String> {
+    if new.assertion_seq < old.trusted_time_seq_floor || new.trusted_time < old.trusted_time_floor {
+        return Err("state-v1 monotonic trusted-time floor would decrease".into());
+    }
+    if new.assertion_seq == old.trusted_time_seq_floor
+        && (new.assertion_sha256 != old.trusted_time_assertion_canonical_sha256
+            || new.trusted_time != old.trusted_time_floor)
     {
         return Err("equal trusted-time sequence has different evidence".into());
     }
-    if new.trusted.device_fingerprint != old_time.device_fingerprint {
+    if new.device_fingerprint != old_time.device_fingerprint {
         return Err("trusted-time device identity changed".into());
     }
-    if new.trusted.tpm_reset_count == old_time.tpm_reset_count {
-        if new.trusted.tpm_clock < old_time.tpm_clock
-            || new.trusted.tpm_restart_count < old_time.tpm_restart_count
+    if new.tpm_reset_count == old_time.tpm_reset_count {
+        if new.tpm_clock < old_time.tpm_clock || new.tpm_restart_count < old_time.tpm_restart_count
         {
             return Err("TPM clock continuity regressed".into());
         }
-    } else if new.trusted.assertion_seq <= old.trusted_time_seq_floor
-        || new.trusted.trusted_time <= old.trusted_time_floor
+    } else if new.assertion_seq <= old.trusted_time_seq_floor
+        || new.trusted_time <= old.trusted_time_floor
     {
         return Err("TPM reset requires strictly newer trusted-time evidence".into());
     }
     let old_seconds = crate::trusted_time::utc_seconds(&old_time.trusted_time)
         .ok_or_else(|| "persisted trusted time is invalid".to_string())?;
-    let new_seconds = crate::trusted_time::utc_seconds(&new.trusted.trusted_time)
+    let new_seconds = crate::trusted_time::utc_seconds(&new.trusted_time)
         .ok_or_else(|| "candidate trusted time is invalid".to_string())?;
-    let elapsed = if new.trusted.tpm_reset_count == old_time.tpm_reset_count {
-        new.trusted.tpm_clock.saturating_sub(old_time.tpm_clock) / 1000
+    let elapsed = if new.tpm_reset_count == old_time.tpm_reset_count {
+        new.tpm_clock.saturating_sub(old_time.tpm_clock) / 1000
     } else {
         0
     };
@@ -2165,6 +2374,18 @@ mod tests {
                 safe: true,
             })
         }
+
+        fn read_initial(&self) -> Result<[u8; 32], InternalError> {
+            self.read()
+        }
+
+        fn provision_initial(&self) -> Result<(), InternalError> {
+            Err(InternalError("test anchor cannot be provisioned".into()))
+        }
+
+        fn extend(&self, _digest: [u8; 32]) -> Result<(), InternalError> {
+            Err(InternalError("test anchor cannot be extended".into()))
+        }
     }
 
     struct GenerationSpec<'a> {
@@ -2199,6 +2420,7 @@ mod tests {
 
     struct MemoryNv {
         anchor: Cell<[u8; 32]>,
+        clock: Cell<TpmClockState>,
         exists: Cell<bool>,
     }
 
@@ -2219,12 +2441,7 @@ mod tests {
         }
 
         fn clock(&self) -> Result<TpmClockState, InternalError> {
-            Ok(TpmClockState {
-                clock: 1_000,
-                reset_count: 1,
-                restart_count: 1,
-                safe: true,
-            })
+            Ok(self.clock.get())
         }
 
         fn read_initial(&self) -> Result<[u8; 32], InternalError> {
@@ -2248,11 +2465,11 @@ mod tests {
 
     fn candidate() -> Candidate<'static> {
         let challenge = TimeChallenge {
-            delegation_snapshot_sha256: hash(b"{}\n").unwrap(),
+            delegation_snapshot_sha256: state_canonical_hash(b"{}\n", "test snapshot").unwrap(),
             device_fingerprint: "b".repeat(64),
             hardware_target: "nvidia-gb10-arm64".into(),
             nonce: "c".repeat(64),
-            release_authorization_sha256: hash(b"{}\n").unwrap(),
+            release_authorization_sha256: state_canonical_hash(b"{}\n", "test release").unwrap(),
             ring: "beta".into(),
             schema: "neural-ice-ota-time-challenge-v2".into(),
             state_nv_anchor: ZERO_ANCHOR.into(),
@@ -2280,7 +2497,7 @@ mod tests {
             snapshot_signature: b"sig",
             trusted: TrustedTimeState {
                 assertion_seq: 1,
-                assertion_sha256: hash(b"{}\n").unwrap(),
+                assertion_sha256: state_canonical_hash(b"{}\n", "test assertion").unwrap(),
                 challenge_sha256: hash(challenge.nonce.as_bytes()).unwrap(),
                 delegation_seq: 1,
                 device_fingerprint: challenge.device_fingerprint.clone(),
@@ -3223,6 +3440,12 @@ mod tests {
         .unwrap();
         let nv = MemoryNv {
             anchor: Cell::new([0; 32]),
+            clock: Cell::new(TpmClockState {
+                clock: 1_000,
+                reset_count: 1,
+                restart_count: 1,
+                safe: true,
+            }),
             exists: Cell::new(false),
         };
         let first = store.commit(&candidate, &nv).unwrap().unwrap();
@@ -3230,6 +3453,176 @@ mod tests {
         assert!(nv.exists.get());
         assert!(!store.root.join("pending-time-challenge.json").exists());
         assert_eq!(store.commit(&candidate, &nv).unwrap().unwrap(), first);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_retry_recovers_a_generation_staged_before_the_first_extend() {
+        let (store, root) = test_store();
+        let candidate = candidate();
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&candidate.challenge).unwrap(),
+        )
+        .unwrap();
+        let nv = MemoryNv {
+            anchor: Cell::new([0; 32]),
+            clock: Cell::new(TpmClockState {
+                clock: 1_000,
+                reset_count: 1,
+                restart_count: 1,
+                safe: true,
+            }),
+            exists: Cell::new(true),
+        };
+        store
+            .stage_generation(1, &candidate, None, ZERO_ANCHOR.into(), Some(1))
+            .unwrap();
+        let receipt = store.commit(&candidate, &nv).unwrap().unwrap();
+        assert_eq!(receipt.generation, 1);
+        assert!(!store.root.join("pending-time-challenge.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_markers_and_unknown_entries_block_zero_anchor_reseeding() {
+        for name in ["current", "enforce-ready.json", "unexpected-state-v1-entry"] {
+            let (store, root) = test_store();
+            write_file(&store.root.join(name), b"durable");
+            let candidate = candidate();
+            let nv = MemoryNv {
+                anchor: Cell::new([0; 32]),
+                clock: Cell::new(TpmClockState {
+                    clock: 1_000,
+                    reset_count: 1,
+                    restart_count: 1,
+                    safe: true,
+                }),
+                exists: Cell::new(false),
+            };
+            let refusal = store.commit(&candidate, &nv).unwrap().unwrap_err();
+            assert!(refusal.contains("durable state history"));
+            assert!(!nv.exists.get());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn candidate_challenge_binds_the_exact_release_and_snapshot_bytes() {
+        let mut altered_release = candidate();
+        altered_release.release = b"{ }\n";
+        assert!(validate_candidate(&altered_release).is_err());
+
+        let mut altered_snapshot = candidate();
+        altered_snapshot.snapshot = b"{ }\n";
+        assert!(validate_candidate(&altered_snapshot).is_err());
+    }
+
+    #[test]
+    fn preapply_and_commit_refuse_a_stale_live_tpm_challenge() {
+        let (store, root) = test_store();
+        let live_clock = TpmClockState {
+            clock: TRUSTED_TIME_MAX_ELAPSED_MS + 1_000,
+            reset_count: 1,
+            restart_count: 1,
+            safe: true,
+        };
+        let nv = MemoryNv {
+            anchor: Cell::new([0; 32]),
+            clock: Cell::new(live_clock),
+            exists: Cell::new(false),
+        };
+
+        let mut commit_candidate = candidate();
+        commit_candidate.challenge.tpm_clock = 999;
+        commit_candidate.trusted.tpm_clock = 999;
+        let commit_refusal = store.commit(&commit_candidate, &nv).unwrap().unwrap_err();
+        assert!(commit_refusal.contains("freshness window"));
+
+        let snapshot_bytes =
+            include_bytes!("../tests/fixtures/delegated-v1/delegation-snapshot.json");
+        let snapshot: Snapshot = parse_canonical(snapshot_bytes, "test snapshot").unwrap();
+        let mut challenge = candidate().challenge;
+        challenge.delegation_snapshot_sha256 =
+            state_canonical_hash(snapshot_bytes, "test snapshot").unwrap();
+        challenge.tpm_clock = 999;
+        let mut trusted = candidate().trusted;
+        trusted.delegation_seq = snapshot.delegation_seq;
+        trusted.tpm_clock = challenge.tpm_clock;
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&challenge).unwrap(),
+        )
+        .unwrap();
+        let preapply = PreapplyCandidate {
+            bom_sha256: &candidate().applied.bom_sha256,
+            bundle_seq: 1,
+            challenge: &challenge,
+            snapshot: &snapshot,
+            snapshot_sha256: &challenge.delegation_snapshot_sha256,
+            trusted: &trusted,
+        };
+        let preapply_refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
+        assert!(preapply_refusal.contains("freshness window"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preapply_refuses_a_missing_legacy_floor_before_payload_application() {
+        let (store, root) = test_store();
+        let (_, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-22T00:00:01Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        let snapshot_bytes =
+            include_bytes!("../tests/fixtures/delegated-v1/delegation-snapshot.json");
+        let snapshot: Snapshot = parse_canonical(snapshot_bytes, "test snapshot").unwrap();
+        let mut challenge = candidate().challenge;
+        challenge.delegation_snapshot_sha256 =
+            state_canonical_hash(snapshot_bytes, "test snapshot").unwrap();
+        challenge.state_nv_anchor = anchor.clone();
+        challenge.tpm_clock = 42;
+        challenge.tpm_reset_count = 3;
+        challenge.tpm_restart_count = 4;
+        let mut trusted = candidate().trusted;
+        trusted.delegation_seq = snapshot.delegation_seq;
+        trusted.tpm_clock = challenge.tpm_clock;
+        trusted.tpm_reset_count = challenge.tpm_reset_count;
+        trusted.tpm_restart_count = challenge.tpm_restart_count;
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&challenge).unwrap(),
+        )
+        .unwrap();
+        let nv = TestAnchor {
+            anchor: decode_hash(&anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: None,
+            safe_clock: true,
+        };
+        let preapply = PreapplyCandidate {
+            bom_sha256: &candidate().applied.bom_sha256,
+            bundle_seq: 1,
+            challenge: &challenge,
+            snapshot: &snapshot,
+            snapshot_sha256: &challenge.delegation_snapshot_sha256,
+            trusted: &trusted,
+        };
+        let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
+        assert!(refusal.contains("legacy TPM floor disappeared"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

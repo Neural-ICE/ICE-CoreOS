@@ -124,11 +124,13 @@ The v2 assertion is valid for at most ten minutes and binds:
 - the current TPM NV anchor, clock, reset count, restart count and safe bit;
 - a fresh 32-byte appliance challenge consumed by the same atomic transaction.
 
-Consumption re-reads that TPM tuple locally. The safe bit must remain true,
-reset/restart counts must be unchanged, the clock must not decrease, and the
-asserted `trusted_time` plus conservatively rounded TPM elapsed time must remain
-strictly below signed `valid_until`. The canonical hash is computed from the
-supplied snapshot bytes, not accepted from a separate caller claim. A scoped
+Both the pre-apply guard and post-health commit re-read that TPM tuple locally.
+The safe bit must remain true, reset/restart counts must be unchanged, and the
+clock must not decrease or advance by more than the ten-minute assertion
+freshness window. The asserted `trusted_time` plus conservatively rounded TPM
+elapsed time must remain strictly below signed `valid_until`. The canonical
+hash is computed from the supplied snapshot bytes, not accepted from a
+separate caller claim. A scoped
 `retiring` time key remains valid only during its bounded snapshot overlap.
 
 For a fresh appliance, the trusted-time key is provisionally authorized only
