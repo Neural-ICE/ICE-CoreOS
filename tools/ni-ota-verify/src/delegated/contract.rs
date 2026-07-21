@@ -371,7 +371,7 @@ fn validate_references(snapshot: &Snapshot) -> Result<(), String> {
         .filter_map(dead)
         .collect();
         match live_peers.as_slice() {
-            [] if key.rotation_overlap.mode == "none" => {}
+            [] if dead_peers.is_empty() && key.rotation_overlap.mode == "none" => {}
             [] if matches!(dead_peers.as_slice(), [peer]
                 if key.rotation_overlap.mode == "bounded"
                     && key.rotation_overlap.with_key_id.as_deref()
@@ -1141,6 +1141,15 @@ mod tests {
             valid_until: None,
         };
         assert!(validate_snapshot(&cleared).is_err());
+
+        let mut missing_dead_overlap = new.clone();
+        missing_dead_overlap.keys[1].rotation_overlap = RotationOverlap {
+            mode: "none".into(),
+            with_key_id: None,
+            valid_from: None,
+            valid_until: None,
+        };
+        assert!(validate_snapshot(&missing_dead_overlap).is_err());
 
         let generation_two_bytes = canonical(&serde_json::to_value(&new).unwrap());
         let generation_two_hash = canonical_hash(&generation_two_bytes).unwrap();

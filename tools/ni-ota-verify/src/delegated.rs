@@ -213,7 +213,7 @@ fn freeze(
     store.secure_temp_bytes(label, &bytes)
 }
 
-fn freeze_authority(
+pub(super) fn freeze_authority(
     store: &FileStateStore,
     source: &Path,
     label: &str,
