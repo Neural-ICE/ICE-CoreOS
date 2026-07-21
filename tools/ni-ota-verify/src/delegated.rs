@@ -14,6 +14,7 @@ mod beta;
 pub(crate) mod contract;
 
 pub(crate) use beta::run as run_beta;
+pub(crate) use beta::run_usb;
 
 use contract::{
     canonical_hash, encode_base64, parse_canonical, safe_uint, sha256, validate_chain,
