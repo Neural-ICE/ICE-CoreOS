@@ -179,16 +179,6 @@ def find_seed_partition(loop: str) -> tuple[str, str]:
 
 
 def verify_mount(partition: str, mountpoint: Path) -> None:
-    run(
-        "mount",
-        "-t",
-        "xfs",
-        "-o",
-        "ro,nosuid,nodev,noexec",
-        partition,
-        str(mountpoint),
-        capture=False,
-    )
     output = run("findmnt", "--json", "--target", str(mountpoint), "--output", "SOURCE,FSTYPE,OPTIONS")
     try:
         filesystems = json.loads(output)["filesystems"]
@@ -537,8 +527,20 @@ def verify(arguments: argparse.Namespace) -> None:
             raise GateError("ni-seed partition device is writable")
 
         mountpoint_path = Path(tempfile.mkdtemp(prefix="neural-ice-ni-seed.", dir="/run"))
-        verify_mount(partition, mountpoint_path)
+        run(
+            "mount",
+            "-t",
+            "xfs",
+            "-o",
+            "ro,nosuid,nodev,noexec",
+            partition,
+            str(mountpoint_path),
+            capture=False,
+        )
+        # Record cleanup responsibility immediately after mount(2) succeeds;
+        # all subsequent source/options/write-probe checks may refuse.
         mounted = True
+        verify_mount(partition, mountpoint_path)
         actual_workspace = Path(
             tempfile.mkdtemp(prefix="neural-ice-seed-manifest.", dir="/run")
         )

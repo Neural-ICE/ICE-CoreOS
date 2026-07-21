@@ -85,8 +85,11 @@ application is bounded to two hours instead of systemd's default 90 seconds.
 
 For debug media, the optional SSH public-key file is validated, hash-bound and written to
 `EFI:/ice-coreos/authorized_keys` before final-media acceptance. Injection is refused unless the
-base image self-identifies as debug. The delivered USB therefore remains byte-for-byte covered by
-the raw and artifact digests in the final receipt; do not modify its ESP after acceptance.
+base image self-identifies as debug and the installed target is that same digest-pinned debug
+reference. The input must be one plain OpenSSH public-key record (never a private key or an
+`authorized_keys` record with options) and at most 512 bytes so its base64 form fits the supported
+ARM64 kernel command line with headroom. The delivered USB therefore remains byte-for-byte covered
+by the raw and artifact digests in the final receipt; do not modify its ESP after acceptance.
 
 Notes:
 - `OUT` names the output archive here but is the bib output DIR in

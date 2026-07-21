@@ -44,6 +44,8 @@ source "$REPO_ROOT/image/lib/debug-ssh-key.sh"
   || { echo "ERROR: TARGET_IMGREF must be a digest-pinned OCI reference" >&2; exit 1; }
 debug_ssh_key_validate "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" \
   || { echo "ERROR: invalid debug SSH key input" >&2; exit 1; }
+debug_ssh_key_require_debug_target "$SSH_AUTHORIZED_KEYS_FILE" "$BASE_IMAGE" "$TARGET_IMGREF" \
+  || { echo "ERROR: debug SSH key cannot be bound to this install target" >&2; exit 1; }
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.

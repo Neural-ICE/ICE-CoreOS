@@ -158,6 +158,28 @@ fi
 losetup --detach "$loop"
 loop=''
 
+mkdir "$work/fake-bin"
+cat > "$work/fake-bin/findmnt" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"filesystems":[]}'
+EOF
+chmod 0755 "$work/fake-bin/findmnt"
+before_mount_dirs="$(find /run -maxdepth 1 -type d -name 'neural-ice-ni-seed.*' -print | sort)"
+if env PATH="$work/fake-bin:$PATH" python3 "$ROOT/image/verify-preloaded-media.py" \
+  --raw "$raw" \
+  --expected-manifest "$work/expected.json" \
+  --artifact "$work/bad-mount.img.zst" \
+  --artifact-checksum "$work/bad-mount.img.zst.sha256" \
+  --compression zstd-fast \
+  --receipt "$work/bad-mount.json" \
+  --receipt-checksum "$work/bad-mount.json.sha256"; then
+  echo "gate accepted ambiguous post-mount verification" >&2
+  exit 1
+fi
+after_mount_dirs="$(find /run -maxdepth 1 -type d -name 'neural-ice-ni-seed.*' -print | sort)"
+test "$after_mount_dirs" = "$before_mount_dirs"
+test -z "$(losetup --associated "$raw" --noheadings --output NAME)"
+
 loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
 sgdisk --change-name 2:ni-seed "$loop" >/dev/null

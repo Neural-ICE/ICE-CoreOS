@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Validate and install an optional operator SSH public key on debug installer media.
 
+# The key is base64-encoded into an installed ARM64 kernel command line. Keep
+# enough headroom for the installer and bootc arguments within the 2 KiB ARM64
+# command-line limit.
+readonly DEBUG_SSH_PUBLIC_KEY_MAX_BYTES=512
+
 debug_ssh_key_validate() {
   if (( $# != 2 )); then
     echo "debug_ssh_key_validate requires a key file and approved SHA-256" >&2
@@ -26,16 +31,44 @@ debug_ssh_key_validate() {
   }
   local key_size
   key_size="$(wc -c < "$key_file")"
-  (( key_size > 0 && key_size <= 16384 )) || {
-    echo "SSH authorized_keys input must contain 1..16384 bytes" >&2
+  (( key_size > 0 && key_size <= DEBUG_SSH_PUBLIC_KEY_MAX_BYTES )) || {
+    echo "SSH public-key input must contain 1..${DEBUG_SSH_PUBLIC_KEY_MAX_BYTES} bytes" >&2
     return 1
   }
   [[ "$(sha256sum "$key_file" | awk '{print $1}')" == "$approved_sha256" ]] || {
     echo "SSH authorized_keys input differs from the approved hash" >&2
     return 1
   }
-  ssh-keygen -l -f "$key_file" >/dev/null || {
-    echo "SSH authorized_keys input contains no valid public key" >&2
+  # Accept exactly one plain OpenSSH public-key record. In particular, do not
+  # rely on `ssh-keygen -l` alone: it also fingerprints private-key files.
+  if ! awk '
+    BEGIN { records = 0 }
+    /^[[:space:]]*$/ { next }
+    {
+      records++
+      if (records != 1 || $1 !~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)$/ ||
+          $2 !~ /^[A-Za-z0-9+\/]+={0,2}$/) {
+        exit 1
+      }
+    }
+    END { if (records != 1) exit 1 }
+  ' "$key_file" || ! ssh-keygen -l -f "$key_file" >/dev/null; then
+    echo "SSH input must be exactly one valid OpenSSH public key without options" >&2
+    return 1
+  fi
+}
+
+debug_ssh_key_require_debug_target() {
+  if (( $# != 3 )); then
+    echo "debug_ssh_key_require_debug_target requires key file, base image and target image" >&2
+    return 2
+  fi
+  local key_file=$1
+  local base_image=$2
+  local target_image=$3
+
+  [[ -z "$key_file" || "$target_image" == "$base_image" ]] || {
+    echo "debug SSH key requires TARGET_IMGREF to equal the approved debug BASE_IMAGE" >&2
     return 1
   }
 }
@@ -75,7 +108,7 @@ debug_ssh_key_install() {
   fi
   install -m 0644 "$key_file" "$destination"
   if [[ "$(sha256sum "$destination" | awk '{print $1}')" != "$approved_sha256" ]] ||
-    ! ssh-keygen -l -f "$destination" >/dev/null; then
+    ! debug_ssh_key_validate "$destination" "$approved_sha256"; then
     rm -f "$destination"
     echo "installer ESP SSH key readback failed validation" >&2
     return 1
@@ -89,6 +122,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "$command_name" in
     validate) debug_ssh_key_validate "$@" ;;
     install) debug_ssh_key_install "$@" ;;
-    *) echo "usage: $0 {validate KEY_FILE SHA256|install KEY_FILE SHA256 ESP_ROOT}" >&2; exit 2 ;;
+    require-debug-target) debug_ssh_key_require_debug_target "$@" ;;
+    *) echo "usage: $0 {validate KEY_FILE SHA256|install KEY_FILE SHA256 ESP_ROOT|require-debug-target KEY_FILE BASE_IMAGE TARGET_IMAGE}" >&2; exit 2 ;;
   esac
 fi
