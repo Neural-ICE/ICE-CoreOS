@@ -11,7 +11,7 @@ use crate::delegated::contract::{
     canonical_hash, ident, parse_canonical, public_key_pem, safe_uint, sha256, signature_profile,
     timestamp, ContractError, Snapshot,
 };
-use crate::delegated::verify_signature;
+use crate::delegated::{verify_signature, AuthenticatedSnapshot};
 use crate::runner;
 use crate::state::FileStateStore;
 
@@ -76,18 +76,18 @@ pub(crate) struct VerifiedTrustedTime {
 }
 
 pub(crate) fn verify(
-    snapshot_bytes: &[u8],
+    authenticated_snapshot: &AuthenticatedSnapshot,
     assertion_bytes: &[u8],
     signature_bytes: &[u8],
     expected: &ExpectedTrustedTime<'_>,
     scratch: &FileStateStore,
 ) -> Result<VerifiedTrustedTime, ContractError> {
-    let snapshot: Snapshot = parse_canonical(snapshot_bytes, "delegation snapshot")?;
-    let snapshot_sha256 = canonical_hash(snapshot_bytes)?;
+    let snapshot = authenticated_snapshot.snapshot();
+    let snapshot_sha256 = authenticated_snapshot.canonical_sha256();
     let assertion: TrustedTimeAssertion =
         parse_canonical(assertion_bytes, "trusted-time assertion")?;
-    validate(&assertion, &snapshot, &snapshot_sha256, expected)?;
-    let key = authority(&snapshot, &assertion, expected)?;
+    validate(&assertion, snapshot, snapshot_sha256, expected)?;
+    let key = authority(snapshot, &assertion, expected)?;
     let key = public_key_pem(&key.public_key)?;
     match verify_signature(&key, TIME_DOMAIN, assertion_bytes, signature_bytes, scratch)
         .map_err(ContractError::Internal)?
