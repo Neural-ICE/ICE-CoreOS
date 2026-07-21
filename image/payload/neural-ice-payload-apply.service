@@ -14,6 +14,9 @@ Before=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# A fully preloaded product payload can exceed 70 GiB. Keep the operation bounded,
+# but do not inherit systemd's 90-second service default during first boot.
+TimeoutStartSec=2h
 ExecStart=/usr/local/bin/neural-ice-payload-apply.sh
 
 [Install]

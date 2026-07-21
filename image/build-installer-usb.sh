@@ -30,12 +30,22 @@ OUT_NAME="${OUT_NAME:-}"            # if set, copy the final raw to <REPO>/<OUT_
 BG_SRC="${BG_SRC:-${REPO_ROOT}/image/branding/grub-bg.png}"
 CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer.toml}"
 BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
+# Debug media may carry an operator public key on the ESP. The expected hash is
+# mandatory so a mutable build-host pathname cannot silently change the key.
+SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
+SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
+# shellcheck source=image/lib/debug-ssh-key.sh
+source "$REPO_ROOT/image/lib/debug-ssh-key.sh"
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: BASE_IMAGE is required as a digest-pinned OCI reference" >&2; exit 1; }
 [[ "$TARGET_IMGREF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_IMGREF must be a digest-pinned OCI reference" >&2; exit 1; }
+debug_ssh_key_validate "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" \
+  || { echo "ERROR: invalid debug SSH key input" >&2; exit 1; }
+debug_ssh_key_require_debug_target "$SSH_AUTHORIZED_KEYS_FILE" "$BASE_IMAGE" "$TARGET_IMGREF" \
+  || { echo "ERROR: debug SSH key cannot be bound to this install target" >&2; exit 1; }
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -44,6 +54,12 @@ if sudo podman image exists "$BASE_IMAGE"; then
   echo "    (using local content-addressed ${BASE_IMAGE})"
 else
   sudo podman pull "$BASE_IMAGE"
+fi
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+  sudo podman run --rm --network none --read-only \
+    --entrypoint /usr/bin/grep "$BASE_IMAGE" \
+    -qx 'PRETTY_NAME="Neural ICE CoreOS (debug)"' /usr/lib/os-release \
+    || { echo "ERROR: operator SSH key injection is restricted to a debug base image" >&2; exit 1; }
 fi
 sudo podman build --platform linux/arm64 \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
@@ -134,6 +150,10 @@ done
 [[ -n "$ESPPART" ]] || { echo "ERROR: installer ESP not found" >&2; exit 1; }
 sudo mount "$ESPPART" "$MNT"
 sudo find "$MNT/EFI" -maxdepth 2 \( -iname 'fbaa64.efi' -o -iname 'BOOT*.CSV' \) -print -delete
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+  sudo bash "$REPO_ROOT/image/lib/debug-ssh-key.sh" install \
+    "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" "$MNT"
+fi
 sync
 sudo umount "$MNT"; sudo losetup -d "$LOOP"; trap - EXIT
 

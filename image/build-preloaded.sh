@@ -16,19 +16,30 @@
 #   SEED_IMAGES=$HOME/ice-seed/images \
 #   SEED_MODELS=$HOME/ice-seed/models \
 #   BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<digest> \
-#   VARIANT=debug COMPRESS=zstd-fast ./image/build-preloaded.sh
+#   SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
+#   SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
+#   COMPRESS=zstd-fast ./image/build-preloaded.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
+# shellcheck source=image/lib/preloaded-sizing.sh
+source "$REPO_ROOT/image/lib/preloaded-sizing.sh"
+# shellcheck source=image/lib/preloaded-output-set.sh
+source "$REPO_ROOT/image/lib/preloaded-output-set.sh"
 
 SEED_IMAGES="${SEED_IMAGES:-${HOME}/ice-seed/images}"
 SEED_MODELS="${SEED_MODELS:-${HOME}/ice-seed/models}"
 # Optional payload dir (a directory containing an executable apply.sh): staged onto the
-# data volume by the autoinstall, applied once on first boot by the image's generic
-# neural-ice-payload-apply.service. KB-sized — headroom covers it.
+# data volume by the autoinstall and applied once on first boot by the image's generic
+# neural-ice-payload-apply.service. It can contain a complete product payload and is sized
+# as part of the seed rather than assumed to be small.
 SEED_PAYLOAD="${SEED_PAYLOAD:-}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
+
+# Refuse a reused OUT before bootc-image-builder replaces the raw or any large seed work starts.
+# Failed builds remain evidence; retries use a fresh output name after diagnosis.
+preloaded_require_fresh_output_set "$REPO_ROOT" "$OUT" "$COMPRESS"
 
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "BASE_IMAGE is required as the signed train's digest-pinned appliance ref" >&2; exit 1; }
@@ -61,7 +72,9 @@ echo "==> 2. build the READY overlay image store (ONCE, here) + size the seed"
 # wants a root-owned graphroot. All reads/copies/cleanup below therefore go through sudo.
 STORE_TMP="$(sudo mktemp -d /var/tmp/ni-seed-store.XXXXXX)"
 RUNROOT="$(sudo mktemp -d /run/ni-seed-runroot.XXXXXX)"
-storecleanup(){ sudo rm -rf "$STORE_TMP" "$RUNROOT" 2>/dev/null||true; }
+VERIFY_TMP="$(sudo mktemp -d /var/tmp/ni-seed-verify.XXXXXX)"
+EXPECTED_SEED_MANIFEST="${VERIFY_TMP}/expected-seed-manifest.json"
+storecleanup(){ sudo rm -rf "$STORE_TMP" "$RUNROOT" "$VERIFY_TMP" 2>/dev/null||true; }
 trap storecleanup EXIT
 shopt -s nullglob
 archives=("$SEED_IMAGES"/*.tar)
@@ -72,12 +85,30 @@ for a in "${archives[@]}"; do
 done
 echo "    store images:"
 sudo podman --root "$STORE_TMP" --runroot "$RUNROOT" --storage-driver overlay images
+
+# Freeze the complete approved source namespace before copying it. The final-media gate below
+# re-creates this manifest from the finalized XFS partition through a genuinely read-only loop.
+# Any concurrent source mutation therefore makes the build refuse instead of silently changing
+# the installer payload.
+manifest_args=(
+  --tree "store=${STORE_TMP}"
+  --tree "models=${SEED_MODELS}"
+)
+if [ -n "$SEED_PAYLOAD" ]; then
+  manifest_args+=(--tree "payload=${SEED_PAYLOAD}")
+fi
+sudo python3 image/seed-tree-manifest.py \
+  "${manifest_args[@]}" \
+  --output "$EXPECTED_SEED_MANIFEST"
+
 STORE_BYTES="$(sudo du -sb "$STORE_TMP" | cut -f1)"
 MODELS_BYTES="$(sudo du -sb "$SEED_MODELS" | cut -f1)"
-SEED_BYTES=$(( STORE_BYTES + MODELS_BYTES ))
-GROW=$(( SEED_BYTES + SEED_BYTES/10 + 4*1024*1024*1024 ))   # store+models + 10% + 4 GiB headroom
-GROW=$(( (GROW + 1048575) / 1048576 * 1048576 ))            # round up to 1 MiB (avoid sub-sector GPT gaps)
-echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
+SEED_PAYLOAD_BYTES=0
+if [ -n "$SEED_PAYLOAD" ]; then
+  SEED_PAYLOAD_BYTES="$(sudo du -sb "$SEED_PAYLOAD" | cut -f1)"
+fi
+GROW="$(preloaded_seed_growth_bytes "$STORE_BYTES" "$MODELS_BYTES" "$SEED_PAYLOAD_BYTES")"
+echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB, payload ≈ $((SEED_PAYLOAD_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
 truncate -s "+${GROW}" "$RAW"
 
 echo "==> 3. relocate GPT backup header + append the ni-seed partition"
@@ -88,40 +119,100 @@ SEEDNUM="$(sudo sgdisk -p "$RAW" | awk '/ni-seed/{n=$1} END{print n}')"
 echo "    ni-seed = partition #${SEEDNUM}"
 
 echo "==> 4. mkfs + copy the store + models into ni-seed"
-LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
-cleanup(){ sudo umount /mnt/ni-seed 2>/dev/null||true; sudo losetup -d "$LOOP" 2>/dev/null||true; storecleanup; }
+LOOP=''
+SEEDPART=''
+MOUNT_DIR="$(sudo mktemp -d /run/ni-seed-build.XXXXXX)"
+MOUNTED=0
+RAW_INO="$(stat -Lc '%i' "$RAW")"
+RAW_DEV="$(python3 - "$RAW" <<'PY'
+import os
+import sys
+
+metadata = os.stat(sys.argv[1])
+print(f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}")
+PY
+)"
+loop_is_ours() {
+  [ -n "$LOOP" ] || return 1
+  sudo losetup --json --list --output NAME,BACK-INO,BACK-MAJ:MIN |
+    python3 -c '
+import json
+import sys
+loop, inode, device = sys.argv[1:]
+document = json.load(sys.stdin)
+raise SystemExit(0 if any(
+    entry.get("name") == loop
+    and str(entry.get("back-ino")) == inode
+    and entry.get("back-maj:min") == device
+    for entry in document.get("loopdevices", [])
+) else 1)
+' "$LOOP" "$RAW_INO" "$RAW_DEV"
+}
+cleanup() {
+  set +e
+  if (( MOUNTED )) && [ -n "$MOUNT_DIR" ]; then
+    source="$(sudo findmnt -n -o SOURCE --target "$MOUNT_DIR" 2>/dev/null || true)"
+    if [ "$source" = "$SEEDPART" ]; then
+      sudo umount "$MOUNT_DIR" 2>/dev/null || true
+    fi
+  fi
+  MOUNTED=0
+  if [ -n "$LOOP" ] && loop_is_ours; then
+    sudo losetup -d "$LOOP" 2>/dev/null || true
+  fi
+  LOOP=''
+  SEEDPART=''
+  if [ -n "$MOUNT_DIR" ]; then
+    sudo rmdir "$MOUNT_DIR" 2>/dev/null || true
+  fi
+  storecleanup
+}
 trap cleanup EXIT
+LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
 SEEDPART="${LOOP}p${SEEDNUM}"
 sudo mkfs.xfs -q -L ni-seed "$SEEDPART"
-sudo mkdir -p /mnt/ni-seed; sudo mount "$SEEDPART" /mnt/ni-seed
-sudo mkdir -p /mnt/ni-seed/store /mnt/ni-seed/models
+sudo mount "$SEEDPART" "$MOUNT_DIR"
+MOUNTED=1
+sudo mkdir -p "$MOUNT_DIR/store" "$MOUNT_DIR/models"
 # cp -a preserves the overlay store faithfully (hardlinks + trusted.* xattrs, hence sudo).
-sudo cp -a "$STORE_TMP/." /mnt/ni-seed/store/
-sudo cp -a "$SEED_MODELS/." /mnt/ni-seed/models/
+sudo cp -a "$STORE_TMP/." "$MOUNT_DIR/store/"
+sudo cp -a "$SEED_MODELS/." "$MOUNT_DIR/models/"
 if [ -n "$SEED_PAYLOAD" ]; then
-  sudo mkdir -p /mnt/ni-seed/payload
-  sudo cp -a "$SEED_PAYLOAD/." /mnt/ni-seed/payload/
-  echo "    payload: $(basename "$SEED_PAYLOAD") ($(sudo du -sh /mnt/ni-seed/payload | cut -f1))"
+  sudo mkdir -p "$MOUNT_DIR/payload"
+  sudo cp -a "$SEED_PAYLOAD/." "$MOUNT_DIR/payload/"
+  echo "    payload: $(basename "$SEED_PAYLOAD") ($(sudo du -sh "$MOUNT_DIR/payload" | cut -f1))"
 fi
 sudo sync
-echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
-sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"; storecleanup; trap - EXIT
+echo "    ni-seed content:"; sudo du -sh "$MOUNT_DIR/store" "$MOUNT_DIR/models"
+sudo umount "$MOUNT_DIR"
+MOUNTED=0
+loop_is_ours || { echo "refusing to detach a loop whose backing identity changed" >&2; exit 1; }
+sudo losetup -d "$LOOP"
+LOOP=''
+SEEDPART=''
+sudo rmdir "$MOUNT_DIR"
+MOUNT_DIR=''
 
-echo "==> 5. compress (${COMPRESS})"
 case "$COMPRESS" in
-  zstd-fast) zstd -3 -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
-  zstd-max)  zstd -19 --long -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
-  none)      ART="$RAW" ;;
-  xz)        xz -T0 -1 -c "$RAW" > "${OUT}.img.xz"; ART="${OUT}.img.xz" ;;
-  *) echo "invalid COMPRESS"; exit 2 ;;
+  zstd-fast|zstd-max) ART="${REPO_ROOT}/${OUT}.img.zst" ;;
+  xz)                 ART="${REPO_ROOT}/${OUT}.img.xz" ;;
+  none)               ART="$RAW" ;;
+  *) echo "invalid COMPRESS" >&2; exit 2 ;;
 esac
-[ "$COMPRESS" = none ] || sha256sum "$ART" > "${ART}.sha256"
-# Compressed outputs above stay repo-relative so their checksum entries remain
-# relocatable. Normalize a separate reporting path because the uncompressed
-# RAW is already absolute and must not receive REPO_ROOT a second time.
-case "$ART" in
-  /*) ART_PATH="$ART" ;;
-  *) ART_PATH="${REPO_ROOT}/${ART}" ;;
-esac
-echo "==> PRELOADED installer ready: ${ART_PATH}"
-ls -lh "${ART_PATH}"
+ART_CHECKSUM="${ART}.sha256"
+FINAL_MEDIA_RECEIPT="${RAW}.final-media.json"
+FINAL_MEDIA_RECEIPT_CHECKSUM="${FINAL_MEDIA_RECEIPT}.sha256"
+
+echo "==> 5. accept the exact raw and build the digest-bound release artifact"
+sudo python3 image/verify-preloaded-media.py \
+  --raw "$RAW" \
+  --expected-manifest "$EXPECTED_SEED_MANIFEST" \
+  --artifact "$ART" \
+  --artifact-checksum "$ART_CHECKSUM" \
+  --compression "$COMPRESS" \
+  --receipt "$FINAL_MEDIA_RECEIPT" \
+  --receipt-checksum "$FINAL_MEDIA_RECEIPT_CHECKSUM"
+storecleanup; trap - EXIT
+
+echo "==> PRELOADED installer ready: ${ART}"
+ls -lh "$ART" "$ART_CHECKSUM" "$FINAL_MEDIA_RECEIPT" "$FINAL_MEDIA_RECEIPT_CHECKSUM"

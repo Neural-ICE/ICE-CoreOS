@@ -191,7 +191,9 @@ mkdir -p "$TGT"
 umount -R "$TGT" 2>/dev/null || true
 for m in system data; do
   cryptsetup close "$m" 2>/dev/null || true
-  [[ -e "/dev/mapper/$m" ]] && dmsetup remove --force "$m" 2>/dev/null || true
+  if [[ -e "/dev/mapper/$m" ]]; then
+    dmsetup remove --force "$m" 2>/dev/null || true
+  fi
 done
 udevadm settle
 
@@ -312,9 +314,11 @@ for csv in "$TGT"/boot/efi/EFI/*/BOOT*.CSV; do
   [[ -f "$csv" ]] || continue
   loader="$(iconv -f UTF-16 -t UTF-8 "$csv" 2>/dev/null | head -1 | cut -d, -f1 | tr -d '\r\n')"
   : "${loader:=shimaa64.efi}"
-  { printf '\xff\xfe'
+  if { printf '\xff\xfe'
     printf '%s,Neural ICE,,Neural ICE CoreOS appliance\r\n' "$loader" | iconv -f UTF-8 -t UTF-16LE
-  } > "$csv" 2>/dev/null && log "Branded shim CSV: ${csv#"$TGT"/boot/efi/} -> Neural ICE" || true
+  } > "$csv" 2>/dev/null; then
+    log "Branded shim CSV: ${csv#"$TGT"/boot/efi/} -> Neural ICE"
+  fi
 done
 if command -v efibootmgr >/dev/null && [[ -d /sys/firmware/efi/efivars && -n "$shim_rel" ]]; then
   present_guids="$(lsblk -rno PARTUUID | tr '[:upper:]' '[:lower:]')"
@@ -326,7 +330,9 @@ if command -v efibootmgr >/dev/null && [[ -d /sys/firmware/efi/efivars && -n "$s
     if [[ "$label" == "Neural ICE" ]] \
        || { [[ -n "$guid" ]] && ! grep -qx "$guid" <<<"$present_guids"; } \
        || { [[ -n "$guid" ]] && grep -qx "$guid" <<<"$usb_guids"; }; then
-      efibootmgr -b "$num" -B >/dev/null 2>&1 && log "NVRAM: dropped entry Boot$num ($label)" || true
+      if efibootmgr -b "$num" -B >/dev/null 2>&1; then
+        log "NVRAM: dropped entry Boot$num ($label)"
+      fi
     fi
   done < <(efibootmgr -v 2>/dev/null | grep '^Boot[0-9A-Fa-f]\{4\}')
   if efibootmgr --create --disk "$target" --part 1 --label "Neural ICE" \
@@ -492,7 +498,9 @@ if [[ -n "$esp_mp" ]] && ( : > "$esp_mp/.ni-wtest" ) 2>/dev/null; then
   } > "$recfile"
   sync
   usb_saved="Saved on the USB EFI partition: $(basename "$recfile")"
-  [[ "$esp_we_mounted" -eq 1 ]] && umount /run/usb-esp 2>/dev/null || true
+  if [[ "$esp_we_mounted" -eq 1 ]]; then
+    umount /run/usb-esp 2>/dev/null || true
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
