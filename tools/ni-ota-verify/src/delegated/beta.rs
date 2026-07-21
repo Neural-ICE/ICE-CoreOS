@@ -298,6 +298,48 @@ fn validate_release(
     now: &str,
     immutable_target: &str,
 ) -> Result<(), String> {
+    validate_release_contract(value, snapshot, snapshot_hash, immutable_target)?;
+    if now < value.valid_from.as_str() || now >= value.valid_until.as_str() {
+        return Err("beta release authorization is not live at trusted time".into());
+    }
+    authorized_key(
+        snapshot,
+        &value.key_id,
+        "beta-release-authorization",
+        immutable_target,
+        &value.issued_at,
+        now,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_release_for_time_challenge<'a>(
+    value: &ReleaseAuthorization,
+    snapshot: &'a Snapshot,
+    snapshot_hash: &str,
+    immutable_target: &str,
+    immutable_variant: &str,
+) -> Result<&'a DelegatedKey, String> {
+    validate_release_contract(value, snapshot, snapshot_hash, immutable_target)?;
+    if value.variant != immutable_variant || !matches!(immutable_variant, "debug" | "prod") {
+        return Err("release variant differs from immutable host variant".into());
+    }
+    authorized_key(
+        snapshot,
+        &value.key_id,
+        "beta-release-authorization",
+        immutable_target,
+        &value.issued_at,
+        &value.issued_at,
+    )
+}
+
+fn validate_release_contract(
+    value: &ReleaseAuthorization,
+    snapshot: &Snapshot,
+    snapshot_hash: &str,
+    immutable_target: &str,
+) -> Result<(), String> {
     if value.schema != "neural-ice-ota-release-authorization-v1"
         || value.signing_role != "release-beta"
         || value.ring != "beta"
@@ -330,19 +372,9 @@ fn validate_release(
         || value.valid_from >= value.valid_until
         || value.issued_at < snapshot.valid_from
         || value.issued_at >= snapshot.valid_until
-        || now < value.valid_from.as_str()
-        || now >= value.valid_until.as_str()
     {
         return Err("beta release authorization contract or binding is invalid".into());
     }
-    authorized_key(
-        snapshot,
-        &value.key_id,
-        "beta-release-authorization",
-        immutable_target,
-        &value.issued_at,
-        now,
-    )?;
     Ok(())
 }
 
@@ -534,5 +566,59 @@ mod tests {
             "nvidia-gb10-arm64",
         )
         .is_err());
+    }
+
+    #[test]
+    fn time_challenge_reuses_the_complete_release_contract() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let snapshot_hash = canonical_hash(SNAPSHOT).unwrap();
+        let release: ReleaseAuthorization = parse_canonical(RELEASE, "release").unwrap();
+        validate_release_for_time_challenge(
+            &release,
+            &snapshot,
+            &snapshot_hash,
+            "nvidia-gb10-arm64",
+            "prod",
+        )
+        .unwrap();
+        assert!(validate_release_for_time_challenge(
+            &release,
+            &snapshot,
+            &snapshot_hash,
+            "nvidia-gb10-arm64",
+            "debug",
+        )
+        .is_err());
+
+        for case in [
+            "attestation",
+            "compat",
+            "identity",
+            "receipt",
+            "snapshot-time",
+        ] {
+            let mut json: serde_json::Value = serde_json::from_slice(RELEASE).unwrap();
+            match case {
+                "attestation" => json["attestation_set_sha256"] = "not-a-hash".into(),
+                "compat" => json["compat_min"] = 6.into(),
+                "identity" => json["issuance_id"] = "contains spaces".into(),
+                "receipt" => json["beta_publication_receipt_sha256"] = Some("a".repeat(64)).into(),
+                "snapshot-time" => json["issued_at"] = "2026-07-20T02:00:00Z".into(),
+                _ => unreachable!(),
+            }
+            let bytes = format!("{}\n", serde_json::to_string(&json).unwrap()).into_bytes();
+            let hostile: ReleaseAuthorization = parse_canonical(&bytes, "release").unwrap();
+            assert!(
+                validate_release_for_time_challenge(
+                    &hostile,
+                    &snapshot,
+                    &snapshot_hash,
+                    "nvidia-gb10-arm64",
+                    "prod",
+                )
+                .is_err(),
+                "{case}"
+            );
+        }
     }
 }

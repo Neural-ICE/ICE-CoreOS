@@ -446,18 +446,50 @@ impl Store {
         nv: &dyn NvAnchor,
         anchor: &str,
     ) -> Result<(), InternalError> {
+        let legacy_floor = nv
+            .legacy_bundle_floor()?
+            .ok_or_else(|| InternalError("legacy TPM bundle floor is absent".into()))?;
         if anchor == ZERO_ANCHOR {
-            if self.scan_generations()?.has_evidence {
+            if self.has_prior_state_evidence()? {
                 return Err(InternalError(
                     "zero TPM anchor with existing state history requires signed recovery".into(),
                 ));
             }
-        } else if self.read_current_locked(nv)?.is_none() {
-            return Err(InternalError(
-                "nonzero TPM anchor has no complete state-v1 generation".into(),
-            ));
+        } else {
+            let current = self.read_current_locked(nv)?.ok_or_else(|| {
+                InternalError("nonzero TPM anchor has no complete state-v1 generation".into())
+            })?;
+            if current.manifest.legacy_bundle_floor != Some(legacy_floor) {
+                return Err(InternalError(
+                    "legacy floor differs from TPM-anchored state-v1 manifest".into(),
+                ));
+            }
         }
         Ok(())
+    }
+
+    fn has_prior_state_evidence(&self) -> Result<bool, InternalError> {
+        if self.scan_generations()?.has_evidence {
+            return Ok(true);
+        }
+        for entry in std::fs::read_dir(&self.root).map_err(|error| {
+            InternalError(format!("cannot enumerate {}: {error}", self.root.display()))
+        })? {
+            let entry = entry
+                .map_err(|error| InternalError(format!("cannot enumerate state-v1: {error}")))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(true);
+            };
+            if name == "generations"
+                || name == "pending-time-challenge.json"
+                || name == ".transaction.json.lock"
+                || (name.starts_with(".transaction.json.") && name.ends_with(".tmp"))
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) fn pending_time_challenge(&self) -> Result<TimeChallenge, InternalError> {
@@ -2407,6 +2439,51 @@ mod tests {
         assert!(store
             .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
             .is_ok());
+
+        for marker in ["current", "enforce-ready.json", "unexpected-state"] {
+            write_file(&store.root.join(marker), b"retained");
+            let error = store
+                .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
+                .unwrap_err();
+            assert!(error.0.contains("requires signed recovery"), "{marker}");
+            std::fs::remove_file(store.root.join(marker)).unwrap();
+        }
+        write_file(
+            &store.root.join("pending-time-challenge.json"),
+            b"replaceable",
+        );
+        assert!(store
+            .validate_challenge_continuity(&fresh, ZERO_ANCHOR)
+            .is_ok());
+        std::fs::remove_file(store.root.join("pending-time-challenge.json")).unwrap();
+
+        let (_, anchored) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        store.publish_current(1).unwrap();
+        let mismatched_legacy = TestAnchor {
+            anchor: decode_hash(&anchored).unwrap(),
+            initialized: true,
+            legacy_floor: Some(2),
+            ..fresh
+        };
+        let error = store
+            .validate_challenge_continuity(&mismatched_legacy, &anchored)
+            .unwrap_err();
+        assert!(error.0.contains("legacy floor differs"));
+        std::fs::remove_dir_all(store.root.join("generations")).unwrap();
+        ensure_secure_state_directory(&store.root.join("generations")).unwrap();
+        std::fs::remove_file(store.root.join("current")).unwrap();
 
         let orphaned = TestAnchor {
             anchor: [7; 32],
