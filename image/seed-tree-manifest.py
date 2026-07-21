@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -36,6 +37,8 @@ MAX_PREFLIGHT_DIRECTORIES = 1_000_000
 CAP_SYS_ADMIN = 21
 BTRFS_SUPER_MAGIC = 0x9123683E
 INITIAL_ID_MAP = ((0, 0, 4294967295),)
+INITIAL_USER_NAMESPACE_INODE = 0xEFFFFFFD
+NS_GET_PARENT = 0xB702
 
 
 class ManifestError(RuntimeError):
@@ -71,18 +74,33 @@ def require_initial_linux_user_namespace() -> None:
         raise ManifestError(
             "authoritative Linux manifests require the initial host user namespace"
         )
+    descriptor: int | None = None
     try:
-        current_namespace = os.stat("/proc/self/ns/user")
-        init_namespace = os.stat("/proc/1/ns/user")
+        descriptor = os.open(
+            "/proc/self/ns/user",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        if os.fstat(descriptor).st_ino != INITIAL_USER_NAMESPACE_INODE:
+            raise ManifestError(
+                "authoritative Linux manifests require the initial host user namespace"
+            )
+        try:
+            parent_descriptor = fcntl.ioctl(descriptor, NS_GET_PARENT)
+        except OSError as error:
+            if error.errno != errno.EPERM:
+                raise ManifestError(
+                    f"cannot verify the Linux user namespace parent: {error}"
+                ) from error
+        else:
+            os.close(parent_descriptor)
+            raise ManifestError(
+                "authoritative Linux manifests require a user namespace without a parent"
+            )
     except OSError as error:
         raise ManifestError(f"cannot verify the Linux host user namespace: {error}") from error
-    if (current_namespace.st_dev, current_namespace.st_ino) != (
-        init_namespace.st_dev,
-        init_namespace.st_ino,
-    ):
-        raise ManifestError(
-            "authoritative Linux manifests require the initial host user namespace"
-        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def require_complete_xattr_visibility() -> None:
@@ -125,11 +143,37 @@ def reject_ambiguous_inode_namespace(descriptor: int, location: str) -> None:
         )
 
 
+def reject_ambiguous_inode_path(path: Path | str, location: str) -> None:
+    if sys.platform != "linux":
+        return
+    flags = (
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ManifestError(f"cannot inspect input filesystem for {location}: {error}") from error
+    try:
+        reject_ambiguous_inode_namespace(descriptor, location)
+    finally:
+        os.close(descriptor)
+
+
+def safe_tree_name(name: str) -> bool:
+    return (
+        bool(name)
+        and name.isascii()
+        and name.replace("-", "").replace("_", "").isalnum()
+    )
+
+
 def parse_tree(value: str) -> tuple[str, Path]:
     name, separator, raw_path = value.partition("=")
     if not separator or not name or not raw_path:
         raise argparse.ArgumentTypeError("tree must be NAME=PATH")
-    if not name.replace("-", "").replace("_", "").isalnum():
+    if not safe_tree_name(name):
         raise argparse.ArgumentTypeError(f"unsafe tree name: {name}")
     return name, Path(raw_path)
 
@@ -278,6 +322,7 @@ def inspect_entry(
     if expected is not None and identity(metadata) != identity(expected):
         raise ManifestError(f"tree root changed before traversal: {path}")
     manifest_path = stable_path(name, relative)
+    reject_ambiguous_inode_path(path, manifest_path)
     item: dict[str, Any] = {"path": manifest_path, **metadata_fields(metadata)}
 
     if stat.S_ISDIR(metadata.st_mode):
@@ -854,8 +899,8 @@ def write_manifest(
     output: Path,
 ) -> None:
     names = [name for name, _ in trees]
-    if not trees or len(names) != len(set(names)):
-        raise ManifestError("tree names must be non-empty and unique")
+    if not trees or len(names) != len(set(names)) or not all(map(safe_tree_name, names)):
+        raise ManifestError("tree names must be safe, non-empty and unique")
     for _, root in trees:
         if output_is_within_tree(output, root):
             raise ManifestError(f"output path is inside input tree: {output}")

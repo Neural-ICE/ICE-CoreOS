@@ -586,6 +586,25 @@ class SeedTreeManifestTests(unittest.TestCase):
         finally:
             os.close(parent_descriptor)
 
+    def test_btrfs_file_mount_is_refused_before_inode_reuse(self) -> None:
+        regular_file = self.source / "models" / "model-a" / "weights"
+        with (
+            mock.patch.object(MANIFEST_MODULE.sys, "platform", "linux"),
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "linux_filesystem_magic",
+                return_value=MANIFEST_MODULE.BTRFS_SUPER_MAGIC,
+            ),
+            self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "Btrfs input is unsupported",
+            ),
+        ):
+            MANIFEST_MODULE.reject_ambiguous_inode_path(
+                regular_file,
+                "models/model-a/weights",
+            )
+
     def test_linux_authoritative_cli_requires_root_and_cap_sys_admin(self) -> None:
         with (
             mock.patch.object(MANIFEST_MODULE.sys, "platform", "linux"),
@@ -645,6 +664,39 @@ class SeedTreeManifestTests(unittest.TestCase):
             ),
         ):
             MANIFEST_MODULE.require_initial_linux_user_namespace()
+
+    def test_linux_authoritative_cli_rejects_non_initial_namespace_inode(self) -> None:
+        descriptor = os.open(self.root, os.O_RDONLY)
+        with (
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "linux_id_map",
+                return_value=MANIFEST_MODULE.INITIAL_ID_MAP,
+            ),
+            mock.patch.object(MANIFEST_MODULE.os, "open", return_value=descriptor),
+            mock.patch.object(
+                MANIFEST_MODULE.os,
+                "fstat",
+                return_value=SimpleNamespace(st_ino=12345),
+            ),
+            self.assertRaisesRegex(
+                MANIFEST_MODULE.ManifestError,
+                "initial host user namespace",
+            ),
+        ):
+            MANIFEST_MODULE.require_initial_linux_user_namespace()
+
+    def test_serializer_api_refuses_unsafe_tree_names(self) -> None:
+        for unsafe_name in ("", ".", "..", "bad/name", "mødels"):
+            with self.subTest(name=unsafe_name):
+                with self.assertRaisesRegex(
+                    MANIFEST_MODULE.ManifestError,
+                    "tree names must be safe",
+                ):
+                    MANIFEST_MODULE.write_manifest(
+                        [(unsafe_name, self.source / "models")],
+                        self.root / f"unsafe-{len(unsafe_name)}.json",
+                    )
 
     def test_maximum_length_output_basename_is_supported(self) -> None:
         output = self.root / ("m" * 255)
