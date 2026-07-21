@@ -34,28 +34,16 @@ BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfd
 # mandatory so a mutable build-host pathname cannot silently change the key.
 SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
 SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
+# shellcheck source=image/lib/debug-ssh-key.sh
+source "$REPO_ROOT/image/lib/debug-ssh-key.sh"
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: BASE_IMAGE is required as a digest-pinned OCI reference" >&2; exit 1; }
 [[ "$TARGET_IMGREF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_IMGREF must be a digest-pinned OCI reference" >&2; exit 1; }
-if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
-  [[ -f "$SSH_AUTHORIZED_KEYS_FILE" && ! -L "$SSH_AUTHORIZED_KEYS_FILE" ]] \
-    || { echo "ERROR: SSH_AUTHORIZED_KEYS_FILE must be a regular non-symlink file" >&2; exit 1; }
-  [[ "$SSH_AUTHORIZED_KEYS_SHA256" =~ ^[0-9a-f]{64}$ ]] \
-    || { echo "ERROR: SSH_AUTHORIZED_KEYS_SHA256 is required with the public key file" >&2; exit 1; }
-  key_size="$(wc -c < "$SSH_AUTHORIZED_KEYS_FILE")"
-  (( key_size > 0 && key_size <= 16384 )) \
-    || { echo "ERROR: SSH authorized_keys input must contain 1..16384 bytes" >&2; exit 1; }
-  [[ "$(sha256sum "$SSH_AUTHORIZED_KEYS_FILE" | awk '{print $1}')" = "$SSH_AUTHORIZED_KEYS_SHA256" ]] \
-    || { echo "ERROR: SSH authorized_keys input differs from the approved hash" >&2; exit 1; }
-  ssh-keygen -l -f "$SSH_AUTHORIZED_KEYS_FILE" >/dev/null \
-    || { echo "ERROR: SSH authorized_keys input contains no valid public key" >&2; exit 1; }
-elif [[ -n "$SSH_AUTHORIZED_KEYS_SHA256" ]]; then
-  echo "ERROR: SSH_AUTHORIZED_KEYS_SHA256 requires SSH_AUTHORIZED_KEYS_FILE" >&2
-  exit 1
-fi
+debug_ssh_key_validate "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" \
+  || { echo "ERROR: invalid debug SSH key input" >&2; exit 1; }
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -161,14 +149,8 @@ done
 sudo mount "$ESPPART" "$MNT"
 sudo find "$MNT/EFI" -maxdepth 2 \( -iname 'fbaa64.efi' -o -iname 'BOOT*.CSV' \) -print -delete
 if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
-  SSH_DEST="$MNT/ice-coreos/authorized_keys"
-  [[ ! -e "$SSH_DEST" && ! -L "$SSH_DEST" ]] \
-    || { echo "ERROR: installer ESP already contains an SSH authorized_keys path" >&2; exit 1; }
-  sudo install -D -m 0644 "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_DEST"
-  [[ "$(sudo sha256sum "$SSH_DEST" | awk '{print $1}')" = "$SSH_AUTHORIZED_KEYS_SHA256" ]] \
-    || { echo "ERROR: installer ESP SSH key readback differs from the approved hash" >&2; exit 1; }
-  sudo ssh-keygen -l -f "$SSH_DEST" \
-    | sed 's/^/    [debug SSH] /'
+  sudo bash "$REPO_ROOT/image/lib/debug-ssh-key.sh" install \
+    "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" "$MNT"
 fi
 sync
 sudo umount "$MNT"; sudo losetup -d "$LOOP"; trap - EXIT

@@ -256,6 +256,42 @@ def validate_filename(filename: str) -> None:
         raise GateError(f"unsafe output filename: {filename!r}")
 
 
+def require_output_set_available(arguments: argparse.Namespace, raw: Path) -> None:
+    outputs = [
+        arguments.artifact_checksum,
+        arguments.receipt,
+        arguments.receipt_checksum,
+    ]
+    if arguments.compression == "none":
+        if arguments.artifact.is_symlink():
+            raise GateError("uncompressed artifact path must not be a symlink")
+        if arguments.artifact.resolve(strict=True) != raw:
+            raise GateError("uncompressed artifact must be the accepted raw path")
+    else:
+        outputs.insert(0, arguments.artifact)
+
+    canonical_outputs: set[tuple[Path, str]] = set()
+    for output in outputs:
+        validate_filename(output.name)
+        parent = output.parent.resolve(strict=True)
+        identity = (parent, output.name)
+        if identity in canonical_outputs:
+            raise GateError("final-media output paths must be unique")
+        canonical_outputs.add(identity)
+        if parent / output.name == raw:
+            raise GateError("final-media output path collides with the accepted raw")
+        directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            try:
+                os.stat(output.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise GateError(f"output already exists: {output}")
+        finally:
+            os.close(directory)
+
+
 def unlink_at(directory_descriptor: int, filename: str) -> None:
     try:
         os.unlink(filename, dir_fd=directory_descriptor)
@@ -451,6 +487,7 @@ def verify(arguments: argparse.Namespace) -> None:
     if arguments.raw.is_symlink():
         raise GateError("raw image path must not be a symlink")
     raw = arguments.raw.resolve(strict=True)
+    require_output_set_available(arguments, raw)
     expected_bytes = read_regular(arguments.expected_manifest, 512 * 1024 * 1024)
     expected_sha = hashlib.sha256(expected_bytes).hexdigest()
     try:
@@ -467,6 +504,7 @@ def verify(arguments: argparse.Namespace) -> None:
     loop = ""
     mounted = False
     mountpoint_path: Path | None = None
+    actual_workspace: Path | None = None
     actual_path: Path | None = None
     try:
         try:
@@ -501,12 +539,11 @@ def verify(arguments: argparse.Namespace) -> None:
         mountpoint_path = Path(tempfile.mkdtemp(prefix="neural-ice-ni-seed.", dir="/run"))
         verify_mount(partition, mountpoint_path)
         mounted = True
-        actual_descriptor, actual_name = tempfile.mkstemp(
-            prefix="neural-ice-seed-manifest.", dir="/run"
+        actual_workspace = Path(
+            tempfile.mkdtemp(prefix="neural-ice-seed-manifest.", dir="/run")
         )
-        os.close(actual_descriptor)
-        actual_path = Path(actual_name)
-        actual_path.unlink()
+        os.chmod(actual_workspace, 0o700)
+        actual_path = actual_workspace / "actual.json"
         manifest_tool = Path(__file__).with_name("seed-tree-manifest.py")
         trees = expected_document.get("trees")
         verify_seed_root(mountpoint_path, trees)
@@ -586,6 +623,11 @@ def verify(arguments: argparse.Namespace) -> None:
                 pass
         if actual_path is not None:
             actual_path.unlink(missing_ok=True)
+        if actual_workspace is not None:
+            try:
+                actual_workspace.rmdir()
+            except OSError:
+                pass
         if mountpoint_path is not None:
             try:
                 mountpoint_path.rmdir()

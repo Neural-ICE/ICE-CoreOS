@@ -21,12 +21,15 @@
 #   COMPRESS=zstd-fast ./image/build-preloaded.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO_ROOT"
+# shellcheck source=image/lib/preloaded-sizing.sh
+source "$REPO_ROOT/image/lib/preloaded-sizing.sh"
 
 SEED_IMAGES="${SEED_IMAGES:-${HOME}/ice-seed/images}"
 SEED_MODELS="${SEED_MODELS:-${HOME}/ice-seed/models}"
 # Optional payload dir (a directory containing an executable apply.sh): staged onto the
-# data volume by the autoinstall, applied once on first boot by the image's generic
-# neural-ice-payload-apply.service. KB-sized — headroom covers it.
+# data volume by the autoinstall and applied once on first boot by the image's generic
+# neural-ice-payload-apply.service. It can contain a complete product payload and is sized
+# as part of the seed rather than assumed to be small.
 SEED_PAYLOAD="${SEED_PAYLOAD:-}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
@@ -94,10 +97,12 @@ sudo python3 image/seed-tree-manifest.py \
 
 STORE_BYTES="$(sudo du -sb "$STORE_TMP" | cut -f1)"
 MODELS_BYTES="$(sudo du -sb "$SEED_MODELS" | cut -f1)"
-SEED_BYTES=$(( STORE_BYTES + MODELS_BYTES ))
-GROW=$(( SEED_BYTES + SEED_BYTES/10 + 4*1024*1024*1024 ))   # store+models + 10% + 4 GiB headroom
-GROW=$(( (GROW + 1048575) / 1048576 * 1048576 ))            # round up to 1 MiB (avoid sub-sector GPT gaps)
-echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
+SEED_PAYLOAD_BYTES=0
+if [ -n "$SEED_PAYLOAD" ]; then
+  SEED_PAYLOAD_BYTES="$(sudo du -sb "$SEED_PAYLOAD" | cut -f1)"
+fi
+GROW="$(preloaded_seed_growth_bytes "$STORE_BYTES" "$MODELS_BYTES" "$SEED_PAYLOAD_BYTES")"
+echo "    store ≈ $((STORE_BYTES/1024/1024/1024)) GiB, models ≈ $((MODELS_BYTES/1024/1024/1024)) GiB, payload ≈ $((SEED_PAYLOAD_BYTES/1024/1024/1024)) GiB → grow raw by $((GROW/1024/1024/1024)) GiB"
 truncate -s "+${GROW}" "$RAW"
 
 echo "==> 3. relocate GPT backup header + append the ni-seed partition"

@@ -78,6 +78,11 @@ flash/read back exactly the raw digest and size recorded in the same receipt. Ex
 checksum or receipt paths are never overwritten; retry with a fresh output name after diagnosing a
 failed build.
 
+The `ni-seed` partition is sized from the extracted image store, models and the complete optional
+product payload. The sum receives 10% proportional headroom plus 4 GiB fixed headroom and is rounded
+up to 1 MiB. This keeps large (~70 GiB) payloads from exhausting the partition. First-boot payload
+application is bounded to two hours instead of systemd's default 90 seconds.
+
 For debug media, the optional SSH public-key file is validated, hash-bound and written to
 `EFI:/ice-coreos/authorized_keys` before final-media acceptance. Injection is refused unless the
 base image self-identifies as debug. The delivered USB therefore remains byte-for-byte covered by
@@ -86,7 +91,7 @@ the raw and artifact digests in the final receipt; do not modify its ESP after a
 Notes:
 - `OUT` names the output archive here but is the bib output DIR in
   `build-installer-usb.sh` — the child is invoked with `env -u OUT` (do not export `OUT` around it).
-- Disk: seed (extracted store + models) + raw + archive needs roughly **2.5× the seed size**
+- Disk: seed (extracted store + models + optional payload) + raw + archive needs roughly **2.5× the seed size**
   free on the build host (~250 GB for a ~63 GB seed).
 - Build time ≈ 11 min on a GB10-class build host (store load + bib + copy + zstd-fast).
 - Publish: dev keeps the `.img.zst` local; releases go to a GitHub Release / object storage.

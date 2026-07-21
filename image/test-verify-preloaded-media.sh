@@ -125,6 +125,7 @@ if python3 "$ROOT/image/verify-preloaded-media.py" \
   exit 1
 fi
 test "$(cat "$work/owned-receipt.json")" = owner-data
+test ! -e "$work/uncompressed.img.sha256"
 
 python3 "$ROOT/image/seed-tree-manifest.py" \
   --tree "store=$work/source/store" \
