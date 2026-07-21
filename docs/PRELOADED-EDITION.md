@@ -64,6 +64,36 @@ Notes:
 - Build time ≈ 11 min on a GB10-class build host (store load + bib + copy + zstd-fast).
 - Publish: dev keeps the `.img.zst` local; releases go to a GitHub Release / object storage.
 
+## Optional LAB baseline receipt on the installer ESP
+
+A LAB installer may carry this exact pair on its EFI System Partition:
+
+```text
+/ice-coreos/ota-lab-baseline.json
+/ice-coreos/ota-lab-baseline.sig
+```
+
+The pair is optional. If both files are absent, installation behaves exactly as before. If only
+one exists, either path is a symlink/non-regular file, either file is empty, the JSON exceeds
+16 KiB, or the signature exceeds 4 KiB, autoinstall fails closed **before wiping the target**.
+
+CoreOS does not parse the record and does not verify or interpret its signature. It snapshots
+the two byte streams before touching the target, then atomically installs them on the encrypted
+system volume as root-owned state:
+
+```text
+/var/lib/neural-ice/ota/lab-baseline/ota-lab-baseline.json  root:root 0600
+/var/lib/neural-ice/ota/lab-baseline/ota-lab-baseline.sig   root:root 0600
+```
+
+The `lab-baseline` directory is `root:root 0700`; writes are compared byte-for-byte and flushed
+before install completion. The target SELinux policy labels the directory in the same pass as
+the rest of runtime `/var`. The Fabric baseline service is the sole consumer responsible for
+signature verification and the trust decision after boot.
+
+This handoff is independent of `/ice-coreos/authorized_keys`; its existing debug-key behavior is
+unchanged.
+
 ## Security note — recovery escrow on the USB
 
 The autoinstall writes `NEURAL-ICE-RECOVERY-<serial>.txt` (data-volume key + system-volume key)

@@ -1,0 +1,45 @@
+name: test-installer-handoff
+
+on:
+  pull_request:
+    paths:
+      - "ota/neural-ice-autoinstall.sh"
+      - "ota/neural-ice-lab-baseline-handoff.sh"
+      - "ota/test-neural-ice-lab-baseline-handoff.sh"
+      - "image/Containerfile.installer"
+      - "docs/PRELOADED-EDITION.md"
+      - ".github/workflows/test-installer-handoff.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ota/neural-ice-autoinstall.sh"
+      - "ota/neural-ice-lab-baseline-handoff.sh"
+      - "ota/test-neural-ice-lab-baseline-handoff.sh"
+      - "image/Containerfile.installer"
+      - "docs/PRELOADED-EDITION.md"
+      - ".github/workflows/test-installer-handoff.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # ICE-CoreOS is public: never execute untrusted fork code on an organization
+    # self-hosted runner.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - name: Validate installer shell
+        run: |
+          bash -n ota/neural-ice-autoinstall.sh \
+            ota/neural-ice-lab-baseline-handoff.sh \
+            ota/test-neural-ice-lab-baseline-handoff.sh
+          shellcheck ota/neural-ice-autoinstall.sh \
+            ota/neural-ice-lab-baseline-handoff.sh \
+            ota/test-neural-ice-lab-baseline-handoff.sh
+      - name: Test optional ESP handoff as runner user
+        run: ./ota/test-neural-ice-lab-baseline-handoff.sh
+      - name: Test durable root-owned handoff
+        run: sudo -n ./ota/test-neural-ice-lab-baseline-handoff.sh

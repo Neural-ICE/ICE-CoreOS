@@ -103,6 +103,50 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# 1c) Optional root-signed LAB baseline receipt for the installed OTA service.
+#     The installer only snapshots a structurally safe byte pair; it does not
+#     parse the JSON or make any signature/trust decision. ICE-Fabric owns that
+#     verification after first boot. A partial or unsafe pair aborts BEFORE the
+#     internal disk is touched; an absent pair preserves ordinary installs.
+# --------------------------------------------------------------------------- #
+readonly LAB_BASELINE_HANDOFF="/usr/local/libexec/neural-ice-lab-baseline-handoff"
+readonly LAB_BASELINE_SNAPSHOT="/run/neural-ice-installer/lab-baseline"
+LAB_BASELINE_PRESENT=0
+_lab_usb_esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
+if [[ -n "${_lab_usb_esp:-}" ]]; then
+  _lab_esp_mp="$(findmnt -nfo TARGET "/dev/$_lab_usb_esp" 2>/dev/null | head -1)"
+  _lab_esp_we_mounted=0
+  if [[ -z "$_lab_esp_mp" ]]; then
+    _lab_esp_mp="/run/neural-ice-lab-esp"
+    install -d -m 0700 "$_lab_esp_mp"
+    mount -o ro "/dev/$_lab_usb_esp" "$_lab_esp_mp" \
+      || die "cannot mount the installer ESP read-only for LAB baseline preflight"
+    _lab_esp_we_mounted=1
+  fi
+
+  _lab_snapshot_rc=0
+  "$LAB_BASELINE_HANDOFF" snapshot "$_lab_esp_mp" "$LAB_BASELINE_SNAPSHOT" \
+    || _lab_snapshot_rc=$?
+  if (( _lab_esp_we_mounted == 1 )); then
+    umount "$_lab_esp_mp" || die "cannot unmount the installer ESP after LAB baseline preflight"
+  fi
+  case "$_lab_snapshot_rc" in
+    0)
+      LAB_BASELINE_PRESENT=1
+      log "Optional LAB baseline receipt pair found and safely snapshotted."
+      ;;
+    3)
+      log "No optional LAB baseline receipt pair on the installer ESP."
+      ;;
+    *)
+      die "optional LAB baseline receipt pair failed structural preflight"
+      ;;
+  esac
+else
+  log "No installer ESP found for the optional LAB baseline receipt pair."
+fi
+
+# --------------------------------------------------------------------------- #
 # 2) Pick the internal target disk: type=disk, != live, transport != usb
 #    -> largest candidate ; ambiguity = abort (unless neuralice.target= given).
 # --------------------------------------------------------------------------- #
@@ -358,6 +402,9 @@ fi
 # --------------------------------------------------------------------------- #
 log "SELinux: labeling deployment /etc,/var,/boot + data volume (target policy)…"
 command -v setfiles >/dev/null || die "setfiles not available in the installer image"
+# The deployment names are bootc/ostree-controlled and cannot contain hostile
+# shell characters; ls keeps the established first-deployment selection here.
+# shellcheck disable=SC2012
 dep="$(ls -d "$TGT"/ostree/deploy/*/deploy/*.0 2>/dev/null | head -1)"
 [[ -n "$dep" && -d "$dep" ]] || die "cannot locate the ostree deployment under $TGT"
 stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
@@ -365,6 +412,11 @@ setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null 
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"
 [[ -f "$fc" ]] || die "target policy file_contexts not found: $fc"
+if (( LAB_BASELINE_PRESENT == 1 )); then
+  "$LAB_BASELINE_HANDOFF" install "$LAB_BASELINE_SNAPSHOT" "$stateroot/var" \
+    || die "cannot persist the optional LAB baseline receipt pair"
+  log "Optional LAB baseline receipt pair persisted for post-install verification."
+fi
 # Deployment /etc (the runtime /etc): -r makes paths match the policy as /etc/…
 setfiles -F -r "$dep" "$fc" "$dep/etc" || die "setfiles failed on deployment /etc"
 # Stateroot /var (the runtime /var): pre-created dirs get their policy labels.
