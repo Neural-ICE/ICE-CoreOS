@@ -4,6 +4,8 @@
 The manifest deliberately excludes timestamps and inode numbers, which change
 when a seed is copied to XFS. It includes every namespace entry, file digest,
 mode, owner, symlink target, hard-link relationship and extended attribute.
+The CLI accepts only trees exposed through read-only filesystem mounts so the
+captured namespace cannot change during traversal.
 """
 
 from __future__ import annotations
@@ -40,10 +42,15 @@ def stable_path(name: str, relative: PurePosixPath | None = None) -> str:
     return f"{name}/{relative.as_posix()}"
 
 
-def identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+def identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
         metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_rdev,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
@@ -144,7 +151,8 @@ def is_allowed_overlay_whiteout(
     return (
         name == "store"
         and relative is not None
-        and relative.parts[:1] == ("overlay",)
+        and len(relative.parts) >= 2
+        and relative.parts[0] == "overlay"
         and is_overlay_whiteout(metadata)
     )
 
@@ -162,35 +170,43 @@ def walk_tree(
     name: str,
     root: Path,
     hardlink_candidates: dict[tuple[int, int], list[str]],
-    retained_identities: list[tuple[Path, os.stat_result, str]],
+    directory_identities: set[tuple[int, int]],
+    *,
+    require_read_only: bool,
 ) -> list[dict[str, Any]]:
     try:
         root_metadata = root.lstat()
     except OSError as error:
         raise ManifestError(f"cannot stat tree root {root}: {error}") from error
-    if not stat.S_ISDIR(root_metadata.st_mode) or root.is_symlink():
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise ManifestError(f"tree root is not a real directory: {root}")
+    if require_read_only:
+        if not hasattr(os, "ST_RDONLY"):
+            raise ManifestError("read-only filesystem verification is unavailable")
+        try:
+            filesystem = os.statvfs(root)
+        except OSError as error:
+            raise ManifestError(f"cannot inspect tree filesystem {root}: {error}") from error
+        if not filesystem.f_flag & os.ST_RDONLY:
+            raise ManifestError(f"tree filesystem is not read-only: {root}")
 
     entries: list[dict[str, Any]] = []
-    stack: list[tuple[str, Path, PurePosixPath | None, os.stat_result | None]] = [
-        ("visit", root, None, None)
+    stack: list[tuple[Path, PurePosixPath | None, os.stat_result | None]] = [
+        (root, None, root_metadata)
     ]
     while stack:
-        operation, path, relative, before = stack.pop()
-        if operation == "revalidate-directory":
-            assert before is not None
-            revalidate(path, before, "directory")
-            retained_identities.append((path, before, "directory"))
-            continue
-
+        path, relative, expected = stack.pop()
         try:
             metadata = path.lstat()
         except OSError as error:
             raise ManifestError(f"cannot stat {path}: {error}") from error
+        if expected is not None and identity(metadata) != identity(expected):
+            raise ManifestError(f"tree root changed before traversal: {path}")
         manifest_path = stable_path(name, relative)
         item: dict[str, Any] = {"path": manifest_path, **metadata_fields(metadata)}
 
         if stat.S_ISDIR(metadata.st_mode):
+            directory_identities.add((metadata.st_dev, metadata.st_ino))
             item["type"] = "directory"
             item["xattrs"] = xattrs(path, follow_symlinks=False)
             entries.append(item)
@@ -199,14 +215,13 @@ def walk_tree(
                     children = sorted(iterator, key=lambda child: os.fsencode(child.name))
             except OSError as error:
                 raise ManifestError(f"cannot scan directory {path}: {error}") from error
-            stack.append(("revalidate-directory", path, relative, metadata))
             for child in reversed(children):
                 child_relative = (
                     PurePosixPath(child.name)
                     if relative is None
                     else relative / child.name
                 )
-                stack.append(("visit", Path(child.path), child_relative, None))
+                stack.append((Path(child.path), child_relative, None))
             continue
 
         if stat.S_ISREG(metadata.st_mode):
@@ -219,8 +234,6 @@ def walk_tree(
                 }
             )
             entries.append(item)
-            revalidate(path, metadata, "regular file")
-            retained_identities.append((path, metadata, "regular file"))
             hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
                 manifest_path
             )
@@ -239,8 +252,6 @@ def walk_tree(
                 }
             )
             entries.append(item)
-            revalidate(path, metadata, "symlink")
-            retained_identities.append((path, metadata, "symlink"))
             hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
                 manifest_path
             )
@@ -261,14 +272,13 @@ def walk_tree(
                 }
             )
             entries.append(item)
-            revalidate(path, metadata, "overlay whiteout")
-            retained_identities.append((path, metadata, "overlay whiteout"))
             hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
                 manifest_path
             )
             continue
 
         raise ManifestError(f"unsupported seed entry type at {path}")
+    revalidate(root, root_metadata, "tree root")
     return entries
 
 
@@ -282,43 +292,72 @@ def output_is_within_tree(output: Path, root: Path) -> bool:
     return True
 
 
-def output_parent_is_manifested_directory(
-    output: Path,
-    retained_identities: list[tuple[Path, os.stat_result, str]],
-) -> bool:
+def open_output_parent(output: Path) -> tuple[int, str, os.stat_result]:
+    if not output.name:
+        raise ManifestError(f"output must name a file: {output}")
     try:
         parent = output.parent.resolve(strict=True)
-        metadata = parent.lstat()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(parent, flags)
     except OSError as error:
-        raise ManifestError(f"cannot stat output directory for {output}: {error}") from error
+        raise ManifestError(f"cannot open output directory for {output}: {error}") from error
+    metadata = os.fstat(descriptor)
     if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
         raise ManifestError(f"output parent is not a directory: {parent}")
+    return descriptor, output.name, metadata
+
+
+def output_parent_is_manifested_directory(
+    metadata: os.stat_result,
+    directory_identities: set[tuple[int, int]],
+) -> bool:
     parent_identity = (metadata.st_dev, metadata.st_ino)
-    return any(
-        kind == "directory" and (before.st_dev, before.st_ino) == parent_identity
-        for _, before, kind in retained_identities
-    )
+    return parent_identity in directory_identities
 
 
-def revalidate_retained(
-    retained_identities: list[tuple[Path, os.stat_result, str]],
+def remove_failed_output(
+    parent_descriptor: int,
+    output_name: str,
+    created_identity: tuple[int, int],
+    output: Path,
+    original_error: BaseException,
 ) -> None:
-    for path, before, kind in retained_identities:
-        revalidate(path, before, kind)
-
-
-def remove_failed_output(output: Path, original_error: BaseException) -> None:
     try:
-        output.unlink()
+        metadata = os.stat(
+            output_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
         return
+    except OSError as cleanup_error:
+        raise ManifestError(
+            f"cannot inspect failed manifest {output}: {cleanup_error}"
+        ) from original_error
+    if (metadata.st_dev, metadata.st_ino) != created_identity:
+        raise ManifestError(
+            f"refusing to remove replaced failed manifest: {output}"
+        ) from original_error
+    try:
+        os.unlink(output_name, dir_fd=parent_descriptor)
     except OSError as cleanup_error:
         raise ManifestError(
             f"cannot remove failed manifest {output}: {cleanup_error}"
         ) from original_error
 
 
-def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
+def write_manifest(
+    trees: list[tuple[str, Path]],
+    output: Path,
+    *,
+    require_read_only: bool,
+) -> None:
     names = [name for name, _ in trees]
     if not trees or len(names) != len(set(names)):
         raise ManifestError("tree names must be non-empty and unique")
@@ -328,13 +367,17 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
 
     entries: list[dict[str, Any]] = []
     hardlink_candidates: dict[tuple[int, int], list[str]] = {}
-    retained_identities: list[tuple[Path, os.stat_result, str]] = []
+    directory_identities: set[tuple[int, int]] = set()
     for name, root in sorted(trees):
         entries.extend(
-            walk_tree(name, root, hardlink_candidates, retained_identities)
+            walk_tree(
+                name,
+                root,
+                hardlink_candidates,
+                directory_identities,
+                require_read_only=require_read_only,
+            )
         )
-    if output_parent_is_manifested_directory(output, retained_identities):
-        raise ManifestError(f"output path is inside input tree: {output}")
     # A depth-first walk is deterministic but not globally lexicographic.  For
     # example, "tree/bucket-archive" sorts before "tree/bucket/child" even
     # though DFS visits the child before returning to the sibling.  Canonical
@@ -359,31 +402,52 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
         "trees": sorted(names),
     }
     encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    revalidate_retained(retained_identities)
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(output, flags, 0o600)
+    parent_descriptor, output_name, parent_metadata = open_output_parent(output)
     try:
-        view = memoryview(encoded)
-        while view:
-            written = os.write(descriptor, view)
-            if written == 0:
-                raise ManifestError(f"short write while creating manifest: {output}")
-            view = view[written:]
-        os.fsync(descriptor)
-        revalidate_retained(retained_identities)
-    except BaseException as error:
+        if output_parent_is_manifested_directory(
+            parent_metadata,
+            directory_identities,
+        ):
+            raise ManifestError(f"output path is inside input tree: {output}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(output_name, flags, 0o600, dir_fd=parent_descriptor)
+        created_metadata = os.fstat(descriptor)
+        created_identity = (created_metadata.st_dev, created_metadata.st_ino)
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written == 0:
+                    raise ManifestError(f"short write while creating manifest: {output}")
+                view = view[written:]
+            os.fsync(descriptor)
+        except BaseException as error:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            remove_failed_output(
+                parent_descriptor,
+                output_name,
+                created_identity,
+                output,
+                error,
+            )
+            raise
         try:
             os.close(descriptor)
-        except OSError:
-            pass
-        remove_failed_output(output, error)
-        raise
-    try:
-        os.close(descriptor)
-    except BaseException as error:
-        remove_failed_output(output, error)
-        raise
+        except BaseException as error:
+            remove_failed_output(
+                parent_descriptor,
+                output_name,
+                created_identity,
+                output,
+                error,
+            )
+            raise
+    finally:
+        os.close(parent_descriptor)
 
 
 def main() -> int:
@@ -392,7 +456,11 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     arguments = parser.parse_args()
     try:
-        write_manifest(arguments.tree, arguments.output)
+        write_manifest(
+            arguments.tree,
+            arguments.output,
+            require_read_only=True,
+        )
     except (ManifestError, OSError) as error:
         print(f"REFUSED: {error}", file=sys.stderr)
         return 1
