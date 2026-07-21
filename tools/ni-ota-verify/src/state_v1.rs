@@ -653,10 +653,6 @@ fn verify_generation(dir: &Path, value: &StateManifest) -> Result<TrustedTimeSta
             &value.delegation_snapshot_signature_sha256,
         ),
         (
-            "release-authorization.json",
-            &value.release_authorization_sha256,
-        ),
-        (
             "release-authorization.sig",
             &value.release_authorization_signature_sha256,
         ),
@@ -667,6 +663,13 @@ fn verify_generation(dir: &Path, value: &StateManifest) -> Result<TrustedTimeSta
     ] {
         read_manifest_artifact(dir, name, expected)?;
     }
+    let release = read_manifest_artifact(
+        dir,
+        "release-authorization.json",
+        &value.release_authorization_sha256,
+    )?;
+    let _: serde_json::Value =
+        parse_canonical(&release, "state-v1 release authorization").map_err(InternalError)?;
     let trusted: TrustedTimeState = parse_canonical(
         &read_manifest_artifact(dir, "trusted-time.json", &value.trusted_time_sha256)?,
         "trusted-time state",
@@ -1363,6 +1366,7 @@ mod tests {
     struct GenerationArtifacts {
         bind_assertion: bool,
         bind_snapshot: bool,
+        release_json: u8,
         variant: u8,
     }
 
@@ -1371,6 +1375,7 @@ mod tests {
             Self {
                 bind_assertion: true,
                 bind_snapshot: true,
+                release_json: 0,
                 variant: 0,
             }
         }
@@ -1413,7 +1418,14 @@ mod tests {
         let snapshot = b"{}\n";
         let assertion = b"{}\n";
         let snapshot_signature = artifact_variant(b"snapshot-signature", artifacts.variant);
-        let release = artifact_variant(b"{}\n", artifacts.variant);
+        let release = artifact_variant(
+            match artifacts.release_json {
+                0 => b"{}\n".as_slice(),
+                1 => b"{ }\n".as_slice(),
+                _ => b"{\n".as_slice(),
+            },
+            artifacts.variant,
+        );
         let release_signature = artifact_variant(b"release-signature", artifacts.variant);
         let assertion_signature = artifact_variant(b"trusted-time-signature", artifacts.variant);
         let snapshot_canonical_hash = if artifacts.bind_snapshot {
@@ -1942,6 +1954,43 @@ mod tests {
                     safe_clock: true,
                 })
                 .is_err());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn release_authorization_must_be_canonical_json_before_recovery() {
+        for release_json in [1, 2] {
+            let (store, root) = test_store();
+            let (_, anchor) = write_generation_with_artifacts(
+                &store,
+                GenerationSpec {
+                    generation: 1,
+                    bundle: 1,
+                    delegation: 1,
+                    time_seq: 1,
+                    trusted_time: "2026-07-21T12:00:00Z",
+                    legacy: Some(1),
+                    previous_manifest: None,
+                    previous_anchor: ZERO_ANCHOR.into(),
+                },
+                GenerationArtifacts {
+                    release_json,
+                    ..GenerationArtifacts::default()
+                },
+            );
+            let error = store
+                .read_current(&TestAnchor {
+                    anchor: decode_hash(&anchor).unwrap(),
+                    initialized: true,
+                    readable: true,
+                    legacy_floor: Some(1),
+                    safe_clock: true,
+                })
+                .unwrap_err();
+            assert!(error.0.contains("release authorization"));
+            assert!(!store.root.join("current").exists());
+            assert!(!store.root.join("enforce-ready.json").exists());
             std::fs::remove_dir_all(root).unwrap();
         }
     }
