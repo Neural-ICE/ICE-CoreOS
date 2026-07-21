@@ -16,9 +16,11 @@ FROM ${BASE_IMAGE}
 
 # Auto-install service (gated by the neuralice.autoinstall kernel argument).
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
+COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-baseline-handoff
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
 RUN set -euxo pipefail; \
-    chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh; \
+    chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
+      /usr/local/libexec/neural-ice-lab-baseline-handoff; \
     systemctl enable neural-ice-autoinstall.service
 
 # Branding (os-release, Plymouth, kargs) is inherited from the canonical image.

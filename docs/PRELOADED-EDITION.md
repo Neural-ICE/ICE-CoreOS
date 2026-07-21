@@ -64,6 +64,64 @@ Notes:
 - Build time ≈ 11 min on a GB10-class build host (store load + bib + copy + zstd-fast).
 - Publish: dev keeps the `.img.zst` local; releases go to a GitHub Release / object storage.
 
+## Optional LAB baseline receipt on the installer ESP
+
+A LAB installer may carry this exact pair on its EFI System Partition:
+
+```text
+/ice-coreos/ota-lab-baseline.json
+/ice-coreos/ota-lab-baseline.sig
+```
+
+The pair is optional. If both files are absent, installation behaves exactly as before. If only
+one exists, either path is a symlink/non-regular file, either file is empty, the JSON exceeds
+16 KiB, or the signature exceeds 4 KiB, autoinstall fails closed **before wiping the target**.
+
+CoreOS does not parse the record and does not verify or interpret its signature. It snapshots
+the two byte streams before touching the target, then atomically installs them on the encrypted
+system volume as root-owned state:
+
+```text
+/var/lib/neural-ice/ota/lab-baseline/ota-lab-baseline.json  root:root 0600
+/var/lib/neural-ice/ota/lab-baseline/ota-lab-baseline.sig   root:root 0600
+```
+
+The `lab-baseline` directory is `root:root 0700`; writes are compared byte-for-byte and flushed
+before install completion. The target SELinux policy labels the directory in the same pass as
+the rest of runtime `/var`. The Fabric baseline service is the sole consumer responsible for
+signature verification and the trust decision after boot.
+
+This handoff is independent of `/ice-coreos/authorized_keys`; its existing debug-key behavior is
+unchanged.
+
+### Failure recovery and one-version rollback
+
+The handoff directory lives in persistent `/var`, not inside a bootc deployment. It therefore
+survives a one-version `bootc rollback`. That persistence is intentional: changing the deployed
+`/usr` must not silently replace the physically delivered trust input or erase evidence of a
+failed bootstrap.
+
+The supported one-version behavior is:
+
+- an older deployment with no baseline consumer ignores the unknown root-only directory;
+- a baseline-aware Fabric service must re-verify the detached signature and all device/train
+  bindings before state mutation, and an exact retry must be idempotent;
+- neither rollback nor a retry may lower, replace, or delete verifier-owned `applied.json`;
+- a different receipt at the same sequence, a bad signature, an incompatible device binding, or
+  insecure metadata is a fail-closed refusal, not a reason to repair or remove state automatically.
+
+Failure before the atomic directory rename leaves no final `lab-baseline` directory and aborts the
+install. Diagnose or replace the USB media and rerun the complete installer; do not boot or repair
+the partially installed target in place. Failure after publication leaves the complete, flushed
+pair, so the same signed bootstrap can be retried safely.
+
+If post-boot verification refuses, preserve the receipt and diagnostic output. Roll back to the
+previous healthy bootc deployment when one exists; that deployment either ignores the pair or
+re-verifies the exact same bytes under the rules above. Recovery then uses a corrected, newly
+signed installation/release input with a strictly valid sequence and bindings. Operators must not
+hand-edit or delete the receipt to force acceptance. The handoff itself never moves a channel or
+authorizes an update.
+
 ## Security note — recovery escrow on the USB
 
 The autoinstall writes `NEURAL-ICE-RECOVERY-<serial>.txt` (data-volume key + system-volume key)
