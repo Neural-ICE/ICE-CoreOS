@@ -140,7 +140,7 @@ def flatten_lsblk(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def find_seed_partition(loop: str) -> tuple[str, str]:
+def find_partition(loop: str, partlabel: str, filesystem: str) -> tuple[str, str]:
     run("udevadm", "settle")
     output = run(
         "lsblk",
@@ -163,22 +163,22 @@ def find_seed_partition(loop: str) -> tuple[str, str]:
         for node in nodes
         if node.get("type") == "part"
         and Path(str(node.get("pkname", ""))).name == loop_name
-        and node.get("partlabel") == "ni-seed"
+        and node.get("partlabel") == partlabel
     ]
     if len(matches) != 1:
-        raise GateError("final raw must contain exactly one ni-seed child partition")
+        raise GateError(f"final raw must contain exactly one {partlabel} child partition")
     partition = matches[0]
-    if partition.get("fstype") != "xfs":
-        raise GateError("ni-seed partition is not XFS")
+    if partition.get("fstype") != filesystem:
+        raise GateError(f"{partlabel} partition is not {filesystem}")
     if str(partition.get("ro")) not in ("1", "True", "true"):
-        raise GateError("ni-seed partition is not read-only")
+        raise GateError(f"{partlabel} partition is not read-only")
     partuuid = partition.get("partuuid")
     if not isinstance(partuuid, str) or not partuuid:
-        raise GateError("ni-seed partition lacks PARTUUID")
+        raise GateError(f"{partlabel} partition lacks PARTUUID")
     return str(partition["name"]), partuuid.lower()
 
 
-def verify_mount(partition: str, mountpoint: Path) -> None:
+def verify_mount(partition: str, expected_filesystem: str, mountpoint: Path) -> None:
     output = run("findmnt", "--json", "--target", str(mountpoint), "--output", "SOURCE,FSTYPE,OPTIONS")
     try:
         filesystems = json.loads(output)["filesystems"]
@@ -186,23 +186,23 @@ def verify_mount(partition: str, mountpoint: Path) -> None:
         raise GateError("findmnt returned invalid JSON") from error
     if len(filesystems) != 1:
         raise GateError("ni-seed mount is ambiguous")
-    filesystem = filesystems[0]
-    source = str(filesystem.get("source", "")).split("[")[0]
-    options = set(str(filesystem.get("options", "")).split(","))
-    if source != partition or filesystem.get("fstype") != "xfs":
-        raise GateError("ni-seed mount source or filesystem changed")
+    mounted_filesystem = filesystems[0]
+    source = str(mounted_filesystem.get("source", "")).split("[")[0]
+    options = set(str(mounted_filesystem.get("options", "")).split(","))
+    if source != partition or mounted_filesystem.get("fstype") != expected_filesystem:
+        raise GateError("read-only media mount source or filesystem changed")
     if not {"ro", "nosuid", "nodev", "noexec"}.issubset(options):
-        raise GateError("ni-seed mount lacks required read-only options")
+        raise GateError("media mount lacks required read-only options")
     probe = mountpoint / ".neural-ice-write-probe"
     try:
         descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except OSError as error:
         if error.errno != errno.EROFS:
-            raise GateError(f"ni-seed write probe failed for an unexpected reason: {error}") from error
+            raise GateError(f"media write probe failed for an unexpected reason: {error}") from error
     else:
         os.close(descriptor)
         os.unlink(probe)
-        raise GateError("ni-seed accepted a write through the release gate")
+        raise GateError("media accepted a write through the release gate")
 
 
 def enter_private_mount_namespace() -> None:
@@ -236,6 +236,63 @@ def verify_seed_root(mountpoint: Path, trees: Any) -> list[str]:
     if actual != trees:
         raise GateError("final ni-seed root namespace differs from the approved tree set")
     return trees
+
+
+def expected_lab_baseline(arguments: argparse.Namespace) -> tuple[str, str] | None:
+    values = (
+        arguments.lab_baseline_bom_sha256,
+        arguments.lab_baseline_signature_sha256,
+    )
+    if values == (None, None):
+        return None
+    if any(value is None for value in values) or any(
+        len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+        for value in values
+        if value is not None
+    ):
+        raise GateError("LAB baseline requires both exact lowercase SHA-256 values")
+    bom_sha256, signature_sha256 = values
+    assert bom_sha256 is not None and signature_sha256 is not None
+    return bom_sha256, signature_sha256
+
+
+def verify_lab_baseline(
+    mountpoint: Path, expected: tuple[str, str] | None
+) -> dict[str, Any] | None:
+    namespace = mountpoint / "ice-coreos"
+    bom_path = namespace / "ota-lab-baseline.json"
+    signature_path = namespace / "ota-lab-baseline.sig"
+    bom_present = bom_path.exists() or bom_path.is_symlink()
+    signature_present = signature_path.exists() or signature_path.is_symlink()
+    if not bom_present and not signature_present:
+        if expected is not None:
+            raise GateError("approved LAB baseline pair is absent from the installer ESP")
+        return None
+    if not bom_present or not signature_present:
+        raise GateError("installer ESP contains an incomplete LAB baseline pair")
+    if expected is None:
+        raise GateError("installer ESP contains an unapproved LAB baseline pair")
+
+    bom = read_regular(bom_path, 16 * 1024)
+    signature = read_regular(signature_path, 4 * 1024)
+    if not bom or not signature:
+        raise GateError("installer ESP LAB baseline files must be non-empty")
+    bom_sha256 = hashlib.sha256(bom).hexdigest()
+    signature_sha256 = hashlib.sha256(signature).hexdigest()
+    if (bom_sha256, signature_sha256) != expected:
+        raise GateError("installer ESP LAB baseline differs from the approved hashes")
+    return {
+        "bom": {
+            "path": "ice-coreos/ota-lab-baseline.json",
+            "sha256": bom_sha256,
+            "size": len(bom),
+        },
+        "signature": {
+            "path": "ice-coreos/ota-lab-baseline.sig",
+            "sha256": signature_sha256,
+            "size": len(signature),
+        },
+    }
 
 
 def validate_filename(filename: str) -> None:
@@ -489,6 +546,7 @@ def verify(arguments: argparse.Namespace) -> None:
         or expected_document.get("schema") != "neural-ice-offline-seed-tree-v1"
     ):
         raise GateError("expected seed manifest schema is invalid")
+    expected_baseline = expected_lab_baseline(arguments)
 
     descriptor = os.open(raw, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     loop = ""
@@ -522,7 +580,7 @@ def verify(arguments: argparse.Namespace) -> None:
         mapped = existing_loop_for(descriptor)
         if len(mapped) != 1 or mapped[0].get("name") != loop:
             raise GateError("raw image has an unexpected concurrent loop mapping")
-        partition, partuuid = find_seed_partition(loop)
+        partition, partuuid = find_partition(loop, "ni-seed", "xfs")
         if run("blockdev", "--getro", partition) != "1":
             raise GateError("ni-seed partition device is writable")
 
@@ -540,7 +598,7 @@ def verify(arguments: argparse.Namespace) -> None:
         # Record cleanup responsibility immediately after mount(2) succeeds;
         # all subsequent source/options/write-probe checks may refuse.
         mounted = True
-        verify_mount(partition, mountpoint_path)
+        verify_mount(partition, "xfs", mountpoint_path)
         actual_workspace = Path(
             tempfile.mkdtemp(prefix="neural-ice-seed-manifest.", dir="/run")
         )
@@ -563,6 +621,30 @@ def verify(arguments: argparse.Namespace) -> None:
         if len(mapped) != 1 or mapped[0].get("name") != loop:
             raise GateError("raw image acquired an unexpected concurrent loop mapping")
 
+        run("umount", str(mountpoint_path), capture=False)
+        mounted = False
+        esp_partition, esp_partuuid = find_partition(loop, "EFI-SYSTEM", "vfat")
+        if run("blockdev", "--getro", esp_partition) != "1":
+            raise GateError("installer ESP partition device is writable")
+        run(
+            "mount",
+            "-t",
+            "vfat",
+            "-o",
+            "ro,nosuid,nodev,noexec",
+            esp_partition,
+            str(mountpoint_path),
+            capture=False,
+        )
+        mounted = True
+        verify_mount(esp_partition, "vfat", mountpoint_path)
+        lab_baseline = verify_lab_baseline(mountpoint_path, expected_baseline)
+        if lab_baseline is not None:
+            lab_baseline["esp"] = {
+                "fstype": "vfat",
+                "mount_options": ["nodev", "noexec", "nosuid", "ro"],
+                "partuuid": esp_partuuid,
+            }
         run("umount", str(mountpoint_path), capture=False)
         mounted = False
         detach_own_loop(loop, descriptor)
@@ -599,6 +681,7 @@ def verify(arguments: argparse.Namespace) -> None:
                 "mount_options": ["nodev", "noexec", "nosuid", "ro"],
                 "partuuid": partuuid,
             },
+            "lab_baseline": lab_baseline,
             "raw": {"sha256": before_digest, "size": metadata.st_size},
             "schema": "neural-ice-preloaded-final-media-receipt-v1",
         }
@@ -651,6 +734,8 @@ def main() -> int:
     )
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--receipt-checksum", required=True, type=Path)
+    parser.add_argument("--lab-baseline-bom-sha256")
+    parser.add_argument("--lab-baseline-signature-sha256")
     arguments = parser.parse_args()
     try:
         verify(arguments)

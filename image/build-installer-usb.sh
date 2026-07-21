@@ -34,8 +34,22 @@ BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfd
 # mandatory so a mutable build-host pathname cannot silently change the key.
 SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
 SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
+LAB_BASELINE_BOM_FILE="${LAB_BASELINE_BOM_FILE:-}"
+LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
+LAB_BASELINE_SIGNATURE_FILE="${LAB_BASELINE_SIGNATURE_FILE:-}"
+LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
+LAB_BASELINE_STAGE_ROOT=""
+LAB_BASELINE_HELPER="$REPO_ROOT/ota/neural-ice-lab-baseline-handoff.sh"
 # shellcheck source=image/lib/debug-ssh-key.sh
 source "$REPO_ROOT/image/lib/debug-ssh-key.sh"
+
+cleanup_lab_baseline_stage() {
+  if [[ -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
+    chmod -R u+w -- "$LAB_BASELINE_STAGE_ROOT" 2>/dev/null || true
+    rm -rf -- "$LAB_BASELINE_STAGE_ROOT"
+    LAB_BASELINE_STAGE_ROOT=""
+  fi
+}
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
@@ -46,6 +60,29 @@ debug_ssh_key_validate "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256"
   || { echo "ERROR: invalid debug SSH key input" >&2; exit 1; }
 debug_ssh_key_require_debug_target "$SSH_AUTHORIZED_KEYS_FILE" "$BASE_IMAGE" "$TARGET_IMGREF" \
   || { echo "ERROR: debug SSH key cannot be bound to this install target" >&2; exit 1; }
+lab_baseline_input_count=0
+for lab_baseline_input in "$LAB_BASELINE_BOM_FILE" "$LAB_BASELINE_BOM_SHA256" \
+  "$LAB_BASELINE_SIGNATURE_FILE" "$LAB_BASELINE_SIGNATURE_SHA256"; do
+  [[ -z "$lab_baseline_input" ]] || lab_baseline_input_count=$((lab_baseline_input_count + 1))
+done
+case "$lab_baseline_input_count" in
+  0) ;;
+  4)
+    [[ "$BASE_IMAGE" == "$TARGET_IMGREF" ]] \
+      || { echo "ERROR: LAB baseline must be bound to the exact installed image digest" >&2; exit 1; }
+    LAB_BASELINE_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ni-lab-baseline-media.XXXXXX")"
+    chmod 0700 "$LAB_BASELINE_STAGE_ROOT"
+    trap cleanup_lab_baseline_stage EXIT
+    bash "$LAB_BASELINE_HELPER" stage-media \
+      "$LAB_BASELINE_BOM_FILE" "$LAB_BASELINE_BOM_SHA256" \
+      "$LAB_BASELINE_SIGNATURE_FILE" "$LAB_BASELINE_SIGNATURE_SHA256" \
+      "$LAB_BASELINE_STAGE_ROOT"
+    ;;
+  *)
+    echo "ERROR: LAB baseline requires BOM, signature and both exact SHA-256 values" >&2
+    exit 1
+    ;;
+esac
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -55,11 +92,11 @@ if sudo podman image exists "$BASE_IMAGE"; then
 else
   sudo podman pull "$BASE_IMAGE"
 fi
-if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" || -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
   sudo podman run --rm --network none --read-only \
     --entrypoint /usr/bin/grep "$BASE_IMAGE" \
     -qx 'PRETTY_NAME="Neural ICE CoreOS (debug)"' /usr/lib/os-release \
-    || { echo "ERROR: operator SSH key injection is restricted to a debug base image" >&2; exit 1; }
+    || { echo "ERROR: LAB-only ESP inputs require a debug base image" >&2; exit 1; }
 fi
 sudo podman build --platform linux/arm64 \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
@@ -79,7 +116,11 @@ RAW="$OUT/image/disk.raw"
 echo "==> post-process GRUB (dual-mode Live + Install)"
 LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
 MNT=/mnt/ni-postproc
-cleanup(){ sudo umount "$MNT" 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true; }
+cleanup(){
+  sudo umount "$MNT" 2>/dev/null || true
+  sudo losetup -d "$LOOP" 2>/dev/null || true
+  cleanup_lab_baseline_stage
+}
 trap cleanup EXIT
 
 # Boot partition = the one labelled "boot".
@@ -154,8 +195,17 @@ if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
   sudo bash "$REPO_ROOT/image/lib/debug-ssh-key.sh" install \
     "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" "$MNT"
 fi
+if [[ -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
+  sudo bash "$LAB_BASELINE_HELPER" stage-media \
+    "$LAB_BASELINE_STAGE_ROOT/ice-coreos/ota-lab-baseline.json" \
+    "$LAB_BASELINE_BOM_SHA256" \
+    "$LAB_BASELINE_STAGE_ROOT/ice-coreos/ota-lab-baseline.sig" \
+    "$LAB_BASELINE_SIGNATURE_SHA256" "$MNT"
+fi
 sync
-sudo umount "$MNT"; sudo losetup -d "$LOOP"; trap - EXIT
+sudo umount "$MNT"; sudo losetup -d "$LOOP"
+cleanup_lab_baseline_stage
+trap - EXIT
 
 if [[ -n "$OUT_NAME" ]]; then
   cp "$RAW" "${REPO_ROOT}/${OUT_NAME}.img"

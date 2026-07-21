@@ -39,6 +39,10 @@ line_of() {
   grep -nF -- "$needle" "$file" | head -1 | cut -d: -f1
 }
 
+sha256() {
+  sha256sum -- "$1" | awk '{print $1}'
+}
+
 # Integration ordering is security-sensitive: the snapshot gate must run before
 # the first destructive warning/wipe, and the durable copy must land only after
 # bootc exposes the target stateroot but before its SELinux relabel.
@@ -110,6 +114,55 @@ cmp -s "$esp/ice-coreos/ota-lab-baseline.sig" "$snapshot/ota-lab-baseline.sig" \
   || fail "receipt snapshot mode is not 0600"
 [[ "$(mode "$snapshot/ota-lab-baseline.sig")" == 600 ]] \
   || fail "signature snapshot mode is not 0600"
+
+# The media builder stages only a complete hash-approved pair. The resulting
+# fixed paths are write-once for that build, and intermediate files never
+# become accepted media paths after an input refusal.
+media_source="$TMP/media-source"
+install -d -m 0700 "$media_source"
+printf '{"schema":"fixture"}\n' >"$media_source/baseline.json"
+printf '\001media-signature\000\377' >"$media_source/baseline.sig"
+bom_sha256="$(sha256 "$media_source/baseline.json")"
+signature_sha256="$(sha256 "$media_source/baseline.sig")"
+wrong_bom_sha256="$(printf '0%.0s' {1..64})"
+[[ "$wrong_bom_sha256" != "$bom_sha256" ]] || wrong_bom_sha256="$(printf '1%.0s' {1..64})"
+media_root="$TMP/media-valid"
+install -d -m 0700 "$media_root"
+"$HELPER" stage-media \
+  "$media_source/baseline.json" "$bom_sha256" \
+  "$media_source/baseline.sig" "$signature_sha256" "$media_root"
+cmp -s "$media_source/baseline.json" "$media_root/ice-coreos/ota-lab-baseline.json" \
+  || fail "staged media receipt differs"
+cmp -s "$media_source/baseline.sig" "$media_root/ice-coreos/ota-lab-baseline.sig" \
+  || fail "staged media signature differs"
+[[ "$(mode "$media_root/ice-coreos")" == 700 ]] \
+  || fail "staged media namespace mode is not 0700"
+[[ "$(mode "$media_root/ice-coreos/ota-lab-baseline.json")" == 600 ]] \
+  || fail "staged media receipt mode is not 0600"
+[[ "$(mode "$media_root/ice-coreos/ota-lab-baseline.sig")" == 600 ]] \
+  || fail "staged media signature mode is not 0600"
+expect_status 1 "$HELPER" stage-media \
+  "$media_source/baseline.json" "$bom_sha256" \
+  "$media_source/baseline.sig" "$signature_sha256" "$media_root"
+
+media_root="$TMP/media-drift"
+install -d -m 0700 "$media_root"
+expect_status 1 "$HELPER" stage-media \
+  "$media_source/baseline.json" "$wrong_bom_sha256" \
+  "$media_source/baseline.sig" "$signature_sha256" "$media_root"
+[[ ! -e "$media_root/ice-coreos/ota-lab-baseline.json" \
+   && ! -e "$media_root/ice-coreos/ota-lab-baseline.sig" ]] \
+  || fail "hash drift published a fixed media path"
+
+ln -s baseline.json "$media_source/baseline-link.json"
+media_root="$TMP/media-symlink"
+install -d -m 0700 "$media_root"
+expect_status 1 "$HELPER" stage-media \
+  "$media_source/baseline-link.json" "$bom_sha256" \
+  "$media_source/baseline.sig" "$signature_sha256" "$media_root"
+[[ ! -e "$media_root/ice-coreos/ota-lab-baseline.json" \
+   && ! -e "$media_root/ice-coreos/ota-lab-baseline.sig" ]] \
+  || fail "symlink input published a fixed media path"
 
 target_var="$TMP/target-var"
 install -d "$target_var"
