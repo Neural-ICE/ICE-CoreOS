@@ -8,10 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::state::FileStateStore;
 use crate::InternalError;
 
 pub(crate) const STATE_NV_INDEX: u32 = 0x0150_0002;
-const LEGACY_NV_INDEX: u32 = 0x0150_0001;
+pub(crate) const LEGACY_NV_INDEX: u32 = 0x0150_0001;
 const STATE_NV_ATTRIBUTES: &str =
     "authread|authwrite|no_da|nt=0x1|ownerread|platformcreate|policydelete";
 const STATE_NV_DELETE_AUTH_POLICY: &str =
@@ -45,24 +46,202 @@ fn capability_ready_for(
                 .into(),
         ));
     }
-    inspect_index(STATE_NV_INDEX).map(|_| true)
+    let state_dir = config.state_dir.ok_or_else(|| {
+        InternalError("atomic-state command set is compiled but state_dir is not configured".into())
+    })?;
+    let tpm = CommandTpm {
+        index: STATE_NV_INDEX,
+        scratch: FileStateStore {
+            path: state_dir.join("state-v1-capability.json"),
+        },
+    };
+    continuity_ready(&tpm)
 }
 
-fn inspect_index(index: u32) -> Result<bool, InternalError> {
-    let output = Command::new(tool("tpm2_nvreadpublic"))
-        .arg(format!("0x{index:08x}"))
-        .output()
-        .map_err(|error| InternalError(format!("cannot execute tpm2_nvreadpublic: {error}")))?;
-    if !output.status.success() {
-        return Err(InternalError(format!(
-            "tpm2_nvreadpublic failed for 0x{index:08x}"
-        )));
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TpmClockState {
+    pub(crate) clock: u64,
+    pub(crate) reset_count: u32,
+    pub(crate) restart_count: u32,
+    pub(crate) safe: bool,
+}
+
+pub(crate) trait NvAnchor {
+    fn attest(&self) -> Result<(), InternalError>;
+    fn read(&self) -> Result<[u8; 32], InternalError>;
+    fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError>;
+    fn clock(&self) -> Result<TpmClockState, InternalError>;
+}
+
+pub(crate) struct CommandTpm {
+    pub(crate) index: u32,
+    pub(crate) scratch: FileStateStore,
+}
+
+impl NvAnchor for CommandTpm {
+    fn attest(&self) -> Result<(), InternalError> {
+        if self.inspect()? {
+            Ok(())
+        } else {
+            Err(InternalError(format!(
+                "TPM NV 0x{:08x} is defined but has no committed state anchor",
+                self.index
+            )))
+        }
     }
-    inspect_state_index(
-        &String::from_utf8(output.stdout)
-            .map_err(|_| InternalError("tpm2_nvreadpublic returned non-UTF-8 output".into()))?,
-        index,
-    )
+
+    fn read(&self) -> Result<[u8; 32], InternalError> {
+        let output = self.scratch.secure_temp_bytes("nv-read", &[])?;
+        let status = Command::new(tool("tpm2_nvread"))
+            .args([
+                format!("0x{:08x}", self.index),
+                "-C".into(),
+                format!("0x{:08x}", self.index),
+                "-s".into(),
+                "32".into(),
+                "-o".into(),
+            ])
+            .arg(output.path())
+            .status()
+            .map_err(|error| InternalError(format!("cannot execute tpm2_nvread: {error}")))?;
+        if !status.success() {
+            return Err(InternalError(format!(
+                "tpm2_nvread failed for initialized 0x{:08x}",
+                self.index
+            )));
+        }
+        output.read()?.try_into().map_err(|_| {
+            InternalError(format!(
+                "TPM NV 0x{:08x} did not return exactly 32 bytes",
+                self.index
+            ))
+        })
+    }
+
+    fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+        let output = self.scratch.secure_temp_bytes("legacy-nv-read", &[])?;
+        let status = Command::new(tool("tpm2_nvread"))
+            .args([
+                format!("0x{LEGACY_NV_INDEX:08x}"),
+                "-C".into(),
+                format!("0x{LEGACY_NV_INDEX:08x}"),
+                "-s".into(),
+                "8".into(),
+                "-o".into(),
+            ])
+            .arg(output.path())
+            .status()
+            .map_err(|error| InternalError(format!("cannot read legacy TPM floor: {error}")))?;
+        if !status.success() {
+            let handles = Command::new(tool("tpm2_getcap"))
+                .arg("handles-nv-index")
+                .output()
+                .map_err(|error| {
+                    InternalError(format!("cannot enumerate TPM NV handles: {error}"))
+                })?;
+            if !handles.status.success() {
+                return Err(InternalError("cannot enumerate TPM NV handles".into()));
+            }
+            let handles = String::from_utf8(handles.stdout)
+                .map_err(|_| InternalError("TPM NV handle list is not UTF-8".into()))?;
+            if contains_nv_handle(&handles, LEGACY_NV_INDEX) {
+                return Err(InternalError(
+                    "legacy TPM floor exists but cannot be read exactly".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let bytes: [u8; 8] = output
+            .read()?
+            .try_into()
+            .map_err(|_| InternalError("legacy TPM floor is not exactly 8 bytes".into()))?;
+        Ok(Some(u64::from_be_bytes(bytes)))
+    }
+
+    fn clock(&self) -> Result<TpmClockState, InternalError> {
+        let output = Command::new(tool("tpm2_readclock"))
+            .output()
+            .map_err(|error| InternalError(format!("cannot execute tpm2_readclock: {error}")))?;
+        if !output.status.success() {
+            return Err(InternalError("tpm2_readclock failed".into()));
+        }
+        parse_clock(
+            &String::from_utf8(output.stdout)
+                .map_err(|_| InternalError("tpm2_readclock returned non-UTF-8 output".into()))?,
+        )
+    }
+}
+
+fn continuity_ready(tpm: &impl NvAnchor) -> Result<bool, InternalError> {
+    tpm.attest()?;
+    tpm.read()?;
+    if tpm.legacy_bundle_floor()?.is_none() {
+        return Err(InternalError(
+            "legacy TPM bundle floor is absent while atomic-state is compiled".into(),
+        ));
+    }
+    if !tpm.clock()?.safe {
+        return Err(InternalError("TPM clock is not safe".into()));
+    }
+    Ok(true)
+}
+
+impl CommandTpm {
+    fn inspect(&self) -> Result<bool, InternalError> {
+        let output = Command::new(tool("tpm2_nvreadpublic"))
+            .arg(format!("0x{:08x}", self.index))
+            .output()
+            .map_err(|error| InternalError(format!("cannot execute tpm2_nvreadpublic: {error}")))?;
+        if !output.status.success() {
+            return Err(InternalError(format!(
+                "tpm2_nvreadpublic failed for 0x{:08x}",
+                self.index
+            )));
+        }
+        inspect_state_index(
+            &String::from_utf8(output.stdout)
+                .map_err(|_| InternalError("tpm2_nvreadpublic returned non-UTF-8 output".into()))?,
+            self.index,
+        )
+    }
+}
+
+fn parse_clock(output: &str) -> Result<TpmClockState, InternalError> {
+    let field = |name: &str| -> Result<&str, InternalError> {
+        let mut values = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(name))
+            .map(str::trim);
+        let value = values
+            .next()
+            .ok_or_else(|| InternalError(format!("tpm2_readclock lacks {name}")))?;
+        if values.next().is_some() {
+            return Err(InternalError(format!(
+                "tpm2_readclock contains duplicate {name}"
+            )));
+        }
+        Ok(value)
+    };
+    let number = |name: &str| -> Result<u64, InternalError> {
+        field(name)?
+            .parse()
+            .map_err(|_| InternalError(format!("tpm2_readclock has invalid {name}")))
+    };
+    let safe = match field("safe:")? {
+        "yes" | "true" | "1" => true,
+        "no" | "false" | "0" => false,
+        _ => return Err(InternalError("tpm2_readclock has invalid safe:".into())),
+    };
+    Ok(TpmClockState {
+        clock: number("clock:")?,
+        reset_count: number("reset_count:")?
+            .try_into()
+            .map_err(|_| InternalError("TPM reset_count overflow".into()))?,
+        restart_count: number("restart_count:")?
+            .try_into()
+            .map_err(|_| InternalError("TPM restart_count overflow".into()))?,
+        safe,
+    })
 }
 
 fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> {
@@ -219,6 +398,19 @@ fn parse_index_header(line: &str) -> Option<u32> {
     u32::from_str_radix(hexadecimal, 16).ok()
 }
 
+fn contains_nv_handle(output: &str, expected: u32) -> bool {
+    output
+        .split_ascii_whitespace()
+        .map(|value| value.trim_start_matches('-').trim())
+        .filter_map(|value| {
+            value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+        })
+        .filter_map(|value| u32::from_str_radix(value, 16).ok())
+        .any(|value| value == expected)
+}
+
 fn tool(name: &str) -> PathBuf {
     #[cfg(feature = "test-path-overrides")]
     if let Some(path) = std::env::var_os(format!("NI_OTA_{}", name.to_ascii_uppercase())) {
@@ -269,6 +461,41 @@ mod tests {
             runner::sha256_bytes(&command_code).unwrap(),
             STATE_NV_DELETE_AUTH_POLICY
         );
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestAnchor {
+        initialized: bool,
+        readable: bool,
+        legacy_floor: Option<u64>,
+        safe_clock: bool,
+    }
+
+    impl NvAnchor for TestAnchor {
+        fn attest(&self) -> Result<(), InternalError> {
+            self.initialized
+                .then_some(())
+                .ok_or_else(|| InternalError("uninitialized state anchor".into()))
+        }
+
+        fn read(&self) -> Result<[u8; 32], InternalError> {
+            self.readable
+                .then_some([0x42; 32])
+                .ok_or_else(|| InternalError("unreadable state anchor".into()))
+        }
+
+        fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+            Ok(self.legacy_floor)
+        }
+
+        fn clock(&self) -> Result<TpmClockState, InternalError> {
+            Ok(TpmClockState {
+                clock: 42,
+                reset_count: 3,
+                restart_count: 4,
+                safe: self.safe_clock,
+            })
+        }
     }
 
     #[test]
@@ -343,5 +570,70 @@ mod tests {
     fn compiled_capability_fails_closed_when_runtime_attestation_cannot_start() {
         let error = capability_ready_for(Path::new("missing.conf"), true).unwrap_err();
         assert!(error.0.contains("unreadable config"));
+    }
+
+    #[test]
+    fn parses_only_safe_tpm_clock() {
+        let value =
+            parse_clock("clock: 42\nreset_count: 3\nrestart_count: 4\nsafe: yes\n").unwrap();
+        assert_eq!(
+            value,
+            TpmClockState {
+                clock: 42,
+                reset_count: 3,
+                restart_count: 4,
+                safe: true
+            }
+        );
+        assert!(
+            !parse_clock("clock: 42\nreset_count: 3\nrestart_count: 4\nsafe: no\n")
+                .unwrap()
+                .safe
+        );
+        assert!(parse_clock("clock: nope\nreset_count: 3\nrestart_count: 4\nsafe: yes\n").is_err());
+        assert!(
+            parse_clock("clock: 42\nclock: 43\nreset_count: 3\nrestart_count: 4\nsafe: yes\n")
+                .is_err()
+        );
+        assert!(parse_clock("clock: 42\nreset_count: 3\nrestart_count: 4\nsafe: maybe\n").is_err());
+    }
+
+    #[test]
+    fn legacy_handle_detection_accepts_tpm_tools_non_padded_hex_only() {
+        assert!(contains_nv_handle("- 0x1500001\n", LEGACY_NV_INDEX));
+        assert!(contains_nv_handle("0X01500001", LEGACY_NV_INDEX));
+        assert!(!contains_nv_handle("0x015000010", LEGACY_NV_INDEX));
+        assert!(!contains_nv_handle("noise1500001", LEGACY_NV_INDEX));
+    }
+
+    #[test]
+    fn continuity_requires_initialized_anchor_legacy_floor_and_safe_clock() {
+        let ready = TestAnchor {
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(7),
+            safe_clock: true,
+        };
+        assert!(continuity_ready(&ready).unwrap());
+        assert!(continuity_ready(&TestAnchor {
+            initialized: false,
+            ..ready
+        })
+        .is_err());
+        assert!(continuity_ready(&TestAnchor {
+            readable: false,
+            ..ready
+        })
+        .is_err());
+        assert!(continuity_ready(&TestAnchor {
+            legacy_floor: None,
+            ..ready
+        })
+        .is_err());
+        assert!(continuity_ready(&TestAnchor {
+            safe_clock: false,
+            ..ready
+        })
+        .is_err());
     }
 }
