@@ -175,6 +175,39 @@ both that history and the image-baked minimum. Root-anchor rotation itself is
 outside this gate and requires a separately approved image/trust-anchor
 transition; accepted snapshot chains keep the immutable root unchanged.
 
+`verify-delegated-beta` composes that same root/chain gate with independently
+domain-separated `release-beta` signatures for the closed beta release and its
+publication receipt. It requires exact snapshot, target, train, BOM,
+attestation, channel-record, compatibility range, bundle sequence,
+release-envelope hash and resolved OCI manifest-digest bindings. The release
+and receipt issuance times must lie inside both the snapshot and delegated-key
+validity windows; the receipt must have been observed during the release
+validity window, and both authorities must also be current and explicitly
+scoped to this immutable target and beta artifact. Tags remain
+non-authoritative; this command returns the signed resolved manifest digest and
+does not move a channel or persist state.
+
+The device compatibility range is compared with the signed release range.
+Unknown or disjoint compatibility refuses when `enforce=1`; during an explicit
+shadow rollout (`enforce=0`) it emits a warning while all authority, signature,
+digest, ring and target failures continue to refuse. Owner authorization is
+recorded by the delegation-v2 and simplified-KMS decisions above plus `GO
+bundles OCI adressés par digest v1 — bundle_digest dans le record signé, pulls
+appliance exclusivement par digest`; no approval in this slice moves a channel.
+
+Receipt recovery also preserves service. An expired receipt, revoked signing
+key, or unavailable/invalid delegation snapshot denies only the candidate and
+leaves the running deployment untouched. For expiry, automation may issue a
+fresh authorization and receipt only for the same immutable evidence or a new
+train under the current delegated key. For compromise, the offline root first
+publishes the next hash-chained snapshot with a tombstone and replacement key;
+the replacement then reissues both beta artifacts. It never reuses the revoked
+identity or lowers sequence state. A one-version rollback uses the already
+retained, previously accepted bootc deployment and does not reinterpret an
+expired receipt as new authorization. This command persists no state, so the
+prior verifier/state format remains usable and rollback cannot erase accepted
+delegation history.
+
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An
 existing directory must already be a real mode-`0700` directory; `verify`

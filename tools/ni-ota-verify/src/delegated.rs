@@ -10,7 +10,10 @@ use crate::config::{immutable_minimum_delegation_seq, Config};
 use crate::state::{ensure_secure_state_directory, FileStateStore, SecureTempFile};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
+mod beta;
 pub(crate) mod contract;
+
+pub(crate) use beta::run as run_beta;
 
 use contract::{
     canonical_hash, encode_base64, parse_canonical, safe_uint, sha256, validate_chain,
@@ -99,8 +102,13 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         return refusal(reason);
     }
     let signature_bytes = signature.read()?;
-    if let Err(reason) = verify_signature(&root_bytes, &snapshot_bytes, &signature_bytes, &scratch)?
-    {
+    if let Err(reason) = verify_signature(
+        &root_bytes,
+        SNAPSHOT_DOMAIN,
+        &snapshot_bytes,
+        &signature_bytes,
+        &scratch,
+    )? {
         return refusal(reason);
     }
     println!(
@@ -317,7 +325,8 @@ fn freeze_root(
 }
 
 fn verify_signature(
-    root: &[u8],
+    public_key: &[u8],
+    domain: &[u8],
     payload: &[u8],
     der: &[u8],
     store: &FileStateStore,
@@ -325,12 +334,12 @@ fn verify_signature(
     if let Err(reason) = validate_der_signature(der) {
         return Ok(Err(reason));
     }
-    let mut message = SNAPSHOT_DOMAIN.to_vec();
+    let mut message = domain.to_vec();
     let Some(payload) = payload.strip_suffix(b"\n") else {
         return Ok(Err("canonical payload lacks LF".into()));
     };
     message.extend_from_slice(payload);
-    let key = store.secure_temp_bytes("delegated-key", root)?;
+    let key = store.secure_temp_bytes("delegated-key", public_key)?;
     let message = store.secure_temp_bytes("delegated-message", &message)?;
     let encoded = encode_base64(der);
     let signature = store.secure_temp_bytes("delegated-signature-b64", encoded.as_bytes())?;
