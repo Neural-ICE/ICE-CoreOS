@@ -40,7 +40,9 @@ done
 if grep -qx 'MAYCAQECAQE=' "$sig" 2>/dev/null; then
   message_hex="$(od -An -tx1 -v "$blob" | tr -d ' \n')" || exit 2
   case "$message_hex" in
-    6e657572616c2d6963653a6f74613a64656c65676174696f6e2d736e617073686f743a763100*) ;;
+    6e657572616c2d6963653a6f74613a64656c65676174696f6e2d736e617073686f743a763100*|\
+    6e657572616c2d6963653a6f74613a72656c656173652d617574686f72697a6174696f6e3a763100*|\
+    6e657572616c2d6963653a6f74613a626574612d7075626c69636174696f6e2d726563656970743a763100*) ;;
     *) echo "stub: missing delegated signature domain" >&2; exit 1 ;;
   esac
 elif ! grep -q '^GOOD' "$sig" 2>/dev/null; then
@@ -1716,4 +1718,75 @@ fn capabilities_are_canonical_bounded_and_argument_free() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
+    let fx = Fixture::new("delegated-beta-receipt");
+    let snapshot = fx.path("delegation-snapshot.json");
+    let release = fx.path("release-authorization.json");
+    let receipt = fx.path("beta-publication-receipt.json");
+    fs::write(
+        &snapshot,
+        include_bytes!("fixtures/delegated-v1/delegation-snapshot.json"),
+    )
+    .unwrap();
+    fs::write(
+        &release,
+        include_bytes!("fixtures/delegated-v1/release-authorization.json"),
+    )
+    .unwrap();
+    fs::write(
+        &receipt,
+        include_bytes!("fixtures/delegated-v1/beta-publication-receipt.json"),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    let encoded = value["root_key"]["public_key"]["spki_der_base64"]
+        .as_str()
+        .unwrap();
+    fs::write(
+        fx.path("ota-root.pub"),
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &encoded[..64],
+            &encoded[64..]
+        ),
+    )
+    .unwrap();
+    let signature = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+    for name in ["snapshot.sig", "release.sig", "receipt.sig"] {
+        fs::write(fx.path(name), signature).unwrap();
+    }
+    let cfg = fx.write_config(1, "");
+    let (code, verdict, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_COSIGN", fx.path("cosign-stub.sh"))
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env(
+            "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+            fx.path("min-delegation-seq"),
+        )
+        .arg("verify-delegated-beta")
+        .args(["--snapshot".as_ref(), snapshot.as_os_str()])
+        .args([
+            "--snapshot-sig".as_ref(),
+            fx.path("snapshot.sig").as_os_str(),
+        ])
+        .args(["--release".as_ref(), release.as_os_str()])
+        .args(["--release-sig".as_ref(), fx.path("release.sig").as_os_str()])
+        .args(["--receipt".as_ref(), receipt.as_os_str()])
+        .args(["--receipt-sig".as_ref(), fx.path("receipt.sig").as_os_str()])
+        .args(["--trusted-now", "2026-07-22T01:00:00Z"])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(verdict["ring"], "beta");
+    assert_eq!(verdict["bundle_seq"], 19);
+    assert_eq!(
+        verdict["receipt_sha256"],
+        "4fff4b85728ffe3b12ecdaf98a0f6a332c93da0dca6855336638d3b1dfc91850"
+    );
+    assert_eq!(
+        verdict["manifest_digest"],
+        "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    );
 }

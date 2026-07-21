@@ -468,6 +468,17 @@ fn validate_public_key(key: &PublicKey) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn public_key_pem(key: &PublicKey) -> Result<Vec<u8>, String> {
+    validate_public_key(key)?;
+    let mut pem = b"-----BEGIN PUBLIC KEY-----\n".to_vec();
+    for chunk in key.spki_der_base64.as_bytes().chunks(64) {
+        pem.extend_from_slice(chunk);
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(b"-----END PUBLIC KEY-----\n");
+    Ok(pem)
+}
+
 fn decode_pem(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "root public key is not UTF-8 PEM")?;
     let body = text
@@ -552,6 +563,11 @@ pub(crate) fn validate_der_signature(bytes: &[u8]) -> Result<(), String> {
         return Err("signature is not minimal ASN.1 DER".into());
     }
     let mut offset = 2;
+    const ORDER: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
     let mut s = &[][..];
     for index in 0..2 {
         if offset + 2 > bytes.len() || bytes[offset] != 0x02 {
@@ -569,6 +585,14 @@ pub(crate) fn validate_der_signature(bytes: &[u8]) -> Result<(), String> {
             || (len > 1 && raw[0] == 0 && raw[1] & 0x80 == 0)
         {
             return Err("signature integer is non-minimal".into());
+        }
+        let significant = if raw.first() == Some(&0) {
+            &raw[1..]
+        } else {
+            raw
+        };
+        if significant.len() > 32 || (significant.len() == 32 && significant >= ORDER.as_slice()) {
+            return Err("signature integer is outside P-256 order".into());
         }
         if index == 1 {
             s = raw;
@@ -589,7 +613,7 @@ pub(crate) fn validate_der_signature(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn signature_profile(algorithm: &str, encoding: &str) -> bool {
+pub(crate) fn signature_profile(algorithm: &str, encoding: &str) -> bool {
     algorithm == "ecdsa-p256-sha256" && encoding == "asn1-der"
 }
 pub(crate) fn sha256(v: &str) -> bool {
@@ -597,14 +621,14 @@ pub(crate) fn sha256(v: &str) -> bool {
         && v.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn ident(v: &str) -> bool {
+pub(crate) fn ident(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 127
         && v.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
         && v.as_bytes()[0].is_ascii_alphanumeric()
 }
-fn target(v: &str) -> bool {
+pub(crate) fn target(v: &str) -> bool {
     matches!(
         v,
         "amd-rocm-x86_64" | "nvidia-cuda-x86_64" | "nvidia-gb10-arm64"
@@ -625,7 +649,7 @@ fn distinct_lineage(predecessor: &Option<String>, successor: &Option<String>) ->
 pub(crate) fn safe_uint(value: u64) -> bool {
     (1..=9_007_199_254_740_991).contains(&value)
 }
-fn timestamp(v: &str) -> bool {
+pub(crate) fn timestamp(v: &str) -> bool {
     let b = v.as_bytes();
     if b.len() != 20
         || b[4] != b'-'
@@ -894,5 +918,13 @@ mod tests {
             0x7e, 0x31, 0x92, 0xa9,
         ]);
         assert!(validate_der_signature(&high_s).is_err());
+        let mut high_r = vec![0x30, 0x26, 0x02, 0x21, 0x00];
+        high_r.extend_from_slice(&[
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ]);
+        high_r.extend_from_slice(&[0x02, 0x01, 0x01]);
+        assert!(validate_der_signature(&high_r).is_err());
     }
 }

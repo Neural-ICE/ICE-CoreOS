@@ -94,6 +94,11 @@ ni-ota-verify verify-delegation-snapshot \
   --trusted-now <YYYY-MM-DDTHH:MM:SSZ> \
   [--accepted-snapshot <path> --accepted-delegation-seq <n> \
    --accepted-delegation-sha256 <64hex>] [--config …]
+ni-ota-verify verify-delegated-beta \
+  --snapshot <path> --snapshot-sig <binary-DER-path> \
+  --release <path> --release-sig <binary-DER-path> \
+  --receipt <path> --receipt-sig <binary-DER-path> \
+  --trusted-now <YYYY-MM-DDTHH:MM:SSZ> [accepted snapshot flags] [--config …]
 ni-ota-verify capabilities
 ```
 
@@ -134,6 +139,18 @@ canonical hash, preserves tombstones, and prevents retained keys from widening
 scope or validity. Multi-snapshot offline catch-up and atomic TPM-backed
 delegation-state persistence are deliberately subsequent slices; this command
 does not authorize a release, publish a channel, or mutate accepted state.
+
+`verify-delegated-beta` composes that same root/chain gate with independently
+domain-separated `release-beta` signatures for the closed beta release and its
+publication receipt. It requires exact snapshot, target, train, BOM,
+attestation, channel-record, compatibility range, bundle sequence,
+release-envelope hash and resolved OCI manifest-digest bindings. The release
+and receipt issuance times must lie inside both the snapshot and delegated-key
+validity windows; the receipt must have been observed during the release
+validity window, and both authorities must also be current and explicitly
+scoped to this immutable target and beta artifact. Tags remain
+non-authoritative; this command returns the signed resolved manifest digest and
+does not move a channel or persist state.
 
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An

@@ -9,7 +9,10 @@ use crate::config::{immutable_minimum_delegation_seq, Config};
 use crate::state::{ensure_secure_state_directory, FileStateStore, SecureTempFile};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
+mod beta;
 pub(crate) mod contract;
+
+pub(crate) use beta::run as run_beta;
 
 use contract::{
     canonical_hash, encode_base64, parse_canonical, safe_uint, sha256, validate_chain,
@@ -80,6 +83,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         verify_root_binding(&candidate, &root_bytes)?;
         verify_signature(
             &root_bytes,
+            SNAPSHOT_DOMAIN,
             &snapshot_bytes,
             &signature.read().map_err(|e| e.0)?,
             &scratch,
@@ -183,20 +187,21 @@ fn freeze(
 }
 
 fn verify_signature(
-    root: &[u8],
+    public_key: &[u8],
+    domain: &[u8],
     payload: &[u8],
     der: &[u8],
     store: &FileStateStore,
 ) -> Result<(), String> {
     validate_der_signature(der)?;
-    let mut message = SNAPSHOT_DOMAIN.to_vec();
+    let mut message = domain.to_vec();
     message.extend_from_slice(
         payload
             .strip_suffix(b"\n")
             .ok_or("canonical payload lacks LF")?,
     );
     let key = store
-        .secure_temp_bytes("delegated-key", root)
+        .secure_temp_bytes("delegated-key", public_key)
         .map_err(|e| e.0)?;
     let message = store
         .secure_temp_bytes("delegated-message", &message)
