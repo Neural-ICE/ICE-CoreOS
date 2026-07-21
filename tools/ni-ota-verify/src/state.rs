@@ -882,12 +882,22 @@ fn sync_directory(dir: &Path) -> Result<(), InternalError> {
         .map_err(|error| InternalError(format!("cannot sync state dir {}: {error}", dir.display())))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_DIRECTORY: i32 = 0o200000;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_DIRECTORY: i32 = 0o40000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(target_os = "linux")]
 const O_CLOEXEC: i32 = 0o2000000;
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+compile_error!("ni-ota-verify supports only linux/amd64 and linux/arm64");
 
 #[cfg(target_os = "macos")]
 const O_DIRECTORY: i32 = 0x0010_0000;
@@ -909,6 +919,7 @@ fn openat_directory(parent: &File, name: &OsStr) -> std::io::Result<File> {
             parent.as_raw_fd(),
             name.as_ptr(),
             O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            0 as std::os::raw::c_uint,
         )
     };
     if fd < 0 {
@@ -1098,6 +1109,28 @@ mod tests {
     fn directory_chain_rejects_parent_traversal() {
         let error = open_directory_chain(Path::new("../state")).unwrap_err();
         assert!(error.0.contains("must not contain '..'"));
+    }
+
+    #[test]
+    fn directory_chain_rejects_intermediate_symlink() {
+        let state = store("intermediate-symlink");
+        let root = state.path.parent().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+
+        let error = open_directory_chain(&root.join("link/child")).unwrap_err();
+        assert!(error.0.contains("without following symlinks"));
+    }
+
+    #[test]
+    fn directory_chain_rejects_non_directory_component() {
+        let state = store("non-directory-component");
+        let root = state.path.parent().unwrap();
+        std::fs::write(root.join("file"), b"not a directory").unwrap();
+
+        let error = open_directory_chain(&root.join("file/child")).unwrap_err();
+        assert!(error.0.contains("without following symlinks"));
     }
 
     #[test]
