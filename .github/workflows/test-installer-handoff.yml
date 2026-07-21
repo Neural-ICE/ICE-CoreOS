@@ -1,15 +1,6 @@
 name: test-installer-handoff
 
 on:
-  pull_request:
-    paths:
-      - "ota/neural-ice-autoinstall.sh"
-      - "ota/neural-ice-lab-baseline-handoff.sh"
-      - "ota/test-neural-ice-lab-baseline-handoff.sh"
-      - "image/Containerfile.installer"
-      - "image/build-preloaded.sh"
-      - "docs/PRELOADED-EDITION.md"
-      - ".github/workflows/test-installer-handoff.yml"
   push:
     branches: [main]
     paths:
@@ -20,19 +11,20 @@ on:
       - "image/build-preloaded.sh"
       - "docs/PRELOADED-EDITION.md"
       - ".github/workflows/test-installer-handoff.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    # ICE-CoreOS is public: never execute untrusted fork code on an organization
-    # self-hosted runner.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - name: Validate installer shell
         run: |
           bash -n ota/neural-ice-autoinstall.sh \
@@ -49,12 +41,14 @@ jobs:
     # The X64 runner intentionally has neither sudo nor user namespaces. The
     # Spark build runner already exposes passwordless sudo to its bounded CI
     # jobs, so use it only for the positive root-owned persistence contract.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, ARM64, spark]
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - name: Test durable root-owned handoff
         run: sudo -n ./ota/test-neural-ice-lab-baseline-handoff.sh
