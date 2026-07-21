@@ -1177,7 +1177,7 @@ mod tests {
         successor.valid_from = generation_three.valid_from.clone();
         let mut der = P256_SPKI_PREFIX.to_vec();
         der.extend_from_slice(&hex_bytes(
-            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f4",
+            "20de84e73ccd3762d01401885c030da6e90b0e6f6eefcfd694174e01e9b8f20f2ef33b4bfe07f3f71856126be5a31c003d0825c7bc129195f6965e0afa6ae0b0",
         ));
         successor.public_key.spki_der_base64 = encode_base64(&der);
         successor.public_key.spki_sha256 = hash_bytes(&der).unwrap();
