@@ -304,17 +304,22 @@ independently authenticated envelope: a compromised release-beta key cannot
 fabricate those proof identities. Mixed image-ci authorities, an absent
 first-party row, or a missing/invalid detached signature fails closed.
 
-The command is verification-only. A pass prints the complete facts needed by
-the future bootstrap transaction, but does not write `applied.json`, accept a
-delegation snapshot or establish trusted time. Initial bootstrap remains
-blocked until the separately reviewed atomic-state implementation persists
-three records together: accepted authority (complete canonical snapshot +
-sequence + hash), applied bundle (sequence + exact BOM hash), and trusted-time
-continuity for new updates. A crash may never expose applied state without its
-authority and time anchors; a one-version rollback must read the prior applied
-record without discarding either new anchor. Until that implementation and its
-media gates land, callers must treat this verdict as diagnostics, not
-installation authorization.
+The delegated beta/USB commands remain verification-only and are composed with
+the atomic-state v2 commands. The controller first calls
+`prepare-trusted-time-v2` with the exact root-signed snapshot and signed
+release. It sends the returned canonical challenge to the licensing service,
+then supplies the short-lived signed assertion to `guard-state-v2` before any
+apply. After apply and health pass it calls `commit-state-v2` with the same
+immutable proof files. A different/replayed challenge, changed TPM continuity,
+or changed release bytes refuses.
+
+`commit-state-v2` persists accepted authority (complete snapshot, signature,
+sequence and hash), applied bundle (sequence and exact BOM hash), and trusted
+time/TPM continuity as one fsynced generation before extending the state NV
+index. Only complete TPM readback consumes the nonce and reports enforcement
+ready. Exact crash retry is idempotent; rollback can boot N-1 but never lowers
+the retained floors. The verifier performs no network access and none of these
+commands resolves or changes a release channel.
 
 The installer assembly pipeline has a separate final-image boundary: after all
 payload copies complete, it must mount the final raw image read-only and compare
