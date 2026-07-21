@@ -117,28 +117,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let Some(root_path) = config.root_pubkey.as_deref() else {
         return refusal("no root_pubkey configured in ota.conf".into());
     };
-    match std::fs::metadata(root_path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
-        Ok(_) => {
-            return refusal(format!(
-                "OTA root pubkey missing or empty: {}",
-                root_path.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return refusal(format!(
-                "OTA root pubkey missing or empty: {}",
-                root_path.display()
-            ))
-        }
-        Err(error) => {
-            return Err(InternalError(format!(
-                "cannot inspect OTA root pubkey {}: {error}",
-                root_path.display()
-            )))
-        }
-    }
-    let root = freeze(&scratch, root_path, "usb-root-public-key")?;
+    let root = match super::super::freeze_root(&scratch, root_path, "usb-root-public-key")? {
+        Ok(root) => root,
+        Err(reason) => return refusal(reason),
+    };
     let now = required("trusted-now")?;
     let context = super::super::CandidateContext {
         now,
