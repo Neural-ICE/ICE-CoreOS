@@ -472,7 +472,8 @@ pub(crate) fn validate_chain(
                     .as_ref()
                     .is_some_and(|old| next.successor_key_id.as_ref() != Some(old))
                 || (key.rotation_overlap.mode == "bounded"
-                    && next.rotation_overlap != key.rotation_overlap)
+                    && next.rotation_overlap != key.rotation_overlap
+                    && !advances_overlap_after_peer_revocation(key, next, new))
             {
                 return Err("retained delegation widened or changed identity".into());
             }
@@ -493,6 +494,30 @@ pub(crate) fn validate_chain(
         }
     }
     Ok(())
+}
+
+fn advances_overlap_after_peer_revocation(
+    old: &DelegatedKey,
+    next: &DelegatedKey,
+    snapshot: &Snapshot,
+) -> bool {
+    let (Some(old_peer), Some(next_peer)) = (
+        old.rotation_overlap.with_key_id.as_deref(),
+        next.rotation_overlap.with_key_id.as_deref(),
+    ) else {
+        return false;
+    };
+    old_peer != next_peer
+        && next.rotation_overlap.mode == "bounded"
+        && snapshot.keys.iter().any(|peer| peer.key_id == next_peer)
+        && snapshot.tombstones.iter().any(|peer| {
+            peer.key_id == old_peer
+                && peer.role == old.role
+                && ((old.predecessor_key_id.as_deref() == Some(old_peer)
+                    && peer.successor_key_id.as_deref() == Some(old.key_id.as_str()))
+                    || (old.successor_key_id.as_deref() == Some(old_peer)
+                        && peer.predecessor_key_id.as_deref() == Some(old.key_id.as_str())))
+        })
 }
 
 pub(crate) fn canonical_hash(canonical: &[u8]) -> Result<String, ContractError> {
@@ -994,7 +1019,7 @@ mod tests {
         validate_snapshot(&new).unwrap();
         validate_chain(&old, &new, &old_hash).unwrap();
 
-        let mut cleared = new;
+        let mut cleared = new.clone();
         cleared.keys[1].predecessor_key_id = None;
         cleared.keys[1].rotation_overlap = RotationOverlap {
             mode: "none".into(),
@@ -1004,6 +1029,41 @@ mod tests {
         };
         validate_snapshot(&cleared).unwrap();
         assert!(validate_chain(&old, &cleared, &old_hash).is_err());
+
+        let generation_two_bytes = canonical(&serde_json::to_value(&new).unwrap());
+        let generation_two_hash = canonical_hash(&generation_two_bytes).unwrap();
+        let mut generation_three = new.clone();
+        generation_three.delegation_seq = 3;
+        generation_three.previous_snapshot_sha256 = Some(generation_two_hash.clone());
+        generation_three.issued_at = "2026-09-01T00:45:00Z".into();
+        generation_three.valid_from = "2026-09-01T01:00:00Z".into();
+        let mut successor = generation_three.keys[1].clone();
+        successor.key_id = "release-beta-v3".into();
+        successor.predecessor_key_id = Some("release-beta-v2".into());
+        successor.successor_key_id = None;
+        let mut der = P256_SPKI_PREFIX.to_vec();
+        der.extend_from_slice(&hex_bytes(
+            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        ));
+        successor.public_key.spki_der_base64 = encode_base64(&der);
+        successor.public_key.spki_sha256 = hash_bytes(&der).unwrap();
+        successor.rotation_overlap.with_key_id = Some("release-beta-v2".into());
+        generation_three.keys[1].successor_key_id = Some(successor.key_id.clone());
+        generation_three.keys[1].rotation_overlap.with_key_id = Some(successor.key_id.clone());
+        generation_three.keys.push(successor);
+        generation_three
+            .keys
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        validate_snapshot(&generation_three).unwrap();
+        validate_chain(&new, &generation_three, &generation_two_hash).unwrap();
+    }
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
     }
     #[test]
     fn timestamp_rejects_impossible_dates() {

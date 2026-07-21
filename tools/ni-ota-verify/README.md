@@ -115,6 +115,13 @@ missing `bundle-digest-v1`, extra top-level keys or a non-zero exit must fail
 closed. The feature states that `verify` requires and authorizes the signed OCI
 bundle manifest digest rather than a mutable tag.
 
+The immediate prior bootc deployment predates this command. A one-version OS
+rollback therefore keeps the appliance running but intentionally disables new
+registry-backed OTA checks: a non-zero capability probe remains fail-closed.
+Recovery is to boot the retained newer deployment or use the separately signed
+offline recovery path; a controller must not infer support by scraping usage
+text or retry without the digest gate.
+
 ### ADR-0039 delegation-snapshot trust gate
 
 `verify-delegation-snapshot` is the first device-side delegated-signing gate.
@@ -156,9 +163,13 @@ last accepted canonical hash; compromise recovery tombstones the affected key
 in that successor and installs a separately scoped replacement. Sequence floors
 are never lowered and accepted history is never deleted. For a one-version OS
 rollback, this slice adds no persisted schema and mutates no delegation state,
-so the retained prior verifier and retained bootc deployment remain usable with
-the existing state. Recovery of a newer candidate resumes only after a valid
-root-signed successor satisfies both that history and the image-baked minimum.
+so the retained prior deployment remains bootable with the existing state. Its
+verifier predates the capability handshake, so new OTA remains blocked until
+the newer deployment or signed offline recovery path is restored. Recovery of
+a newer candidate resumes only after a valid root-signed successor satisfies
+both that history and the image-baked minimum. Root-anchor rotation itself is
+outside this gate and requires a separately approved image/trust-anchor
+transition; accepted snapshot chains keep the immutable root unchanged.
 
 An absent configured `state_dir` is created component by component as mode
 `0700`, with every new directory and parent entry synced before use. An

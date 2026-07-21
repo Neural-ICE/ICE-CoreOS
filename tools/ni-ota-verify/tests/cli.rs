@@ -1720,6 +1720,73 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
 }
 
 #[test]
+fn delegated_snapshot_keeps_anchor_refusals_distinct_from_broken_hashing() {
+    let fx = Fixture::new("delegation-failure-classification");
+    let snapshot = fx.path("delegation-snapshot.json");
+    fs::write(
+        &snapshot,
+        include_bytes!("fixtures/delegated-v1/delegation-snapshot.json"),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    let encoded = value["root_key"]["public_key"]["spki_der_base64"]
+        .as_str()
+        .unwrap();
+    let root = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+        &encoded[..64],
+        &encoded[64..]
+    );
+    fs::write(fx.path("ota-root.pub"), &root).unwrap();
+    fs::write(
+        fx.path("snapshot.sig"),
+        [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+    )
+    .unwrap();
+    let command = |config: &Path| {
+        let mut command = Command::new(BIN);
+        command
+            .env("NI_OTA_COSIGN", fx.path("cosign-stub.sh"))
+            .env(
+                "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+                fx.path("min-delegation-seq"),
+            )
+            .arg("verify-delegation-snapshot")
+            .args(["--snapshot".as_ref(), snapshot.as_os_str()])
+            .args([
+                "--snapshot-sig".as_ref(),
+                fx.path("snapshot.sig").as_os_str(),
+            ])
+            .args(["--trusted-now", "2026-07-22T00:00:00Z"])
+            .args(["--config".as_ref(), config.as_os_str()]);
+        command
+    };
+
+    let no_anchor = fx.path("no-anchor.conf");
+    fs::write(
+        &no_anchor,
+        format!("enforce=1\nstate_dir={}\n", fx.path("state").display()),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&mut command(&no_anchor));
+    assert_eq!(code, 1, "{stderr}");
+
+    let config = fx.write_config(1, "");
+    fs::write(fx.path("ota-root.pub"), "").unwrap();
+    let (code, _, stderr) = run(&mut command(&config));
+    assert_eq!(code, 1, "{stderr}");
+
+    fs::write(fx.path("ota-root.pub"), root).unwrap();
+    let empty_path = fx.path("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+    let mut broken_hash = command(&config);
+    broken_hash.env("PATH", empty_path);
+    let (code, _, stderr) = run(&mut broken_hash);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("sha256sum"), "{stderr}");
+}
+
+#[test]
 fn capabilities_are_canonical_bounded_and_argument_free() {
     let output = Command::new(BIN).arg("capabilities").output().unwrap();
     assert!(output.status.success());

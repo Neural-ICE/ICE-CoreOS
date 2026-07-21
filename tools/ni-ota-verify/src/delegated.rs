@@ -14,7 +14,7 @@ pub(crate) mod contract;
 use contract::{
     canonical_hash, encode_base64, parse_canonical, safe_uint, sha256, validate_chain,
     validate_der_signature, validate_snapshot, validate_snapshot_time, verify_root_binding,
-    Snapshot,
+    ContractError, Snapshot,
 };
 
 const SNAPSHOT_DOMAIN: &[u8] = b"neural-ice:ota:delegation-snapshot:v1\0";
@@ -58,10 +58,30 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         Path::new(required("snapshot-sig")?),
         "delegation-signature",
     )?;
-    let root = config
-        .root_pubkey
-        .as_deref()
-        .ok_or_else(|| InternalError("root_pubkey is required".into()))?;
+    let Some(root) = config.root_pubkey.as_deref() else {
+        return refusal("no root_pubkey configured in ota.conf".into());
+    };
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+        Ok(_) => {
+            return refusal(format!(
+                "OTA root pubkey missing or empty: {}",
+                root.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refusal(format!(
+                "OTA root pubkey missing or empty: {}",
+                root.display()
+            ))
+        }
+        Err(error) => {
+            return Err(InternalError(format!(
+                "cannot inspect OTA root pubkey {}: {error}",
+                root.display()
+            )))
+        }
+    }
     let root = freeze(&scratch, root, "root-public-key")?;
     let snapshot_bytes = snapshot.read()?;
     let candidate = match parse_canonical(&snapshot_bytes, "delegation snapshot") {
@@ -77,7 +97,8 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     let hash = match validate_candidate(&candidate, &context) {
         Ok(hash) => hash,
-        Err(reason) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Internal(error)) => return Err(error),
     };
     let root_bytes = root.read()?;
     if let Err(reason) = verify_root_binding(&candidate, &root_bytes) {
@@ -106,13 +127,18 @@ struct CandidateContext<'a> {
 fn validate_candidate(
     candidate: &Snapshot,
     context: &CandidateContext<'_>,
-) -> Result<String, String> {
+) -> Result<String, ContractError> {
     validate_snapshot(candidate)?;
-    validate_snapshot_time(candidate, context.now)?;
+    validate_snapshot_time(candidate, context.now).map_err(ContractError::Refusal)?;
     if candidate.delegation_seq < context.minimum {
         return Err("snapshot is below immutable delegation sequence floor".into());
     }
-    let hash = canonical_hash(&context.snapshot_file.read().map_err(|e| e.0)?)?;
+    let hash = canonical_hash(
+        &context
+            .snapshot_file
+            .read()
+            .map_err(ContractError::Internal)?,
+    )?;
     match (
         context.flags.get("accepted-delegation-seq"),
         context.flags.get("accepted-delegation-sha256"),
@@ -120,16 +146,17 @@ fn validate_candidate(
     ) {
         (None, None, None) => {}
         (Some(sequence), Some(state_hash), Some(previous)) => {
-            let sequence = sequence
-                .parse::<u64>()
-                .map_err(|_| "accepted delegation sequence is invalid")?;
+            let sequence = sequence.parse::<u64>().map_err(|_| {
+                ContractError::Refusal("accepted delegation sequence is invalid".into())
+            })?;
             if !safe_uint(sequence) || !sha256(state_hash) {
                 return Err("accepted delegation authority is invalid".into());
             }
             let previous = freeze(context.scratch, Path::new(previous), "accepted-snapshot")
-                .map_err(|e| e.0)?;
-            let previous_bytes = previous.read().map_err(|e| e.0)?;
-            let old: Snapshot = parse_canonical(&previous_bytes, "accepted snapshot")?;
+                .map_err(ContractError::Internal)?;
+            let previous_bytes = previous.read().map_err(ContractError::Internal)?;
+            let old: Snapshot = parse_canonical(&previous_bytes, "accepted snapshot")
+                .map_err(ContractError::Refusal)?;
             validate_snapshot(&old)?;
             let old_hash = canonical_hash(&previous_bytes)?;
             if sequence != old.delegation_seq || state_hash != &old_hash {
