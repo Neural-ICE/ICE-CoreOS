@@ -597,12 +597,13 @@ mod tests {
     #[test]
     fn exported_machine_contract_matches_the_closed_trusted_time_artifact() {
         let contract: serde_json::Value = serde_json::from_slice(LICENSING_CONTRACT).unwrap();
-        let expected: Vec<_> = contract["artifacts"]
+        let artifact = contract["artifacts"]
             .as_array()
             .unwrap()
             .iter()
             .find(|artifact| artifact["schema"] == "neural-ice-ota-trusted-time-v2")
-            .unwrap()["fields"]
+            .unwrap();
+        let expected: Vec<_> = artifact["fields"]
             .as_array()
             .unwrap()
             .iter()
@@ -616,6 +617,12 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(actual, expected);
+        let domain_hex: String = TIME_DOMAIN
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(artifact["domain_hex"], domain_hex);
+        assert_eq!(artifact["terminal_nul"], true);
     }
 
     #[test]
