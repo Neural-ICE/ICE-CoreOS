@@ -39,6 +39,9 @@ const P256_SPKI_PREFIX: &[u8] = &[
     0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
 ];
 
+const ALL_HARDWARE_TARGETS: &[&str] =
+    &["amd-rocm-x86_64", "nvidia-cuda-x86_64", "nvidia-gb10-arm64"];
+
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PublicKey {
@@ -183,7 +186,7 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), ContractError
             || !ident(&tombstone.key_id)
             || !matches!(
                 tombstone.role.as_str(),
-                "image-ci" | "release-beta" | "release-stable"
+                "image-ci" | "release-beta" | "release-stable" | "trusted-time"
             )
             || !sha256(&tombstone.spki_sha256)
             || tombstone.terminal_status != "revoked"
@@ -241,6 +244,7 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
             &["beta"][..],
         ),
         "release-stable" => (&["stable-release-authorization"][..], &["stable"][..]),
+        "trusted-time" => (&["trusted-time-assertion"][..], &["beta", "stable"][..]),
         _ => return Err("unknown delegated role".into()),
     };
     if key
@@ -255,6 +259,15 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
             .ne(policy.1.iter().copied())
     {
         return Err("delegated role scope differs from closed policy".into());
+    }
+    if key.role == "trusted-time"
+        && key
+            .hardware_targets
+            .iter()
+            .map(String::as_str)
+            .ne(ALL_HARDWARE_TARGETS.iter().copied())
+    {
+        return Err("trusted-time must cover every supported hardware target".into());
     }
     match key.rotation_overlap.mode.as_str() {
         "none"
@@ -773,10 +786,7 @@ pub(crate) fn ident(v: &str) -> bool {
         && v.as_bytes()[0].is_ascii_alphanumeric()
 }
 pub(crate) fn target(v: &str) -> bool {
-    matches!(
-        v,
-        "amd-rocm-x86_64" | "nvidia-cuda-x86_64" | "nvidia-gb10-arm64"
-    )
+    ALL_HARDWARE_TARGETS.contains(&v)
 }
 fn sorted_unique(v: &[String]) -> bool {
     v.windows(2).all(|w| w[0] < w[1])
@@ -874,7 +884,7 @@ mod tests {
         let hash = canonical_hash(SNAPSHOT).unwrap();
         assert_eq!(
             hash,
-            "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b"
+            "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500"
         );
     }
 
@@ -895,6 +905,27 @@ mod tests {
         widened["keys"][1]["rings"] = serde_json::json!(["beta", "stable"]);
         let widened: Snapshot = parse_canonical(&canonical(&widened), "snapshot").unwrap();
         assert!(validate_snapshot(&widened).is_err());
+    }
+
+    #[test]
+    fn trusted_time_requires_every_supported_hardware_target() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let trusted_time = snapshot
+            .keys
+            .iter()
+            .position(|key| key.role == "trusted-time")
+            .unwrap();
+
+        for omitted in ALL_HARDWARE_TARGETS {
+            let mut narrowed = snapshot.clone();
+            narrowed.keys[trusted_time]
+                .hardware_targets
+                .retain(|target| target != omitted);
+            assert!(
+                validate_snapshot(&narrowed).is_err(),
+                "accepted without {omitted}"
+            );
+        }
     }
 
     #[test]
@@ -1176,7 +1207,7 @@ mod tests {
         successor.valid_from = generation_three.valid_from.clone();
         let mut der = P256_SPKI_PREFIX.to_vec();
         der.extend_from_slice(&hex_bytes(
-            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+            "20de84e73ccd3762d01401885c030da6e90b0e6f6eefcfd694174e01e9b8f20f2ef33b4bfe07f3f71856126be5a31c003d0825c7bc129195f6965e0afa6ae0b0",
         ));
         successor.public_key.spki_der_base64 = encode_base64(&der);
         successor.public_key.spki_sha256 = hash_bytes(&der).unwrap();

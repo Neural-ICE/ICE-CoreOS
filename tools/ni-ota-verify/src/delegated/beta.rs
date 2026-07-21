@@ -482,7 +482,7 @@ mod tests {
         let snapshot_hash = canonical_hash(SNAPSHOT).unwrap();
         assert_eq!(
             canonical_hash(RECEIPT).unwrap(),
-            "4fff4b85728ffe3b12ecdaf98a0f6a332c93da0dca6855336638d3b1dfc91850"
+            "ddc2000c61895c5094691e51cd953f2aec43123987460d7a2e5316b09beb6df5"
         );
         validate_release(
             &release,

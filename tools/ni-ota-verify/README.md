@@ -159,6 +159,20 @@ cérémonie root-only, bootstrap KMS automatisé`. These approvals cover the
 delegated trust model and its local verifier only; they authorize no channel
 movement.
 
+The closed snapshot contract also reserves a distinct `trusted-time` role for
+canonical assertions issued by `licensing.neural-ice.ch`. It cannot sign images,
+releases, receipts or channels. On first bootstrap, the immutable root may
+authenticate the physically delivered candidate snapshot before trusted time is
+available; the snapshot is accepted only in the later atomic transaction after
+an assertion under that candidate's scoped time key proves the snapshot current.
+Subsequent rotations must chain from the persisted snapshot and floors. An N-1
+rollback keeps the installed deployment bootable but cannot authorize a new
+trusted-time update until the newer state-capable verifier is restored. Loss,
+expiry or reset therefore denies only new updates and never lowers accepted
+authority, applied-bundle or time floors. The atomic persistence and one-time
+freshness mechanism are implemented in the stacked state-v1 change, not by this
+contract-only slice.
+
 Recovery is fail-closed but does not stop the installed release. An unavailable,
 expired, malformed or rollback snapshot leaves the last accepted snapshot and
 the running bootc deployment untouched and denies only the candidate update.
@@ -238,13 +252,14 @@ first-party row, or a missing/invalid detached signature fails closed.
 The command is verification-only. A pass prints the complete facts needed by
 the future bootstrap transaction, but does not write `applied.json`, accept a
 delegation snapshot or establish trusted time. Initial bootstrap remains
-blocked until the Owner approves one atomic contract with three distinct
-records: accepted authority (complete canonical snapshot + sequence + hash),
-applied bundle (sequence + exact BOM hash), and trusted-time continuity for new
-updates. A crash may never expose applied state without its authority and time
-anchors; a one-version rollback must read the prior applied record without
-discarding either new anchor. Until that schema is approved, callers must treat
-this verdict as diagnostics, not installation authorization.
+blocked until the separately reviewed atomic-state implementation persists
+three records together: accepted authority (complete canonical snapshot +
+sequence + hash), applied bundle (sequence + exact BOM hash), and trusted-time
+continuity for new updates. A crash may never expose applied state without its
+authority and time anchors; a one-version rollback must read the prior applied
+record without discarding either new anchor. Until that implementation and its
+media gates land, callers must treat this verdict as diagnostics, not
+installation authorization.
 
 The installer assembly pipeline has a separate final-image boundary: after all
 payload copies complete, it must mount the final raw image read-only and compare
