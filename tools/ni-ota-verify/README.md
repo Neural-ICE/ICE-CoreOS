@@ -252,13 +252,14 @@ first-party row, or a missing/invalid detached signature fails closed.
 The command is verification-only. A pass prints the complete facts needed by
 the future bootstrap transaction, but does not write `applied.json`, accept a
 delegation snapshot or establish trusted time. Initial bootstrap remains
-blocked until the Owner approves one atomic contract with three distinct
-records: accepted authority (complete canonical snapshot + sequence + hash),
-applied bundle (sequence + exact BOM hash), and trusted-time continuity for new
-updates. A crash may never expose applied state without its authority and time
-anchors; a one-version rollback must read the prior applied record without
-discarding either new anchor. Until that schema is approved, callers must treat
-this verdict as diagnostics, not installation authorization.
+blocked until the separately reviewed atomic-state implementation persists
+three records together: accepted authority (complete canonical snapshot +
+sequence + hash), applied bundle (sequence + exact BOM hash), and trusted-time
+continuity for new updates. A crash may never expose applied state without its
+authority and time anchors; a one-version rollback must read the prior applied
+record without discarding either new anchor. Until that implementation and its
+media gates land, callers must treat this verdict as diagnostics, not
+installation authorization.
 
 The installer assembly pipeline has a separate final-image boundary: after all
 payload copies complete, it must mount the final raw image read-only and compare
