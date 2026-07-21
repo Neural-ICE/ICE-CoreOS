@@ -1942,6 +1942,13 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
         "sha256:9999999999999999999999999999999999999999999999999999999999999999"
     );
 
+    let receipt_bytes = fs::read(&receipt).unwrap();
+    fs::write(&receipt, []).unwrap();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("beta-receipt must be a non-empty regular"));
+    fs::write(&receipt, receipt_bytes).unwrap();
+
     let incompatible = fx.write_config(
         1,
         "device_channel=beta\ndevice_compat_min=6\ndevice_compat_max=6\n",

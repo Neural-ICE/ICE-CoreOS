@@ -9,7 +9,8 @@ use super::contract::{
     target, timestamp, ContractError, DelegatedKey, Snapshot,
 };
 use super::{
-    freeze, freeze_root, refusal, validate_candidate, verify_root_binding, verify_signature,
+    freeze_authority, freeze_root, refusal, validate_candidate, verify_root_binding,
+    verify_signature,
 };
 use crate::config::{
     immutable_appliance_variant, immutable_hardware_target, immutable_minimum_delegation_seq,
@@ -110,13 +111,20 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let scratch = FileStateStore {
         path: state_dir.join("applied.json"),
     };
-    let artifact = |flag: &str, label: &str| freeze(&scratch, Path::new(required(flag)?), label);
-    let snapshot_file = artifact("snapshot", "delegation-snapshot")?;
-    let snapshot_sig = artifact("snapshot-sig", "delegation-signature")?;
-    let release_file = artifact("release", "beta-release")?;
-    let release_sig = artifact("release-sig", "beta-release-signature")?;
-    let receipt_file = artifact("receipt", "beta-receipt")?;
-    let receipt_sig = artifact("receipt-sig", "beta-receipt-signature")?;
+    macro_rules! artifact {
+        ($flag:literal, $label:literal) => {
+            match freeze_authority(&scratch, Path::new(required($flag)?), $label)? {
+                Ok(file) => file,
+                Err(reason) => return refusal(reason),
+            }
+        };
+    }
+    let snapshot_file = artifact!("snapshot", "delegation-snapshot");
+    let snapshot_sig = artifact!("snapshot-sig", "delegation-signature");
+    let release_file = artifact!("release", "beta-release");
+    let release_sig = artifact!("release-sig", "beta-release-signature");
+    let receipt_file = artifact!("receipt", "beta-receipt");
+    let receipt_sig = artifact!("receipt-sig", "beta-receipt-signature");
     let Some(root) = config.root_pubkey.as_deref() else {
         return refusal("no root_pubkey configured in ota.conf".into());
     };
