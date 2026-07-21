@@ -13,6 +13,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 TOOL = Path(__file__).with_name("seed-tree-manifest.py")
@@ -105,6 +106,98 @@ class SeedTreeManifestTests(unittest.TestCase):
             paths.index("models/bucket-archive"),
             paths.index("models/bucket/child"),
         )
+
+    def test_hard_links_are_grouped_across_input_trees(self) -> None:
+        source = self.source / "models" / "model-a" / "weights"
+        destination = self.source / "payload" / "weights-cross-tree"
+        os.link(source, destination)
+
+        output = self.root / "cross-tree-hardlinks.json"
+        result = self.generate(self.source, output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = {
+            entry["path"]: entry
+            for entry in json.loads(output.read_bytes())["entries"]
+        }
+        linked_paths = (
+            "models/model-a/weights",
+            "models/model-a/weights-hardlink",
+            "payload/weights-cross-tree",
+        )
+        self.assertEqual(
+            {entries[path]["hardlink_to"] for path in linked_paths},
+            {"models/model-a/weights"},
+        )
+
+    def test_hard_linked_symlinks_preserve_topology(self) -> None:
+        source = self.source / "models" / "model-a" / "current"
+        destination = self.source / "payload" / "current-cross-tree"
+        try:
+            os.link(source, destination, follow_symlinks=False)
+        except (NotImplementedError, OSError) as error:
+            self.skipTest(f"hard-linked symlinks unavailable: {error}")
+
+        output = self.root / "symlink-hardlinks.json"
+        result = self.generate(self.source, output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = {
+            entry["path"]: entry
+            for entry in json.loads(output.read_bytes())["entries"]
+        }
+        self.assertEqual(
+            entries["models/model-a/current"]["hardlink_to"],
+            "models/model-a/current",
+        )
+        self.assertEqual(
+            entries["payload/current-cross-tree"]["hardlink_to"],
+            "models/model-a/current",
+        )
+
+    @unittest.skipIf(sys.platform == "darwin", "macOS PATH_MAX is below recursion limit")
+    def test_deep_tree_does_not_depend_on_python_recursion(self) -> None:
+        deep_root = self.source / "models" / "deep"
+        current = deep_root
+        current.mkdir()
+        try:
+            for _ in range(1050):
+                current /= "d"
+                current.mkdir()
+            (current / "leaf").write_bytes(b"deep")
+
+            result = self.generate(self.source, self.root / "deep.json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            # tempfile/shutil cleanup is itself recursive on some Python
+            # versions, so remove this deliberate stress tree iteratively in
+            # the platform utility before TemporaryDirectory tears down.
+            subprocess.run(("rm", "-rf", str(deep_root)), check=True)
+
+    def test_directory_mutation_during_walk_is_refused(self) -> None:
+        original_digest = MANIFEST_MODULE.file_digest
+        mutated = False
+
+        def mutate_parent(path: Path, metadata: os.stat_result) -> str:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                (path.parent / "appeared-during-walk").write_bytes(b"race")
+            return original_digest(path, metadata)
+
+        output = self.root / "mutated.json"
+        with mock.patch.object(MANIFEST_MODULE, "file_digest", side_effect=mutate_parent):
+            with self.assertRaisesRegex(MANIFEST_MODULE.ManifestError, "directory changed"):
+                MANIFEST_MODULE.write_manifest(
+                    [("models", self.source / "models")],
+                    output,
+                )
+        self.assertFalse(output.exists())
+
+    def test_output_inside_input_tree_is_refused_before_walk(self) -> None:
+        output = self.source / "models" / "manifest.json"
+        result = self.generate(self.source, output)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("output path is inside input tree", result.stderr)
+        self.assertFalse(output.exists())
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
     def test_fifo_is_rejected_without_reading_it(self) -> None:

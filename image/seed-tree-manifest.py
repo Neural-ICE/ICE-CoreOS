@@ -136,7 +136,20 @@ def is_overlay_whiteout(metadata: os.stat_result) -> bool:
     )
 
 
-def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
+def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
+    try:
+        after = path.lstat()
+    except OSError as error:
+        raise ManifestError(f"cannot re-stat {kind} {path}: {error}") from error
+    if identity(after) != identity(before):
+        raise ManifestError(f"{kind} changed while walking: {path}")
+
+
+def walk_tree(
+    name: str,
+    root: Path,
+    hardlink_candidates: dict[tuple[int, int], list[str]],
+) -> list[dict[str, Any]]:
     try:
         root_metadata = root.lstat()
     except OSError as error:
@@ -145,9 +158,16 @@ def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
         raise ManifestError(f"tree root is not a real directory: {root}")
 
     entries: list[dict[str, Any]] = []
-    hardlink_candidates: dict[tuple[int, int], list[str]] = {}
+    stack: list[tuple[str, Path, PurePosixPath | None, os.stat_result | None]] = [
+        ("visit", root, None, None)
+    ]
+    while stack:
+        operation, path, relative, before = stack.pop()
+        if operation == "revalidate-directory":
+            assert before is not None
+            revalidate(path, before, "directory")
+            continue
 
-    def visit(path: Path, relative: PurePosixPath | None) -> None:
         try:
             metadata = path.lstat()
         except OSError as error:
@@ -160,17 +180,19 @@ def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
             item["xattrs"] = xattrs(path, follow_symlinks=False)
             entries.append(item)
             try:
-                children = sorted(os.scandir(path), key=lambda child: os.fsencode(child.name))
+                with os.scandir(path) as iterator:
+                    children = sorted(iterator, key=lambda child: os.fsencode(child.name))
             except OSError as error:
                 raise ManifestError(f"cannot scan directory {path}: {error}") from error
-            for child in children:
+            stack.append(("revalidate-directory", path, relative, metadata))
+            for child in reversed(children):
                 child_relative = (
                     PurePosixPath(child.name)
                     if relative is None
                     else relative / child.name
                 )
-                visit(Path(child.path), child_relative)
-            return
+                stack.append(("visit", Path(child.path), child_relative, None))
+            continue
 
         if stat.S_ISREG(metadata.st_mode):
             item.update(
@@ -182,11 +204,11 @@ def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
                 }
             )
             entries.append(item)
-            if metadata.st_nlink > 1:
-                hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
-                    manifest_path
-                )
-            return
+            revalidate(path, metadata, "regular file")
+            hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
+                manifest_path
+            )
+            continue
 
         if stat.S_ISLNK(metadata.st_mode):
             try:
@@ -201,7 +223,11 @@ def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
                 }
             )
             entries.append(item)
-            return
+            revalidate(path, metadata, "symlink")
+            hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
+                manifest_path
+            )
+            continue
 
         # containers/storage represents OCI whiteouts in an extracted overlay
         # graphroot as character devices with the reserved 0:0 device number.
@@ -218,31 +244,38 @@ def walk_tree(name: str, root: Path) -> list[dict[str, Any]]:
                 }
             )
             entries.append(item)
-            return
+            revalidate(path, metadata, "overlay whiteout")
+            hardlink_candidates.setdefault((metadata.st_dev, metadata.st_ino), []).append(
+                manifest_path
+            )
+            continue
 
         raise ManifestError(f"unsupported seed entry type at {path}")
-
-    visit(root, None)
-    hardlink_roots: dict[str, str] = {}
-    for paths in hardlink_candidates.values():
-        if len(paths) < 2:
-            raise ManifestError(f"hard-link count changed while walking: {paths[0]}")
-        representative = min(paths)
-        for path in paths:
-            hardlink_roots[path] = representative
-    for item in entries:
-        if item["path"] in hardlink_roots:
-            item["hardlink_to"] = hardlink_roots[item["path"]]
     return entries
+
+
+def output_is_within_tree(output: Path, root: Path) -> bool:
+    resolved_output = output.resolve(strict=False)
+    resolved_root = root.resolve(strict=True)
+    try:
+        resolved_output.relative_to(resolved_root)
+    except ValueError:
+        return False
+    return True
 
 
 def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
     names = [name for name, _ in trees]
     if not trees or len(names) != len(set(names)):
         raise ManifestError("tree names must be non-empty and unique")
+    for _, root in trees:
+        if output_is_within_tree(output, root):
+            raise ManifestError(f"output path is inside input tree: {output}")
+
     entries: list[dict[str, Any]] = []
+    hardlink_candidates: dict[tuple[int, int], list[str]] = {}
     for name, root in sorted(trees):
-        entries.extend(walk_tree(name, root))
+        entries.extend(walk_tree(name, root, hardlink_candidates))
     # A depth-first walk is deterministic but not globally lexicographic.  For
     # example, "tree/bucket-archive" sorts before "tree/bucket/child" even
     # though DFS visits the child before returning to the sibling.  Canonical
@@ -251,6 +284,16 @@ def write_manifest(trees: list[tuple[str, Path]], output: Path) -> None:
     paths = [entry["path"] for entry in entries]
     if len(paths) != len(set(paths)):
         raise ManifestError("manifest paths are not unique")
+    hardlink_roots: dict[str, str] = {}
+    for linked_paths in hardlink_candidates.values():
+        if len(linked_paths) < 2:
+            continue
+        representative = min(linked_paths)
+        for linked_path in linked_paths:
+            hardlink_roots[linked_path] = representative
+    for item in entries:
+        if item["path"] in hardlink_roots:
+            item["hardlink_to"] = hardlink_roots[item["path"]]
     document = {
         "entries": entries,
         "schema": "neural-ice-offline-seed-tree-v1",
