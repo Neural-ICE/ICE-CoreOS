@@ -274,7 +274,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     Ok(EXIT_PASS)
 }
 
-fn device_compatibility(
+pub(crate) fn device_compatibility(
     release: &ReleaseAuthorization,
     device: Option<(i64, i64)>,
 ) -> Result<(), String> {
@@ -291,7 +291,7 @@ fn device_compatibility(
     Ok(())
 }
 
-fn validate_release(
+pub(crate) fn validate_release(
     value: &ReleaseAuthorization,
     snapshot: &Snapshot,
     snapshot_hash: &str,
@@ -461,7 +461,7 @@ fn validate_receipt(
     Ok(())
 }
 
-fn authorized_key<'a>(
+pub(crate) fn authorized_key<'a>(
     snapshot: &'a Snapshot,
     key_id: &str,
     artifact: &str,

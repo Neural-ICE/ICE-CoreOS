@@ -22,6 +22,7 @@
 //!   2  internal error (missing cosign, unreadable config, …) — ALWAYS,
 //!      regardless of mode: broken tooling never passes (fail-closed).
 
+mod atomic_state;
 mod bootstrap;
 mod commit;
 mod config;
@@ -31,7 +32,6 @@ mod runner;
 mod state;
 mod state_v1;
 mod time_challenge;
-#[allow(dead_code, reason = "used by the next stacked atomic commit layer")]
 mod trusted_time;
 mod verify;
 
@@ -54,6 +54,14 @@ const USAGE: &str = "usage:
                           [--config /etc/neural-ice/ota.conf]
                           [--device-compat <min,max>] [--applied-state <path>]
   ni-ota-verify commit --bom <path> [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
+  ni-ota-verify commit-state-v2 --bom <path> --release <path> --release-sig <path>
+                       --snapshot <path> --snapshot-sig <path>
+                       --trusted-time <path> --trusted-time-sig <path>
+                       [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify guard-state-v2 --bom <path> --release <path> --release-sig <path>
+                       --snapshot <path> --snapshot-sig <path>
+                       --trusted-time <path> --trusted-time-sig <path>
+                       [--config /etc/neural-ice/ota.conf]
   ni-ota-verify prepare-trusted-time-v2 --snapshot <path> --snapshot-sig <path>
                        --release <path> --release-sig <path>
                        [--config /etc/neural-ice/ota.conf]
@@ -96,6 +104,8 @@ fn run() -> u8 {
         Some("verify") => verify::run(&args[1..]),
         Some("bootstrap") => bootstrap::run(&args[1..]),
         Some("commit") => commit::run(&args[1..]),
+        Some("commit-state-v2") => atomic_state::run(&args[1..]),
+        Some("guard-state-v2") => atomic_state::guard(&args[1..]),
         Some("prepare-trusted-time-v2") => time_challenge::run(&args[1..]),
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),

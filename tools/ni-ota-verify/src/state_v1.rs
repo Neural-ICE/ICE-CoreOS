@@ -186,10 +186,6 @@ pub(crate) struct CommitReceipt {
     pub(crate) nv_anchor: String,
 }
 
-#[allow(
-    dead_code,
-    reason = "constructed by the next stacked verifier integration"
-)]
 pub(crate) struct PreapplyCandidate<'a> {
     pub(crate) bom_sha256: &'a str,
     pub(crate) bundle_seq: u64,
@@ -681,7 +677,7 @@ impl Store {
         Ok(challenge)
     }
 
-    #[allow(dead_code, reason = "called by the next stacked verifier integration")]
+    #[allow(dead_code, reason = "locked atomic command uses the internal variant")]
     pub(crate) fn guard_preapply(
         &self,
         nv: &dyn NvAnchor,
@@ -691,7 +687,7 @@ impl Store {
         self.guard_preapply_locked(nv, candidate)
     }
 
-    fn guard_preapply_locked(
+    pub(crate) fn guard_preapply_locked(
         &self,
         nv: &dyn NvAnchor,
         candidate: &PreapplyCandidate<'_>,
@@ -794,7 +790,7 @@ impl Store {
         Ok(Ok(()))
     }
 
-    #[allow(dead_code, reason = "called by the next stacked command layer")]
+    #[allow(dead_code, reason = "locked atomic command uses the internal variant")]
     pub(crate) fn commit(
         &self,
         candidate: &Candidate<'_>,
@@ -804,7 +800,7 @@ impl Store {
         self.commit_locked(candidate, nv)
     }
 
-    fn commit_locked(
+    pub(crate) fn commit_locked(
         &self,
         candidate: &Candidate<'_>,
         nv: &dyn NvAnchor,
@@ -937,6 +933,38 @@ impl Store {
             generation,
             manifest_sha256,
             nv_anchor: expected,
+        }))
+    }
+
+    #[allow(dead_code, reason = "locked atomic command uses the internal variant")]
+    pub(crate) fn exact_receipt(
+        &self,
+        candidate: &Candidate<'_>,
+        nv: &dyn NvAnchor,
+    ) -> Result<Result<CommitReceipt, String>, InternalError> {
+        let _lock = self.lock_store().lock_commit()?;
+        self.exact_receipt_locked(candidate, nv)
+    }
+
+    pub(crate) fn exact_receipt_locked(
+        &self,
+        candidate: &Candidate<'_>,
+        nv: &dyn NvAnchor,
+    ) -> Result<Result<CommitReceipt, String>, InternalError> {
+        validate_candidate(candidate)?;
+        let current = self
+            .read_current_locked(nv)?
+            .ok_or_else(|| InternalError("state-v1 is unseeded".into()))?;
+        self.verify_enforce_ready_locked(nv)?;
+        if !same_candidate(&current.manifest, candidate)? {
+            return Ok(Err(
+                "consumed trusted-time challenge is not an exact committed retry".into(),
+            ));
+        }
+        Ok(Ok(CommitReceipt {
+            generation: current.manifest.generation,
+            manifest_sha256: current.manifest_sha256,
+            nv_anchor: current.nv_anchor,
         }))
     }
 
