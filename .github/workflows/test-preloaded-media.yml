@@ -1,0 +1,46 @@
+---
+name: test-preloaded-media
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'image/seed-tree-manifest.py'
+      - 'image/test-seed-tree-manifest.py'
+      - '.github/workflows/test-preloaded-media.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-preloaded-media-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x86_64:
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Portable manifest tests
+        run: |
+          python3 -m py_compile image/seed-tree-manifest.py
+          python3 image/test-seed-tree-manifest.py
+
+  linux-arm64:
+    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Portable manifest tests
+        run: |
+          python3 -m py_compile image/seed-tree-manifest.py
+          python3 image/test-seed-tree-manifest.py
