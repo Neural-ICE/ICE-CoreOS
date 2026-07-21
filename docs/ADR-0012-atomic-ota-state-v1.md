@@ -1,4 +1,4 @@
-# ADR-0011 — Atomic TPM-anchored OTA state
+# ADR-0012 — Atomic TPM-anchored OTA state
 
 - Status: Accepted
 - Date: 2026-07-21
@@ -21,8 +21,12 @@ The verifier uses a separate SHA-256, 32-byte TPM NV EXTEND index at
 `0x01500002`. Its exact base attributes are
 `authread|authwrite|no_da|nt=extend|ownerread|policydelete`; `written` is the
 only permitted dynamic attribute. Runtime extension authenticates to this
-index, not to the owner hierarchy. Capability discovery advertises
-`atomic-state-v1` only after exact `nvreadpublic` attestation.
+index, not to the owner hierarchy. The index attestation accepts both the
+zero-padded and canonical unpadded hexadecimal handle emitted by supported
+`tpm2-tools`, then compares the parsed numeric handle. Capability discovery
+must additionally prove that the complete pre-apply guard and post-health
+commit command set is present. Consequently this first policy slice does
+**not** advertise `atomic-state-v1`, even when a correct index already exists.
 
 Each committed generation binds the complete root-signed delegation snapshot,
 the exact signed release authorization and BOM, the applied bundle floor, and
@@ -72,9 +76,11 @@ newer deployment or signed recovery media before changing update state.
 ## Delivery
 
 Implementation lands as a reviewable stack. This first layer only parses and
-attests the reserved index and cannot provision, extend, commit, recover or
-move any channel. Later layers add storage, transactional mutation,
-trusted-time v2 challenge handling and caller integration. The capability
-remains absent until the exact index already exists and passes attestation.
+attests the reserved index policy and cannot provision, extend, commit,
+recover or move any channel. Later layers add installer/first-boot
+provisioning, storage, transactional mutation, trusted-time v2 challenge
+handling and caller integration. The public capability remains absent until
+the exact index exists, passes attestation, and the same verifier binary
+contains the pre-apply and post-health state-v1 commands.
 
 No release channel, live appliance or USB medium is changed by this ADR.
