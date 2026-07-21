@@ -171,6 +171,19 @@ fi
 target_serial="$(lsblk -dno SERIAL "$target" 2>/dev/null | head -1 || true)"
 : "${target_serial:=unknown}"
 
+# Provision/attest the dedicated device root before the selected target is
+# touched.  A malformed occupied handle is therefore a non-destructive
+# refusal rather than an error after repartitioning.  The preflight receipt is
+# deliberately ephemeral: after bootc has created the stateroot, the exact
+# same helper attests that handle again and persists its public receipt below.
+readonly DEVICE_ROOT_PREFLIGHT_IDENTITY="/run/neural-ice-installer/device-root-preflight-v1.json"
+install -d -m 0700 "$(dirname -- "$DEVICE_ROOT_PREFLIGHT_IDENTITY")"
+/usr/libexec/neural-ice-device-root ensure \
+  --identity "$DEVICE_ROOT_PREFLIGHT_IDENTITY" \
+  >/dev/null \
+  || die "cannot preflight the dedicated TPM device-root before disk writes"
+log "Dedicated TPM device-root preflight passed."
+
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 

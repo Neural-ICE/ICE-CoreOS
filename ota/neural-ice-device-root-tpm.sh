@@ -237,6 +237,19 @@ pending_fields() {
     || die "pending recovery challenge is not canonical"
 }
 
+freeze_recovery_input() {
+  local source="$1" destination="$2"
+  [[ -f "$source" && ! -L "$source" ]] || die "invalid recovery input"
+  # `--no-dereference` turns a replacement by symlink into a failure.  All
+  # subsequent comparison and signature verification use this single private
+  # copy, never a caller-controlled recovery-media pathname.
+  cp --no-dereference -- "$source" "$destination" \
+    || die "cannot freeze recovery input"
+  [[ -f "$destination" && ! -L "$destination" ]] \
+    || die "cannot freeze recovery input"
+  chmod 0600 -- "$destination" || die "cannot protect recovery input"
+}
+
 create_challenge() {
   local identity="$1" pending="$2" nonce
   with_workspace
@@ -254,14 +267,14 @@ recover_identity() {
   local identity="$1" pending="$2" authorization="$3" signature="$4" actual
   with_workspace
   pending_fields "$pending"
-  [[ -f "$authorization" && ! -L "$authorization" ]] || die "invalid recovery authorization"
-  [[ -f "$signature" && ! -L "$signature" ]] || die "invalid recovery signature"
   [[ -f "$ROOT_KEY" && ! -L "$ROOT_KEY" ]] || die "immutable OTA root public key is absent"
-  cmp -s "$pending" "$authorization" \
+  freeze_recovery_input "$authorization" "$WORK/authorization.json"
+  freeze_recovery_input "$signature" "$WORK/signature"
+  cmp -s "$pending" "$WORK/authorization.json" \
     || die "root authorization does not match the exact pending challenge"
 
-  { printf '%s\0' "$RECOVERY_DOMAIN"; cat -- "$authorization"; } > "$WORK/signing-bytes"
-  "$(tool base64)" -w0 "$signature" > "$WORK/signature.base64"
+  { printf '%s\0' "$RECOVERY_DOMAIN"; cat -- "$WORK/authorization.json"; } > "$WORK/signing-bytes"
+  "$(tool base64)" -w0 "$WORK/signature" > "$WORK/signature.base64"
   printf '\n' >> "$WORK/signature.base64"
   "$(tool cosign)" verify-blob --key "$ROOT_KEY" --insecure-ignore-tlog=true \
     --signature "$WORK/signature.base64" "$WORK/signing-bytes" >/dev/null 2>&1 \

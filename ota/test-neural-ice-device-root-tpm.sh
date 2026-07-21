@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # literal source-contract assertions below
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -201,11 +202,30 @@ grep -Fq 'COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-
   "$ROOT/image/Containerfile.installer"
 grep -Fq 'COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service' \
   "$ROOT/image/Containerfile.installer"
-grep -Fq 'systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service' \
+grep -Fq 'systemctl disable neural-ice-device-root.service' \
+  "$ROOT/image/Containerfile.installer"
+grep -Fq 'systemctl enable neural-ice-autoinstall.service' \
   "$ROOT/image/Containerfile.installer"
 grep -Fq '/usr/libexec/neural-ice-device-root ensure' "$ROOT/ota/neural-ice-autoinstall.sh"
 grep -Fq 'ExecStart=/usr/libexec/neural-ice-device-root ensure' \
   "$ROOT/image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
+
+# The dual-mode Live entry must not start the device-root unit, while the
+# auto-install path preflights the TPM before any destructive disk operation.
+preflight_line="$(grep -nF 'DEVICE_ROOT_PREFLIGHT_IDENTITY=' "$ROOT/ota/neural-ice-autoinstall.sh" | cut -d: -f1)"
+wipe_line="$(grep -nF 'wipefs -a "$target"' "$ROOT/ota/neural-ice-autoinstall.sh" | cut -d: -f1)"
+[[ "$preflight_line" =~ ^[0-9]+$ && "$wipe_line" =~ ^[0-9]+$ && "$preflight_line" -lt "$wipe_line" ]]
+grep -Fq -- '--identity "$DEVICE_ROOT_PREFLIGHT_IDENTITY"' "$ROOT/ota/neural-ice-autoinstall.sh"
+grep -Fq 'cannot preflight the dedicated TPM device-root before disk writes' \
+  "$ROOT/ota/neural-ice-autoinstall.sh"
+
+# Recovery media may be replaced while supplied by an operator.  The helper
+# must compare and verify only its protected, one-time copies.
+grep -Fq 'freeze_recovery_input "$authorization" "$WORK/authorization.json"' "$SCRIPT"
+grep -Fq 'freeze_recovery_input "$signature" "$WORK/signature"' "$SCRIPT"
+grep -Fq 'cmp -s "$pending" "$WORK/authorization.json"' "$SCRIPT"
+grep -Fq 'cat -- "$WORK/authorization.json"' "$SCRIPT"
+grep -Fq '"$(tool base64)" -w0 "$WORK/signature"' "$SCRIPT"
 
 # Fresh provisioning creates only 0x81010005 and produces a closed identity.
 run ensure --identity "$IDENTITY" >/dev/null
