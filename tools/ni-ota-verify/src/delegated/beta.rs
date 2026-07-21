@@ -8,7 +8,9 @@ use super::contract::{
     canonical_hash, ident, parse_canonical, public_key_pem, safe_uint, sha256, signature_profile,
     target, timestamp, ContractError, DelegatedKey, Snapshot,
 };
-use super::{freeze, refusal, validate_candidate, verify_root_binding, verify_signature};
+use super::{
+    freeze, freeze_root, refusal, validate_candidate, verify_root_binding, verify_signature,
+};
 use crate::config::{
     immutable_appliance_variant, immutable_hardware_target, immutable_minimum_delegation_seq,
     Config,
@@ -118,28 +120,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let Some(root) = config.root_pubkey.as_deref() else {
         return refusal("no root_pubkey configured in ota.conf".into());
     };
-    match std::fs::metadata(root) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
-        Ok(_) => {
-            return refusal(format!(
-                "OTA root pubkey missing or empty: {}",
-                root.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return refusal(format!(
-                "OTA root pubkey missing or empty: {}",
-                root.display()
-            ))
-        }
-        Err(error) => {
-            return Err(InternalError(format!(
-                "cannot inspect OTA root pubkey {}: {error}",
-                root.display()
-            )))
-        }
-    }
-    let root = freeze(&scratch, root, "root-public-key")?;
+    let root = match freeze_root(&scratch, root, "root-public-key")? {
+        Ok(root) => root,
+        Err(reason) => return refusal(reason),
+    };
     let snapshot_bytes = snapshot_file.read()?;
     let release_bytes = release_file.read()?;
     let receipt_bytes = receipt_file.read()?;
