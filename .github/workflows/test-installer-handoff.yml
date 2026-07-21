@@ -7,7 +7,10 @@ on:
       - "ota/neural-ice-autoinstall.sh"
       - "ota/neural-ice-lab-baseline-handoff.sh"
       - "ota/test-neural-ice-lab-baseline-handoff.sh"
+      - "ota/neural-ice-device-root-tpm.sh"
+      - "ota/test-neural-ice-device-root-tpm.sh"
       - "image/Containerfile.installer"
+      - "image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
       - "image/build-preloaded.sh"
       - "image/lib/preloaded-sizing.sh"
       - "image/lib/preloaded-output-set.sh"
@@ -31,15 +34,21 @@ jobs:
         run: |
           bash -n ota/neural-ice-autoinstall.sh \
             ota/neural-ice-lab-baseline-handoff.sh \
-            ota/test-neural-ice-lab-baseline-handoff.sh
+            ota/test-neural-ice-lab-baseline-handoff.sh \
+            ota/neural-ice-device-root-tpm.sh \
+            ota/test-neural-ice-device-root-tpm.sh
           shellcheck ota/neural-ice-autoinstall.sh \
             ota/neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-lab-baseline-handoff.sh \
+            ota/neural-ice-device-root-tpm.sh \
+            ota/test-neural-ice-device-root-tpm.sh \
             image/build-preloaded.sh \
             image/lib/preloaded-sizing.sh \
             image/lib/preloaded-output-set.sh
       - name: Test ESP handoff and non-root refusal
-        run: ./ota/test-neural-ice-lab-baseline-handoff.sh
+        run: |
+          ./ota/test-neural-ice-lab-baseline-handoff.sh
+          ./ota/test-neural-ice-device-root-tpm.sh
 
   test-root-install:
     # The X64 runner intentionally has neither sudo nor user namespaces. The
@@ -55,4 +64,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Test durable root-owned handoff
-        run: sudo -n ./ota/test-neural-ice-lab-baseline-handoff.sh
+        run: |
+          ./ota/test-neural-ice-device-root-tpm.sh
+          sudo -n ./ota/test-neural-ice-lab-baseline-handoff.sh

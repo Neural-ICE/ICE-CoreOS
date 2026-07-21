@@ -122,9 +122,12 @@ RUN curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-co
  && install -d -m 0755 /etc/cdi
 
 COPY image/bootc-overlay/            /
+COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
 RUN test "$(cat /usr/lib/neural-ice/hardware-target)" = nvidia-gb10-arm64
 
 RUN set -euxo pipefail; \
+    chmod 0755 /usr/libexec/neural-ice-device-root; \
+    systemctl enable neural-ice-device-root.service; \
     chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \
     chmod 0700 /etc/neural-ice/pki
 

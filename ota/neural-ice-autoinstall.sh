@@ -418,6 +418,15 @@ setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null 
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"
 [[ -f "$fc" ]] || die "target policy file_contexts not found: $fc"
+# Create the exact non-exportable device-root on the installed machine's TPM
+# and persist only its public identity in the new stateroot. The same image-
+# baked helper attests it idempotently on every boot. An occupied/malformed
+# 0x81010005 refuses; neither the PKI handle 0x81010004 nor the EK is touched.
+/usr/libexec/neural-ice-device-root ensure \
+  --identity "$stateroot/var/lib/neural-ice/ota/device-root-v1.json" \
+  >/dev/null \
+  || die "cannot provision and attest the dedicated TPM device-root"
+log "Dedicated TPM device-root provisioned and attested at 0x81010005."
 if (( LAB_BASELINE_PRESENT == 1 )); then
   "$LAB_BASELINE_HANDOFF" install "$LAB_BASELINE_SNAPSHOT" "$stateroot/var" \
     || die "cannot persist the optional LAB baseline receipt pair"
