@@ -4,11 +4,47 @@ use crate::delegated::contract::{parse_canonical, public_key_pem, validate_snaps
 const DER: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
 const SNAPSHOT: &[u8] =
     include_bytes!("../../tests/fixtures/delegated-v1/delegation-snapshot.json");
+const CONTRACT: &[u8] = include_bytes!("../../contracts/licensing-bootstrap-v1.contract.json");
 
 fn canonical<T: Serialize>(value: &T) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(value).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+fn contract_fields(schema: &str) -> Vec<String> {
+    let contract: serde_json::Value = serde_json::from_slice(CONTRACT).unwrap();
+    contract["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["schema"] == schema)
+        .unwrap()["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn structure_fields(name: &str) -> Vec<String> {
+    let contract: serde_json::Value = serde_json::from_slice(CONTRACT).unwrap();
+    contract["structures"][name]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn serialized_fields<T: Serialize>(value: &T) -> Vec<String> {
+    serde_json::to_value(value)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn snapshot() -> Snapshot {
@@ -35,6 +71,10 @@ fn baseline(snapshot: &Snapshot) -> BaselineIdentity {
         bootstrap_snapshot_sha256: canonical_hash(&snapshot_bytes(snapshot)).unwrap(),
         compatibility_version: 5,
         hardware_target: "nvidia-gb10-arm64".into(),
+        minimum_bundle_seq: 1,
+        minimum_delegation_seq: 1,
+        minimum_recovery_seq: 1,
+        minimum_trusted_time_seq: 1,
         os_image_manifest_digest: format!("sha256:{}", "c".repeat(64)),
         ota_root_spki_sha256: snapshot.root_spki_sha256().into(),
         ota_root_version: snapshot.root_version(),
@@ -58,6 +98,11 @@ fn state(snapshot: &Snapshot) -> AuthoritativeState {
         last_trusted_time_assertion_sha256: "f".repeat(64),
         recovery_seq: 1,
         recovery_sha256: Some("1".repeat(64)),
+        release_authorizations: vec![ReleaseAuthorizationHighWater {
+            authorization_sha256: "2".repeat(64),
+            bundle_seq: 9,
+            ring: "beta".into(),
+        }],
         root_spki_sha256: baseline(snapshot).ota_root_spki_sha256,
         root_transition_sha256: None,
         root_version: 1,
@@ -268,6 +313,62 @@ fn recovery_requires_previous_device_full_floors_and_exact_reason() {
 }
 
 #[test]
+fn recovery_floors_and_release_high_water_are_closed_and_baseline_bounded() {
+    let snapshot = snapshot();
+    let mut value = initial(&snapshot);
+    value.bootstrap_seq = 2;
+    value.previous_authorization_sha256 = Some("6".repeat(64));
+    value.previous_device_root = Some(device('7'));
+    value.authoritative_state = Some(state(&snapshot));
+    value.reason = "state_loss_recovery".into();
+
+    for case in [
+        "zero-floor",
+        "below-baseline",
+        "release-gap",
+        "release-order",
+    ] {
+        let mut hostile = value.clone();
+        let state = hostile.authoritative_state.as_mut().unwrap();
+        match case {
+            "zero-floor" => state.trusted_time_seq = 0,
+            "below-baseline" => {
+                state.baseline.minimum_bundle_seq = 10;
+                state.bundle_seq = 9;
+            }
+            "release-gap" => state.release_authorizations[0].bundle_seq = 8,
+            "release-order" => {
+                state.release_authorizations = vec![
+                    ReleaseAuthorizationHighWater {
+                        authorization_sha256: "3".repeat(64),
+                        bundle_seq: 9,
+                        ring: "stable".into(),
+                    },
+                    ReleaseAuthorizationHighWater {
+                        authorization_sha256: "2".repeat(64),
+                        bundle_seq: 9,
+                        ring: "beta".into(),
+                    },
+                ]
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_bootstrap_with(
+                &snapshot,
+                &snapshot_bytes(&snapshot),
+                &canonical(&hostile),
+                DER,
+                &expected(&hostile),
+                accept_expected_domain,
+            )
+            .is_err(),
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn bootstrap_refuses_wrong_role_schema_key_signature_and_freshness() {
     let snapshot = snapshot();
     let baseline = initial(&snapshot);
@@ -325,7 +426,51 @@ fn bootstrap_refuses_wrong_role_schema_key_signature_and_freshness() {
     .is_err());
 }
 
-fn acknowledgement(snapshot: &Snapshot) -> LicensingRecoveryAck {
+fn root_recovery(
+    snapshot: &Snapshot,
+    current: &AuthoritativeState,
+    resulting: &AuthoritativeState,
+) -> StateRecoveryAuthorization {
+    StateRecoveryAuthorization {
+        acknowledgement_authority: RecoveryAcknowledgementAuthority {
+            artifact_types: vec!["ota-licensing-recovery-ack-v1".into()],
+            key_id: "licensing-bootstrap-v1".into(),
+            public_key: snapshot.keys[0].public_key.clone(),
+            schema: "ota-recovery-ack-authority-v1".into(),
+            signing_role: "licensing-bootstrap".into(),
+        },
+        baseline: current.baseline.clone(),
+        current_state: current.clone(),
+        device_root: device('3'),
+        device_serial: "device-001".into(),
+        incident_id: "incident-0001".into(),
+        issuance_id: "root-recovery-0001".into(),
+        issued_at: "2026-07-21T12:00:00Z".into(),
+        key_id: format!("ota-root-v{}", current.root_version),
+        previous_recovery_sha256: current.recovery_sha256.clone().unwrap(),
+        reason: "tpm-state-loss".into(),
+        recovery_nonce: "5".repeat(64),
+        recovery_seq: resulting.recovery_seq,
+        release_authorization_sha256: Some("2".repeat(64)),
+        resulting_state: RecoveryTargetState::from_authoritative(resulting),
+        root_spki_sha256: current.root_spki_sha256.clone(),
+        root_version: current.root_version,
+        schema: "ota-state-recovery-v1".into(),
+        signature_algorithm: "ecdsa-p256-sha256".into(),
+        signature_encoding: "asn1-der".into(),
+        signing_role: "ota-root".into(),
+        tpm_clock: 1_000,
+        tpm_reset_count: 2,
+        tpm_restart_count: 3,
+        tpm_safe: true,
+        valid_until: "2026-07-21T12:10:00Z".into(),
+    }
+}
+
+fn acknowledgement(
+    resulting_state: AuthoritativeState,
+    root_recovery_sha256: String,
+) -> LicensingRecoveryAck {
     LicensingRecoveryAck {
         device_root: device('3'),
         device_serial: "device-001".into(),
@@ -334,8 +479,8 @@ fn acknowledgement(snapshot: &Snapshot) -> LicensingRecoveryAck {
         key_id: "licensing-bootstrap-v1".into(),
         licence_record_id: "4".repeat(64),
         recovery_nonce: "5".repeat(64),
-        resulting_state: state(snapshot),
-        root_recovery_sha256: "6".repeat(64),
+        resulting_state,
+        root_recovery_sha256,
         schema: "ota-licensing-recovery-ack-v1".into(),
         signature_algorithm: "ecdsa-p256-sha256".into(),
         signature_encoding: "asn1-der".into(),
@@ -348,13 +493,8 @@ fn acknowledgement(snapshot: &Snapshot) -> LicensingRecoveryAck {
     }
 }
 
-fn expected_ack<'a>(
-    snapshot: &'a Snapshot,
-    value: &'a LicensingRecoveryAck,
-) -> ExpectedRecoveryAck<'a> {
+fn expected_ack<'a>(value: &'a LicensingRecoveryAck) -> ExpectedRecoveryAck<'a> {
     ExpectedRecoveryAck {
-        authorized_key: &snapshot.keys[0].public_key,
-        authorized_key_id: &value.key_id,
         current_tpm: CurrentTpmState {
             tpm_clock: value.tpm_clock + 600_000,
             tpm_reset_count: value.tpm_reset_count,
@@ -370,21 +510,81 @@ fn expected_ack<'a>(
             tpm_reset_count: value.tpm_reset_count,
             tpm_restart_count: value.tpm_restart_count,
         },
-        recovery_nonce: &value.recovery_nonce,
         resulting_state: &value.resulting_state,
-        root_recovery_sha256: &value.root_recovery_sha256,
     }
 }
 
 #[test]
 fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
     let snapshot = snapshot();
-    let value = acknowledgement(&snapshot);
+    let current = state(&snapshot);
+    let mut resulting = current.clone();
+    resulting.recovery_seq += 1;
+    resulting.recovery_sha256 = Some("0".repeat(64));
+    let root = root_recovery(&snapshot, &current, &resulting);
+    let root_bytes = canonical(&root);
+    let root_hash = canonical_hash(&root_bytes).unwrap();
+    resulting.recovery_sha256 = Some(root_hash.clone());
+    let expected_root = ExpectedRootRecovery {
+        baseline: &current.baseline,
+        current_state: &current,
+        current_tpm: CurrentTpmState {
+            tpm_clock: root.tpm_clock + 600_000,
+            tpm_reset_count: root.tpm_reset_count,
+            tpm_restart_count: root.tpm_restart_count,
+            tpm_safe: true,
+        },
+        device_root: &root.device_root,
+        device_serial: &root.device_serial,
+        pending: PendingChallenge {
+            nonce: &root.recovery_nonce,
+            tpm_clock: root.tpm_clock,
+            tpm_reset_count: root.tpm_reset_count,
+            tpm_restart_count: root.tpm_restart_count,
+        },
+        release_authorization_sha256: root.release_authorization_sha256.as_deref(),
+        resulting_state: &resulting,
+        root_public_key: snapshot.root_public_key(),
+    };
+    let authority = verify_root_recovery_authority_with(
+        &root_bytes,
+        DER,
+        &expected_root,
+        |_key, domain, _payload, _signature| {
+            assert_eq!(domain, STATE_RECOVERY_DOMAIN);
+            assert_eq!(domain.last(), Some(&0));
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let mut widened = root.clone();
+    widened
+        .acknowledgement_authority
+        .artifact_types
+        .push("ota-licensing-bootstrap-v1".into());
+    assert!(verify_root_recovery_authority_with(
+        &canonical(&widened),
+        DER,
+        &expected_root,
+        |_key, _domain, _payload, _signature| Ok(()),
+    )
+    .is_err());
+    assert!(verify_root_recovery_authority_with(
+        &root_bytes,
+        DER,
+        &expected_root,
+        |_key, _domain, _payload, _signature| Err("wrong root signature".into()),
+    )
+    .is_err());
+
+    let value = acknowledgement(resulting.clone(), root_hash);
     let bytes = canonical(&value);
-    let expected = expected_ack(&snapshot, &value);
+    let expected = expected_ack(&value);
     let verified = verify_recovery_ack_with(
         &bytes,
         DER,
+        &authority,
         &expected,
         |_key, domain, _payload, _signature| {
             assert_eq!(domain, RECOVERY_ACK_DOMAIN);
@@ -396,18 +596,14 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
     assert_eq!(verified.root_recovery_sha256, value.root_recovery_sha256);
 
     let correct_key = public_key_pem(&snapshot.keys[0].public_key).unwrap();
-    let mut wrong_authority = expected_ack(&snapshot, &value);
-    wrong_authority.authorized_key = &snapshot.keys[1].public_key;
     assert!(verify_recovery_ack_with(
         &bytes,
         DER,
-        &wrong_authority,
+        &authority,
+        &expected,
         |key, _domain, _payload, _signature| {
-            if key == correct_key {
-                Ok(())
-            } else {
-                Err("recovery acknowledgement used a generic snapshot key".into())
-            }
+            assert_eq!(key, correct_key);
+            Err("signature was made by a different key".into())
         },
     )
     .is_err());
@@ -427,6 +623,7 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
             verify_recovery_ack_with(
                 &canonical(&hostile),
                 DER,
+                &authority,
                 &expected,
                 |_key, _domain, _payload, _signature| Ok(()),
             )
@@ -434,6 +631,59 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
             "{case}"
         );
     }
+
+    let wrong_root = ExpectedRootRecovery {
+        root_public_key: &snapshot.keys[1].public_key,
+        ..expected_root
+    };
+    assert!(verify_root_recovery_authority_with(
+        &root_bytes,
+        DER,
+        &wrong_root,
+        |_key, _domain, _payload, _signature| Ok(()),
+    )
+    .is_err());
+}
+
+#[test]
+fn root_recovery_refuses_same_sequence_release_split_view() {
+    let snapshot = snapshot();
+    let current = state(&snapshot);
+    let mut resulting = current.clone();
+    resulting.recovery_seq += 1;
+    resulting.recovery_sha256 = Some("0".repeat(64));
+    resulting.release_authorizations[0].authorization_sha256 = "8".repeat(64);
+    let root = root_recovery(&snapshot, &current, &resulting);
+    let root_bytes = canonical(&root);
+    resulting.recovery_sha256 = Some(canonical_hash(&root_bytes).unwrap());
+    let expected_root = ExpectedRootRecovery {
+        baseline: &current.baseline,
+        current_state: &current,
+        current_tpm: CurrentTpmState {
+            tpm_clock: root.tpm_clock,
+            tpm_reset_count: root.tpm_reset_count,
+            tpm_restart_count: root.tpm_restart_count,
+            tpm_safe: true,
+        },
+        device_root: &root.device_root,
+        device_serial: &root.device_serial,
+        pending: PendingChallenge {
+            nonce: &root.recovery_nonce,
+            tpm_clock: root.tpm_clock,
+            tpm_reset_count: root.tpm_reset_count,
+            tpm_restart_count: root.tpm_restart_count,
+        },
+        release_authorization_sha256: root.release_authorization_sha256.as_deref(),
+        resulting_state: &resulting,
+        root_public_key: snapshot.root_public_key(),
+    };
+    assert!(verify_root_recovery_authority_with(
+        &root_bytes,
+        DER,
+        &expected_root,
+        |_key, _domain, _payload, _signature| Ok(()),
+    )
+    .is_err());
 }
 
 #[test]
@@ -465,7 +715,7 @@ fn contracts_refuse_unknown_fields_noncanonical_json_and_cross_schema_replay() {
     )
     .is_err());
 
-    let ack = acknowledgement(&snapshot);
+    let ack = acknowledgement(state(&snapshot), "6".repeat(64));
     assert!(verify_bootstrap_with(
         &snapshot,
         &snapshot_bytes(&snapshot),
@@ -475,4 +725,50 @@ fn contracts_refuse_unknown_fields_noncanonical_json_and_cross_schema_replay() {
         accept_expected_domain,
     )
     .is_err());
+}
+
+#[test]
+fn exported_machine_contract_matches_every_closed_licensing_artifact() {
+    let snapshot = snapshot();
+    let bootstrap = initial(&snapshot);
+    let current = state(&snapshot);
+    let mut resulting = current.clone();
+    resulting.recovery_seq += 1;
+    resulting.recovery_sha256 = Some("6".repeat(64));
+    let recovery = root_recovery(&snapshot, &current, &resulting);
+    let acknowledgement = acknowledgement(resulting, "6".repeat(64));
+    assert_eq!(
+        serialized_fields(&bootstrap),
+        contract_fields("ota-licensing-bootstrap-v1")
+    );
+    assert_eq!(
+        serialized_fields(&recovery),
+        contract_fields("ota-state-recovery-v1")
+    );
+    assert_eq!(
+        serialized_fields(&acknowledgement),
+        contract_fields("ota-licensing-recovery-ack-v1")
+    );
+    for (name, fields) in [
+        (
+            "acknowledgement_authority",
+            serialized_fields(&recovery.acknowledgement_authority),
+        ),
+        ("authoritative_state", serialized_fields(&current)),
+        ("baseline_identity", serialized_fields(&current.baseline)),
+        (
+            "device_root_identity",
+            serialized_fields(&bootstrap.device_root),
+        ),
+        (
+            "public_key",
+            serialized_fields(&recovery.acknowledgement_authority.public_key),
+        ),
+        (
+            "recovery_target_state",
+            serialized_fields(&recovery.resulting_state),
+        ),
+    ] {
+        assert_eq!(fields, structure_fields(name), "{name}");
+    }
 }

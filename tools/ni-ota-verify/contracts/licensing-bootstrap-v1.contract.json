@@ -1,0 +1,201 @@
+{
+  "artifacts": [
+    {
+      "domain": "neural-ice:ota:licensing-bootstrap:v1\\0",
+      "fields": [
+        "active_product",
+        "authoritative_state",
+        "baseline",
+        "bootstrap_seq",
+        "device_root",
+        "device_serial",
+        "entitlement_policy_revision",
+        "issuance_id",
+        "issued_at",
+        "key_id",
+        "licence_record_id",
+        "licensing_bootstrap_nonce",
+        "previous_authorization_sha256",
+        "previous_device_root",
+        "reason",
+        "schema",
+        "signature_algorithm",
+        "signature_encoding",
+        "signing_role",
+        "tpm_clock",
+        "tpm_reset_count",
+        "tpm_restart_count",
+        "tpm_safe",
+        "valid_until"
+      ],
+      "schema": "ota-licensing-bootstrap-v1"
+    },
+    {
+      "domain": "neural-ice:ota:state-recovery:v1\\0",
+      "fields": [
+        "acknowledgement_authority",
+        "baseline",
+        "current_state",
+        "device_root",
+        "device_serial",
+        "incident_id",
+        "issuance_id",
+        "issued_at",
+        "key_id",
+        "previous_recovery_sha256",
+        "reason",
+        "recovery_nonce",
+        "recovery_seq",
+        "release_authorization_sha256",
+        "resulting_state",
+        "root_spki_sha256",
+        "root_version",
+        "schema",
+        "signature_algorithm",
+        "signature_encoding",
+        "signing_role",
+        "tpm_clock",
+        "tpm_reset_count",
+        "tpm_restart_count",
+        "tpm_safe",
+        "valid_until"
+      ],
+      "schema": "ota-state-recovery-v1"
+    },
+    {
+      "domain": "neural-ice:ota:licensing-recovery-ack:v1\\0",
+      "fields": [
+        "device_root",
+        "device_serial",
+        "issuance_id",
+        "issued_at",
+        "key_id",
+        "licence_record_id",
+        "recovery_nonce",
+        "resulting_state",
+        "root_recovery_sha256",
+        "schema",
+        "signature_algorithm",
+        "signature_encoding",
+        "signing_role",
+        "tpm_clock",
+        "tpm_reset_count",
+        "tpm_restart_count",
+        "tpm_safe",
+        "valid_until"
+      ],
+      "schema": "ota-licensing-recovery-ack-v1"
+    },
+    {
+      "domain": "neural-ice:ota:trusted-time:v2\\0",
+      "fields": [
+        "assertion_seq",
+        "bootstrap_authorization_sha256",
+        "delegation_seq",
+        "delegation_snapshot_sha256",
+        "device_fingerprint",
+        "hardware_target",
+        "issuance_id",
+        "issued_at",
+        "issuer",
+        "key_id",
+        "nonce",
+        "release_authorization_sha256",
+        "ring",
+        "schema",
+        "signature_algorithm",
+        "signature_encoding",
+        "signing_role",
+        "state_nv_anchor",
+        "tpm_clock",
+        "tpm_reset_count",
+        "tpm_restart_count",
+        "tpm_safe",
+        "trusted_time",
+        "valid_until"
+      ],
+      "schema": "neural-ice-ota-trusted-time-v2"
+    }
+  ],
+  "authoritative_state": {
+    "release_authorization_entry_fields": [
+      "authorization_sha256",
+      "bundle_seq",
+      "ring"
+    ],
+    "release_authorization_order": [
+      "beta",
+      "stable"
+    ],
+    "same_sequence_identity": "byte-identical"
+  },
+  "canonical_encoding": "compact-sorted-json-plus-single-lf",
+  "schema": "neural-ice-ota-licensing-contract-set-v1",
+  "signature_encoding": "asn1-der-low-s",
+  "signature_profile": "ecdsa-p256-sha256",
+  "structures": {
+    "acknowledgement_authority": [
+      "artifact_types",
+      "key_id",
+      "public_key",
+      "schema",
+      "signing_role"
+    ],
+    "authoritative_state": [
+      "baseline",
+      "bundle_seq",
+      "delegation_seq",
+      "delegation_snapshot_sha256",
+      "last_trusted_time_assertion_sha256",
+      "recovery_seq",
+      "recovery_sha256",
+      "release_authorizations",
+      "root_spki_sha256",
+      "root_transition_sha256",
+      "root_version",
+      "trusted_time",
+      "trusted_time_recovery_floor",
+      "trusted_time_seq"
+    ],
+    "baseline_identity": [
+      "baseline_manifest_sha256",
+      "bootstrap_delegation_seq",
+      "bootstrap_snapshot_sha256",
+      "compatibility_version",
+      "hardware_target",
+      "minimum_bundle_seq",
+      "minimum_delegation_seq",
+      "minimum_recovery_seq",
+      "minimum_trusted_time_seq",
+      "os_image_manifest_digest",
+      "ota_root_spki_sha256",
+      "ota_root_version",
+      "release_variant"
+    ],
+    "device_root_identity": [
+      "spki_sha256",
+      "tpm_name"
+    ],
+    "public_key": [
+      "algorithm",
+      "encoding",
+      "spki_der_base64",
+      "spki_sha256"
+    ],
+    "recovery_target_state": [
+      "baseline",
+      "bundle_seq",
+      "delegation_seq",
+      "delegation_snapshot_sha256",
+      "last_trusted_time_assertion_sha256",
+      "release_authorizations",
+      "root_spki_sha256",
+      "root_transition_sha256",
+      "root_version",
+      "trusted_time",
+      "trusted_time_recovery_floor",
+      "trusted_time_seq"
+    ]
+  },
+  "unknown_fields": "refuse"
+}

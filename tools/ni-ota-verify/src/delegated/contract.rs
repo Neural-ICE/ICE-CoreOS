@@ -42,7 +42,7 @@ const P256_SPKI_PREFIX: &[u8] = &[
 const ALL_HARDWARE_TARGETS: &[&str] =
     &["amd-rocm-x86_64", "nvidia-cuda-x86_64", "nvidia-gb10-arm64"];
 
-#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PublicKey {
     algorithm: String,
@@ -125,6 +125,17 @@ impl Snapshot {
 
     pub(crate) fn root_spki_sha256(&self) -> &str {
         &self.root_key.public_key.spki_sha256
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_public_key(&self) -> &PublicKey {
+        &self.root_key.public_key
+    }
+}
+
+impl PublicKey {
+    pub(crate) fn spki_sha256(&self) -> &str {
+        &self.spki_sha256
     }
 }
 

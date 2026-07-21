@@ -12,6 +12,7 @@ use crate::delegated::contract::{
     timestamp, ContractError, Snapshot,
 };
 use crate::delegated::verify_signature;
+use crate::licensing_bootstrap::VerifiedBootstrap;
 use crate::runner;
 use crate::state::FileStateStore;
 
@@ -21,6 +22,7 @@ const TIME_DOMAIN: &[u8] = b"neural-ice:ota:trusted-time:v2\0";
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrustedTimeAssertion {
     pub(crate) assertion_seq: u64,
+    pub(crate) bootstrap_authorization_sha256: Option<String>,
     pub(crate) delegation_seq: u64,
     pub(crate) delegation_snapshot_sha256: String,
     pub(crate) device_fingerprint: String,
@@ -46,6 +48,7 @@ pub(crate) struct TrustedTimeAssertion {
 }
 
 pub(crate) struct ExpectedTrustedTime<'a> {
+    pub(crate) bootstrap: TrustedTimeBootstrap<'a>,
     pub(crate) delegation_snapshot_sha256: &'a str,
     pub(crate) device_fingerprint: &'a str,
     pub(crate) hardware_target: &'a str,
@@ -63,10 +66,16 @@ pub(crate) struct ExpectedTrustedTime<'a> {
     pub(crate) consumption_tpm_safe: bool,
 }
 
+pub(crate) enum TrustedTimeBootstrap<'a> {
+    Routine,
+    Verified(&'a VerifiedBootstrap),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VerifiedTrustedTime {
     pub(crate) assertion_seq: u64,
     pub(crate) assertion_sha256: String,
+    pub(crate) bootstrap_authorization_sha256: Option<String>,
     pub(crate) delegation_seq: u64,
     pub(crate) device_fingerprint: String,
     pub(crate) key_id: String,
@@ -98,6 +107,7 @@ pub(crate) fn verify(
     Ok(VerifiedTrustedTime {
         assertion_seq: assertion.assertion_seq,
         assertion_sha256: canonical_hash(assertion_bytes)?,
+        bootstrap_authorization_sha256: assertion.bootstrap_authorization_sha256,
         delegation_seq: assertion.delegation_seq,
         device_fingerprint: assertion.device_fingerprint,
         key_id: assertion.key_id,
@@ -143,6 +153,12 @@ fn validate(
     snapshot_sha256: &str,
     expected: &ExpectedTrustedTime<'_>,
 ) -> Result<(), ContractError> {
+    let expected_bootstrap_sha256 = match expected.bootstrap {
+        TrustedTimeBootstrap::Routine => None,
+        TrustedTimeBootstrap::Verified(authorization) => {
+            Some(authorization.authorization_sha256.as_str())
+        }
+    };
     if value.schema != "neural-ice-ota-trusted-time-v2"
         || value.issuer != "licensing.neural-ice.ch"
         || value.signing_role != "trusted-time"
@@ -172,6 +188,11 @@ fn validate(
         || !matches!(expected.ring, "beta" | "stable")
         || value.release_authorization_sha256 != expected.release_authorization_sha256
         || !sha256(&value.release_authorization_sha256)
+        || value.bootstrap_authorization_sha256.as_deref() != expected_bootstrap_sha256
+        || value
+            .bootstrap_authorization_sha256
+            .as_deref()
+            .is_some_and(|hash| !sha256(hash))
         || value.delegation_snapshot_sha256 != expected.delegation_snapshot_sha256
         || value.delegation_snapshot_sha256 != snapshot_sha256
         || !sha256(&value.delegation_snapshot_sha256)
@@ -192,6 +213,29 @@ fn validate(
         return Err("trusted-time v2 assertion scope, challenge or time is invalid".into());
     }
     Ok(())
+}
+
+/// The later atomic state layer may consume bootstrap and time only through
+/// this exact-hash pair. Constructing the pair rejects cross-proof replay even
+/// if both inputs were independently signed and otherwise valid.
+pub(crate) struct VerifiedBootstrapTime<'a> {
+    pub(crate) bootstrap: &'a VerifiedBootstrap,
+    pub(crate) trusted_time: &'a VerifiedTrustedTime,
+}
+
+pub(crate) fn bind_bootstrap_transaction<'a>(
+    bootstrap: &'a VerifiedBootstrap,
+    trusted_time: &'a VerifiedTrustedTime,
+) -> Result<VerifiedBootstrapTime<'a>, ContractError> {
+    if trusted_time.bootstrap_authorization_sha256.as_deref()
+        != Some(bootstrap.authorization_sha256.as_str())
+    {
+        return Err("trusted-time assertion is not bound to the verified bootstrap proof".into());
+    }
+    Ok(VerifiedBootstrapTime {
+        bootstrap,
+        trusted_time,
+    })
 }
 
 fn consumption_precedes_expiry(
@@ -268,10 +312,13 @@ mod tests {
 
     const SNAPSHOT: &[u8] =
         include_bytes!("../tests/fixtures/delegated-v1/delegation-snapshot.json");
+    const LICENSING_CONTRACT: &[u8] =
+        include_bytes!("../contracts/licensing-bootstrap-v1.contract.json");
 
     fn assertion() -> TrustedTimeAssertion {
         TrustedTimeAssertion {
             assertion_seq: 1,
+            bootstrap_authorization_sha256: None,
             delegation_seq: 1,
             delegation_snapshot_sha256: canonical_hash(SNAPSHOT).unwrap(),
             device_fingerprint: "d".repeat(64),
@@ -299,6 +346,7 @@ mod tests {
 
     fn expected(value: &TrustedTimeAssertion) -> ExpectedTrustedTime<'_> {
         ExpectedTrustedTime {
+            bootstrap: TrustedTimeBootstrap::Routine,
             delegation_snapshot_sha256: &value.delegation_snapshot_sha256,
             device_fingerprint: &value.device_fingerprint,
             hardware_target: &value.hardware_target,
@@ -314,6 +362,16 @@ mod tests {
             consumption_tpm_reset_count: value.tpm_reset_count,
             consumption_tpm_restart_count: value.tpm_restart_count,
             consumption_tpm_safe: value.tpm_safe,
+        }
+    }
+
+    fn bootstrap(hash: &str) -> VerifiedBootstrap {
+        VerifiedBootstrap {
+            authorization_sha256: hash.into(),
+            bootstrap_seq: 1,
+            key_id: "licensing-bootstrap-v1".into(),
+            licence_record_id: "4".repeat(64),
+            reason: "initial_activation".into(),
         }
     }
 
@@ -344,6 +402,58 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn bootstrap_time_requires_the_exact_verified_proof_and_transaction_pair() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let snapshot_sha256 = canonical_hash(SNAPSHOT).unwrap();
+        let proof = bootstrap(&"e".repeat(64));
+        let other = bootstrap(&"f".repeat(64));
+        let mut value = assertion();
+        value.bootstrap_authorization_sha256 = Some(proof.authorization_sha256.clone());
+        let mut bootstrap_expected = expected(&value);
+        bootstrap_expected.bootstrap = TrustedTimeBootstrap::Verified(&proof);
+        assert!(validate(&value, &snapshot, &snapshot_sha256, &bootstrap_expected).is_ok());
+
+        let verified_time = VerifiedTrustedTime {
+            assertion_seq: value.assertion_seq,
+            assertion_sha256: "1".repeat(64),
+            bootstrap_authorization_sha256: value.bootstrap_authorization_sha256.clone(),
+            delegation_seq: value.delegation_seq,
+            device_fingerprint: value.device_fingerprint.clone(),
+            key_id: value.key_id.clone(),
+            nonce_sha256: "2".repeat(64),
+            signature_sha256: "3".repeat(64),
+            trusted_time: value.trusted_time.clone(),
+        };
+        let pair = bind_bootstrap_transaction(&proof, &verified_time).unwrap();
+        assert_eq!(
+            pair.bootstrap.authorization_sha256,
+            proof.authorization_sha256
+        );
+        assert_eq!(pair.trusted_time.assertion_seq, value.assertion_seq);
+        assert!(bind_bootstrap_transaction(&other, &verified_time).is_err());
+
+        let mut missing = value.clone();
+        missing.bootstrap_authorization_sha256 = None;
+        assert!(validate(&missing, &snapshot, &snapshot_sha256, &bootstrap_expected).is_err());
+        let mut mismatched = value.clone();
+        mismatched.bootstrap_authorization_sha256 = Some(other.authorization_sha256.clone());
+        assert!(validate(
+            &mismatched,
+            &snapshot,
+            &snapshot_sha256,
+            &bootstrap_expected
+        )
+        .is_err());
+
+        let routine = assertion();
+        let mut routine_expected = expected(&routine);
+        routine_expected.bootstrap = TrustedTimeBootstrap::Routine;
+        let mut cross_proof = routine.clone();
+        cross_proof.bootstrap_authorization_sha256 = Some(proof.authorization_sha256);
+        assert!(validate(&cross_proof, &snapshot, &snapshot_sha256, &routine_expected).is_err());
     }
 
     #[test]
@@ -428,6 +538,30 @@ mod tests {
         assert!(parse_canonical::<TrustedTimeAssertion>(&bytes, "assertion").is_err());
         assert_eq!(utc_seconds("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(utc_seconds("2023-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn exported_machine_contract_matches_the_closed_trusted_time_artifact() {
+        let contract: serde_json::Value = serde_json::from_slice(LICENSING_CONTRACT).unwrap();
+        let expected: Vec<_> = contract["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["schema"] == "neural-ice-ota-trusted-time-v2")
+            .unwrap()["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        let assertion = serde_json::to_value(assertion()).unwrap();
+        let actual: Vec<_> = assertion
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

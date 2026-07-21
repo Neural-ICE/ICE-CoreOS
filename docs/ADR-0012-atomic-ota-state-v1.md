@@ -124,6 +124,13 @@ The v2 assertion is valid for at most ten minutes and binds:
 - the current TPM NV anchor, clock, reset count, restart count and safe bit;
 - a fresh 32-byte appliance challenge consumed by the same atomic transaction.
 
+The assertion always carries the nullable
+`bootstrap_authorization_sha256`. It is non-null only during bootstrap, where
+it must equal the canonical hash returned by the already-verified licensing
+proof; routine and recovery assertions require `null`. The transaction layer
+can consume the two verdicts only through that exact-hash pair, preventing a
+valid assertion from being replayed across two independently valid proofs.
+
 Consumption re-reads that TPM tuple locally. The safe bit must remain true,
 reset/restart counts must be unchanged, the clock must not decrease, and the
 asserted `trusted_time` plus conservatively rounded TPM elapsed time must remain
@@ -139,10 +146,24 @@ one-use challenge, the exact immutable image/baseline/root/snapshot identity,
 and either `initial_activation` or the complete server-held forward-only state
 for `state_loss_recovery`. A simultaneous disk and TPM loss therefore always
 requires the signed online recovery proof; there is no local fallback.
+The immutable baseline carries non-zero numeric minimums for bundle,
+delegation, recovery and trusted-time sequences. Recovered floors are validated
+at `max(baseline minimum, server high-water)` and zero cannot silently mean
+"unknown". The server state also carries an ordered, closed beta/stable set of
+release-authorization sequence/hash identities. A retained ring at the same
+sequence must retain the identical hash.
 
 Root recovery additionally requires the exact licensing recovery
 acknowledgement signed by the one key and scope embedded in the root artifact;
 generic snapshot membership does not grant that acknowledgement authority.
+The verifier first authenticates canonical `ota-state-recovery-v1` bytes under
+the exact currently accepted root (itself chained to the immutable baseline)
+and terminal-NUL
+`neural-ice:ota:state-recovery:v1\0` domain. Only that operation can construct
+the opaque recovery-ACK authority. It fixes the complete P-256 SPKI/key id, the
+single `ota-licensing-recovery-ack-v1` artifact scope, device challenge,
+recovery hash and exact forward state. The ACK verifier accepts no caller-
+supplied public key.
 Snapshot, licensing proof, assertion, release and first state generation are
 accepted atomically; none becomes independent authority on failure. The
 contract verifier is compiled before that transaction but deliberately exposes
@@ -182,6 +203,12 @@ the exact index exists, passes attestation, and the same verifier binary
 contains the pre-apply and post-health state-v1 commands.
 
 No release channel, live appliance or USB medium is changed by this ADR.
+
+The machine-readable closed field inventory and domains shared with the
+licensing signer are versioned in
+`tools/ni-ota-verify/contracts/licensing-bootstrap-v1.contract.json`; unit tests
+compare its field lists to the Rust serializers so cross-repository signer and
+verifier implementations cannot drift unnoticed.
 
 The attribute and command constraints follow the published TCG TPM 2.0 Library
 Part 2 (TPMA_NV) and Part 3 (`TPM2_NV_UndefineSpaceSpecial`) specifications.
