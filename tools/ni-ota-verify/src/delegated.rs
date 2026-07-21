@@ -87,6 +87,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         flags: &flags,
         snapshot_file: &snapshot,
         scratch: &scratch,
+        allow_unseeded_bootstrap: false,
     };
     let hash = match validate_candidate(&candidate, &context) {
         Ok(hash) => hash,
@@ -115,6 +116,7 @@ struct CandidateContext<'a> {
     flags: &'a HashMap<String, String>,
     snapshot_file: &'a SecureTempFile,
     scratch: &'a FileStateStore,
+    allow_unseeded_bootstrap: bool,
 }
 
 fn validate_candidate(
@@ -137,7 +139,14 @@ fn validate_candidate(
         context.flags.get("accepted-delegation-sha256"),
         context.flags.get("accepted-snapshot"),
     ) {
-        (None, None, None) => {}
+        (None, None, None)
+            if context.allow_unseeded_bootstrap && candidate.delegation_seq == context.minimum => {}
+        (None, None, None) => {
+            return Err(
+                "accepted delegation state is required outside explicit floor-bound bootstrap"
+                    .into(),
+            )
+        }
         (Some(sequence), Some(state_hash), Some(previous)) => {
             let sequence = sequence.parse::<u64>().map_err(|_| {
                 ContractError::Refusal("accepted delegation sequence is invalid".into())

@@ -474,8 +474,12 @@ pub(crate) fn validate_chain(
     if new.delegation_seq != old.delegation_seq + 1
         || new.previous_snapshot_sha256.as_deref() != Some(old_hash)
         || new.root_key != old.root_key
+        || new.issued_at < old.issued_at
+        || new.valid_from < old.valid_from
     {
-        return Err("delegation sequence, root or previous-hash link is invalid".into());
+        return Err(
+            "delegation sequence, root, previous-hash or activation link is invalid".into(),
+        );
     }
     for dead in &old.tombstones {
         if !new.tombstones.contains(dead) {
@@ -490,6 +494,11 @@ pub(crate) fn validate_chain(
             || dead.revocation_seq != new.delegation_seq
         {
             return Err("new delegation tombstone is backdated or lacks a live predecessor".into());
+        }
+    }
+    for key in &new.keys {
+        if !old.keys.iter().any(|old| old.key_id == key.key_id) && key.valid_from < new.valid_from {
+            return Err("new delegation authority predates successor activation".into());
         }
     }
     for key in &old.keys {
@@ -1144,6 +1153,7 @@ mod tests {
         successor.key_id = "release-beta-v3".into();
         successor.predecessor_key_id = Some("release-beta-v2".into());
         successor.successor_key_id = None;
+        successor.valid_from = generation_three.valid_from.clone();
         let mut der = P256_SPKI_PREFIX.to_vec();
         der.extend_from_slice(&hex_bytes(
             "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
@@ -1151,8 +1161,11 @@ mod tests {
         successor.public_key.spki_der_base64 = encode_base64(&der);
         successor.public_key.spki_sha256 = hash_bytes(&der).unwrap();
         successor.rotation_overlap.with_key_id = Some("release-beta-v2".into());
+        successor.rotation_overlap.valid_from = Some(generation_three.valid_from.clone());
         generation_three.keys[1].successor_key_id = Some(successor.key_id.clone());
         generation_three.keys[1].rotation_overlap.with_key_id = Some(successor.key_id.clone());
+        generation_three.keys[1].rotation_overlap.valid_from =
+            Some(generation_three.valid_from.clone());
         generation_three.keys.push(successor);
         generation_three
             .keys
@@ -1247,6 +1260,46 @@ mod tests {
 
         validate_snapshot(&new).unwrap();
         assert!(validate_chain(&old, &new, &old_hash).is_err());
+    }
+
+    #[test]
+    fn chain_refuses_backdated_snapshot_and_new_authority() {
+        let old: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let old_hash = canonical_hash(SNAPSHOT).unwrap();
+
+        let mut backdated = old.clone();
+        backdated.delegation_seq = 2;
+        backdated.previous_snapshot_sha256 = Some(old_hash.clone());
+        backdated.issued_at = "2026-07-20T00:45:00Z".into();
+        backdated.valid_from = "2026-07-20T01:00:00Z".into();
+        assert!(validate_snapshot(&backdated).is_ok());
+        assert!(validate_chain(&old, &backdated, &old_hash).is_err());
+
+        let mut successor = old.clone();
+        successor.delegation_seq = 2;
+        successor.previous_snapshot_sha256 = Some(old_hash.clone());
+        successor.issued_at = "2026-08-01T00:45:00Z".into();
+        successor.valid_from = "2026-08-01T01:00:00Z".into();
+        let mut added = old
+            .keys
+            .iter()
+            .find(|key| key.key_id == "release-beta-v1")
+            .unwrap()
+            .clone();
+        added.key_id = "release-beta-cuda-v1".into();
+        added.hardware_targets = vec!["nvidia-cuda-x86_64".into()];
+        let mut der = P256_SPKI_PREFIX.to_vec();
+        der.extend_from_slice(&hex_bytes(
+            "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1",
+        ));
+        added.public_key.spki_der_base64 = encode_base64(&der);
+        added.public_key.spki_sha256 = hash_bytes(&der).unwrap();
+        successor.keys.push(added);
+        successor
+            .keys
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        assert!(validate_snapshot(&successor).is_ok());
+        assert!(validate_chain(&old, &successor, &old_hash).is_err());
     }
 
     fn hex_bytes(value: &str) -> Vec<u8> {

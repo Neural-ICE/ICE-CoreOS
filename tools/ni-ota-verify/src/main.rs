@@ -52,8 +52,8 @@ const USAGE: &str = "usage:
   ni-ota-verify commit --bom <path> [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
   ni-ota-verify verify-delegation-snapshot --snapshot <path> --snapshot-sig <path>
                        --trusted-now <UTC-seconds>
-                       [--accepted-snapshot <path>]
-                       [--accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>]
+                       --accepted-snapshot <path>
+                       --accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify capabilities
   ni-ota-verify --version";

@@ -1686,6 +1686,12 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
                 "--snapshot-sig".as_ref(),
                 fx.path("snapshot.sig").as_os_str(),
             ])
+            .args(["--accepted-snapshot".as_ref(), snapshot.as_os_str()])
+            .args(["--accepted-delegation-seq", "1"])
+            .args([
+                "--accepted-delegation-sha256",
+                "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+            ])
             .args(["--trusted-now", "2026-07-22T00:00:00Z"])
             .args(["--config".as_ref(), cfg.as_os_str()]);
         run(&mut command)
@@ -1694,6 +1700,25 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(verdict["verdict"], "pass");
     assert!(verdict.get("ring").is_none());
+
+    let mut omitted_state = Command::new(BIN);
+    omitted_state
+        .env("NI_OTA_COSIGN", fx.path("cosign-stub.sh"))
+        .env(
+            "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+            fx.path("min-delegation-seq"),
+        )
+        .arg("verify-delegation-snapshot")
+        .args(["--snapshot".as_ref(), snapshot.as_os_str()])
+        .args([
+            "--snapshot-sig".as_ref(),
+            fx.path("snapshot.sig").as_os_str(),
+        ])
+        .args(["--trusted-now", "2026-07-22T00:00:00Z"])
+        .args(["--config".as_ref(), cfg.as_os_str()]);
+    let (code, _, stderr) = run(&mut omitted_state);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("accepted delegation state is required"));
 
     let mut missing_cosign = Command::new(BIN);
     missing_cosign
@@ -1707,6 +1732,12 @@ fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
         .args([
             "--snapshot-sig".as_ref(),
             fx.path("snapshot.sig").as_os_str(),
+        ])
+        .args(["--accepted-snapshot".as_ref(), snapshot.as_os_str()])
+        .args(["--accepted-delegation-seq", "1"])
+        .args([
+            "--accepted-delegation-sha256",
+            "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
         ])
         .args(["--trusted-now", "2026-07-22T00:00:00Z"])
         .args(["--config".as_ref(), cfg.as_os_str()]);
@@ -1756,6 +1787,12 @@ fn delegated_snapshot_keeps_anchor_refusals_distinct_from_broken_hashing() {
             .args([
                 "--snapshot-sig".as_ref(),
                 fx.path("snapshot.sig").as_os_str(),
+            ])
+            .args(["--accepted-snapshot".as_ref(), snapshot.as_os_str()])
+            .args(["--accepted-delegation-seq", "1"])
+            .args([
+                "--accepted-delegation-sha256",
+                "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
             ])
             .args(["--trusted-now", "2026-07-22T00:00:00Z"])
             .args(["--config".as_ref(), config.as_os_str()]);

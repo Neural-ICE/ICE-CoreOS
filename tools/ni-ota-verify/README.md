@@ -136,16 +136,20 @@ Cosign receives protected root-only snapshots of the message, public key and
 base64 transport form of the contract's binary DER signature; the authority
 signature remains the binary low-S DER artifact.
 
-Without accepted delegation state, the candidate sequence must meet the
-minimum baked into immutable `/usr/lib/neural-ice/ota-min-delegation-seq`.
-With state, the accepted complete
-snapshot plus the sequence and canonical hash read from the trusted state
+`verify-delegation-snapshot` always requires the accepted complete snapshot
+plus the sequence and canonical hash read from the trusted state
 backend are required; this slice deliberately defines no new persisted schema:
 the verifier permits an identical retry or exactly `N+1`, checks the previous
 canonical hash, preserves tombstones, and prevents retained keys from widening
 scope or validity. Multi-snapshot offline catch-up and atomic TPM-backed
 delegation-state persistence are deliberately subsequent slices; this command
 does not authorize a release, publish a channel, or mutate accepted state.
+
+The sole unseeded exception belongs to the distinct physical
+`verify-delegated-usb` path. It is explicitly floor-bound to the immutable
+`/usr/lib/neural-ice/ota-min-delegation-seq` and additionally requires the
+signed debug target/release/media bindings. Omitting accepted state from the
+generic or network verifier is always an authority refusal.
 
 Owner authorization for this gate is recorded in the 2026-07-20/21 task by
 the explicit decisions `GO signed-boot LAB debug ... gate LAB/PROD #37`,
