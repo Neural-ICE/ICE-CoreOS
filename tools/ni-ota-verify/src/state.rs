@@ -1112,6 +1112,28 @@ mod tests {
     }
 
     #[test]
+    fn directory_chain_rejects_intermediate_symlink() {
+        let state = store("intermediate-symlink");
+        let root = state.path.parent().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+
+        let error = open_directory_chain(&root.join("link/child")).unwrap_err();
+        assert!(error.0.contains("without following symlinks"));
+    }
+
+    #[test]
+    fn directory_chain_rejects_non_directory_component() {
+        let state = store("non-directory-component");
+        let root = state.path.parent().unwrap();
+        std::fs::write(root.join("file"), b"not a directory").unwrap();
+
+        let error = open_directory_chain(&root.join("file/child")).unwrap_err();
+        assert!(error.0.contains("without following symlinks"));
+    }
+
+    #[test]
     fn new_parent_chain_fsyncs_every_new_directory_and_entry() {
         let state = store("nested-fsync");
         let root = state.path.parent().unwrap();
