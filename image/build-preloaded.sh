@@ -115,13 +115,13 @@ case "$COMPRESS" in
   xz)        xz -T0 -1 -c "$RAW" > "${OUT}.img.xz"; ART="${OUT}.img.xz" ;;
   *) echo "invalid COMPRESS"; exit 2 ;;
 esac
-# Compressed outputs above are repo-relative while the uncompressed RAW is
-# already absolute. Normalize once so the success proof cannot accidentally
-# prefix REPO_ROOT twice in COMPRESS=none builds.
-case "$ART" in
-  /*) ;;
-  *) ART="${REPO_ROOT}/${ART}" ;;
-esac
 [ "$COMPRESS" = none ] || sha256sum "$ART" > "${ART}.sha256"
-echo "==> PRELOADED installer ready: ${ART}"
-ls -lh "${ART}"
+# Compressed outputs above stay repo-relative so their checksum entries remain
+# relocatable. Normalize a separate reporting path because the uncompressed
+# RAW is already absolute and must not receive REPO_ROOT a second time.
+case "$ART" in
+  /*) ART_PATH="$ART" ;;
+  *) ART_PATH="${REPO_ROOT}/${ART}" ;;
+esac
+echo "==> PRELOADED installer ready: ${ART_PATH}"
+ls -lh "${ART_PATH}"
