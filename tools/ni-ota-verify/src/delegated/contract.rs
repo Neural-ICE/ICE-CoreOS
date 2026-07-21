@@ -183,7 +183,7 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), ContractError
             || !ident(&tombstone.key_id)
             || !matches!(
                 tombstone.role.as_str(),
-                "image-ci" | "release-beta" | "release-stable"
+                "image-ci" | "release-beta" | "release-stable" | "trusted-time"
             )
             || !sha256(&tombstone.spki_sha256)
             || tombstone.terminal_status != "revoked"
@@ -241,6 +241,7 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
             &["beta"][..],
         ),
         "release-stable" => (&["stable-release-authorization"][..], &["stable"][..]),
+        "trusted-time" => (&["trusted-time-assertion"][..], &["beta", "stable"][..]),
         _ => return Err("unknown delegated role".into()),
     };
     if key
@@ -874,7 +875,7 @@ mod tests {
         let hash = canonical_hash(SNAPSHOT).unwrap();
         assert_eq!(
             hash,
-            "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b"
+            "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500"
         );
     }
 
@@ -1176,7 +1177,7 @@ mod tests {
         successor.valid_from = generation_three.valid_from.clone();
         let mut der = P256_SPKI_PREFIX.to_vec();
         der.extend_from_slice(&hex_bytes(
-            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f4",
         ));
         successor.public_key.spki_der_base64 = encode_base64(&der);
         successor.public_key.spki_sha256 = hash_bytes(&der).unwrap();

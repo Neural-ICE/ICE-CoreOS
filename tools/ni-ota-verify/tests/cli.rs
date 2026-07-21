@@ -1936,7 +1936,7 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
     assert_eq!(verdict["bundle_seq"], 19);
     assert_eq!(
         verdict["receipt_sha256"],
-        "4fff4b85728ffe3b12ecdaf98a0f6a332c93da0dca6855336638d3b1dfc91850"
+        "ddc2000c61895c5094691e51cd953f2aec43123987460d7a2e5316b09beb6df5"
     );
     assert_eq!(
         verdict["manifest_digest"],
@@ -2049,7 +2049,7 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
         "bom_sha256": bom_hash.clone(),
         "bundle_seq": 19,
         "delegation_seq": 1,
-        "delegation_snapshot_sha256": "959c879bc0583bdf98ac029503d37e814c5f51120a5aef6ddf5ed0896b859a3b",
+        "delegation_snapshot_sha256": "a28f900d07d6bb0ee155e17fc5e0f1b327e52f898d82685b9d6782175dfbd500",
         "generated_at": "2026-07-21T02:00:00Z",
         "hardware_target": "nvidia-gb10-arm64",
         "images": [
