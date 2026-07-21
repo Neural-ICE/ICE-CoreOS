@@ -41,3 +41,17 @@ jobs:
             ota/test-neural-ice-lab-baseline-handoff.sh
       - name: Test ESP handoff and non-root refusal
         run: ./ota/test-neural-ice-lab-baseline-handoff.sh
+
+  test-root-install:
+    # The X64 runner intentionally has neither sudo nor user namespaces. The
+    # Spark build runner already exposes passwordless sudo to its bounded CI
+    # jobs, so use it only for the positive root-owned persistence contract.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, ARM64, spark]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - name: Test durable root-owned handoff
+        run: sudo -n ./ota/test-neural-ice-lab-baseline-handoff.sh

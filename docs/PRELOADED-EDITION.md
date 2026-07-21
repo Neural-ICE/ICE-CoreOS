@@ -94,6 +94,34 @@ signature verification and the trust decision after boot.
 This handoff is independent of `/ice-coreos/authorized_keys`; its existing debug-key behavior is
 unchanged.
 
+### Failure recovery and one-version rollback
+
+The handoff directory lives in persistent `/var`, not inside a bootc deployment. It therefore
+survives a one-version `bootc rollback`. That persistence is intentional: changing the deployed
+`/usr` must not silently replace the physically delivered trust input or erase evidence of a
+failed bootstrap.
+
+The supported one-version behavior is:
+
+- an older deployment with no baseline consumer ignores the unknown root-only directory;
+- a baseline-aware Fabric service must re-verify the detached signature and all device/train
+  bindings before state mutation, and an exact retry must be idempotent;
+- neither rollback nor a retry may lower, replace, or delete verifier-owned `applied.json`;
+- a different receipt at the same sequence, a bad signature, an incompatible device binding, or
+  insecure metadata is a fail-closed refusal, not a reason to repair or remove state automatically.
+
+Failure before the atomic directory rename leaves no final `lab-baseline` directory and aborts the
+install. Diagnose or replace the USB media and rerun the complete installer; do not boot or repair
+the partially installed target in place. Failure after publication leaves the complete, flushed
+pair, so the same signed bootstrap can be retried safely.
+
+If post-boot verification refuses, preserve the receipt and diagnostic output. Roll back to the
+previous healthy bootc deployment when one exists; that deployment either ignores the pair or
+re-verifies the exact same bytes under the rules above. Recovery then uses a corrected, newly
+signed installation/release input with a strictly valid sequence and bindings. Operators must not
+hand-edit or delete the receipt to force acceptance. The handoff itself never moves a channel or
+authorizes an update.
+
 ## Security note — recovery escrow on the USB
 
 The autoinstall writes `NEURAL-ICE-RECOVERY-<serial>.txt` (data-volume key + system-volume key)
