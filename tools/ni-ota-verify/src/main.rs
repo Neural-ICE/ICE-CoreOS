@@ -25,6 +25,7 @@
 mod bootstrap;
 mod commit;
 mod config;
+mod delegated;
 mod record;
 mod runner;
 mod state;
