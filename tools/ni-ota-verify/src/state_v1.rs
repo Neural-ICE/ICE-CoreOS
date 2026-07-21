@@ -20,17 +20,25 @@ const STATE_NV_ATTRIBUTES: &str = "authread|authwrite|no_da|nt=extend|ownerread|
 // advertising a protocol this binary cannot enforce.
 const STATE_V1_COMMAND_SET_READY: bool = false;
 
-pub(crate) fn capability_ready(config_path: &Path) -> bool {
-    if !STATE_V1_COMMAND_SET_READY {
-        return false;
+pub(crate) fn capability_ready(config_path: &Path) -> Result<bool, InternalError> {
+    capability_ready_for(config_path, STATE_V1_COMMAND_SET_READY)
+}
+
+fn capability_ready_for(
+    config_path: &Path,
+    command_set_ready: bool,
+) -> Result<bool, InternalError> {
+    if !command_set_ready {
+        return Ok(false);
     }
-    let Ok(config) = crate::config::Config::load(config_path) else {
-        return false;
-    };
+    let config = crate::config::Config::load(config_path)?;
     if config.nv_index != Some(LEGACY_NV_INDEX) || config.state_nv_index != Some(STATE_NV_INDEX) {
-        return false;
+        return Err(InternalError(
+            "atomic-state command set is compiled but TPM indices are not exactly configured"
+                .into(),
+        ));
     }
-    inspect_index(STATE_NV_INDEX).is_ok()
+    inspect_index(STATE_NV_INDEX).map(|_| true)
 }
 
 fn inspect_index(index: u32) -> Result<bool, InternalError> {
@@ -144,6 +152,12 @@ mod tests {
 
     #[test]
     fn capability_stays_hidden_until_the_complete_command_set_lands() {
-        assert!(!capability_ready(Path::new("missing.conf")));
+        assert!(!capability_ready(Path::new("missing.conf")).unwrap());
+    }
+
+    #[test]
+    fn compiled_capability_fails_closed_when_runtime_attestation_cannot_start() {
+        let error = capability_ready_for(Path::new("missing.conf"), true).unwrap_err();
+        assert!(error.0.contains("unreadable config"));
     }
 }
