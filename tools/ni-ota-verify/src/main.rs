@@ -26,6 +26,11 @@ mod bootstrap;
 mod commit;
 mod config;
 mod delegated;
+#[allow(
+    dead_code,
+    reason = "compiled for the next stacked atomic bootstrap transaction; no standalone capability"
+)]
+mod licensing_bootstrap;
 mod record;
 mod runner;
 mod state;

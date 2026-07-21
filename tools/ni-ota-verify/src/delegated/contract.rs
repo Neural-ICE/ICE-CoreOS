@@ -137,7 +137,7 @@ struct Tombstone {
     terminal_status: String,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Snapshot {
     pub(crate) delegation_seq: u64,
@@ -152,6 +152,16 @@ pub(crate) struct Snapshot {
     tombstones: Vec<Tombstone>,
     pub(crate) valid_from: String,
     pub(crate) valid_until: String,
+}
+
+impl Snapshot {
+    pub(crate) fn root_version(&self) -> u64 {
+        self.root_key.root_version
+    }
+
+    pub(crate) fn root_spki_sha256(&self) -> &str {
+        &self.root_key.public_key.spki_sha256
+    }
 }
 
 pub(crate) fn parse_canonical<T>(bytes: &[u8], what: &str) -> Result<T, String>
@@ -222,7 +232,11 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), ContractError
             || !ident(&tombstone.key_id)
             || !matches!(
                 tombstone.role.as_str(),
-                "image-ci" | "release-beta" | "release-stable" | "trusted-time"
+                "image-ci"
+                    | "licensing-bootstrap"
+                    | "release-beta"
+                    | "release-stable"
+                    | "trusted-time"
             )
             || !sha256(&tombstone.spki_sha256)
             || tombstone.terminal_status != "revoked"
@@ -275,6 +289,13 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
             ][..],
             &["beta", "stable"][..],
         ),
+        "licensing-bootstrap" => (
+            &[
+                "ota-licensing-bootstrap-v1",
+                "ota-licensing-recovery-ack-v1",
+            ][..],
+            &["beta", "stable"][..],
+        ),
         "release-beta" => (
             &["beta-publication-receipt", "beta-release-authorization"][..],
             &["beta"][..],
@@ -296,14 +317,14 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
     {
         return Err("delegated role scope differs from closed policy".into());
     }
-    if key.role == "trusted-time"
+    if matches!(key.role.as_str(), "licensing-bootstrap" | "trusted-time")
         && key
             .hardware_targets
             .iter()
             .map(String::as_str)
             .ne(ALL_HARDWARE_TARGETS.iter().copied())
     {
-        return Err("trusted-time must cover every supported hardware target".into());
+        return Err(format!("{} must cover every supported hardware target", key.role).into());
     }
     match key.rotation_overlap.mode.as_str() {
         "none"

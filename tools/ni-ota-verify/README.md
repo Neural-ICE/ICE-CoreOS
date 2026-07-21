@@ -147,6 +147,17 @@ Recovery is to boot the retained newer deployment or use the separately signed
 offline recovery path; a controller must not infer support by scraping usage
 text or retry without the digest gate.
 
+The binary also compiles the closed, local-only
+`ota-licensing-bootstrap-v1` and `ota-licensing-recovery-ack-v1` contract
+verifiers for the next atomic bootstrap layer. They require canonical JSON,
+exact P-256 low-S signatures, distinct terminal-NUL domains, an opaque licence
+record, the dedicated device-root TPM Name/SPKI, a fresh pending nonce, the
+complete immutable baseline and the expected monotonic server chain/floors.
+They perform no network access and have no local fallback. They intentionally
+have no standalone CLI or feature advertisement: only the complete future
+state-v1 transaction may consume their verdict while committing snapshot,
+release, trusted time and anti-rollback state together.
+
 ### ADR-0039 delegation-snapshot trust gate
 
 `verify-delegation-snapshot` is the first device-side delegated-signing gate.
