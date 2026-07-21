@@ -132,6 +132,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         flags: &flags,
         snapshot_file: &snapshot_file,
         scratch: &scratch,
+        allow_unseeded_bootstrap: true,
     };
     let snapshot_hash = match super::super::validate_candidate(&snapshot, &context) {
         Ok(hash) => hash,
