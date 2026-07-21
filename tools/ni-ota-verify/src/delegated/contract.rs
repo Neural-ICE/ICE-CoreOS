@@ -39,6 +39,9 @@ const P256_SPKI_PREFIX: &[u8] = &[
     0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
 ];
 
+const ALL_HARDWARE_TARGETS: &[&str] =
+    &["amd-rocm-x86_64", "nvidia-cuda-x86_64", "nvidia-gb10-arm64"];
+
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PublicKey {
@@ -256,6 +259,15 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
             .ne(policy.1.iter().copied())
     {
         return Err("delegated role scope differs from closed policy".into());
+    }
+    if key.role == "trusted-time"
+        && key
+            .hardware_targets
+            .iter()
+            .map(String::as_str)
+            .ne(ALL_HARDWARE_TARGETS.iter().copied())
+    {
+        return Err("trusted-time must cover every supported hardware target".into());
     }
     match key.rotation_overlap.mode.as_str() {
         "none"
@@ -774,10 +786,7 @@ pub(crate) fn ident(v: &str) -> bool {
         && v.as_bytes()[0].is_ascii_alphanumeric()
 }
 pub(crate) fn target(v: &str) -> bool {
-    matches!(
-        v,
-        "amd-rocm-x86_64" | "nvidia-cuda-x86_64" | "nvidia-gb10-arm64"
-    )
+    ALL_HARDWARE_TARGETS.contains(&v)
 }
 fn sorted_unique(v: &[String]) -> bool {
     v.windows(2).all(|w| w[0] < w[1])
@@ -896,6 +905,27 @@ mod tests {
         widened["keys"][1]["rings"] = serde_json::json!(["beta", "stable"]);
         let widened: Snapshot = parse_canonical(&canonical(&widened), "snapshot").unwrap();
         assert!(validate_snapshot(&widened).is_err());
+    }
+
+    #[test]
+    fn trusted_time_requires_every_supported_hardware_target() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let trusted_time = snapshot
+            .keys
+            .iter()
+            .position(|key| key.role == "trusted-time")
+            .unwrap();
+
+        for omitted in ALL_HARDWARE_TARGETS {
+            let mut narrowed = snapshot.clone();
+            narrowed.keys[trusted_time]
+                .hardware_targets
+                .retain(|target| target != omitted);
+            assert!(
+                validate_snapshot(&narrowed).is_err(),
+                "accepted without {omitted}"
+            );
+        }
     }
 
     #[test]
