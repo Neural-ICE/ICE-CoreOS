@@ -8,6 +8,7 @@ on:
       - "ota/neural-ice-lab-baseline-handoff.sh"
       - "ota/test-neural-ice-lab-baseline-handoff.sh"
       - "ota/neural-ice-device-root-tpm.sh"
+      - "ota/neural-ice-device-root-installer-only.conf"
       - "ota/test-neural-ice-device-root-tpm.sh"
       - "image/Containerfile.bootc"
       - "image/Containerfile.installer"

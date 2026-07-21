@@ -13,6 +13,8 @@ readonly RECOVERY_DOMAIN="neural-ice:ota:device-root-recovery:v1"
 readonly DEFAULT_IDENTITY="/var/lib/neural-ice/ota/device-root-v1.json"
 readonly DEFAULT_PENDING="/var/lib/neural-ice/ota/device-root-recovery-pending-v1.json"
 readonly DEFAULT_ROOT_KEY="/etc/neural-ice/keys/ota-root.pub"
+readonly MAX_RECOVERY_AUTHORIZATION_BYTES=1024
+readonly MAX_RECOVERY_SIGNATURE_BYTES=1024
 
 die() { printf 'neural-ice-device-root: refused: %s\n' "$*" >&2; exit 1; }
 [[ "$HANDLE" != "$FORBIDDEN_PKI_HANDLE" ]] || die "device-root handle overlaps the PKI root"
@@ -238,15 +240,20 @@ pending_fields() {
 }
 
 freeze_recovery_input() {
-  local source="$1" destination="$2"
+  local source="$1" destination="$2" maximum_bytes="$3" actual_bytes
   [[ -f "$source" && ! -L "$source" ]] || die "invalid recovery input"
-  # `--no-dereference` turns a replacement by symlink into a failure.  All
-  # subsequent comparison and signature verification use this single private
-  # copy, never a caller-controlled recovery-media pathname.
-  cp --no-dereference -- "$source" "$destination" \
+  # The protocol artifacts are intentionally tiny.  Bound the one-time copy
+  # (including a growing file) before it consumes /run, and refuse a symlink
+  # raced in after the initial check.  Subsequent comparison and verification
+  # use this one protected copy, never a recovery-media pathname.
+  "$(tool dd)" if="$source" of="$destination" bs=1 count="$(( maximum_bytes + 1 ))" \
+    iflag=nofollow status=none \
     || die "cannot freeze recovery input"
   [[ -f "$destination" && ! -L "$destination" ]] \
     || die "cannot freeze recovery input"
+  actual_bytes="$(stat -c '%s' -- "$destination")"
+  [[ "$actual_bytes" =~ ^[0-9]+$ && "$actual_bytes" -le "$maximum_bytes" ]] \
+    || die "recovery input exceeds the maximum protocol size"
   chmod 0600 -- "$destination" || die "cannot protect recovery input"
 }
 
@@ -268,10 +275,12 @@ recover_identity() {
   with_workspace
   pending_fields "$pending"
   [[ -f "$ROOT_KEY" && ! -L "$ROOT_KEY" ]] || die "immutable OTA root public key is absent"
-  freeze_recovery_input "$authorization" "$WORK/authorization.json"
-  freeze_recovery_input "$signature" "$WORK/signature"
+  freeze_recovery_input "$authorization" "$WORK/authorization.json" \
+    "$MAX_RECOVERY_AUTHORIZATION_BYTES"
   cmp -s "$pending" "$WORK/authorization.json" \
     || die "root authorization does not match the exact pending challenge"
+  freeze_recovery_input "$signature" "$WORK/signature" \
+    "$MAX_RECOVERY_SIGNATURE_BYTES"
 
   { printf '%s\0' "$RECOVERY_DOMAIN"; cat -- "$WORK/authorization.json"; } > "$WORK/signing-bytes"
   "$(tool base64)" -w0 "$WORK/signature" > "$WORK/signature.base64"

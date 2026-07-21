@@ -427,6 +427,15 @@ command -v setfiles >/dev/null || die "setfiles not available in the installer i
 dep="$(ls -d "$TGT"/ostree/deploy/*/deploy/*.0 2>/dev/null | head -1)"
 [[ -n "$dep" && -d "$dep" ]] || die "cannot locate the ostree deployment under $TGT"
 stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
+# This installer-only Live guard is intentionally not part of the installed
+# deployment.  Keeping the base unit enabled makes first-boot and later
+# attestation idempotent; leaving the guard would suppress both forever.
+installer_device_root_dropin="$dep/etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf"
+[[ -f "$installer_device_root_dropin" && ! -L "$installer_device_root_dropin" ]] \
+  || die "installer device-root Live guard is missing from the target deployment"
+rm -f -- "$installer_device_root_dropin" \
+  || die "cannot remove the installer-only device-root Live guard"
+rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
 setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null | head -1)"
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"

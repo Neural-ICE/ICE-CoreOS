@@ -46,11 +46,24 @@ cat > "$TOOLS/flock" <<'EOF'
 #!/usr/bin/env bash
 [[ "$1" == -x && "$2" == 9 ]]
 EOF
+cat > "$TOOLS/dd" <<'EOF'
+#!/usr/bin/env bash
+input= output= count=
+for arg in "$@"; do
+  case "$arg" in
+    if=*) input="${arg#if=}" ;;
+    of=*) output="${arg#of=}" ;;
+    count=*) count="${arg#count=}" ;;
+  esac
+done
+[[ -n "$input" && -n "$output" && "$count" =~ ^[0-9]+$ ]]
+head -c "$count" "$input" > "$output"
+EOF
 cat > "$TOOLS/sync" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod +x "$TOOLS/base64" "$TOOLS/cosign" "$TOOLS/flock" "$TOOLS/sync"
+chmod +x "$TOOLS/base64" "$TOOLS/cosign" "$TOOLS/flock" "$TOOLS/dd" "$TOOLS/sync"
 
 cat > "$TOOLS/tpm2_getcap" <<'EOF'
 #!/usr/bin/env bash
@@ -202,13 +215,22 @@ grep -Fq 'COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-
   "$ROOT/image/Containerfile.installer"
 grep -Fq 'COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service' \
   "$ROOT/image/Containerfile.installer"
-grep -Fq 'systemctl disable neural-ice-device-root.service' \
+grep -Fq 'COPY ota/neural-ice-device-root-installer-only.conf' \
   "$ROOT/image/Containerfile.installer"
-grep -Fq 'systemctl enable neural-ice-autoinstall.service' \
+grep -Fq 'systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service' \
   "$ROOT/image/Containerfile.installer"
 grep -Fq '/usr/libexec/neural-ice-device-root ensure' "$ROOT/ota/neural-ice-autoinstall.sh"
+grep -Fq 'installer_device_root_dropin=' "$ROOT/ota/neural-ice-autoinstall.sh"
+grep -Fq 'cannot remove the installer-only device-root Live guard' \
+  "$ROOT/ota/neural-ice-autoinstall.sh"
 grep -Fq 'ExecStart=/usr/libexec/neural-ice-device-root ensure' \
   "$ROOT/image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
+grep -Fq 'StateDirectory=neural-ice/ota' \
+  "$ROOT/image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
+grep -Fq 'ConditionKernelCommandLine=neuralice.autoinstall' \
+  "$ROOT/ota/neural-ice-device-root-installer-only.conf"
+grep -Fq 'ota/neural-ice-device-root-installer-only.conf' \
+  "$ROOT/.github/workflows/test-installer-handoff.yml"
 
 # The dual-mode Live entry must not start the device-root unit, while the
 # auto-install path preflights the TPM before any destructive disk operation.
@@ -226,6 +248,10 @@ grep -Fq 'freeze_recovery_input "$signature" "$WORK/signature"' "$SCRIPT"
 grep -Fq 'cmp -s "$pending" "$WORK/authorization.json"' "$SCRIPT"
 grep -Fq 'cat -- "$WORK/authorization.json"' "$SCRIPT"
 grep -Fq '"$(tool base64)" -w0 "$WORK/signature"' "$SCRIPT"
+grep -Fq 'MAX_RECOVERY_AUTHORIZATION_BYTES=1024' "$SCRIPT"
+grep -Fq 'MAX_RECOVERY_SIGNATURE_BYTES=1024' "$SCRIPT"
+grep -Fq '"$(tool dd)" if="$source"' "$SCRIPT"
+grep -Fq 'iflag=nofollow status=none' "$SCRIPT"
 
 # Fresh provisioning creates only 0x81010005 and produces a closed identity.
 run ensure --identity "$IDENTITY" >/dev/null
