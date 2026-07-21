@@ -153,10 +153,26 @@ verifiers for the next atomic bootstrap layer. They require canonical JSON,
 exact P-256 low-S signatures, distinct terminal-NUL domains, an opaque licence
 record, the dedicated device-root TPM Name/SPKI, a fresh pending nonce, the
 complete immutable baseline and the expected monotonic server chain/floors.
+The baseline includes exact non-zero minimum bundle/delegation/recovery/time
+sequences, while recovery carries an ordered closed beta/stable inventory of
+release-authorization sequence/hash identities. Same-sequence identities must
+be byte-identical.
+
+Bootstrap trusted time carries the exact canonical licensing-proof hash;
+routine trusted-time assertions require that nullable field to be `null`. An
+opaque verified pair is the only input shape reserved for the future atomic
+transaction. Root recovery similarly derives its one-use ACK public key and
+scope only from canonical `ota-state-recovery-v1` bytes verified under the
+exact accepted root chained to the immutable baseline. The ACK API accepts no
+raw caller-selected key.
 They perform no network access and have no local fallback. They intentionally
 have no standalone CLI or feature advertisement: only the complete future
 state-v1 transaction may consume their verdict while committing snapshot,
 release, trusted time and anti-rollback state together.
+
+The exact artifact fields and terminal-NUL domains exported for Fabric/AC1
+signers are in `contracts/licensing-bootstrap-v1.contract.json`. Tests compare
+that machine contract with each serializer and refuse unknown JSON fields.
 
 ### ADR-0039 delegation-snapshot trust gate
 
