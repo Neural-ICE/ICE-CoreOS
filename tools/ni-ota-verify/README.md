@@ -217,15 +217,23 @@ delegation history.
 
 `verify-delegated-usb` is the local, receipt-free verification surface for the
 physically delivered debug installer. It accepts no URL, channel tag or shell
-hook. It verifies the exact root-signed delegation snapshot and exact
-release-beta signature, then binds the release to the raw BOM and channel
-record bytes, canonical image-attestation set, observed OCI bundle digest,
-immutable hardware target, immutable `debug` variant, booted OS digest ref,
-installed `PAYLOAD_ID`, beta channel, compatibility range, train and bundle
-sequence. The channel record is evidence carried inside the immutable USB
-bundle; the command cannot fetch or repoint it. Missing receipt evidence is
+hook. It verifies the exact root-signed delegation snapshot, exact release-beta
+signature, and detached image-ci signature over the canonical image-attestation
+set, then binds the release to the raw BOM and channel record bytes, observed
+OCI bundle digest, immutable hardware target, immutable `debug` variant,
+booted OS digest ref, installed `PAYLOAD_ID`, beta channel, compatibility
+range, train and bundle sequence. The channel record is evidence carried inside
+the immutable USB bundle; the command cannot fetch or repoint it. Missing receipt evidence is
 intentional for this physical bootstrap only and is never accepted by the
 network beta verifier.
+
+The image-ci signature uses the domain
+`neural-ice:ota:image-attestation-set:v1` over the complete canonical set. All
+first-party rows in one set must name the same authorized image-ci key. This
+turns their exact image-signature, provenance and SBOM digests into one
+independently authenticated envelope: a compromised release-beta key cannot
+fabricate those proof identities. Mixed image-ci authorities, an absent
+first-party row, or a missing/invalid detached signature fails closed.
 
 The command is verification-only. A pass prints the complete facts needed by
 the future bootstrap transaction, but does not write `applied.json`, accept a

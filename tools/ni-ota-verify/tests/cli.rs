@@ -42,6 +42,7 @@ if grep -qx 'MAYCAQECAQE=' "$sig" 2>/dev/null; then
   case "$message_hex" in
     6e657572616c2d6963653a6f74613a64656c65676174696f6e2d736e617073686f743a763100*|\
     6e657572616c2d6963653a6f74613a72656c656173652d617574686f72697a6174696f6e3a763100*|\
+    6e657572616c2d6963653a6f74613a696d6167652d6174746573746174696f6e2d7365743a763100*|\
     6e657572616c2d6963653a6f74613a626574612d7075626c69636174696f6e2d726563656970743a763100*) ;;
     *) echo "stub: missing delegated signature domain" >&2; exit 1 ;;
   esac
@@ -2010,6 +2011,7 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     let signature = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
     fs::write(fx.path("snapshot.sig"), signature).unwrap();
     fs::write(fx.path("release.sig"), signature).unwrap();
+    fs::write(fx.path("attestation.sig"), signature).unwrap();
 
     let bom = fx.path("bom.json");
     let mut bom_bytes = serde_json::to_vec_pretty(&serde_json::json!({
@@ -2122,6 +2124,10 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
             .args(["--bom".as_ref(), bom.as_os_str()])
             .args(["--record".as_ref(), record.as_os_str()])
             .args(["--attestation".as_ref(), attestation.as_os_str()])
+            .args([
+                "--attestation-sig".as_ref(),
+                fx.path("attestation.sig").as_os_str(),
+            ])
             .args(["--bundle-digest", digest])
             .args(["--current-os-ref", os])
             .args(["--current-seed-ref", seed])
@@ -2134,6 +2140,12 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(verdict["mode"], "delegated-usb-beta");
     assert_eq!(verdict["bom_sha256"], bom_hash);
     assert!(!fx.path("state/applied.json").exists());
+
+    fs::write(fx.path("attestation.sig"), b"not-a-der-signature").unwrap();
+    let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("DER"), "{stderr}");
+    fs::write(fx.path("attestation.sig"), signature).unwrap();
 
     let wrong_os = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     let (code, _, stderr) = run(&mut command(wrong_os, TEST_SEED_REF, TEST_BUNDLE_DIGEST));

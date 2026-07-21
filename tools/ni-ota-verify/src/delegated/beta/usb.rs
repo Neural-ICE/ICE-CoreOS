@@ -14,6 +14,8 @@ use crate::runner;
 use crate::state::{ensure_secure_state_directory, FileStateStore};
 use crate::verify::BomCore;
 
+const ATTESTATION_SET_DOMAIN: &[u8] = b"neural-ice:ota:image-attestation-set:v1\0";
+
 macro_rules! refuse_try {
     ($expression:expr) => {
         match $expression {
@@ -61,6 +63,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "bom",
             "record",
             "attestation",
+            "attestation-sig",
             "bundle-digest",
             "current-os-ref",
             "current-seed-ref",
@@ -96,6 +99,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let bom_file = artifact("bom", "usb-bom")?;
     let record_file = artifact("record", "usb-channel-record")?;
     let attestation_file = artifact("attestation", "usb-attestation-set")?;
+    let attestation_sig = artifact("attestation-sig", "usb-attestation-signature")?;
 
     let snapshot_bytes = snapshot_file.read()?;
     let release_bytes = release_file.read()?;
@@ -213,6 +217,25 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         current_seed,
         now,
     ));
+    let image_ci_key_id = refuse_try!(attestation_image_ci_key_id(&attestation));
+    let image_ci_key = refuse_try!(authorized_image_ci_key(
+        &snapshot,
+        image_ci_key_id,
+        &attestation,
+        now,
+    ));
+    let image_ci_pem = match public_key_pem(&image_ci_key.public_key) {
+        Ok(pem) => pem,
+        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Internal(error)) => return Err(error),
+    };
+    refuse_try!(super::super::verify_signature(
+        &image_ci_pem,
+        ATTESTATION_SET_DOMAIN,
+        &attestation_bytes,
+        &attestation_sig.read()?,
+        &scratch,
+    )?);
 
     println!(
         "{}",
@@ -354,30 +377,60 @@ fn validate_attestation(
     Ok(())
 }
 
-fn image_ci_authorized(snapshot: &Snapshot, key_id: &str, set: &AttestationSet, now: &str) -> bool {
-    snapshot
-        .keys
+fn attestation_image_ci_key_id(value: &AttestationSet) -> Result<&str, String> {
+    let mut key_id = None;
+    for image in value
+        .images
         .iter()
-        .filter(|key| {
-            key.key_id == key_id
-                && key.role == "image-ci"
-                && key.hardware_targets.contains(&set.hardware_target)
-                && key.rings.iter().any(|ring| ring == "beta")
-                && [
-                    "oci-image-signature",
-                    "slsa-provenance-attestation",
-                    "spdx-sbom-attestation",
-                ]
-                .iter()
-                .all(|kind| key.artifact_types.iter().any(|value| value == kind))
-                && matches!(key.status.as_str(), "active" | "retiring")
-                && key.valid_from <= set.generated_at
-                && set.generated_at < key.valid_until
-                && key.valid_from.as_str() <= now
-                && now < key.valid_until.as_str()
-        })
-        .count()
-        == 1
+        .filter(|image| image.authority == "image-ci")
+    {
+        let current = image
+            .image_ci_key_id
+            .as_deref()
+            .ok_or("product image lacks image-ci key id")?;
+        if key_id.is_some_and(|accepted| accepted != current) {
+            return Err("attestation set mixes image-ci signing authorities".into());
+        }
+        key_id = Some(current);
+    }
+    key_id.ok_or_else(|| "attestation set lacks image-ci signed product images".into())
+}
+
+fn authorized_image_ci_key<'a>(
+    snapshot: &'a Snapshot,
+    key_id: &str,
+    set: &AttestationSet,
+    now: &str,
+) -> Result<&'a DelegatedKey, String> {
+    let mut keys = snapshot.keys.iter().filter(|key| {
+        key.key_id == key_id
+            && key.role == "image-ci"
+            && key.hardware_targets.contains(&set.hardware_target)
+            && key.rings.iter().any(|ring| ring == "beta")
+            && [
+                "oci-image-signature",
+                "slsa-provenance-attestation",
+                "spdx-sbom-attestation",
+            ]
+            .iter()
+            .all(|kind| key.artifact_types.iter().any(|value| value == kind))
+            && matches!(key.status.as_str(), "active" | "retiring")
+            && key.valid_from <= set.generated_at
+            && set.generated_at < key.valid_until
+            && key.valid_from.as_str() <= now
+            && now < key.valid_until.as_str()
+    });
+    let key = keys
+        .next()
+        .ok_or("attestation set image-ci authority is unavailable")?;
+    if keys.next().is_some() {
+        return Err("attestation set image-ci authority is ambiguous".into());
+    }
+    Ok(key)
+}
+
+fn image_ci_authorized(snapshot: &Snapshot, key_id: &str, set: &AttestationSet, now: &str) -> bool {
+    authorized_image_ci_key(snapshot, key_id, set, now).is_ok()
 }
 
 fn repository(value: &str) -> bool {
