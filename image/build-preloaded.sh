@@ -116,5 +116,12 @@ case "$COMPRESS" in
   *) echo "invalid COMPRESS"; exit 2 ;;
 esac
 [ "$COMPRESS" = none ] || sha256sum "$ART" > "${ART}.sha256"
-echo "==> PRELOADED installer ready: ${REPO_ROOT}/${ART}"
-ls -lh "${REPO_ROOT}/${ART}"
+# Compressed outputs above stay repo-relative so their checksum entries remain
+# relocatable. Normalize a separate reporting path because the uncompressed
+# RAW is already absolute and must not receive REPO_ROOT a second time.
+case "$ART" in
+  /*) ART_PATH="$ART" ;;
+  *) ART_PATH="${REPO_ROOT}/${ART}" ;;
+esac
+echo "==> PRELOADED installer ready: ${ART_PATH}"
+ls -lh "${ART_PATH}"

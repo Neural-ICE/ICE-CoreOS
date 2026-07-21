@@ -7,6 +7,7 @@ on:
       - "ota/neural-ice-lab-baseline-handoff.sh"
       - "ota/test-neural-ice-lab-baseline-handoff.sh"
       - "image/Containerfile.installer"
+      - "image/build-preloaded.sh"
       - "docs/PRELOADED-EDITION.md"
       - ".github/workflows/test-installer-handoff.yml"
   push:
@@ -16,6 +17,7 @@ on:
       - "ota/neural-ice-lab-baseline-handoff.sh"
       - "ota/test-neural-ice-lab-baseline-handoff.sh"
       - "image/Containerfile.installer"
+      - "image/build-preloaded.sh"
       - "docs/PRELOADED-EDITION.md"
       - ".github/workflows/test-installer-handoff.yml"
 
@@ -38,7 +40,8 @@ jobs:
             ota/test-neural-ice-lab-baseline-handoff.sh
           shellcheck ota/neural-ice-autoinstall.sh \
             ota/neural-ice-lab-baseline-handoff.sh \
-            ota/test-neural-ice-lab-baseline-handoff.sh
+            ota/test-neural-ice-lab-baseline-handoff.sh \
+            image/build-preloaded.sh
       - name: Test ESP handoff and non-root refusal
         run: ./ota/test-neural-ice-lab-baseline-handoff.sh
 
