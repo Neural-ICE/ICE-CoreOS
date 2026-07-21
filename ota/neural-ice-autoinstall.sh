@@ -171,6 +171,19 @@ fi
 target_serial="$(lsblk -dno SERIAL "$target" 2>/dev/null | head -1 || true)"
 : "${target_serial:=unknown}"
 
+# Provision/attest the dedicated device root before the selected target is
+# touched.  A malformed occupied handle is therefore a non-destructive
+# refusal rather than an error after repartitioning.  The preflight receipt is
+# deliberately ephemeral: after bootc has created the stateroot, the exact
+# same helper attests that handle again and persists its public receipt below.
+readonly DEVICE_ROOT_PREFLIGHT_IDENTITY="/run/neural-ice-installer/device-root-preflight-v1.json"
+install -d -m 0700 "$(dirname -- "$DEVICE_ROOT_PREFLIGHT_IDENTITY")"
+/usr/libexec/neural-ice-device-root ensure \
+  --identity "$DEVICE_ROOT_PREFLIGHT_IDENTITY" \
+  >/dev/null \
+  || die "cannot preflight the dedicated TPM device-root before disk writes"
+log "Dedicated TPM device-root preflight passed."
+
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 
@@ -414,10 +427,28 @@ command -v setfiles >/dev/null || die "setfiles not available in the installer i
 dep="$(ls -d "$TGT"/ostree/deploy/*/deploy/*.0 2>/dev/null | head -1)"
 [[ -n "$dep" && -d "$dep" ]] || die "cannot locate the ostree deployment under $TGT"
 stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
+# This installer-only Live guard is intentionally not part of the installed
+# deployment.  Keeping the base unit enabled makes first-boot and later
+# attestation idempotent; leaving the guard would suppress both forever.
+installer_device_root_dropin="$dep/etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf"
+[[ -f "$installer_device_root_dropin" && ! -L "$installer_device_root_dropin" ]] \
+  || die "installer device-root Live guard is missing from the target deployment"
+rm -f -- "$installer_device_root_dropin" \
+  || die "cannot remove the installer-only device-root Live guard"
+rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
 setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null | head -1)"
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"
 [[ -f "$fc" ]] || die "target policy file_contexts not found: $fc"
+# Create the exact non-exportable device-root on the installed machine's TPM
+# and persist only its public identity in the new stateroot. The same image-
+# baked helper attests it idempotently on every boot. An occupied/malformed
+# 0x81010005 refuses; neither the PKI handle 0x81010004 nor the EK is touched.
+/usr/libexec/neural-ice-device-root ensure \
+  --identity "$stateroot/var/lib/neural-ice/ota/device-root-v1.json" \
+  >/dev/null \
+  || die "cannot provision and attest the dedicated TPM device-root"
+log "Dedicated TPM device-root provisioned and attested at 0x81010005."
 if (( LAB_BASELINE_PRESENT == 1 )); then
   "$LAB_BASELINE_HANDOFF" install "$LAB_BASELINE_SNAPSHOT" "$stateroot/var" \
     || die "cannot persist the optional LAB baseline receipt pair"

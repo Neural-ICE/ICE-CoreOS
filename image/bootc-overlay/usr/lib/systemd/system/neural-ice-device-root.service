@@ -1,0 +1,25 @@
+[Unit]
+Description=Provision and attest the dedicated TPM device root
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS/blob/main/docs/ADR-0013-device-root-tpm-v1.md
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=network-online.target
+ConditionPathExistsGlob=/dev/tpm*
+RequiresMountsFor=/var/lib/neural-ice/ota
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/neural-ice-device-root ensure
+RemainAfterExit=yes
+StateDirectory=neural-ice/ota
+StateDirectoryMode=0700
+UMask=0077
+RuntimeDirectory=neural-ice-device-root
+RuntimeDirectoryMode=0700
+ProtectSystem=strict
+ReadWritePaths=/var/lib/neural-ice/ota /run/neural-ice-device-root
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=null
+
+[Install]
+WantedBy=multi-user.target
