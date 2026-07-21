@@ -48,6 +48,18 @@ impl AuthenticatedSnapshot {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn authenticated_snapshot_for_test(
+    snapshot_bytes: &[u8],
+) -> Result<AuthenticatedSnapshot, ContractError> {
+    let snapshot: Snapshot = parse_canonical(snapshot_bytes, "delegation snapshot")?;
+    validate_snapshot(&snapshot)?;
+    Ok(AuthenticatedSnapshot {
+        snapshot,
+        canonical_sha256: canonical_hash(snapshot_bytes)?,
+    })
+}
+
 #[allow(
     dead_code,
     reason = "consumed by the next stacked atomic-state command layer"

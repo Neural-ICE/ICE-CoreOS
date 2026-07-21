@@ -92,6 +92,10 @@ fn snapshot_bytes(snapshot: &Snapshot) -> Vec<u8> {
     canonical(&serde_json::to_value(snapshot).unwrap())
 }
 
+fn authenticated(snapshot: &Snapshot) -> AuthenticatedSnapshot {
+    crate::delegated::authenticated_snapshot_for_test(&snapshot_bytes(snapshot)).unwrap()
+}
+
 fn baseline(snapshot: &Snapshot) -> BaselineIdentity {
     BaselineIdentity {
         baseline_manifest_sha256: "a".repeat(64),
@@ -262,6 +266,34 @@ fn delegation_scope_for_licensing_is_closed_and_hardware_complete() {
 }
 
 #[test]
+fn retiring_licensing_key_remains_authorized_only_inside_bounded_overlap() {
+    let snapshot = snapshot();
+    let mut value = serde_json::to_value(&snapshot).unwrap();
+    value["keys"][0]["status"] = "retiring".into();
+    value["keys"][0]["rotation_overlap"] = serde_json::json!({
+        "mode": "bounded",
+        "valid_from": "2026-07-21T11:00:00Z",
+        "valid_until": "2026-07-21T13:00:00Z",
+        "with_key_id": "licensing-bootstrap-v2"
+    });
+    let retiring: Snapshot = parse_canonical(&canonical(&value), "retiring snapshot").unwrap();
+    assert!(unique_snapshot_key(
+        &retiring,
+        "licensing-bootstrap-v1",
+        "2026-07-21T12:00:00Z",
+        "nvidia-gb10-arm64",
+    )
+    .is_ok());
+    assert!(unique_snapshot_key(
+        &retiring,
+        "licensing-bootstrap-v1",
+        "2026-07-21T13:00:00Z",
+        "nvidia-gb10-arm64",
+    )
+    .is_err());
+}
+
+#[test]
 fn bootstrap_refuses_wrong_device_nonce_baseline_licence_or_chain_replay() {
     let snapshot = snapshot();
     let signed = initial(&snapshot);
@@ -319,6 +351,7 @@ fn recovery_requires_previous_device_full_floors_and_exact_reason() {
         "same-device-root",
         "floor",
         "proof-hash",
+        "baseline-link",
     ] {
         let mut hostile = value.clone();
         match case {
@@ -334,6 +367,14 @@ fn recovery_requires_previous_device_full_floors_and_exact_reason() {
                     .as_mut()
                     .unwrap()
                     .recovery_sha256 = None
+            }
+            "baseline-link" => {
+                hostile
+                    .authoritative_state
+                    .as_mut()
+                    .unwrap()
+                    .baseline
+                    .baseline_manifest_sha256 = "8".repeat(64)
             }
             _ => unreachable!(),
         }
@@ -633,7 +674,9 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
     let root_bytes = canonical(&root);
     let root_hash = canonical_hash(&root_bytes).unwrap();
     resulting.recovery_sha256 = Some(root_hash.clone());
+    let authenticated_snapshot = authenticated(&snapshot);
     let expected_root = ExpectedRootRecovery {
+        authenticated_snapshot: &authenticated_snapshot,
         baseline: &current.baseline,
         current_state: &current,
         current_tpm: CurrentTpmState {
@@ -652,7 +695,6 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
         },
         release_authorization_sha256: root.release_authorization_sha256.as_deref(),
         resulting_state: &resulting,
-        root_public_key: snapshot.root_public_key(),
     };
     let authority = verify_root_recovery_authority_with(
         &root_bytes,
@@ -712,6 +754,17 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
     .unwrap();
     assert_eq!(verified.root_recovery_sha256, value.root_recovery_sha256);
 
+    let mut after_root_expiry = expected_ack(&value);
+    after_root_expiry.current_tpm.tpm_clock = root.tpm_clock + MAX_TPM_ELAPSED_MS;
+    assert!(verify_recovery_ack_with(
+        &bytes,
+        DER,
+        &authority,
+        &after_root_expiry,
+        |_key, _domain, _payload, _signature| Ok(()),
+    )
+    .is_err());
+
     let correct_key = public_key_pem(&snapshot.keys[0].public_key).unwrap();
     assert!(verify_recovery_ack_with(
         &bytes,
@@ -752,8 +805,16 @@ fn recovery_ack_uses_only_exact_root_authorized_signer_and_state() {
         );
     }
 
+    let mut wrong_root_value = serde_json::to_value(&snapshot).unwrap();
+    let original_root_key = wrong_root_value["root_key"]["public_key"].clone();
+    wrong_root_value["root_key"]["public_key"] =
+        serde_json::to_value(&snapshot.keys[1].public_key).unwrap();
+    wrong_root_value["keys"][1]["public_key"] = original_root_key;
+    let wrong_root_snapshot: Snapshot =
+        parse_canonical(&canonical(&wrong_root_value), "wrong root snapshot").unwrap();
+    let wrong_authenticated_snapshot = authenticated(&wrong_root_snapshot);
     let wrong_root = ExpectedRootRecovery {
-        root_public_key: &snapshot.keys[1].public_key,
+        authenticated_snapshot: &wrong_authenticated_snapshot,
         ..expected_root
     };
     assert!(verify_root_recovery_authority_with(
@@ -776,7 +837,9 @@ fn root_recovery_refuses_same_sequence_release_split_view() {
     let root = root_recovery(&snapshot, &current, &resulting);
     let root_bytes = canonical(&root);
     resulting.recovery_sha256 = Some(canonical_hash(&root_bytes).unwrap());
+    let authenticated_snapshot = authenticated(&snapshot);
     let expected_root = ExpectedRootRecovery {
+        authenticated_snapshot: &authenticated_snapshot,
         baseline: &current.baseline,
         current_state: &current,
         current_tpm: CurrentTpmState {
@@ -795,7 +858,51 @@ fn root_recovery_refuses_same_sequence_release_split_view() {
         },
         release_authorization_sha256: root.release_authorization_sha256.as_deref(),
         resulting_state: &resulting,
-        root_public_key: snapshot.root_public_key(),
+    };
+    assert!(verify_root_recovery_authority_with(
+        &root_bytes,
+        DER,
+        &expected_root,
+        |_key, _domain, _payload, _signature| Ok(()),
+    )
+    .is_err());
+}
+
+#[test]
+fn root_recovery_never_lowers_trusted_time_when_sequence_advances() {
+    let snapshot = snapshot();
+    let current = state(&snapshot);
+    let mut resulting = current.clone();
+    resulting.recovery_seq += 1;
+    resulting.trusted_time_seq += 1;
+    resulting.trusted_time = "2026-07-20T00:00:00Z".into();
+    resulting.trusted_time_recovery_floor = "2026-07-20T00:00:00Z".into();
+    resulting.last_trusted_time_assertion_sha256 = "8".repeat(64);
+    resulting.recovery_sha256 = Some("0".repeat(64));
+    let root = root_recovery(&snapshot, &current, &resulting);
+    let root_bytes = canonical(&root);
+    resulting.recovery_sha256 = Some(canonical_hash(&root_bytes).unwrap());
+    let authenticated_snapshot = authenticated(&snapshot);
+    let expected_root = ExpectedRootRecovery {
+        authenticated_snapshot: &authenticated_snapshot,
+        baseline: &current.baseline,
+        current_state: &current,
+        current_tpm: CurrentTpmState {
+            tpm_clock: root.tpm_clock,
+            tpm_reset_count: root.tpm_reset_count,
+            tpm_restart_count: root.tpm_restart_count,
+            tpm_safe: true,
+        },
+        device_root: &root.device_root,
+        device_serial: &root.device_serial,
+        pending: PendingChallenge {
+            nonce: &root.recovery_nonce,
+            tpm_clock: root.tpm_clock,
+            tpm_reset_count: root.tpm_reset_count,
+            tpm_restart_count: root.tpm_restart_count,
+        },
+        release_authorization_sha256: root.release_authorization_sha256.as_deref(),
+        resulting_state: &resulting,
     };
     assert!(verify_root_recovery_authority_with(
         &root_bytes,

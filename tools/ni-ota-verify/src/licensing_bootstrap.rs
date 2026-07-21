@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegated::contract::{
     canonical_hash, ident, parse_canonical, public_key_pem, safe_nonnegative_uint, safe_uint,
-    sha256, signature_profile, target, timestamp, validate_der_signature, validate_snapshot,
-    ContractError, PublicKey, Snapshot,
+    sha256, signature_profile, target, timestamp, validate_der_signature, ContractError, PublicKey,
+    Snapshot,
 };
-use crate::delegated::verify_signature;
+use crate::delegated::{verify_signature, AuthenticatedSnapshot};
 use crate::state::FileStateStore;
 use crate::trusted_time::utc_seconds;
 
@@ -146,16 +146,14 @@ pub(crate) struct VerifiedBootstrap {
 }
 
 pub(crate) fn verify_bootstrap(
-    snapshot: &Snapshot,
-    snapshot_bytes: &[u8],
+    authenticated_snapshot: &AuthenticatedSnapshot,
     authorization_bytes: &[u8],
     signature_bytes: &[u8],
     expected: &ExpectedBootstrap<'_>,
     scratch: &FileStateStore,
 ) -> Result<VerifiedBootstrap, ContractError> {
-    verify_bootstrap_with(
-        snapshot,
-        snapshot_bytes,
+    verify_authenticated_bootstrap_with(
+        authenticated_snapshot,
         authorization_bytes,
         signature_bytes,
         expected,
@@ -170,9 +168,8 @@ pub(crate) fn verify_bootstrap(
     )
 }
 
-fn verify_bootstrap_with<F>(
-    snapshot: &Snapshot,
-    snapshot_bytes: &[u8],
+fn verify_authenticated_bootstrap_with<F>(
+    authenticated_snapshot: &AuthenticatedSnapshot,
     authorization_bytes: &[u8],
     signature_bytes: &[u8],
     expected: &ExpectedBootstrap<'_>,
@@ -181,17 +178,13 @@ fn verify_bootstrap_with<F>(
 where
     F: FnOnce(&[u8], &[u8], &[u8], &[u8]) -> Result<(), ContractError>,
 {
-    let parsed_snapshot: Snapshot = parse_canonical(snapshot_bytes, "delegation snapshot")?;
-    if parsed_snapshot != *snapshot {
-        return Err("delegation snapshot bytes differ from parsed authority".into());
-    }
-    validate_snapshot(snapshot)?;
+    let snapshot = authenticated_snapshot.snapshot();
     let authorization: LicensingBootstrapAuthorization =
         parse_canonical(authorization_bytes, "licensing-bootstrap authorization")?;
     validate_bootstrap(
         &authorization,
         snapshot,
-        &canonical_hash(snapshot_bytes)?,
+        authenticated_snapshot.canonical_sha256(),
         expected,
     )?;
     validate_der_signature(signature_bytes)?;
@@ -215,6 +208,31 @@ where
         licence_record_id: authorization.licence_record_id,
         reason: authorization.reason,
     })
+}
+
+#[cfg(test)]
+fn verify_bootstrap_with<F>(
+    snapshot: &Snapshot,
+    snapshot_bytes: &[u8],
+    authorization_bytes: &[u8],
+    signature_bytes: &[u8],
+    expected: &ExpectedBootstrap<'_>,
+    signature_verifier: F,
+) -> Result<VerifiedBootstrap, ContractError>
+where
+    F: FnOnce(&[u8], &[u8], &[u8], &[u8]) -> Result<(), ContractError>,
+{
+    let authenticated = crate::delegated::authenticated_snapshot_for_test(snapshot_bytes)?;
+    if authenticated.snapshot() != snapshot {
+        return Err("delegation snapshot bytes differ from parsed authority".into());
+    }
+    verify_authenticated_bootstrap_with(
+        &authenticated,
+        authorization_bytes,
+        signature_bytes,
+        expected,
+        signature_verifier,
+    )
 }
 
 fn validate_bootstrap(
@@ -298,6 +316,10 @@ fn validate_bootstrap(
                     .authoritative_state
                     .as_ref()
                     .is_some_and(valid_authoritative_state)
+                && value
+                    .authoritative_state
+                    .as_ref()
+                    .is_some_and(|state| state.baseline == value.baseline)
                 && expected.reason == "state_loss_recovery"
                 && value.previous_device_root.as_ref() == expected.previous_device_root
                 && value.authoritative_state.as_ref() == expected.authoritative_state => {}
@@ -318,7 +340,7 @@ fn unique_snapshot_key<'a>(
         .filter(|key| {
             key.key_id == key_id
                 && key.role == "licensing-bootstrap"
-                && key.status == "active"
+                && key.authorizes_at(issued_at)
                 && key.artifact_types
                     == [
                         "ota-licensing-bootstrap-v1",
@@ -329,8 +351,6 @@ fn unique_snapshot_key<'a>(
                     .hardware_targets
                     .iter()
                     .any(|value| value == hardware_target)
-                && key.valid_from.as_str() <= issued_at
-                && issued_at < key.valid_until.as_str()
         })
         .collect();
     match keys.as_slice() {
@@ -535,6 +555,7 @@ struct StateRecoveryAuthorization {
 }
 
 pub(crate) struct ExpectedRootRecovery<'a> {
+    pub(crate) authenticated_snapshot: &'a AuthenticatedSnapshot,
     pub(crate) baseline: &'a BaselineIdentity,
     pub(crate) current_state: &'a AuthoritativeState,
     pub(crate) current_tpm: CurrentTpmState,
@@ -543,7 +564,6 @@ pub(crate) struct ExpectedRootRecovery<'a> {
     pub(crate) pending: PendingChallenge<'a>,
     pub(crate) release_authorization_sha256: Option<&'a str>,
     pub(crate) resulting_state: &'a AuthoritativeState,
-    pub(crate) root_public_key: &'a PublicKey,
 }
 
 /// Opaque recovery-only authority. It can be created only after canonical
@@ -559,6 +579,8 @@ pub(crate) struct RecoveryAckAuthority {
     tpm_clock: u64,
     tpm_reset_count: u32,
     tpm_restart_count: u32,
+    root_issued_at: String,
+    root_valid_until: String,
 }
 
 pub(crate) fn verify_root_recovery_authority(
@@ -596,7 +618,7 @@ where
     let root_recovery_sha256 = canonical_hash(authorization_bytes)?;
     validate_root_recovery(&value, &root_recovery_sha256, expected)?;
     validate_der_signature(signature_bytes)?;
-    let root_key = public_key_pem(expected.root_public_key)?;
+    let root_key = public_key_pem(expected.authenticated_snapshot.snapshot().root_public_key())?;
     signature_verifier(
         &root_key,
         STATE_RECOVERY_DOMAIN,
@@ -614,6 +636,8 @@ where
         tpm_clock: value.tpm_clock,
         tpm_reset_count: value.tpm_reset_count,
         tpm_restart_count: value.tpm_restart_count,
+        root_issued_at: value.issued_at,
+        root_valid_until: value.valid_until,
     })
 }
 
@@ -627,16 +651,21 @@ fn validate_root_recovery(
         .recovery_seq
         .checked_add(1)
         .filter(|value| safe_uint(*value));
+    let authenticated_root = expected.authenticated_snapshot.snapshot();
     if value.schema != "ota-state-recovery-v1"
         || value.signing_role != "ota-root"
         || !signature_profile(&value.signature_algorithm, &value.signature_encoding)
         || value.key_id != format!("ota-root-v{}", value.root_version)
         || value.root_version != value.current_state.root_version
         || value.root_spki_sha256 != value.current_state.root_spki_sha256
-        || expected.root_public_key.spki_sha256() != value.root_spki_sha256
+        || authenticated_root.root_version() != value.root_version
+        || authenticated_root.root_spki_sha256() != value.root_spki_sha256
         || value.baseline != *expected.baseline
         || !valid_baseline(&value.baseline)
         || value.current_state != *expected.current_state
+        || value.current_state.baseline != value.baseline
+        || value.current_state.root_version != authenticated_root.root_version()
+        || value.current_state.root_spki_sha256 != authenticated_root.root_spki_sha256()
         || !valid_authoritative_state(&value.current_state)
         || value.resulting_state
             != RecoveryTargetState::from_authoritative(expected.resulting_state)
@@ -701,6 +730,8 @@ fn forward_recovery_state(current: &AuthoritativeState, next: &AuthoritativeStat
             && next.delegation_snapshot_sha256 != current.delegation_snapshot_sha256)
         || next.bundle_seq < current.bundle_seq
         || next.trusted_time_seq < current.trusted_time_seq
+        || next.trusted_time < current.trusted_time
+        || next.trusted_time_recovery_floor < current.trusted_time_recovery_floor
         || (next.trusted_time_seq == current.trusted_time_seq
             && (next.last_trusted_time_assertion_sha256
                 != current.last_trusted_time_assertion_sha256
@@ -811,6 +842,12 @@ where
             &value.issued_at,
             &value.valid_until,
             value.tpm_clock,
+            expected.current_tpm.tpm_clock,
+        )
+        || !consumption_precedes_expiry(
+            &authority.root_issued_at,
+            &authority.root_valid_until,
+            authority.tpm_clock,
             expected.current_tpm.tpm_clock,
         )
         || value.key_id != authority.acknowledgement_key_id

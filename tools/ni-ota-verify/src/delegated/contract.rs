@@ -163,15 +163,8 @@ impl Snapshot {
         &self.root_key.public_key.spki_sha256
     }
 
-    #[cfg(test)]
     pub(crate) fn root_public_key(&self) -> &PublicKey {
         &self.root_key.public_key
-    }
-}
-
-impl PublicKey {
-    pub(crate) fn spki_sha256(&self) -> &str {
-        &self.spki_sha256
     }
 }
 
