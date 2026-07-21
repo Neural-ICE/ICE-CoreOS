@@ -166,6 +166,48 @@ def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
         raise ManifestError(f"{kind} changed while walking: {path}")
 
 
+def mountinfo_has_writable_alias(lines: list[str], device: str) -> tuple[bool, bool]:
+    found = False
+    for line in lines:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            mounted_device = fields[2]
+            mount_options = fields[5].split(",")
+            superblock_options = fields[separator + 3].split(",")
+        except (IndexError, ValueError) as error:
+            raise ManifestError("cannot parse /proc/self/mountinfo") from error
+        if mounted_device != device:
+            continue
+        found = True
+        if "rw" in mount_options or "rw" in superblock_options:
+            return found, True
+    return found, False
+
+
+def require_exclusive_read_only_mount(root: Path, metadata: os.stat_result) -> None:
+    if not hasattr(os, "ST_RDONLY"):
+        raise ManifestError("read-only filesystem verification is unavailable")
+    try:
+        filesystem = os.statvfs(root)
+    except OSError as error:
+        raise ManifestError(f"cannot inspect tree filesystem {root}: {error}") from error
+    if not filesystem.f_flag & os.ST_RDONLY:
+        raise ManifestError(f"tree filesystem is not read-only: {root}")
+    if sys.platform != "linux":
+        raise ManifestError("exclusive read-only mount verification requires Linux")
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines()
+    except OSError as error:
+        raise ManifestError(f"cannot read mount topology for {root}: {error}") from error
+    device = f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}"
+    found, writable = mountinfo_has_writable_alias(mountinfo, device)
+    if not found:
+        raise ManifestError(f"tree mount is absent from mount topology: {root}")
+    if writable:
+        raise ManifestError(f"tree filesystem has a writable mount alias: {root}")
+
+
 def walk_tree(
     name: str,
     root: Path,
@@ -181,14 +223,7 @@ def walk_tree(
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise ManifestError(f"tree root is not a real directory: {root}")
     if require_read_only:
-        if not hasattr(os, "ST_RDONLY"):
-            raise ManifestError("read-only filesystem verification is unavailable")
-        try:
-            filesystem = os.statvfs(root)
-        except OSError as error:
-            raise ManifestError(f"cannot inspect tree filesystem {root}: {error}") from error
-        if not filesystem.f_flag & os.ST_RDONLY:
-            raise ManifestError(f"tree filesystem is not read-only: {root}")
+        require_exclusive_read_only_mount(root, root_metadata)
 
     entries: list[dict[str, Any]] = []
     stack: list[tuple[Path, PurePosixPath | None, os.stat_result | None]] = [

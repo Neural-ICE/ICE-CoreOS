@@ -208,12 +208,15 @@ class SeedTreeManifestTests(unittest.TestCase):
         replacement = self.source / "replacement"
         replacement.mkdir()
 
-        def replace_root(_: Path) -> SimpleNamespace:
+        def replace_root(_: Path, __: os.stat_result) -> None:
             models.rename(original)
             models.symlink_to(replacement, target_is_directory=True)
-            return SimpleNamespace(f_flag=MANIFEST_MODULE.os.ST_RDONLY)
 
-        with mock.patch.object(MANIFEST_MODULE.os, "statvfs", side_effect=replace_root):
+        with mock.patch.object(
+            MANIFEST_MODULE,
+            "require_exclusive_read_only_mount",
+            side_effect=replace_root,
+        ):
             with self.assertRaisesRegex(
                 MANIFEST_MODULE.ManifestError,
                 "tree root changed before traversal",
@@ -223,6 +226,31 @@ class SeedTreeManifestTests(unittest.TestCase):
                     self.root / "root-replaced.json",
                     require_read_only=True,
                 )
+
+    def test_mount_topology_refuses_any_writable_alias(self) -> None:
+        read_only = (
+            "101 1 8:4 / /media/seed ro,nosuid,nodev - xfs /dev/sda4 ro,inode64"
+        )
+        writable_alias = (
+            "102 1 8:4 / /media/alias rw,nosuid,nodev - xfs /dev/sda4 rw,inode64"
+        )
+        other_device = (
+            "103 1 8:5 / /media/other rw,nosuid,nodev - xfs /dev/sda5 rw,inode64"
+        )
+        self.assertEqual(
+            MANIFEST_MODULE.mountinfo_has_writable_alias(
+                [read_only, other_device],
+                "8:4",
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            MANIFEST_MODULE.mountinfo_has_writable_alias(
+                [read_only, writable_alias],
+                "8:4",
+            ),
+            (True, True),
+        )
 
     def test_output_inside_input_tree_is_refused_before_walk(self) -> None:
         output = self.source / "models" / "manifest.json"
