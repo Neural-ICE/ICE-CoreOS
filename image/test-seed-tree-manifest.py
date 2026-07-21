@@ -26,6 +26,15 @@ SPEC.loader.exec_module(MANIFEST_MODULE)
 
 class SeedTreeManifestTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Unit fixtures exercise serialization semantics independently of the
+        # runner's backing filesystem. Btrfs refusal has its own explicit test.
+        self.filesystem_magic = mock.patch.object(
+            MANIFEST_MODULE,
+            "linux_filesystem_magic",
+            return_value=0xEF53,
+        )
+        self.filesystem_magic.start()
+        self.addCleanup(self.filesystem_magic.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "source"
