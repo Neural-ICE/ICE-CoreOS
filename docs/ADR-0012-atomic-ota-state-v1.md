@@ -36,6 +36,20 @@ constructed as:
    `neural-ice:ota:state-nv-delete:v1\0`;
 2. `TPM2_PolicyCommandCode(TPM_CC_NV_UndefineSpaceSpecial)`.
 
+Per TCG TPM 2.0 Library Part 3 section 23.2.3, `PolicyUpdate` hashes its
+variable-sized arguments in two distinct steps; it does not concatenate the
+key Name and `policyRef` into one hash. For SHA-256 the reproducible chain is:
+
+- `H(0^32 || 0000016a || ota-root-v1.Name)` =
+  `8599598585b872929367c006ff1e53da890a41a20a590f436b160ebb141d7e85`;
+- `H(previous || policyRef.buffer)` =
+  `acd9fab3a701a6738e092425f342abd45962ffc2808f399d59aa615f892df063`;
+- `H(previous || 0000016c || 0000011f)` = the pinned authorization policy
+  `921f9fa2ce8c30bbf29b84500a8456188f1febc04f154e9eccca4d5b1bc8a25d`.
+
+The same values are emitted by a trial policy session on `swtpm` through
+`tpm2_policyauthorize` and `tpm2_policycommandcode`.
+
 The root signature authorizes the approved recovery policy; it does not expose
 or import the root private key on the appliance. The platform hierarchy must
 also authorize the special undefine command. Owner/password undefine and an

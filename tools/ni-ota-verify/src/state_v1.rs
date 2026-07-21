@@ -230,6 +230,46 @@ fn tool(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner;
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn deletion_policy_uses_the_normative_two_step_policy_update() {
+        let mut authorize_name = vec![0_u8; 32];
+        authorize_name.extend_from_slice(&0x0000_016a_u32.to_be_bytes());
+        authorize_name.extend_from_slice(&hex_bytes(
+            "000beb256627a4315f1a3d2a2a0c9931760ad30e8822b35c5ebed854f1829b07b7b1",
+        ));
+        let authorize_name = runner::sha256_bytes(&authorize_name).unwrap();
+        assert_eq!(
+            authorize_name,
+            "8599598585b872929367c006ff1e53da890a41a20a590f436b160ebb141d7e85"
+        );
+
+        let mut authorize_ref = hex_bytes(&authorize_name);
+        authorize_ref.extend_from_slice(b"neural-ice:ota:state-nv-delete:v1\0");
+        let authorize_ref = runner::sha256_bytes(&authorize_ref).unwrap();
+        assert_eq!(
+            authorize_ref,
+            "acd9fab3a701a6738e092425f342abd45962ffc2808f399d59aa615f892df063"
+        );
+
+        let mut command_code = hex_bytes(&authorize_ref);
+        command_code.extend_from_slice(&0x0000_016c_u32.to_be_bytes());
+        command_code.extend_from_slice(&0x0000_011f_u32.to_be_bytes());
+        assert_eq!(
+            runner::sha256_bytes(&command_code).unwrap(),
+            STATE_NV_DELETE_AUTH_POLICY
+        );
+    }
 
     #[test]
     fn state_nv_attestation_requires_exact_index_type_size_and_policy() {
