@@ -106,69 +106,100 @@ SEEDNUM="$(sudo sgdisk -p "$RAW" | awk '/ni-seed/{n=$1} END{print n}')"
 echo "    ni-seed = partition #${SEEDNUM}"
 
 echo "==> 4. mkfs + copy the store + models into ni-seed"
-LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
-cleanup(){ sudo umount /mnt/ni-seed 2>/dev/null||true; sudo losetup -d "$LOOP" 2>/dev/null||true; storecleanup; }
+LOOP=''
+SEEDPART=''
+MOUNT_DIR="$(sudo mktemp -d /run/ni-seed-build.XXXXXX)"
+MOUNTED=0
+RAW_INO="$(stat -Lc '%i' "$RAW")"
+RAW_DEV="$(python3 - "$RAW" <<'PY'
+import os
+import sys
+
+metadata = os.stat(sys.argv[1])
+print(f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}")
+PY
+)"
+loop_is_ours() {
+  [ -n "$LOOP" ] || return 1
+  sudo losetup --json --list --output NAME,BACK-INO,BACK-MAJ:MIN |
+    python3 -c '
+import json
+import sys
+loop, inode, device = sys.argv[1:]
+document = json.load(sys.stdin)
+raise SystemExit(0 if any(
+    entry.get("name") == loop
+    and str(entry.get("back-ino")) == inode
+    and entry.get("back-maj:min") == device
+    for entry in document.get("loopdevices", [])
+) else 1)
+' "$LOOP" "$RAW_INO" "$RAW_DEV"
+}
+cleanup() {
+  set +e
+  if (( MOUNTED )) && [ -n "$MOUNT_DIR" ]; then
+    source="$(sudo findmnt -n -o SOURCE --target "$MOUNT_DIR" 2>/dev/null || true)"
+    if [ "$source" = "$SEEDPART" ]; then
+      sudo umount "$MOUNT_DIR" 2>/dev/null || true
+    fi
+  fi
+  MOUNTED=0
+  if [ -n "$LOOP" ] && loop_is_ours; then
+    sudo losetup -d "$LOOP" 2>/dev/null || true
+  fi
+  LOOP=''
+  SEEDPART=''
+  if [ -n "$MOUNT_DIR" ]; then
+    sudo rmdir "$MOUNT_DIR" 2>/dev/null || true
+  fi
+  storecleanup
+}
 trap cleanup EXIT
+LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
 SEEDPART="${LOOP}p${SEEDNUM}"
 sudo mkfs.xfs -q -L ni-seed "$SEEDPART"
-sudo mkdir -p /mnt/ni-seed; sudo mount "$SEEDPART" /mnt/ni-seed
-sudo mkdir -p /mnt/ni-seed/store /mnt/ni-seed/models
+sudo mount "$SEEDPART" "$MOUNT_DIR"
+MOUNTED=1
+sudo mkdir -p "$MOUNT_DIR/store" "$MOUNT_DIR/models"
 # cp -a preserves the overlay store faithfully (hardlinks + trusted.* xattrs, hence sudo).
-sudo cp -a "$STORE_TMP/." /mnt/ni-seed/store/
-sudo cp -a "$SEED_MODELS/." /mnt/ni-seed/models/
+sudo cp -a "$STORE_TMP/." "$MOUNT_DIR/store/"
+sudo cp -a "$SEED_MODELS/." "$MOUNT_DIR/models/"
 if [ -n "$SEED_PAYLOAD" ]; then
-  sudo mkdir -p /mnt/ni-seed/payload
-  sudo cp -a "$SEED_PAYLOAD/." /mnt/ni-seed/payload/
-  echo "    payload: $(basename "$SEED_PAYLOAD") ($(sudo du -sh /mnt/ni-seed/payload | cut -f1))"
+  sudo mkdir -p "$MOUNT_DIR/payload"
+  sudo cp -a "$SEED_PAYLOAD/." "$MOUNT_DIR/payload/"
+  echo "    payload: $(basename "$SEED_PAYLOAD") ($(sudo du -sh "$MOUNT_DIR/payload" | cut -f1))"
 fi
 sudo sync
-echo "    ni-seed content:"; sudo du -sh /mnt/ni-seed/store /mnt/ni-seed/models
-sudo umount /mnt/ni-seed; sudo losetup -d "$LOOP"
+echo "    ni-seed content:"; sudo du -sh "$MOUNT_DIR/store" "$MOUNT_DIR/models"
+sudo umount "$MOUNT_DIR"
+MOUNTED=0
+loop_is_ours || { echo "refusing to detach a loop whose backing identity changed" >&2; exit 1; }
+sudo losetup -d "$LOOP"
+LOOP=''
+SEEDPART=''
+sudo rmdir "$MOUNT_DIR"
+MOUNT_DIR=''
 
-echo "==> 5. verify finalized ni-seed from the exact raw through a read-only loop"
+case "$COMPRESS" in
+  zstd-fast|zstd-max) ART="${REPO_ROOT}/${OUT}.img.zst" ;;
+  xz)                 ART="${REPO_ROOT}/${OUT}.img.xz" ;;
+  none)               ART="$RAW" ;;
+  *) echo "invalid COMPRESS" >&2; exit 2 ;;
+esac
+ART_CHECKSUM="${ART}.sha256"
 FINAL_MEDIA_RECEIPT="${RAW}.final-media.json"
+FINAL_MEDIA_RECEIPT_CHECKSUM="${FINAL_MEDIA_RECEIPT}.sha256"
+
+echo "==> 5. accept the exact raw and build the digest-bound release artifact"
 sudo python3 image/verify-preloaded-media.py \
   --raw "$RAW" \
   --expected-manifest "$EXPECTED_SEED_MANIFEST" \
-  --receipt "$FINAL_MEDIA_RECEIPT"
-sudo chmod 0644 "$FINAL_MEDIA_RECEIPT"
+  --artifact "$ART" \
+  --artifact-checksum "$ART_CHECKSUM" \
+  --compression "$COMPRESS" \
+  --receipt "$FINAL_MEDIA_RECEIPT" \
+  --receipt-checksum "$FINAL_MEDIA_RECEIPT_CHECKSUM"
 storecleanup; trap - EXIT
 
-echo "==> 6. compress (${COMPRESS})"
-case "$COMPRESS" in
-  zstd-fast) zstd -3 -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
-  zstd-max)  zstd -19 --long -T0 -c "$RAW" > "${OUT}.img.zst"; ART="${OUT}.img.zst" ;;
-  none)      ART="$RAW" ;;
-  xz)        xz -T0 -1 -c "$RAW" > "${OUT}.img.xz"; ART="${OUT}.img.xz" ;;
-  *) echo "invalid COMPRESS"; exit 2 ;;
-esac
-[ "$COMPRESS" = none ] || sha256sum "$ART" > "${ART}.sha256"
-# The receipt binds the raw bytes accepted above. Re-read the raw after compression so a
-# concurrent writer cannot substitute bytes between the gate and artifact creation.
-python3 - "$FINAL_MEDIA_RECEIPT" "$RAW" <<'PY'
-import hashlib
-import json
-import sys
-
-receipt_path, raw_path = sys.argv[1:]
-with open(receipt_path, encoding="ascii") as stream:
-    expected = json.load(stream)["raw"]
-digest = hashlib.sha256()
-size = 0
-with open(raw_path, "rb", buffering=0) as stream:
-    while chunk := stream.read(8 * 1024 * 1024):
-        digest.update(chunk)
-        size += len(chunk)
-if size != expected["size"] or digest.hexdigest() != expected["sha256"]:
-    raise SystemExit("REFUSED: raw changed after final-media acceptance")
-PY
-sha256sum "$FINAL_MEDIA_RECEIPT" > "${FINAL_MEDIA_RECEIPT}.sha256"
-# Compressed outputs above stay repo-relative so their checksum entries remain
-# relocatable. Normalize a separate reporting path because the uncompressed
-# RAW is already absolute and must not receive REPO_ROOT a second time.
-case "$ART" in
-  /*) ART_PATH="$ART" ;;
-  *) ART_PATH="${REPO_ROOT}/${ART}" ;;
-esac
-echo "==> PRELOADED installer ready: ${ART_PATH}"
-ls -lh "${ART_PATH}"
+echo "==> PRELOADED installer ready: ${ART}"
+ls -lh "$ART" "$ART_CHECKSUM" "$FINAL_MEDIA_RECEIPT" "$FINAL_MEDIA_RECEIPT_CHECKSUM"
