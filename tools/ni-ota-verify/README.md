@@ -171,10 +171,24 @@ delegation-state persistence are deliberately subsequent slices; this command
 does not authorize a release, publish a channel, or mutate accepted state.
 
 The sole unseeded exception belongs to the distinct physical
-`verify-delegated-usb` path. It is explicitly floor-bound to the immutable
-`/usr/lib/neural-ice/ota-min-delegation-seq` and additionally requires the
-signed debug target/release/media bindings. Omitting accepted state from the
+`verify-delegated-usb` path. It is explicitly bound to both the immutable
+`/usr/lib/neural-ice/ota-min-delegation-seq` and the exact canonical snapshot
+hash in `/usr/lib/neural-ice/ota-bootstrap-delegation-sha256`, and additionally
+requires the signed debug target/release/media bindings. A missing, malformed,
+or different immutable hash fails closed. Omitting accepted state from the
 generic or network verifier is always an authority refusal.
+
+The physical USB command never accepts caller-provided `--accepted-*` state.
+Those values are not a trusted persistence boundary and supplying any of them
+is an authority refusal; the unseeded USB path always evaluates the exact
+image-baked epoch.
+
+The vanilla ICE-CoreOS image intentionally does not choose or embed a Neural
+ICE product delegation epoch. The private, branded ICE-Fabric product layer
+owns that immutable marker and the matching public snapshot/signature bytes;
+it must materialize all three in the final appliance image before an installer
+can use this unseeded path. A vanilla image without the product marker remains
+usable as a base OS but cannot bootstrap product update authority.
 
 Owner authorization for this gate is recorded in the 2026-07-20/21 task by
 the explicit decisions `GO signed-boot LAB debug ... gate LAB/PROD #37`,
@@ -225,6 +239,16 @@ a newer candidate resumes only after a valid root-signed successor satisfies
 both that history and the image-baked minimum. Root-anchor rotation itself is
 outside this gate and requires a separately approved image/trust-anchor
 transition; accepted snapshot chains keep the immutable root unchanged.
+
+The first epoch-aware debug installer is the transition baseline: no production
+device predates it. A rollback to a deployment containing the earlier verifier
+keeps the already installed workload bootable, but that verifier must not be
+used to authorize a fresh physical bootstrap. Physical recovery during this
+transition boots the current signed installer media, whose branded product
+layer contains the fixed epoch marker and epoch-aware verifier. After the next
+train, the retained N-1 deployment is itself epoch-aware, so normal one-version
+rollback preserves this pin. Neither transition path moves a release channel
+or lowers accepted delegation state.
 
 `prepare-trusted-time-v2` is the networkless appliance-side preparation step.
 It accepts `--snapshot`, `--snapshot-sig`, `--release` and `--release-sig`,

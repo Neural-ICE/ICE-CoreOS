@@ -74,6 +74,19 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "config",
         ],
     )?;
+    if [
+        "accepted-snapshot",
+        "accepted-delegation-seq",
+        "accepted-delegation-sha256",
+    ]
+    .iter()
+    .any(|name| flags.contains_key(*name))
+    {
+        return refusal(
+            "caller-provided accepted delegation state is forbidden for physical USB bootstrap"
+                .into(),
+        );
+    }
     let required = |name: &str| {
         flags
             .get(name)
