@@ -77,7 +77,7 @@ fn baseline(snapshot: &Snapshot) -> BaselineIdentity {
         hardware_target: "nvidia-gb10-arm64".into(),
         minimum_bundle_seq: 1,
         minimum_delegation_seq: 1,
-        minimum_recovery_seq: 1,
+        minimum_recovery_seq: 0,
         minimum_trusted_time_seq: 1,
         os_image_manifest_digest: format!("sha256:{}", "c".repeat(64)),
         ota_root_spki_sha256: snapshot.root_spki_sha256().into(),
@@ -314,6 +314,36 @@ fn recovery_requires_previous_device_full_floors_and_exact_reason() {
             "{case}"
         );
     }
+
+    let mut no_recovery_history = value.clone();
+    let state = no_recovery_history.authoritative_state.as_mut().unwrap();
+    state.recovery_seq = 0;
+    state.recovery_sha256 = None;
+    assert!(verify_bootstrap_with(
+        &snapshot,
+        &snapshot_bytes(&snapshot),
+        &canonical(&no_recovery_history),
+        DER,
+        &expected(&no_recovery_history),
+        accept_expected_domain,
+    )
+    .is_ok());
+
+    let mut ambiguous_zero = no_recovery_history.clone();
+    ambiguous_zero
+        .authoritative_state
+        .as_mut()
+        .unwrap()
+        .recovery_sha256 = Some("9".repeat(64));
+    assert!(verify_bootstrap_with(
+        &snapshot,
+        &snapshot_bytes(&snapshot),
+        &canonical(&ambiguous_zero),
+        DER,
+        &expected(&ambiguous_zero),
+        accept_expected_domain,
+    )
+    .is_err());
 }
 
 #[test]
@@ -453,7 +483,7 @@ fn root_recovery(
         issuance_id: "root-recovery-0001".into(),
         issued_at: "2026-07-21T12:00:00Z".into(),
         key_id: format!("ota-root-v{}", current.root_version),
-        previous_recovery_sha256: current.recovery_sha256.clone().unwrap(),
+        previous_recovery_sha256: current.recovery_sha256.clone(),
         reason: "tpm-state-loss".into(),
         recovery_nonce: "5".repeat(64),
         recovery_seq: resulting.recovery_seq,
