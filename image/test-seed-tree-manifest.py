@@ -199,7 +199,7 @@ class SeedTreeManifestTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("tree filesystem is not read-only", result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
         self.assertFalse(output.exists())
 
     def test_tree_root_replacement_after_read_only_check_is_refused(self) -> None:
@@ -212,10 +212,13 @@ class SeedTreeManifestTests(unittest.TestCase):
             models.rename(original)
             models.symlink_to(replacement, target_is_directory=True)
 
-        with mock.patch.object(
-            MANIFEST_MODULE,
-            "require_exclusive_read_only_mount",
-            side_effect=replace_root,
+        with (
+            mock.patch.object(MANIFEST_MODULE, "require_private_mount_namespace"),
+            mock.patch.object(
+                MANIFEST_MODULE,
+                "require_exclusive_read_only_mount",
+                side_effect=replace_root,
+            ),
         ):
             with self.assertRaisesRegex(
                 MANIFEST_MODULE.ManifestError,
@@ -228,26 +231,20 @@ class SeedTreeManifestTests(unittest.TestCase):
                 )
 
     def test_mount_topology_refuses_any_writable_alias(self) -> None:
-        read_only = (
-            "101 1 8:4 / /media/seed ro,nosuid,nodev - xfs /dev/sda4 ro,inode64"
-        )
-        writable_alias = (
-            "102 1 8:4 / /media/alias rw,nosuid,nodev - xfs /dev/sda4 rw,inode64"
-        )
-        other_device = (
-            "103 1 8:5 / /media/other rw,nosuid,nodev - xfs /dev/sda5 rw,inode64"
-        )
+        read_only = b"101 1 8:4 / /media/\xc3\xa9 ro,nosuid - xfs /dev/sda4 ro,inode64"
+        writable_alias = b"102 1 8:4 / /media/alias rw - xfs /dev/sda4 rw,inode64"
+        other_device = b"103 1 8:5 / /media/other rw - xfs /dev/sda5 rw,inode64"
         self.assertEqual(
             MANIFEST_MODULE.mountinfo_has_writable_alias(
                 [read_only, other_device],
-                "8:4",
+                b"8:4",
             ),
             (True, False),
         )
         self.assertEqual(
             MANIFEST_MODULE.mountinfo_has_writable_alias(
                 [read_only, writable_alias],
-                "8:4",
+                b"8:4",
             ),
             (True, True),
         )

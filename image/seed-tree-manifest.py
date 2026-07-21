@@ -166,23 +166,36 @@ def revalidate(path: Path, before: os.stat_result, kind: str) -> None:
         raise ManifestError(f"{kind} changed while walking: {path}")
 
 
-def mountinfo_has_writable_alias(lines: list[str], device: str) -> tuple[bool, bool]:
+def mountinfo_has_writable_alias(
+    lines: list[bytes],
+    device: bytes,
+) -> tuple[bool, bool]:
     found = False
     for line in lines:
         fields = line.split()
         try:
-            separator = fields.index("-")
+            separator = fields.index(b"-")
             mounted_device = fields[2]
-            mount_options = fields[5].split(",")
-            superblock_options = fields[separator + 3].split(",")
+            mount_options = fields[5].split(b",")
+            superblock_options = fields[separator + 3].split(b",")
         except (IndexError, ValueError) as error:
             raise ManifestError("cannot parse /proc/self/mountinfo") from error
         if mounted_device != device:
             continue
         found = True
-        if "rw" in mount_options or "rw" in superblock_options:
+        if b"rw" in mount_options or b"rw" in superblock_options:
             return found, True
     return found, False
+
+
+def require_private_mount_namespace() -> None:
+    try:
+        current = Path("/proc/self/ns/mnt").stat()
+        initial = Path("/proc/1/ns/mnt").stat()
+    except OSError as error:
+        raise ManifestError(f"cannot verify private mount namespace: {error}") from error
+    if (current.st_dev, current.st_ino) == (initial.st_dev, initial.st_ino):
+        raise ManifestError("manifest traversal requires a private mount namespace")
 
 
 def require_exclusive_read_only_mount(root: Path, metadata: os.stat_result) -> None:
@@ -197,10 +210,10 @@ def require_exclusive_read_only_mount(root: Path, metadata: os.stat_result) -> N
     if sys.platform != "linux":
         raise ManifestError("exclusive read-only mount verification requires Linux")
     try:
-        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines()
+        mountinfo = Path("/proc/self/mountinfo").read_bytes().splitlines()
     except OSError as error:
         raise ManifestError(f"cannot read mount topology for {root}: {error}") from error
-    device = f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}"
+    device = f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}".encode("ascii")
     found, writable = mountinfo_has_writable_alias(mountinfo, device)
     if not found:
         raise ManifestError(f"tree mount is absent from mount topology: {root}")
@@ -237,6 +250,8 @@ def walk_tree(
             raise ManifestError(f"cannot stat {path}: {error}") from error
         if expected is not None and identity(metadata) != identity(expected):
             raise ManifestError(f"tree root changed before traversal: {path}")
+        if require_read_only and metadata.st_dev != root_metadata.st_dev:
+            raise ManifestError(f"tree crosses a filesystem boundary: {path}")
         manifest_path = stable_path(name, relative)
         item: dict[str, Any] = {"path": manifest_path, **metadata_fields(metadata)}
 
@@ -314,6 +329,8 @@ def walk_tree(
 
         raise ManifestError(f"unsupported seed entry type at {path}")
     revalidate(root, root_metadata, "tree root")
+    if require_read_only:
+        require_exclusive_read_only_mount(root, root_metadata)
     return entries
 
 
@@ -396,6 +413,8 @@ def write_manifest(
     names = [name for name, _ in trees]
     if not trees or len(names) != len(set(names)):
         raise ManifestError("tree names must be non-empty and unique")
+    if require_read_only:
+        require_private_mount_namespace()
     for _, root in trees:
         if output_is_within_tree(output, root):
             raise ManifestError(f"output path is inside input tree: {output}")
