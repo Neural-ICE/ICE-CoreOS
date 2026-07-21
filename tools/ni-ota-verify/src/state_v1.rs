@@ -177,6 +177,7 @@ pub(crate) struct Candidate<'a> {
     pub(crate) trusted: TrustedTimeState,
     pub(crate) trusted_assertion: &'a [u8],
     pub(crate) trusted_signature: &'a [u8],
+    pub(crate) trusted_valid_until: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,7 +197,9 @@ pub(crate) struct PreapplyCandidate<'a> {
     pub(crate) challenge: &'a TimeChallenge,
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) snapshot_sha256: &'a str,
+    pub(crate) snapshot_signature: &'a [u8],
     pub(crate) trusted: &'a TrustedTimeState,
+    pub(crate) trusted_valid_until: &'a str,
 }
 
 pub(crate) struct Store {
@@ -689,7 +692,12 @@ impl Store {
         if self.pending_time_challenge()? != *candidate.challenge {
             return Ok(Err("pending trusted-time challenge differs".into()));
         }
-        if let Err(reason) = self.challenge_is_live(nv, candidate.challenge)? {
+        if let Err(reason) = self.challenge_is_live(
+            nv,
+            candidate.challenge,
+            &candidate.trusted.trusted_time,
+            candidate.trusted_valid_until,
+        )? {
             return Ok(Err(reason));
         }
         let anchor = hex(nv.read_initial()?);
@@ -700,7 +708,12 @@ impl Store {
             return if self.has_prior_state_evidence()? {
                 Ok(Err("zero TPM anchor has existing state history".into()))
             } else {
-                if candidate.bundle_seq < nv.legacy_bundle_floor()?.unwrap_or(0) {
+                let Some(legacy_floor) = nv.legacy_bundle_floor()? else {
+                    return Ok(Err(
+                        "legacy TPM floor is absent before state-v1 seeding".into()
+                    ));
+                };
+                if candidate.bundle_seq < legacy_floor {
                     return Ok(Err("candidate bundle is below legacy TPM floor".into()));
                 }
                 Ok(Ok(()))
@@ -739,7 +752,12 @@ impl Store {
             return Ok(Err(reason));
         }
         if candidate.snapshot.delegation_seq == current.manifest.delegation_seq_floor {
-            if candidate.snapshot_sha256 != current.manifest.delegation_snapshot_canonical_sha256 {
+            if !same_preapply_snapshot(
+                candidate.snapshot_sha256,
+                candidate.snapshot_signature,
+                &current.manifest.delegation_snapshot_canonical_sha256,
+                &current.manifest.delegation_snapshot_signature_sha256,
+            )? {
                 return Ok(Err(
                     "equal delegation sequence has a different snapshot".into()
                 ));
@@ -792,6 +810,11 @@ impl Store {
             self.remove_temporary_generation("generation-0000000000000001")?;
         }
         let state_index_ready = nv.attest().is_ok();
+        let Some(legacy_floor) = nv.legacy_bundle_floor()? else {
+            return Ok(Err(
+                "legacy TPM floor is absent before state-v1 seeding".into()
+            ));
+        };
         let scan = self.scan_generations()?;
         let current = if initial_anchor == ZERO_ANCHOR {
             if prior_history {
@@ -801,7 +824,7 @@ impl Store {
                 ));
             }
             if scan.has_evidence
-                && !self.exact_unanchored_generation(candidate, nv.legacy_bundle_floor()?)?
+                && !self.exact_unanchored_generation(candidate, Some(legacy_floor))?
             {
                 return Ok(Err(
                     "zero TPM anchor with existing state history requires signed recovery".into(),
@@ -812,17 +835,7 @@ impl Store {
             nv.attest()?;
             self.read_current_locked(nv)?
         };
-        let legacy_floor = nv.legacy_bundle_floor()?;
-        if current
-            .as_ref()
-            .is_some_and(|value| value.manifest.legacy_bundle_floor.is_some())
-            && legacy_floor.is_none()
-        {
-            return Ok(Err(
-                "legacy TPM floor disappeared after state-v1 seeding".into()
-            ));
-        }
-        let observed_floor = legacy_floor.unwrap_or(0);
+        let observed_floor = legacy_floor;
         let persisted_floor = current
             .as_ref()
             .and_then(|value| value.manifest.legacy_bundle_floor)
@@ -851,7 +864,12 @@ impl Store {
                 }));
             }
         }
-        if let Err(reason) = self.challenge_is_live(nv, &candidate.challenge)? {
+        if let Err(reason) = self.challenge_is_live(
+            nv,
+            &candidate.challenge,
+            &candidate.trusted.trusted_time,
+            candidate.trusted_valid_until,
+        )? {
             return Ok(Err(reason));
         }
         if self.pending_time_challenge()? != candidate.challenge {
@@ -885,11 +903,7 @@ impl Store {
             candidate,
             current.as_ref().map(|value| value.manifest_sha256.clone()),
             initial_anchor.clone(),
-            legacy_floor.or_else(|| {
-                current
-                    .as_ref()
-                    .and_then(|value| value.manifest.legacy_bundle_floor)
-            }),
+            Some(legacy_floor),
         )?;
         let manifest_sha256 = hash(&canonical(&manifest)?)?;
         let expected = extend_value(&initial_anchor, &manifest_sha256)?;
@@ -1064,6 +1078,8 @@ impl Store {
         &self,
         nv: &dyn NvAnchor,
         challenge: &TimeChallenge,
+        trusted_time: &str,
+        valid_until: &str,
     ) -> Result<Result<(), String>, InternalError> {
         let live = nv.clock()?;
         if !live.safe {
@@ -1086,6 +1102,23 @@ impl Store {
         if elapsed > TRUSTED_TIME_MAX_ELAPSED_MS {
             return Ok(Err(
                 "trusted-time challenge exceeded its freshness window".into()
+            ));
+        }
+        let trusted_time = crate::trusted_time::utc_seconds(trusted_time).ok_or_else(|| {
+            InternalError("trusted-time assertion has invalid trusted time".into())
+        })?;
+        let valid_until = crate::trusted_time::utc_seconds(valid_until)
+            .ok_or_else(|| InternalError("trusted-time assertion has invalid expiry".into()))?;
+        let elapsed_seconds = elapsed
+            .checked_add(999)
+            .ok_or_else(|| InternalError("TPM elapsed-time overflow".into()))?
+            / 1_000;
+        if trusted_time
+            .checked_add(elapsed_seconds)
+            .is_none_or(|now| now >= valid_until)
+        {
+            return Ok(Err(
+                "trusted-time assertion expired at the current TPM clock".into(),
             ));
         }
         Ok(Ok(()))
@@ -1727,6 +1760,8 @@ fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
         || !safe_uint(value.trusted.assertion_seq)
         || value.trusted.delegation_seq != value.authority.delegation_seq
         || !timestamp(&value.trusted.trusted_time)
+        || !timestamp(value.trusted_valid_until)
+        || value.trusted.trusted_time.as_str() >= value.trusted_valid_until
         || !sha256(&value.authority.snapshot_sha256)
         || !sha256(&value.authority.snapshot_signature_sha256)
         || !sha256(&value.applied.bom_sha256)
@@ -1750,6 +1785,8 @@ fn validate_preapply_candidate(value: &PreapplyCandidate<'_>) -> Result<(), Inte
         || !safe_uint(value.snapshot.delegation_seq)
         || value.snapshot.delegation_seq != value.trusted.delegation_seq
         || value.snapshot_sha256 != value.challenge.delegation_snapshot_sha256
+        || !timestamp(value.trusted_valid_until)
+        || value.trusted.trusted_time.as_str() >= value.trusted_valid_until
     {
         return Err(InternalError("invalid state-v1 pre-apply candidate".into()));
     }
@@ -1829,6 +1866,9 @@ fn monotonic_trusted(
     if new.device_fingerprint != old_time.device_fingerprint {
         return Err("trusted-time device identity changed".into());
     }
+    if new.tpm_reset_count < old_time.tpm_reset_count {
+        return Err("TPM reset count decreased".into());
+    }
     if new.tpm_reset_count == old_time.tpm_reset_count {
         if new.tpm_clock < old_time.tpm_clock || new.tpm_restart_count < old_time.tpm_restart_count
         {
@@ -1852,6 +1892,16 @@ fn monotonic_trusted(
         return Err("trusted-time advance exceeds TPM elapsed plus ten minutes".into());
     }
     Ok(())
+}
+
+fn same_preapply_snapshot(
+    canonical_sha256: &str,
+    signature: &[u8],
+    accepted_canonical_sha256: &str,
+    accepted_signature_sha256: &str,
+) -> Result<bool, InternalError> {
+    Ok(canonical_sha256 == accepted_canonical_sha256
+        && hash(signature)? == accepted_signature_sha256)
 }
 
 fn same_candidate(old: &StateManifest, new: &Candidate<'_>) -> Result<bool, InternalError> {
@@ -2584,6 +2634,7 @@ mod tests {
             },
             trusted_assertion: b"{}\n",
             trusted_signature: b"sig",
+            trusted_valid_until: "2026-07-22T00:05:00Z",
         }
     }
 
@@ -3689,11 +3740,119 @@ mod tests {
             challenge: &challenge,
             snapshot: &snapshot,
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
+            snapshot_signature: b"sig",
             trusted: &trusted,
+            trusted_valid_until: "2026-07-22T00:05:00Z",
         };
         let preapply_refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
         assert!(preapply_refusal.contains("freshness window"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_refuses_an_assertion_that_expires_before_the_freshness_cap() {
+        let (store, root) = test_store();
+        let mut value = candidate();
+        value.trusted_valid_until = "2026-07-22T00:00:02Z";
+        let nv = MemoryNv {
+            anchor: Cell::new([0; 32]),
+            clock: Cell::new(TpmClockState {
+                clock: value.challenge.tpm_clock + 1_000,
+                reset_count: value.challenge.tpm_reset_count,
+                restart_count: value.challenge.tpm_restart_count,
+                safe: true,
+            }),
+            exists: Cell::new(false),
+        };
+        let refusal = store.commit(&value, &nv).unwrap().unwrap_err();
+        assert!(refusal.contains("assertion expired"));
+        assert!(!nv.exists.get());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_anchor_preapply_requires_the_legacy_floor() {
+        let (store, root) = test_store();
+        let snapshot_bytes =
+            include_bytes!("../tests/fixtures/delegated-v1/delegation-snapshot.json");
+        let snapshot: Snapshot = parse_canonical(snapshot_bytes, "test snapshot").unwrap();
+        let mut challenge = candidate().challenge;
+        challenge.delegation_snapshot_sha256 =
+            state_canonical_hash(snapshot_bytes, "test snapshot").unwrap();
+        challenge.tpm_clock = 42;
+        challenge.tpm_reset_count = 3;
+        challenge.tpm_restart_count = 4;
+        let mut trusted = candidate().trusted;
+        trusted.delegation_seq = snapshot.delegation_seq;
+        trusted.tpm_clock = challenge.tpm_clock;
+        trusted.tpm_reset_count = challenge.tpm_reset_count;
+        trusted.tpm_restart_count = challenge.tpm_restart_count;
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&challenge).unwrap(),
+        )
+        .unwrap();
+        let nv = TestAnchor {
+            anchor: [0; 32],
+            initialized: true,
+            readable: true,
+            legacy_floor: None,
+            safe_clock: true,
+        };
+        let preapply = PreapplyCandidate {
+            bom_sha256: &candidate().applied.bom_sha256,
+            bundle_seq: 1,
+            challenge: &challenge,
+            snapshot: &snapshot,
+            snapshot_sha256: &challenge.delegation_snapshot_sha256,
+            snapshot_signature: b"sig",
+            trusted: &trusted,
+            trusted_valid_until: "2026-07-22T00:05:00Z",
+        };
+        let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
+        assert!(refusal.contains("legacy TPM floor is absent"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_anchor_commit_requires_the_legacy_floor_before_staging() {
+        let (store, root) = test_store();
+        let nv = TestAnchor {
+            anchor: [0; 32],
+            initialized: true,
+            readable: true,
+            legacy_floor: None,
+            safe_clock: true,
+        };
+        let refusal = store.commit(&candidate(), &nv).unwrap().unwrap_err();
+        assert!(refusal.contains("legacy TPM floor is absent"));
+        assert!(!store
+            .root
+            .join("generations")
+            .join("generation-0000000000000001")
+            .exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preapply_equal_sequence_requires_the_accepted_snapshot_signature() {
+        let canonical = "a".repeat(64);
+        let signature = b"accepted-signature";
+        assert!(same_preapply_snapshot(
+            &canonical,
+            signature,
+            &canonical,
+            &hash(signature).unwrap()
+        )
+        .unwrap());
+        assert!(!same_preapply_snapshot(
+            &canonical,
+            b"re-signed",
+            &canonical,
+            &hash(signature).unwrap()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -3746,7 +3905,9 @@ mod tests {
             challenge: &challenge,
             snapshot: &snapshot,
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
+            snapshot_signature: b"sig",
             trusted: &trusted,
+            trusted_valid_until: "2026-07-22T00:05:00Z",
         };
         let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
         assert!(refusal.contains("legacy TPM floor disappeared"));
@@ -3792,6 +3953,14 @@ mod tests {
         re_signed_assertion.trusted.signature_sha256 =
             hash(re_signed_assertion.trusted_signature).unwrap();
         assert!(monotonic(&manifest, &baseline.trusted, &re_signed_assertion).is_err());
+        let mut prior_time = baseline.trusted.clone();
+        prior_time.tpm_reset_count = 2;
+        prior_time.tpm_clock = 2_000;
+        let reset_regressed = candidate();
+        assert_eq!(
+            monotonic_trusted(&manifest, &prior_time, &reset_regressed.trusted),
+            Err("TPM reset count decreased".into())
+        );
         let mut jump = candidate();
         jump.applied.bundle_seq = 2;
         jump.trusted.assertion_seq = 2;
