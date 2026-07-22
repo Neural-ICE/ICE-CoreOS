@@ -21,6 +21,7 @@ const TIME_DOMAIN: &[u8] = b"neural-ice:ota:trusted-time:v2\0";
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrustedTimeAssertion {
     pub(crate) assertion_seq: u64,
+    pub(crate) bootstrap_authorization_sha256: Option<String>,
     pub(crate) delegation_seq: u64,
     pub(crate) delegation_snapshot_sha256: String,
     pub(crate) device_fingerprint: String,
@@ -46,6 +47,7 @@ pub(crate) struct TrustedTimeAssertion {
 }
 
 pub(crate) struct ExpectedTrustedTime<'a> {
+    pub(crate) bootstrap_authorization_sha256: Option<&'a str>,
     pub(crate) delegation_snapshot_sha256: &'a str,
     pub(crate) device_fingerprint: &'a str,
     pub(crate) hardware_target: &'a str,
@@ -67,6 +69,7 @@ pub(crate) struct ExpectedTrustedTime<'a> {
 pub(crate) struct VerifiedTrustedTime {
     pub(crate) assertion_seq: u64,
     pub(crate) assertion_sha256: String,
+    pub(crate) bootstrap_authorization_sha256: Option<String>,
     pub(crate) delegation_seq: u64,
     pub(crate) device_fingerprint: String,
     pub(crate) key_id: String,
@@ -106,6 +109,7 @@ pub(crate) fn verify(
     Ok(VerifiedTrustedTime {
         assertion_seq: assertion.assertion_seq,
         assertion_sha256: canonical_hash(assertion_bytes)?,
+        bootstrap_authorization_sha256: assertion.bootstrap_authorization_sha256,
         delegation_seq: assertion.delegation_seq,
         device_fingerprint: assertion.device_fingerprint,
         key_id: assertion.key_id,
@@ -130,6 +134,7 @@ pub(crate) fn receipt_evidence(
     Ok(VerifiedTrustedTime {
         assertion_seq: assertion.assertion_seq,
         assertion_sha256: canonical_hash(assertion_bytes)?,
+        bootstrap_authorization_sha256: assertion.bootstrap_authorization_sha256,
         delegation_seq: assertion.delegation_seq,
         device_fingerprint: assertion.device_fingerprint,
         key_id: assertion.key_id,
@@ -209,6 +214,12 @@ fn validate(
         || value.ring != expected.ring
         || !matches!(expected.ring, "beta" | "stable")
         || value.release_authorization_sha256 != expected.release_authorization_sha256
+        || value.bootstrap_authorization_sha256.as_deref()
+            != expected.bootstrap_authorization_sha256
+        || value
+            .bootstrap_authorization_sha256
+            .as_deref()
+            .is_some_and(|hash| !sha256(hash))
         || !sha256(&value.release_authorization_sha256)
         || value.delegation_snapshot_sha256 != expected.delegation_snapshot_sha256
         || value.delegation_snapshot_sha256 != snapshot_sha256
@@ -363,6 +374,7 @@ mod tests {
     fn assertion() -> TrustedTimeAssertion {
         TrustedTimeAssertion {
             assertion_seq: 1,
+            bootstrap_authorization_sha256: None,
             delegation_seq: 1,
             delegation_snapshot_sha256: canonical_hash(SNAPSHOT).unwrap(),
             device_fingerprint: "d".repeat(64),
@@ -390,6 +402,7 @@ mod tests {
 
     fn expected(value: &TrustedTimeAssertion) -> ExpectedTrustedTime<'_> {
         ExpectedTrustedTime {
+            bootstrap_authorization_sha256: value.bootstrap_authorization_sha256.as_deref(),
             delegation_snapshot_sha256: &value.delegation_snapshot_sha256,
             device_fingerprint: &value.device_fingerprint,
             hardware_target: &value.hardware_target,
@@ -435,6 +448,29 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn v2_binds_the_exact_licensing_bootstrap_authorization_when_present() {
+        let snapshot: Snapshot = parse_canonical(SNAPSHOT, "snapshot").unwrap();
+        let snapshot_sha256 = canonical_hash(SNAPSHOT).unwrap();
+        let mut baseline = assertion();
+        baseline.bootstrap_authorization_sha256 = Some("e".repeat(64));
+        assert!(validate(&baseline, &snapshot, &snapshot_sha256, &expected(&baseline)).is_ok());
+
+        let mut missing = baseline.clone();
+        missing.bootstrap_authorization_sha256 = None;
+        assert!(validate(&missing, &snapshot, &snapshot_sha256, &expected(&baseline)).is_err());
+
+        let mut malformed = baseline.clone();
+        malformed.bootstrap_authorization_sha256 = Some("E".repeat(64));
+        assert!(validate(
+            &malformed,
+            &snapshot,
+            &snapshot_sha256,
+            &expected(&malformed)
+        )
+        .is_err());
     }
 
     #[test]

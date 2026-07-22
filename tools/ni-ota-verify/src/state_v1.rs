@@ -79,6 +79,7 @@ pub(crate) struct AppliedStateV1 {
 pub(crate) struct TrustedTimeState {
     pub(crate) assertion_seq: u64,
     pub(crate) assertion_sha256: String,
+    pub(crate) bootstrap_authorization_sha256: Option<String>,
     pub(crate) challenge_sha256: String,
     pub(crate) delegation_seq: u64,
     pub(crate) device_fingerprint: String,
@@ -129,6 +130,7 @@ struct LoadedGeneration {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TimeChallenge {
+    pub(crate) bootstrap_authorization_sha256: Option<String>,
     pub(crate) delegation_snapshot_sha256: String,
     pub(crate) device_fingerprint: String,
     pub(crate) hardware_target: String,
@@ -141,6 +143,13 @@ pub(crate) struct TimeChallenge {
     pub(crate) tpm_reset_count: u32,
     pub(crate) tpm_restart_count: u32,
     pub(crate) tpm_safe: bool,
+}
+
+pub(crate) struct TimeChallengeScope<'a> {
+    pub(crate) delegation_snapshot_sha256: &'a str,
+    pub(crate) hardware_target: &'a str,
+    pub(crate) release_authorization_sha256: &'a str,
+    pub(crate) ring: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -582,20 +591,80 @@ impl Store {
         hardware_target: &str,
         ring: &str,
     ) -> Result<TimeChallenge, InternalError> {
+        let scope = TimeChallengeScope {
+            delegation_snapshot_sha256,
+            hardware_target,
+            release_authorization_sha256,
+            ring,
+        };
+        self.issue_time_challenge_bound(tpm, &scope, None, None)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the stacked licensing-bootstrap command"
+    )]
+    pub(crate) fn issue_bootstrap_time_challenge(
+        &self,
+        tpm: &CommandTpm,
+        scope: &TimeChallengeScope<'_>,
+        bootstrap_authorization_sha256: &str,
+        licensing_bootstrap_nonce: &str,
+    ) -> Result<TimeChallenge, InternalError> {
+        if !sha256(bootstrap_authorization_sha256) || !lower_hex_nonce(licensing_bootstrap_nonce) {
+            return Err(InternalError(
+                "licensing-bootstrap binding is outside the closed contract".into(),
+            ));
+        }
+        self.issue_time_challenge_bound(
+            tpm,
+            scope,
+            Some(bootstrap_authorization_sha256),
+            Some(licensing_bootstrap_nonce),
+        )
+    }
+
+    fn issue_time_challenge_bound(
+        &self,
+        tpm: &CommandTpm,
+        scope: &TimeChallengeScope<'_>,
+        bootstrap_authorization_sha256: Option<&str>,
+        distinct_from_nonce: Option<&str>,
+    ) -> Result<TimeChallenge, InternalError> {
         ensure_secure_state_directory(&self.root)?;
         let anchor = tpm.initial_or_existing_anchor()?;
         self.validate_challenge_continuity(tpm, &anchor)?;
+        if anchor == ZERO_ANCHOR && bootstrap_authorization_sha256.is_none() {
+            return Err(InternalError(
+                "initial trusted-time requires a verified licensing-bootstrap authorization".into(),
+            ));
+        }
+        if anchor != ZERO_ANCHOR && bootstrap_authorization_sha256.is_some() {
+            return Err(InternalError(
+                "licensing-bootstrap trusted time requires a pristine TPM state anchor".into(),
+            ));
+        }
         let clock = tpm.clock()?;
         if !clock.safe {
             return Err(InternalError("TPM clock is not safe".into()));
         }
+        let mut nonce = fresh_nonce()?;
+        if distinct_from_nonce == Some(nonce.as_str()) {
+            nonce = fresh_nonce()?;
+        }
+        if distinct_from_nonce == Some(nonce.as_str()) {
+            return Err(InternalError(
+                "trusted-time nonce is not distinct from licensing-bootstrap nonce".into(),
+            ));
+        }
         let challenge = TimeChallenge {
-            delegation_snapshot_sha256: delegation_snapshot_sha256.to_owned(),
+            bootstrap_authorization_sha256: bootstrap_authorization_sha256.map(str::to_owned),
+            delegation_snapshot_sha256: scope.delegation_snapshot_sha256.to_owned(),
             device_fingerprint: tpm.device_fingerprint()?,
-            hardware_target: hardware_target.to_owned(),
-            nonce: fresh_nonce()?,
-            release_authorization_sha256: release_authorization_sha256.to_owned(),
-            ring: ring.to_owned(),
+            hardware_target: scope.hardware_target.to_owned(),
+            nonce,
+            release_authorization_sha256: scope.release_authorization_sha256.to_owned(),
+            ring: scope.ring.to_owned(),
             schema: "neural-ice-ota-time-challenge-v2".into(),
             state_nv_anchor: anchor,
             tpm_clock: clock.clock,
@@ -709,6 +778,11 @@ impl Store {
             return Ok(Err("trusted-time challenge anchor is stale".into()));
         }
         if anchor == ZERO_ANCHOR {
+            if candidate.challenge.bootstrap_authorization_sha256.is_none() {
+                return Ok(Err(
+                    "initial state requires a verified licensing-bootstrap authorization".into(),
+                ));
+            }
             return if self.has_prior_state_evidence()? {
                 Ok(Err("zero TPM anchor has existing state history".into()))
             } else {
@@ -1758,15 +1832,15 @@ fn safe_key_id(value: &str) -> bool {
 
 fn validate_time_challenge(value: &TimeChallenge) -> Result<(), InternalError> {
     if value.schema != "neural-ice-ota-time-challenge-v2"
+        || value
+            .bootstrap_authorization_sha256
+            .as_deref()
+            .is_some_and(|hash| !sha256(hash))
         || !sha256(&value.delegation_snapshot_sha256)
         || !sha256(&value.device_fingerprint)
         || !sha256(&value.release_authorization_sha256)
         || !sha256(&value.state_nv_anchor)
-        || value.nonce.len() != 64
-        || !value
-            .nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !lower_hex_nonce(&value.nonce)
         || !matches!(value.ring.as_str(), "beta" | "stable")
         || !value.tpm_safe
         || !safe_uint(value.tpm_clock)
@@ -1776,6 +1850,13 @@ fn validate_time_challenge(value: &TimeChallenge) -> Result<(), InternalError> {
         ));
     }
     Ok(())
+}
+
+fn lower_hex_nonce(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
@@ -1805,6 +1886,8 @@ fn validate_candidate(value: &Candidate<'_>) -> Result<(), InternalError> {
         || !sha256(&value.trusted.assertion_sha256)
         || !sha256(&value.trusted.signature_sha256)
         || !sha256(&value.trusted.challenge_sha256)
+        || value.trusted.bootstrap_authorization_sha256
+            != value.challenge.bootstrap_authorization_sha256
         || !sha256(&value.trusted.device_fingerprint)
         || value.authority.snapshot_signature_sha256 != hash(value.snapshot_signature)?
         || value.trusted.assertion_sha256
@@ -1841,6 +1924,7 @@ fn validate_trusted_challenge(
         || !sha256(&trusted.assertion_sha256)
         || !sha256(&trusted.signature_sha256)
         || !sha256(&trusted.challenge_sha256)
+        || trusted.bootstrap_authorization_sha256 != challenge.bootstrap_authorization_sha256
         || !sha256(&trusted.device_fingerprint)
         || trusted.device_fingerprint != challenge.device_fingerprint
         || trusted.challenge_sha256 != hash(challenge.nonce.as_bytes())?
@@ -1867,6 +1951,7 @@ fn signed_assertion_valid_until(
     if state_canonical_hash(assertion_bytes, "state-v1 trusted-time assertion")?
         != trusted.assertion_sha256
         || assertion.assertion_seq != trusted.assertion_seq
+        || assertion.bootstrap_authorization_sha256 != trusted.bootstrap_authorization_sha256
         || assertion.delegation_seq != trusted.delegation_seq
         || assertion.device_fingerprint != trusted.device_fingerprint
         || assertion.key_id != trusted.key_id
@@ -2660,6 +2745,7 @@ mod tests {
         Box::leak(
             canonical(&crate::trusted_time::TrustedTimeAssertion {
                 assertion_seq: trusted.assertion_seq,
+                bootstrap_authorization_sha256: trusted.bootstrap_authorization_sha256.clone(),
                 delegation_seq: trusted.delegation_seq,
                 delegation_snapshot_sha256: challenge.delegation_snapshot_sha256.clone(),
                 device_fingerprint: trusted.device_fingerprint.clone(),
@@ -2690,6 +2776,7 @@ mod tests {
 
     fn candidate() -> Candidate<'static> {
         let challenge = TimeChallenge {
+            bootstrap_authorization_sha256: Some("e".repeat(64)),
             delegation_snapshot_sha256: state_canonical_hash(b"{}\n", "test snapshot").unwrap(),
             device_fingerprint: "b".repeat(64),
             hardware_target: "nvidia-gb10-arm64".into(),
@@ -2706,6 +2793,7 @@ mod tests {
         let mut trusted = TrustedTimeState {
             assertion_seq: 1,
             assertion_sha256: String::new(),
+            bootstrap_authorization_sha256: challenge.bootstrap_authorization_sha256.clone(),
             challenge_sha256: hash(challenge.nonce.as_bytes()).unwrap(),
             delegation_seq: 1,
             device_fingerprint: challenge.device_fingerprint.clone(),
@@ -2819,6 +2907,7 @@ mod tests {
         let trusted = TrustedTimeState {
             assertion_seq: spec.time_seq,
             assertion_sha256: assertion_canonical_hash,
+            bootstrap_authorization_sha256: None,
             challenge_sha256: hash(b"challenge").unwrap(),
             delegation_seq: spec.delegation,
             device_fingerprint: "d".repeat(64),
@@ -3526,6 +3615,7 @@ mod tests {
     #[test]
     fn time_challenge_is_closed_and_nonce_is_exact() {
         let value = TimeChallenge {
+            bootstrap_authorization_sha256: None,
             delegation_snapshot_sha256: "a".repeat(64),
             device_fingerprint: "b".repeat(64),
             hardware_target: "nvidia-gb10-arm64".into(),
@@ -3931,6 +4021,59 @@ mod tests {
         };
         let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
         assert!(refusal.contains("legacy TPM floor is absent"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_anchor_preapply_requires_the_licensing_bootstrap_binding() {
+        let (store, root) = test_store();
+        let snapshot_bytes =
+            include_bytes!("../tests/fixtures/delegated-v1/delegation-snapshot.json");
+        let snapshot: Snapshot = parse_canonical(snapshot_bytes, "test snapshot").unwrap();
+        let mut challenge = candidate().challenge;
+        challenge.bootstrap_authorization_sha256 = None;
+        challenge.delegation_snapshot_sha256 =
+            state_canonical_hash(snapshot_bytes, "test snapshot").unwrap();
+        challenge.tpm_clock = 42;
+        challenge.tpm_reset_count = 3;
+        challenge.tpm_restart_count = 4;
+        let mut trusted = candidate().trusted;
+        trusted.bootstrap_authorization_sha256 = None;
+        trusted.delegation_seq = snapshot.delegation_seq;
+        trusted.tpm_clock = challenge.tpm_clock;
+        trusted.tpm_reset_count = challenge.tpm_reset_count;
+        trusted.tpm_restart_count = challenge.tpm_restart_count;
+        let assertion = test_signed_assertion(&challenge, &trusted, "2026-07-22T00:05:00Z");
+        trusted.assertion_sha256 =
+            state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
+        atomic_replace(
+            &store.root,
+            "pending-time-challenge.json",
+            &canonical(&challenge).unwrap(),
+        )
+        .unwrap();
+        let nv = TestAnchor {
+            anchor: [0; 32],
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        let preapply = PreapplyCandidate {
+            bom_sha256: &candidate().applied.bom_sha256,
+            bundle_seq: 1,
+            challenge: &challenge,
+            snapshot: &snapshot,
+            snapshot_sha256: &challenge.delegation_snapshot_sha256,
+            snapshot_signature: b"sig",
+            trusted: &trusted,
+            trusted_assertion: assertion,
+        };
+        let refusal = store.guard_preapply(&nv, &preapply).unwrap().unwrap_err();
+        assert!(
+            refusal.contains("verified licensing-bootstrap authorization"),
+            "{refusal}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

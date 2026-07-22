@@ -170,11 +170,19 @@ separate caller claim. A scoped
 `retiring` time key remains valid only during its bounded snapshot overlap.
 
 For a fresh appliance, the trusted-time key is provisionally authorized only
-by the candidate root-signed initial snapshot. Snapshot, assertion, release
-and first state generation are accepted atomically; none becomes independent
-authority on failure. A TPM-state recovery is a distinct root-signed artifact
-bound to a new one-use appliance challenge and the complete replacement state.
-Ordinary trusted-time assertions can never reset or lower a floor.
+by the candidate root-signed initial snapshot **and** an already verified
+`ota-licensing-bootstrap-v1` authorization. The appliance persists one
+licensing nonce before requesting that authorization, then creates a distinct
+fresh trusted-time nonce. The trusted-time challenge, assertion and committed
+state bind the canonical licensing authorization SHA-256; a missing, malformed
+or changed binding refuses before TPM/state mutation. Snapshot, licensing
+authorization, assertion, release and first state generation are accepted
+atomically; none becomes independent authority on failure. Routine
+trusted-time challenge creation refuses an all-zero state anchor, and the
+bootstrap-only primitive refuses a nonzero anchor. A TPM-state recovery is a
+distinct root-signed artifact bound to a new one-use appliance challenge and
+the complete replacement state. Ordinary trusted-time assertions can never
+reset or lower a floor.
 
 `ni-ota-verify prepare-trusted-time-v2` is the controller's local,
 networkless preparation gate. It first freezes the four caller-supplied
