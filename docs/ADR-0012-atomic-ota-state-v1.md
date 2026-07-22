@@ -116,6 +116,19 @@ above. The marker is additive and omitted when `None`, so the retained N-1
 verifier (lenient serde, no `deny_unknown_fields`) still parses a marked
 record after rollback.
 
+Two hardening rules complete the marker contract. First, the N-1 verifier's
+supported equal-sequence repair commit rewrites `applied.json` without the
+marker; every marker-aware write therefore also persists a sidecar
+(`applied.format.v1.json`, unknown to N-1) and the reader restores the marker
+only when the sidecar carries it for the exact same
+`(bundle_seq, bom_sha256)` record. An N-1 write that *advances* the sequence
+invalidates the sidecar and the baseline reads as media-era (reinstall) —
+N-1 may repair, never advance. Second, on a TPM-anchored appliance (NV
+indices configured) `commit` refuses to seed an unseeded store outright:
+baseline seeding belongs exclusively to the media-verified `bootstrap` path,
+so a lost state file with persisting TPM floors can never let a routine
+commit mint a fresh marker.
+
 The retained N-1 bootc image remains a valid local rollback because the new
 schema only removes optional media fields: N-1 can read and verify the same
 media-independent signed BOM and preserved applied state. Rollback never lowers

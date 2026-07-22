@@ -819,7 +819,11 @@ fn bootstrap_uses_one_protected_snapshot_when_source_mutates_during_cosign() {
     entries.sort();
     assert_eq!(
         entries,
-        [".applied.json.lock", "applied.json"],
+        [
+            ".applied.json.lock",
+            "applied.format.v1.json",
+            "applied.json"
+        ],
         "snapshot cleanup leaves only durable state and its kernel-lock inode"
     );
 }
@@ -1749,6 +1753,86 @@ fn commit_writes_the_marker_and_marked_roots_stay_upgradable() {
     let (code, receipt, stderr) = commit(&bom8);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(receipt["bundle_seq"], 8);
+}
+
+#[test]
+fn n1_repair_rewrite_keeps_media_independence_via_sidecar() {
+    let fx = Fixture::new("sidecar-n1-repair");
+    fx.arrange_happy();
+    let bom = fx.path("bom.json");
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    // Simulate the supported N-1 repair commit: rewrite applied.json with the
+    // same (seq, sha) but without bom_format. The sidecar must preserve the
+    // format proof so the marked baseline stays upgradable.
+    fx.seed_legacy_applied(7, &sha256_of(&bom));
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 0, "{verdict}");
+    assert!(check(&verdict, "anti_rollback")["detail"]
+        .as_str()
+        .unwrap()
+        .contains("repair"));
+    let bom8 = fx.write_bom("0.44.8", 8);
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom8.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bom_format"], "media-independent-v1");
+}
+
+#[test]
+fn sidecar_never_launders_a_different_legacy_baseline() {
+    let fx = Fixture::new("sidecar-mismatch");
+    fx.arrange_happy();
+    let bom = fx.path("bom.json");
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    // An unmarked record that does NOT match the sidecar (different seq/sha)
+    // is a media-era baseline: the stale sidecar must not restore the marker.
+    fx.seed_legacy_applied(9, &"c".repeat(64));
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 1);
+    let detail = check(&verdict, "anti_rollback")["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        detail.contains("media-independent format marker"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn commit_refuses_to_seed_when_tpm_anchoring_is_configured() {
+    let fx = Fixture::new("tpm-anchored-seed");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "nv_index=0x01500001\n");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("unseeded while TPM anchoring is configured"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("bootstrap"), "{stderr}");
+    assert!(!fx.path("state/applied.json").exists());
 }
 
 #[test]

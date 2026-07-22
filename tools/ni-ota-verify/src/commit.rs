@@ -55,8 +55,18 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
     match store.read() {
         // First commit seeds the record (P2 shadow burn-in; P3's NV seeding
-        // reads exactly this record — plan P3).
-        Ok(StateRead::Unseeded) => {}
+        // reads exactly this record — plan P3). On a TPM-anchored appliance
+        // (NV indices configured) seeding authority belongs exclusively to the
+        // media-verified bootstrap path: a lost state file with persisting TPM
+        // floors must not let commit mint a fresh media-independent marker.
+        Ok(StateRead::Unseeded) => {
+            if cfg.nv_index.is_some() {
+                return refuse(format!(
+                    "state at {} is unseeded while TPM anchoring is configured — baseline seeding belongs to the verified bootstrap path; reinstall from verified final media (ADR-0012)",
+                    store.describe()
+                ));
+            }
+        }
         Ok(StateRead::Applied(applied)) => {
             if !applied.is_media_independent() {
                 return refuse(format!(
