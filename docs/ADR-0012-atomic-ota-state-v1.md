@@ -76,6 +76,17 @@ anchor. The verifier stages and fsyncs all files, extends the TPM with the
 manifest hash, reads the expected anchor back, then publishes and rereads the
 current pointer and enforcement marker. No success receipt is emitted earlier.
 
+The signed BOM is an installed-authority artifact, not a final-media identity.
+It binds the immutable OS manifest digest, exact seed commit, OCI bundle
+digest, train, compatibility and hardware target, but it must not contain the
+installer image `raw_sha256` or `caibx` identity. Embedding either value would
+make the signed object depend on bytes that themselves embed that object and
+would therefore create a circular, non-reproducible authority chain. The
+verifier rejects such a BOM before bootstrap, pre-apply or state mutation.
+The final installer image hash, size and optional chunk index remain separate
+out-of-band build/flash evidence; they prove which physical bytes were
+written, but never become OTA authority or part of the TPM-anchored state.
+
 ### Persistent disk contract
 
 The canonical root is `${state_dir}/state-v1` (normally
