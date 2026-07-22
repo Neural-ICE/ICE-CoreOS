@@ -14,8 +14,10 @@ Authority-bearing BOMs describe the installed state, never the installer that
 may carry them. Delegated USB verification binds the exact booted OS digest,
 Fabric seed commit, signed bundle digest and image-attestation set. It refuses
 `appliance.raw_sha256` and `appliance.caibx`: final installer raw/archive and
-chunk-index evidence is emitted only by the independent final-media gate after
-assembly, avoiding an impossible self-hash cycle.
+partition evidence is emitted only by the independent final-media gate after
+assembly, avoiding an impossible self-hash cycle. That gate does not currently
+bind `caibx`; this release path refuses to treat or distribute a chunk index as
+verified media evidence until a separate digest-bound contract is implemented.
 
 ## The verification contract
 

@@ -83,9 +83,34 @@ installer image `raw_sha256` or `caibx` identity. Embedding either value would
 make the signed object depend on bytes that themselves embed that object and
 would therefore create a circular, non-reproducible authority chain. The
 verifier rejects such a BOM before bootstrap, pre-apply or state mutation.
-The final installer image hash, size and optional chunk index remain separate
-out-of-band build/flash evidence; they prove which physical bytes were
-written, but never become OTA authority or part of the TPM-anchored state.
+The final-media receipt binds the installer raw/archive hashes and sizes,
+partition identities, seed manifest and optional embedded baseline pair. It
+does **not** currently bind or authorize a `caibx` chunk index. A chunk index
+must not be distributed by this release path until a separate deterministic
+generation, digest-binding and verification contract is reviewed and
+implemented. Neither form of physical-media evidence becomes OTA authority or
+part of the TPM-anchored installed state.
+
+### Rollout, recovery and N-1 behavior
+
+This transition is approved only for the fresh debug/LAB installation being
+rebuilt from USB; there are no fielded customer appliances or production
+generations to migrate. No implicit migration exists. If a host already has a
+baseline or committed generation derived from a BOM carrying `raw_sha256` or
+`caibx`, the new verifier refuses the next candidate before mutation and leaves
+the existing state and TPM floors intact. Such a host is outside this rollout:
+recovery is a reviewed full LAB reinstall from a media-independent baseline.
+Any future field migration requires its own ADR, tests and root-authorized
+recovery procedure before rollout.
+
+The retained N-1 bootc image remains a valid local rollback because the new
+schema only removes optional media fields: N-1 can read and verify the same
+media-independent signed BOM and preserved applied state. Rollback never lowers
+the bundle or TPM floors. After this transition the release pipeline must not
+sign or serve media-bearing BOMs, so the older verifier's former ability to
+accept one is not an authorized recovery path. A rollback may restore runtime
+availability; it may not create, migrate or advance authority from a legacy
+media-bearing BOM.
 
 ### Persistent disk contract
 
