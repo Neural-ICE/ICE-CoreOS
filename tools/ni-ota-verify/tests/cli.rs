@@ -116,7 +116,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},"raw_sha256":"bb","version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
+                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},"version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -2149,6 +2149,20 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(verdict["mode"], "delegated-usb-beta");
     assert_eq!(verdict["bom_sha256"], bom_hash);
     assert!(!fx.path("state/applied.json").exists());
+
+    let clean_bom = fs::read(&bom).unwrap();
+    for media_field in ["raw_sha256", "caibx"] {
+        let mut circular: Value = serde_json::from_slice(&clean_bom).unwrap();
+        circular["appliance"][media_field] = Value::String("f".repeat(64));
+        let mut circular_bytes = serde_json::to_vec_pretty(&circular).unwrap();
+        circular_bytes.push(b'\n');
+        fs::write(&bom, circular_bytes).unwrap();
+        let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("installer-media identity"), "{stderr}");
+        assert!(!fx.path("state/applied.json").exists());
+    }
+    fs::write(&bom, clean_bom).unwrap();
 
     fs::remove_file(fx.path("bootstrap-delegation-sha256")).unwrap();
     let mut seeded = command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST);

@@ -10,6 +10,13 @@ The appliance is treated like a game console: it must verify every update
 no reach-back and no operator. This binary is that gate. It verifies **local
 files only**; fetching them is the OTA caller's job (see *Caller integration*).
 
+Authority-bearing BOMs describe the installed state, never the installer that
+may carry them. Delegated USB verification binds the exact booted OS digest,
+Fabric seed commit, signed bundle digest and image-attestation set. It refuses
+`appliance.raw_sha256` and `appliance.caibx`: final installer raw/archive and
+chunk-index evidence is emitted only by the independent final-media gate after
+assembly, avoiding an impossible self-hash cycle.
+
 ## The verification contract
 
 Checks run in the order of the ICE-Fabric plan (§0,

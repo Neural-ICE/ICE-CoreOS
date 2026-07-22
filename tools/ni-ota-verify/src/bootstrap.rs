@@ -97,6 +97,9 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         Ok(bom) => bom,
         Err(e) => return refuse(format!("malformed BOM {}: {e}", bom_path.display())),
     };
+    if let Err(why) = bom.require_media_independent() {
+        return refuse(why);
+    }
     if bom.bundle_seq == 0 {
         return refuse("BOM bundle_seq must be greater than zero".to_string());
     }

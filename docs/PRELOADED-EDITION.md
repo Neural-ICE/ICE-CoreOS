@@ -119,6 +119,18 @@ non-regular/empty/oversized inputs and hash drift, and never overwrites an exist
 LAB injection is restricted to a debug image where `BASE_IMAGE` and the installed target are the
 same digest-pinned reference.
 
+The signed BOM deliberately contains **no final installer raw/archive hash and no installer
+chunk-index identity**. It authorizes the installed result: the exact booted OS manifest digest,
+the exact Fabric seed commit, the digest-addressed bundle and its image-attestation set. Putting
+the raw-media hash in a BOM embedded on that media would be circular because adding the BOM and
+signature changes the raw image. `ni-ota-verify` therefore refuses legacy delegated/bootstrap BOMs
+that contain `appliance.raw_sha256` or `appliance.caibx`.
+
+Media integrity remains independently complete: the final-media gate emits the raw/archive hashes,
+partition identities and embedded baseline-file hashes only after assembly. That receipt and its
+checksum are operator/build evidence kept next to the artifact and verified before flashing; they
+are not release authority and are never copied into the signed BOM.
+
 After `ni-seed` has been added, the final-media gate independently opens the finalized raw,
 selects exactly one `EFI-SYSTEM` vfat child of its retained read-only loop, mounts it
 `ro,nosuid,nodev,noexec`, and re-hashes both fixed paths. The receipt binds the approved file paths,

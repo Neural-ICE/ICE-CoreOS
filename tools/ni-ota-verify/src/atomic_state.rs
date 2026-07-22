@@ -244,6 +244,9 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     let bom_bytes = bom_file.read()?;
     let bom: BomCore = serde_json::from_slice(&bom_bytes)
         .map_err(|error| InternalError(format!("malformed state-v2 BOM: {error}")))?;
+    if let Err(reason) = bom.require_media_independent() {
+        return refusal(reason);
+    }
     let bom_hash = runner::sha256_bytes(&bom_bytes)?;
     if let Err(reason) = validate_bom_binding(
         &bom,
