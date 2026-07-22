@@ -1648,6 +1648,33 @@ fn commit_refuses_malformed_bom_as_internal_error() {
 }
 
 #[test]
+fn commit_refuses_media_identity_without_mutating_applied_state() {
+    let fx = Fixture::new("commit-media-identity");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    let applied = fs::read(fx.path("state/applied.json")).unwrap();
+
+    let mut circular: Value = serde_json::from_slice(&fs::read(&bom).unwrap()).unwrap();
+    circular["bundle_seq"] = Value::from(8);
+    circular["appliance"]["raw_sha256"] = Value::String("f".repeat(64));
+    fs::write(&bom, serde_json::to_vec(&circular).unwrap()).unwrap();
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("installer-media identity"), "{stderr}");
+    assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), applied);
+}
+
+#[test]
 fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
     let fx = Fixture::new("delegation-snapshot");
     let snapshot = fx.path("delegation-snapshot.json");

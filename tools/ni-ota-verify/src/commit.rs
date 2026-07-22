@@ -32,6 +32,13 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let bytes = bom_snapshot.read()?;
     let bom: BomCore = serde_json::from_slice(&bytes)
         .map_err(|e| InternalError(format!("malformed BOM {}: {e}", bom_path.display())))?;
+    let refuse = |why: String| -> Result<u8, InternalError> {
+        eprintln!("ni-ota-verify: commit REFUSED: {why}");
+        Ok(EXIT_REFUSE)
+    };
+    if let Err(reason) = bom.require_media_independent() {
+        return refuse(reason);
+    }
     let hardware_target = immutable_hardware_target()?;
     let bom_sha = runner::sha256_file(bom_snapshot.path())?;
     if bom_snapshot.read()? != bytes {
@@ -40,10 +47,6 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         ));
     }
 
-    let refuse = |why: String| -> Result<u8, InternalError> {
-        eprintln!("ni-ota-verify: commit REFUSED: {why}");
-        Ok(EXIT_REFUSE)
-    };
     if bom.hardware_target != hardware_target {
         return refuse(format!(
             "BOM hardware_target '{}' does not match immutable host target '{hardware_target}'",
