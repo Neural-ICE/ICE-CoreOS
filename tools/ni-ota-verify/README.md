@@ -442,10 +442,14 @@ ni-ota-verify bootstrap \
   --device-compat 5,5
 ```
 
-`commit` records `{bundle_seq, bom_sha256}` in `state_dir/applied.json`
-**after** the caller's health gate passes. It refuses (exit 1) any BOM that
-would lower the recorded seq, and an equal seq with a different hash; an equal
-seq with the identical hash re-commits idempotently (repair). Bootstrap and
+`commit` records `{bundle_seq, bom_sha256, bom_format}` in
+`state_dir/applied.json` **after** the caller's health gate passes, with
+`bom_format` fixed to `"media-independent-v1"` (the ADR-0012 baseline format
+marker). It refuses (exit 1) any BOM that would lower the recorded seq, an
+equal seq with a different hash, and any existing baseline without the
+media-independent marker (media-era record — reinstall, no implicit
+migration); an equal seq with the identical hash re-commits idempotently
+(repair). Bootstrap and
 commit both consume protected BOM snapshots and share the same durable writer:
 unique mode-`0600` temporary inode, file sync, atomic publication, directory
 sync, then metadata and content readback before success is reported.

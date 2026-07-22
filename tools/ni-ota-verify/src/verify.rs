@@ -462,7 +462,15 @@ fn anti_rollback_check(
             }
         }
         Ok(StateRead::Applied(applied)) => {
-            if bom_seq > applied.bundle_seq {
+            if !applied.is_media_independent() {
+                Check::fail(
+                    "anti_rollback",
+                    format!(
+                        "applied baseline at {} lacks the media-independent format marker (media-era verifier) — implicit migration is unsupported; reinstall from verified final media (ADR-0012)",
+                        store.describe()
+                    ),
+                )
+            } else if bom_seq > applied.bundle_seq {
                 Check::pass(
                     "anti_rollback",
                     format!("bundle_seq {bom_seq} > applied {}", applied.bundle_seq),
@@ -607,6 +615,7 @@ mod tests {
         MemStore(Ok(Some(AppliedStateForTest {
             bundle_seq: seq,
             bom_sha256: sha.to_string(),
+            bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
         })))
     }
 

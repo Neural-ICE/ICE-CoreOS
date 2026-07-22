@@ -159,6 +159,20 @@ impl Fixture {
         let path = self.path("state/applied.json");
         fs::write(
             &path,
+            format!(
+                r#"{{"bundle_seq":{seq},"bom_sha256":"{sha}","bom_format":"media-independent-v1"}}"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A baseline written by a pre-marker (media-era) verifier: same shape,
+    /// no bom_format. Every authority-advancing path must refuse it.
+    fn seed_legacy_applied(&self, seq: u64, sha: &str) {
+        let path = self.path("state/applied.json");
+        fs::write(
+            &path,
             format!(r#"{{"bundle_seq":{seq},"bom_sha256":"{sha}"}}"#),
         )
         .unwrap();
@@ -1674,6 +1688,67 @@ fn commit_refuses_media_identity_without_mutating_applied_state() {
         assert!(stderr.contains("installer-media identity"), "{stderr}");
         assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), applied);
     }
+}
+
+#[test]
+fn verify_refuses_media_era_baseline_without_marker() {
+    let fx = Fixture::new("legacy-root-verify");
+    fx.arrange_happy();
+    // Clean higher-seq candidate over an unmarked (media-era) baseline: the
+    // anti-rollback gate must refuse instead of allowing implicit migration.
+    fx.seed_legacy_applied(6, &"c".repeat(64));
+    let cfg = fx.write_config(1, "");
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 1);
+    let c = check(&verdict, "anti_rollback");
+    assert_eq!(c["ok"], false);
+    let detail = c["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("media-independent format marker"),
+        "{detail}"
+    );
+    assert!(detail.contains("reinstall"), "{detail}");
+}
+
+#[test]
+fn commit_refuses_media_era_baseline_without_mutating_it() {
+    let fx = Fixture::new("legacy-root-commit");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    fx.seed_legacy_applied(6, &"c".repeat(64));
+    let before = fs::read(fx.path("state/applied.json")).unwrap();
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("media-era verifier"), "{stderr}");
+    assert!(stderr.contains("reinstall"), "{stderr}");
+    assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), before);
+}
+
+#[test]
+fn commit_writes_the_marker_and_marked_roots_stay_upgradable() {
+    let fx = Fixture::new("marker-write");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(0, "");
+    let commit = |bom: &Path| -> (i32, Value, String) {
+        run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()]))
+    };
+    let (code, _, stderr) = commit(&bom);
+    assert_eq!(code, 0, "{stderr}");
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bom_format"], "media-independent-v1");
+    let bom8 = fx.write_bom("0.44.8", 8);
+    let (code, receipt, stderr) = commit(&bom8);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 8);
 }
 
 #[test]

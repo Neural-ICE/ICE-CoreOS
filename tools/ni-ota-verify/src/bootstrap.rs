@@ -190,6 +190,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let expected = AppliedState {
         bundle_seq: bom.bundle_seq,
         bom_sha256,
+        bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
     };
     match store.read() {
         Ok(StateRead::Applied(applied)) => {
@@ -253,6 +254,13 @@ fn finish_existing(
     seed_ref: &str,
     applied: AppliedState,
 ) -> Result<u8, InternalError> {
+    if !applied.is_media_independent() {
+        eprintln!(
+            "ni-ota-verify: bootstrap REFUSED: applied baseline at {} was recorded by a media-era verifier (no media-independent format marker) — implicit migration is unsupported; reinstall from verified final media (ADR-0012)",
+            store.describe()
+        );
+        return Ok(EXIT_REFUSE);
+    }
     if applied != *expected {
         eprintln!(
             "ni-ota-verify: bootstrap REFUSED: applied state already exists with a different baseline ({})",

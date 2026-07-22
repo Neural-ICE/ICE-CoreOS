@@ -103,6 +103,19 @@ recovery is a reviewed full LAB reinstall from a media-independent baseline.
 Any future field migration requires its own ADR, tests and root-authorized
 recovery procedure before rollout.
 
+The refusal is enforced through a persisted baseline format marker, because
+neither the legacy BOM hash nor the legacy TPM floor (a bare counter) can
+prove how the baseline was derived. Every applied state written by a
+media-independent-aware verifier (`bootstrap`, `commit`) carries
+`"bom_format": "media-independent-v1"` in `applied.json`. Every path that
+advances authority from an existing root — `verify` anti-rollback, legacy
+`commit`, `bootstrap` over an existing baseline, and state-v1 seeding in
+`guard-state-v2`/`commit-state-v2` — requires that marker and refuses an
+absent, unreadable or unmarked (media-era) record with the reinstall message
+above. The marker is additive and omitted when `None`, so the retained N-1
+verifier (lenient serde, no `deny_unknown_fields`) still parses a marked
+record after rollback.
+
 The retained N-1 bootc image remains a valid local rollback because the new
 schema only removes optional media fields: N-1 can read and verify the same
 media-independent signed BOM and preserved applied state. Rollback never lowers

@@ -58,6 +58,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         // reads exactly this record — plan P3).
         Ok(StateRead::Unseeded) => {}
         Ok(StateRead::Applied(applied)) => {
+            if !applied.is_media_independent() {
+                return refuse(format!(
+                    "applied baseline at {} was recorded by a media-era verifier (no media-independent format marker) — implicit migration is unsupported; reinstall from verified final media (ADR-0012)",
+                    store.describe()
+                ));
+            }
             if bom.bundle_seq < applied.bundle_seq {
                 return refuse(format!(
                     "bundle_seq {} would LOWER the applied seq {} (anti-rollback is forward-only)",
@@ -90,6 +96,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let state = AppliedState {
         bundle_seq: bom.bundle_seq,
         bom_sha256: bom_sha,
+        bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
     };
     store.write(&state)?;
     let receipt = serde_json::json!({
