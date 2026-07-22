@@ -125,6 +125,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
                     };
                 (
                     TimeChallenge {
+                        bootstrap_authorization_sha256: assertion.bootstrap_authorization_sha256,
                         delegation_snapshot_sha256: assertion.delegation_snapshot_sha256,
                         device_fingerprint: assertion.device_fingerprint,
                         hardware_target: assertion.hardware_target,
@@ -167,6 +168,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
             return refusal("TPM continuity changed after challenge issuance".into());
         }
         let expected = ExpectedTrustedTime {
+            bootstrap_authorization_sha256: challenge.bootstrap_authorization_sha256.as_deref(),
             delegation_snapshot_sha256: snapshot_hash,
             device_fingerprint: &challenge.device_fingerprint,
             hardware_target: &target,
@@ -261,6 +263,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     let trusted_state = TrustedTimeState {
         assertion_seq: trusted.assertion_seq,
         assertion_sha256: trusted.assertion_sha256.clone(),
+        bootstrap_authorization_sha256: trusted.bootstrap_authorization_sha256.clone(),
         challenge_sha256: trusted.nonce_sha256.clone(),
         delegation_seq: trusted.delegation_seq,
         device_fingerprint: trusted.device_fingerprint.clone(),
