@@ -32,6 +32,13 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let bytes = bom_snapshot.read()?;
     let bom: BomCore = serde_json::from_slice(&bytes)
         .map_err(|e| InternalError(format!("malformed BOM {}: {e}", bom_path.display())))?;
+    let refuse = |why: String| -> Result<u8, InternalError> {
+        eprintln!("ni-ota-verify: commit REFUSED: {why}");
+        Ok(EXIT_REFUSE)
+    };
+    if let Err(reason) = bom.require_media_independent() {
+        return refuse(reason);
+    }
     let hardware_target = immutable_hardware_target()?;
     let bom_sha = runner::sha256_file(bom_snapshot.path())?;
     if bom_snapshot.read()? != bytes {
@@ -40,10 +47,6 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         ));
     }
 
-    let refuse = |why: String| -> Result<u8, InternalError> {
-        eprintln!("ni-ota-verify: commit REFUSED: {why}");
-        Ok(EXIT_REFUSE)
-    };
     if bom.hardware_target != hardware_target {
         return refuse(format!(
             "BOM hardware_target '{}' does not match immutable host target '{hardware_target}'",
@@ -52,9 +55,25 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
     match store.read() {
         // First commit seeds the record (P2 shadow burn-in; P3's NV seeding
-        // reads exactly this record — plan P3).
-        Ok(StateRead::Unseeded) => {}
+        // reads exactly this record — plan P3). On a TPM-anchored appliance
+        // (NV indices configured) seeding authority belongs exclusively to the
+        // media-verified bootstrap path: a lost state file with persisting TPM
+        // floors must not let commit mint a fresh media-independent marker.
+        Ok(StateRead::Unseeded) => {
+            if cfg.nv_index.is_some() {
+                return refuse(format!(
+                    "state at {} is unseeded while TPM anchoring is configured — baseline seeding belongs to the verified bootstrap path; reinstall from verified final media (ADR-0012)",
+                    store.describe()
+                ));
+            }
+        }
         Ok(StateRead::Applied(applied)) => {
+            if !applied.is_media_independent() {
+                return refuse(format!(
+                    "applied baseline at {} was recorded by a media-era verifier (no media-independent format marker) — implicit migration is unsupported; reinstall from verified final media (ADR-0012)",
+                    store.describe()
+                ));
+            }
             if bom.bundle_seq < applied.bundle_seq {
                 return refuse(format!(
                     "bundle_seq {} would LOWER the applied seq {} (anti-rollback is forward-only)",
@@ -87,6 +106,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let state = AppliedState {
         bundle_seq: bom.bundle_seq,
         bom_sha256: bom_sha,
+        bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
     };
     store.write(&state)?;
     let receipt = serde_json::json!({

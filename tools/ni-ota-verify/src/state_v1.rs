@@ -170,6 +170,9 @@ pub(crate) struct Candidate<'a> {
     pub(crate) applied: AppliedStateV1,
     pub(crate) authority: AuthorityState,
     pub(crate) challenge: TimeChallenge,
+    /// See PreapplyCandidate::legacy_root_media_independent — same gate,
+    /// re-evaluated on the commit path before seeding a first generation.
+    pub(crate) legacy_root_media_independent: bool,
     pub(crate) release: &'a [u8],
     pub(crate) release_signature: &'a [u8],
     pub(crate) snapshot: &'a [u8],
@@ -190,6 +193,12 @@ pub(crate) struct PreapplyCandidate<'a> {
     pub(crate) bom_sha256: &'a str,
     pub(crate) bundle_seq: u64,
     pub(crate) challenge: &'a TimeChallenge,
+    /// True only when the caller read the legacy applied.json and it carries
+    /// the media-independent format marker. Seeding from any other root
+    /// (absent, unreadable or media-era record) is refused: the legacy TPM
+    /// floor alone is a bare counter and cannot prove the baseline format
+    /// (ADR-0012 — reinstall instead of implicit migration).
+    pub(crate) legacy_root_media_independent: bool,
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) snapshot_sha256: &'a str,
     pub(crate) snapshot_signature: &'a [u8],
@@ -720,6 +729,11 @@ impl Store {
                 if candidate.bundle_seq < legacy_floor {
                     return Ok(Err("candidate bundle is below legacy TPM floor".into()));
                 }
+                if !candidate.legacy_root_media_independent {
+                    return Ok(Err(
+                        "legacy applied baseline lacks the media-independent format marker — implicit migration is unsupported; reinstall from verified final media (ADR-0012)".into()
+                    ));
+                }
                 Ok(Ok(()))
             };
         }
@@ -832,6 +846,11 @@ impl Store {
             {
                 return Ok(Err(
                     "zero TPM anchor with existing state history requires signed recovery".into(),
+                ));
+            }
+            if !candidate.legacy_root_media_independent {
+                return Ok(Err(
+                    "legacy applied baseline lacks the media-independent format marker — implicit migration is unsupported; reinstall from verified final media (ADR-0012)".into()
                 ));
             }
             None
@@ -2722,6 +2741,7 @@ mod tests {
         trusted.assertion_sha256 =
             state_canonical_hash(assertion, "test trusted-time assertion").unwrap();
         Candidate {
+            legacy_root_media_independent: true,
             applied: AppliedStateV1 {
                 bom_sha256: "e".repeat(64),
                 bundle_seq: 1,
@@ -3855,6 +3875,7 @@ mod tests {
             bom_sha256: &candidate().applied.bom_sha256,
             bundle_seq: 1,
             challenge: &challenge,
+            legacy_root_media_independent: true,
             snapshot: &snapshot,
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
             snapshot_signature: b"sig",
@@ -3923,6 +3944,7 @@ mod tests {
             bom_sha256: &candidate().applied.bom_sha256,
             bundle_seq: 1,
             challenge: &challenge,
+            legacy_root_media_independent: true,
             snapshot: &snapshot,
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
             snapshot_signature: b"sig",
@@ -4025,6 +4047,7 @@ mod tests {
             bom_sha256: &candidate().applied.bom_sha256,
             bundle_seq: 1,
             challenge: &challenge,
+            legacy_root_media_independent: true,
             snapshot: &snapshot,
             snapshot_sha256: &challenge.delegation_snapshot_sha256,
             snapshot_signature: b"sig",

@@ -19,6 +19,13 @@ use crate::InternalError;
 
 const LEGACY_STATE_DIR: &str = "/var/lib/neural-ice/ota";
 
+/// Baseline format marker recorded with every applied state written by a
+/// media-independent-aware verifier. A record without it was written by a
+/// media-era verifier and may descend from a BOM carrying installer-media
+/// identity — an unsupported legacy root that every authority-advancing path
+/// refuses (ADR-0012); recovery is reinstallation from verified final media.
+pub(crate) const BOM_FORMAT_MEDIA_INDEPENDENT_V1: &str = "media-independent-v1";
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppliedState {
     /// bundle_seq of the last successfully applied bundle (post health gate).
@@ -26,6 +33,18 @@ pub(crate) struct AppliedState {
     /// sha256 of the exact BOM file that was applied — the repair carve-out
     /// anchor (equal seq is only acceptable for the byte-identical BOM).
     pub bom_sha256: String,
+    /// `Some(BOM_FORMAT_MEDIA_INDEPENDENT_V1)` for records written here.
+    /// Optional and omitted when absent so the previous deployment's verifier
+    /// (lenient serde derive, no deny_unknown_fields) still parses the record
+    /// after a rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bom_format: Option<String>,
+}
+
+impl AppliedState {
+    pub(crate) fn is_media_independent(&self) -> bool {
+        self.bom_format.as_deref() == Some(BOM_FORMAT_MEDIA_INDEPENDENT_V1)
+    }
 }
 
 pub(crate) enum StateRead {
@@ -203,6 +222,7 @@ impl FileStateStore {
             drop(staged);
             sync_directory(dir)?;
             self.readback(state)?;
+            self.write_format_sidecar(state)?;
         }
         Ok(created)
     }
@@ -373,6 +393,44 @@ impl FileStateStore {
             .with_file_name(format!(".{}.lock", file_name.to_string_lossy())))
     }
 
+    /// The supported N-1 repair commit rewrites applied.json without the
+    /// bom_format field. This sidecar, written by every marker-aware write and
+    /// unknown to the N-1 verifier, preserves the format proof across that
+    /// rewrite for the exact same (bundle_seq, bom_sha256) record only.
+    fn format_sidecar_path(&self) -> PathBuf {
+        self.path.with_extension("format.v1.json")
+    }
+
+    fn read_format_sidecar_matching(&self, state: &AppliedState) -> Option<AppliedState> {
+        let path = self.format_sidecar_path();
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        let sidecar: AppliedState = serde_json::from_slice(&bytes).ok()?;
+        (sidecar.is_media_independent()
+            && sidecar.bundle_seq == state.bundle_seq
+            && sidecar.bom_sha256 == state.bom_sha256)
+            .then_some(sidecar)
+    }
+
+    fn write_format_sidecar(&self, state: &AppliedState) -> Result<(), InternalError> {
+        if !state.is_media_independent() {
+            return Ok(());
+        }
+        let dir = self.parent()?;
+        let staged = self.stage_state(state)?;
+        std::fs::rename(staged.path(), self.format_sidecar_path()).map_err(|e| {
+            InternalError(format!(
+                "cannot move {} into place: {e}",
+                staged.path().display()
+            ))
+        })?;
+        drop(staged);
+        sync_directory(dir)
+    }
+
     fn stage_state(&self, state: &AppliedState) -> Result<SecureTempFile, InternalError> {
         let json = serde_json::to_string(state)
             .map_err(|e| InternalError(format!("cannot serialize applied state: {e}")))?;
@@ -500,6 +558,11 @@ impl AppliedStateStore for FileStateStore {
         };
         let state: AppliedState = serde_json::from_slice(&bytes)
             .map_err(|e| format!("corrupt applied state {}: {e}", self.path.display()))?;
+        if !state.is_media_independent() {
+            if let Some(marked) = self.read_format_sidecar_matching(&state) {
+                return Ok(StateRead::Applied(marked));
+            }
+        }
         Ok(StateRead::Applied(state))
     }
 
@@ -515,7 +578,8 @@ impl AppliedStateStore for FileStateStore {
         })?;
         drop(staged);
         sync_directory(dir)?;
-        self.readback(state)
+        self.readback(state)?;
+        self.write_format_sidecar(state)
     }
 
     fn describe(&self) -> String {
@@ -1008,11 +1072,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_record_parses_without_marker_and_marked_record_stays_n1_readable() {
+        // A record written by a media-era verifier has no bom_format: it must
+        // parse (None) so the refusal is a typed policy decision, not a parse
+        // error.
+        let legacy: AppliedState = serde_json::from_str(
+            r#"{"bundle_seq":7,"bom_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.bom_format, None);
+        assert!(!legacy.is_media_independent());
+
+        // A marked record serializes the marker, and an N-1 reader modeled as
+        // a lenient two-field struct still parses it after rollback.
+        let marked = AppliedState {
+            bundle_seq: 8,
+            bom_sha256: "bb".repeat(32),
+            bom_format: Some(BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
+        };
+        let encoded = serde_json::to_string(&marked).unwrap();
+        assert!(encoded.contains(r#""bom_format":"media-independent-v1""#));
+        #[derive(Deserialize)]
+        struct N1AppliedState {
+            bundle_seq: u64,
+            bom_sha256: String,
+        }
+        let n1: N1AppliedState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(n1.bundle_seq, 8);
+        assert_eq!(n1.bom_sha256, marked.bom_sha256);
+    }
+
+    #[test]
     fn roundtrips_and_detects_corruption() {
         let s = store("roundtrip");
         let state = AppliedState {
             bundle_seq: 7,
             bom_sha256: "ab".repeat(32),
+            bom_format: Some(BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
         };
         s.write(&state).unwrap();
         match s.read().unwrap() {

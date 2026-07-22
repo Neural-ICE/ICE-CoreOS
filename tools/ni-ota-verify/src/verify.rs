@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::IgnoredAny, Deserialize, Deserializer, Serialize};
 
 use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
 use crate::record::{self, ChannelRecord};
@@ -14,7 +14,8 @@ use crate::state::{ensure_secure_state_directory, AppliedStateStore, FileStateSt
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
 /// The signed IMMUTABLE core of the release-train lockfile (ICE-Fabric
-/// `release-train.sh bom` — canonical `jq -S del(.status)` serialization).
+/// `release-train.sh bom` — canonical release identity with installer-media
+/// outputs removed before signing).
 /// Only the fields the §0 checks consume are modeled; the rest of the BOM
 /// (digests, sources, …) is the apply-side caller's business.
 #[derive(Deserialize)]
@@ -37,6 +38,36 @@ pub(crate) struct BomCore {
 #[derive(Deserialize)]
 pub(crate) struct BomAppliance {
     pub os_base: Option<BomOsBase>,
+    /// Legacy lockfile-only media evidence. These fields are modeled solely so
+    /// authority-bearing verification can reject a circular BOM that claims to
+    /// authenticate the installer which embeds that same BOM/signature.
+    #[serde(default, rename = "raw_sha256", deserialize_with = "field_present")]
+    pub raw_sha256_present: bool,
+    #[serde(default, rename = "caibx", deserialize_with = "field_present")]
+    pub caibx_present: bool,
+}
+
+fn field_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer).map(|_| true)
+}
+
+impl BomCore {
+    pub(crate) fn require_media_independent(&self) -> Result<(), String> {
+        if self
+            .appliance
+            .as_ref()
+            .is_some_and(|appliance| appliance.raw_sha256_present || appliance.caibx_present)
+        {
+            return Err(
+                "signed BOM contains installer-media identity; final media hashes belong only to the out-of-band final-media receipt"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -202,7 +233,8 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         ),
         Err(e) => Check::fail("record_parse", format!("channel record unusable: {e}")),
     });
-    let bom: Result<BomCore, String> = read_json(&bom_path);
+    let bom: Result<BomCore, String> =
+        read_json(&bom_path).and_then(|bom: BomCore| bom.require_media_independent().map(|()| bom));
     checks.push(match &bom {
         Ok(b) => Check::pass(
             "bom_parse",
@@ -430,7 +462,15 @@ fn anti_rollback_check(
             }
         }
         Ok(StateRead::Applied(applied)) => {
-            if bom_seq > applied.bundle_seq {
+            if !applied.is_media_independent() {
+                Check::fail(
+                    "anti_rollback",
+                    format!(
+                        "applied baseline at {} lacks the media-independent format marker (media-era verifier) — implicit migration is unsupported; reinstall from verified final media (ADR-0012)",
+                        store.describe()
+                    ),
+                )
+            } else if bom_seq > applied.bundle_seq {
                 Check::pass(
                     "anti_rollback",
                     format!("bundle_seq {bom_seq} > applied {}", applied.bundle_seq),
@@ -575,6 +615,7 @@ mod tests {
         MemStore(Ok(Some(AppliedStateForTest {
             bundle_seq: seq,
             bom_sha256: sha.to_string(),
+            bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
         })))
     }
 

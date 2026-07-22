@@ -76,6 +76,68 @@ anchor. The verifier stages and fsyncs all files, extends the TPM with the
 manifest hash, reads the expected anchor back, then publishes and rereads the
 current pointer and enforcement marker. No success receipt is emitted earlier.
 
+The signed BOM is an installed-authority artifact, not a final-media identity.
+It binds the immutable OS manifest digest, exact seed commit, OCI bundle
+digest, train, compatibility and hardware target, but it must not contain the
+installer image `raw_sha256` or `caibx` identity. Embedding either value would
+make the signed object depend on bytes that themselves embed that object and
+would therefore create a circular, non-reproducible authority chain. The
+verifier rejects such a BOM before bootstrap, pre-apply or state mutation.
+The final-media receipt binds the installer raw/archive hashes and sizes,
+partition identities, seed manifest and optional embedded baseline pair. It
+does **not** currently bind or authorize a `caibx` chunk index. A chunk index
+must not be distributed by this release path until a separate deterministic
+generation, digest-binding and verification contract is reviewed and
+implemented. Neither form of physical-media evidence becomes OTA authority or
+part of the TPM-anchored installed state.
+
+### Rollout, recovery and N-1 behavior
+
+This transition is approved only for the fresh debug/LAB installation being
+rebuilt from USB; there are no fielded customer appliances or production
+generations to migrate. No implicit migration exists. If a host already has a
+baseline or committed generation derived from a BOM carrying `raw_sha256` or
+`caibx`, the new verifier refuses the next candidate before mutation and leaves
+the existing state and TPM floors intact. Such a host is outside this rollout:
+recovery is a reviewed full LAB reinstall from a media-independent baseline.
+Any future field migration requires its own ADR, tests and root-authorized
+recovery procedure before rollout.
+
+The refusal is enforced through a persisted baseline format marker, because
+neither the legacy BOM hash nor the legacy TPM floor (a bare counter) can
+prove how the baseline was derived. Every applied state written by a
+media-independent-aware verifier (`bootstrap`, `commit`) carries
+`"bom_format": "media-independent-v1"` in `applied.json`. Every path that
+advances authority from an existing root — `verify` anti-rollback, legacy
+`commit`, `bootstrap` over an existing baseline, and state-v1 seeding in
+`guard-state-v2`/`commit-state-v2` — requires that marker and refuses an
+absent, unreadable or unmarked (media-era) record with the reinstall message
+above. The marker is additive and omitted when `None`, so the retained N-1
+verifier (lenient serde, no `deny_unknown_fields`) still parses a marked
+record after rollback.
+
+Two hardening rules complete the marker contract. First, the N-1 verifier's
+supported equal-sequence repair commit rewrites `applied.json` without the
+marker; every marker-aware write therefore also persists a sidecar
+(`applied.format.v1.json`, unknown to N-1) and the reader restores the marker
+only when the sidecar carries it for the exact same
+`(bundle_seq, bom_sha256)` record. An N-1 write that *advances* the sequence
+invalidates the sidecar and the baseline reads as media-era (reinstall) —
+N-1 may repair, never advance. Second, on a TPM-anchored appliance (NV
+indices configured) `commit` refuses to seed an unseeded store outright:
+baseline seeding belongs exclusively to the media-verified `bootstrap` path,
+so a lost state file with persisting TPM floors can never let a routine
+commit mint a fresh marker.
+
+The retained N-1 bootc image remains a valid local rollback because the new
+schema only removes optional media fields: N-1 can read and verify the same
+media-independent signed BOM and preserved applied state. Rollback never lowers
+the bundle or TPM floors. After this transition the release pipeline must not
+sign or serve media-bearing BOMs, so the older verifier's former ability to
+accept one is not an authorized recovery path. A rollback may restore runtime
+availability; it may not create, migrate or advance authority from a legacy
+media-bearing BOM.
+
 ### Persistent disk contract
 
 The canonical root is `${state_dir}/state-v1` (normally

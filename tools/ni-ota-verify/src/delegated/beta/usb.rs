@@ -136,6 +136,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let bom: BomCore = refuse_try!(
         serde_json::from_slice(&bom_bytes).map_err(|error| format!("invalid BOM: {error}"))
     );
+    refuse_try!(bom.require_media_independent());
     let record = refuse_try!(record::parse(&record_bytes));
 
     let Some(root_path) = config.root_pubkey.as_deref() else {

@@ -116,7 +116,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},"raw_sha256":"bb","version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
+                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},"version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -156,6 +156,20 @@ impl Fixture {
     }
 
     fn seed_applied(&self, seq: u64, sha: &str) {
+        let path = self.path("state/applied.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"bundle_seq":{seq},"bom_sha256":"{sha}","bom_format":"media-independent-v1"}}"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A baseline written by a pre-marker (media-era) verifier: same shape,
+    /// no bom_format. Every authority-advancing path must refuse it.
+    fn seed_legacy_applied(&self, seq: u64, sha: &str) {
         let path = self.path("state/applied.json");
         fs::write(
             &path,
@@ -805,7 +819,11 @@ fn bootstrap_uses_one_protected_snapshot_when_source_mutates_during_cosign() {
     entries.sort();
     assert_eq!(
         entries,
-        [".applied.json.lock", "applied.json"],
+        [
+            ".applied.json.lock",
+            "applied.format.v1.json",
+            "applied.json"
+        ],
         "snapshot cleanup leaves only durable state and its kernel-lock inode"
     );
 }
@@ -1648,6 +1666,176 @@ fn commit_refuses_malformed_bom_as_internal_error() {
 }
 
 #[test]
+fn commit_refuses_media_identity_without_mutating_applied_state() {
+    let fx = Fixture::new("commit-media-identity");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    let applied = fs::read(fx.path("state/applied.json")).unwrap();
+
+    let mut circular: Value = serde_json::from_slice(&fs::read(&bom).unwrap()).unwrap();
+    circular["bundle_seq"] = Value::from(8);
+    for value in [Value::String("f".repeat(64)), Value::Null] {
+        circular["appliance"]["raw_sha256"] = value;
+        fs::write(&bom, serde_json::to_vec(&circular).unwrap()).unwrap();
+        let (code, _, stderr) = run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()]));
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("installer-media identity"), "{stderr}");
+        assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), applied);
+    }
+}
+
+#[test]
+fn verify_refuses_media_era_baseline_without_marker() {
+    let fx = Fixture::new("legacy-root-verify");
+    fx.arrange_happy();
+    // Clean higher-seq candidate over an unmarked (media-era) baseline: the
+    // anti-rollback gate must refuse instead of allowing implicit migration.
+    fx.seed_legacy_applied(6, &"c".repeat(64));
+    let cfg = fx.write_config(1, "");
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 1);
+    let c = check(&verdict, "anti_rollback");
+    assert_eq!(c["ok"], false);
+    let detail = c["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("media-independent format marker"),
+        "{detail}"
+    );
+    assert!(detail.contains("reinstall"), "{detail}");
+}
+
+#[test]
+fn commit_refuses_media_era_baseline_without_mutating_it() {
+    let fx = Fixture::new("legacy-root-commit");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "");
+    fx.seed_legacy_applied(6, &"c".repeat(64));
+    let before = fs::read(fx.path("state/applied.json")).unwrap();
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("media-era verifier"), "{stderr}");
+    assert!(stderr.contains("reinstall"), "{stderr}");
+    assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), before);
+}
+
+#[test]
+fn commit_writes_the_marker_and_marked_roots_stay_upgradable() {
+    let fx = Fixture::new("marker-write");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(0, "");
+    let commit = |bom: &Path| -> (i32, Value, String) {
+        run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()]))
+    };
+    let (code, _, stderr) = commit(&bom);
+    assert_eq!(code, 0, "{stderr}");
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bom_format"], "media-independent-v1");
+    let bom8 = fx.write_bom("0.44.8", 8);
+    let (code, receipt, stderr) = commit(&bom8);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(receipt["bundle_seq"], 8);
+}
+
+#[test]
+fn n1_repair_rewrite_keeps_media_independence_via_sidecar() {
+    let fx = Fixture::new("sidecar-n1-repair");
+    fx.arrange_happy();
+    let bom = fx.path("bom.json");
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    // Simulate the supported N-1 repair commit: rewrite applied.json with the
+    // same (seq, sha) but without bom_format. The sidecar must preserve the
+    // format proof so the marked baseline stays upgradable.
+    fx.seed_legacy_applied(7, &sha256_of(&bom));
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 0, "{verdict}");
+    assert!(check(&verdict, "anti_rollback")["detail"]
+        .as_str()
+        .unwrap()
+        .contains("repair"));
+    let bom8 = fx.write_bom("0.44.8", 8);
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom8.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bom_format"], "media-independent-v1");
+}
+
+#[test]
+fn sidecar_never_launders_a_different_legacy_baseline() {
+    let fx = Fixture::new("sidecar-mismatch");
+    fx.arrange_happy();
+    let bom = fx.path("bom.json");
+    let cfg = fx.write_config(1, "");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "{stderr}");
+    // An unmarked record that does NOT match the sidecar (different seq/sha)
+    // is a media-era baseline: the stale sidecar must not restore the marker.
+    fx.seed_legacy_applied(9, &"c".repeat(64));
+    let (code, verdict, _) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 1);
+    let detail = check(&verdict, "anti_rollback")["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        detail.contains("media-independent format marker"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn commit_refuses_to_seed_when_tpm_anchoring_is_configured() {
+    let fx = Fixture::new("tpm-anchored-seed");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "nv_index=0x01500001\n");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("unseeded while TPM anchoring is configured"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("bootstrap"), "{stderr}");
+    assert!(!fx.path("state/applied.json").exists());
+}
+
+#[test]
 fn delegation_snapshot_accepts_exact_vector_and_enforces_immutable_floor() {
     let fx = Fixture::new("delegation-snapshot");
     let snapshot = fx.path("delegation-snapshot.json");
@@ -2149,6 +2337,23 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(verdict["mode"], "delegated-usb-beta");
     assert_eq!(verdict["bom_sha256"], bom_hash);
     assert!(!fx.path("state/applied.json").exists());
+
+    let clean_bom = fs::read(&bom).unwrap();
+    for media_field in ["raw_sha256", "caibx"] {
+        for value in [Value::String("f".repeat(64)), Value::Null] {
+            let mut circular: Value = serde_json::from_slice(&clean_bom).unwrap();
+            circular["appliance"][media_field] = value;
+            let mut circular_bytes = serde_json::to_vec_pretty(&circular).unwrap();
+            circular_bytes.push(b'\n');
+            fs::write(&bom, circular_bytes).unwrap();
+            let (code, _, stderr) =
+                run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+            assert_eq!(code, 1, "{stderr}");
+            assert!(stderr.contains("installer-media identity"), "{stderr}");
+            assert!(!fx.path("state/applied.json").exists());
+        }
+    }
+    fs::write(&bom, clean_bom).unwrap();
 
     fs::remove_file(fx.path("bootstrap-delegation-sha256")).unwrap();
     let mut seeded = command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST);

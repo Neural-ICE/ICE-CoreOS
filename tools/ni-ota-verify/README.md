@@ -10,6 +10,15 @@ The appliance is treated like a game console: it must verify every update
 no reach-back and no operator. This binary is that gate. It verifies **local
 files only**; fetching them is the OTA caller's job (see *Caller integration*).
 
+Authority-bearing BOMs describe the installed state, never the installer that
+may carry them. Delegated USB verification binds the exact booted OS digest,
+Fabric seed commit, signed bundle digest and image-attestation set. It refuses
+`appliance.raw_sha256` and `appliance.caibx`: final installer raw/archive and
+partition evidence is emitted only by the independent final-media gate after
+assembly, avoiding an impossible self-hash cycle. That gate does not currently
+bind `caibx`; this release path refuses to treat or distribute a chunk index as
+verified media evidence until a separate digest-bound contract is implemented.
+
 ## The verification contract
 
 Checks run in the order of the ICE-Fabric plan (§0,
@@ -433,10 +442,14 @@ ni-ota-verify bootstrap \
   --device-compat 5,5
 ```
 
-`commit` records `{bundle_seq, bom_sha256}` in `state_dir/applied.json`
-**after** the caller's health gate passes. It refuses (exit 1) any BOM that
-would lower the recorded seq, and an equal seq with a different hash; an equal
-seq with the identical hash re-commits idempotently (repair). Bootstrap and
+`commit` records `{bundle_seq, bom_sha256, bom_format}` in
+`state_dir/applied.json` **after** the caller's health gate passes, with
+`bom_format` fixed to `"media-independent-v1"` (the ADR-0012 baseline format
+marker). It refuses (exit 1) any BOM that would lower the recorded seq, an
+equal seq with a different hash, and any existing baseline without the
+media-independent marker (media-era record — reinstall, no implicit
+migration); an equal seq with the identical hash re-commits idempotently
+(repair). Bootstrap and
 commit both consume protected BOM snapshots and share the same durable writer:
 unique mode-`0600` temporary inode, file sync, atomic publication, directory
 sync, then metadata and content readback before success is reported.

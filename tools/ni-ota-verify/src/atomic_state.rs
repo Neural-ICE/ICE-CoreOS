@@ -69,6 +69,19 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     let store = Store {
         root: state_dir.join("state-v1"),
     };
+    // The legacy TPM floor is a bare counter and cannot prove the baseline
+    // format: gate state-v1 seeding on the applied.json marker instead.
+    // Absent, unreadable or media-era records all fail closed (ADR-0012).
+    let legacy_root_media_independent = {
+        use crate::state::{AppliedStateStore, FileStateStore, StateRead};
+        let legacy_store = FileStateStore {
+            path: state_dir.join("applied.json"),
+        };
+        matches!(
+            legacy_store.read(),
+            Ok(StateRead::Applied(applied)) if applied.is_media_independent()
+        )
+    };
     let scratch = store.lock_store();
     let _lock = scratch.lock_commit()?;
     macro_rules! artifact {
@@ -244,6 +257,9 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     let bom_bytes = bom_file.read()?;
     let bom: BomCore = serde_json::from_slice(&bom_bytes)
         .map_err(|error| InternalError(format!("malformed state-v2 BOM: {error}")))?;
+    if let Err(reason) = bom.require_media_independent() {
+        return refusal(reason);
+    }
     let bom_hash = runner::sha256_bytes(&bom_bytes)?;
     if let Err(reason) = validate_bom_binding(
         &bom,
@@ -274,6 +290,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         bom_sha256: &bom_hash,
         bundle_seq: bom.bundle_seq,
         challenge: &challenge,
+        legacy_root_media_independent,
         snapshot,
         snapshot_sha256: snapshot_hash,
         snapshot_signature: &snapshot_signature,
@@ -309,6 +326,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
             snapshot_signature_sha256: runner::sha256_bytes(&snapshot_signature)?,
         },
         challenge: challenge.clone(),
+        legacy_root_media_independent,
         release: &release_bytes,
         release_signature: &release_signature,
         snapshot: &snapshot_bytes,
