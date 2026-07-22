@@ -27,6 +27,11 @@ mod bootstrap;
 mod commit;
 mod config;
 mod delegated;
+#[allow(
+    dead_code,
+    reason = "verified authority is consumed by the next stacked bootstrap command"
+)]
+mod licensing_bootstrap;
 mod record;
 mod runner;
 mod state;
