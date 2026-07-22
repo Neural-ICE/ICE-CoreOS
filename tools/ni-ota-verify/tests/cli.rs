@@ -1662,16 +1662,18 @@ fn commit_refuses_media_identity_without_mutating_applied_state() {
 
     let mut circular: Value = serde_json::from_slice(&fs::read(&bom).unwrap()).unwrap();
     circular["bundle_seq"] = Value::from(8);
-    circular["appliance"]["raw_sha256"] = Value::String("f".repeat(64));
-    fs::write(&bom, serde_json::to_vec(&circular).unwrap()).unwrap();
-    let (code, _, stderr) = run(Command::new(BIN)
-        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
-        .arg("commit")
-        .args(["--bom".as_ref(), bom.as_os_str()])
-        .args(["--config".as_ref(), cfg.as_os_str()]));
-    assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("installer-media identity"), "{stderr}");
-    assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), applied);
+    for value in [Value::String("f".repeat(64)), Value::Null] {
+        circular["appliance"]["raw_sha256"] = value;
+        fs::write(&bom, serde_json::to_vec(&circular).unwrap()).unwrap();
+        let (code, _, stderr) = run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()]));
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("installer-media identity"), "{stderr}");
+        assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), applied);
+    }
 }
 
 #[test]
@@ -2179,15 +2181,18 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
 
     let clean_bom = fs::read(&bom).unwrap();
     for media_field in ["raw_sha256", "caibx"] {
-        let mut circular: Value = serde_json::from_slice(&clean_bom).unwrap();
-        circular["appliance"][media_field] = Value::String("f".repeat(64));
-        let mut circular_bytes = serde_json::to_vec_pretty(&circular).unwrap();
-        circular_bytes.push(b'\n');
-        fs::write(&bom, circular_bytes).unwrap();
-        let (code, _, stderr) = run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
-        assert_eq!(code, 1, "{stderr}");
-        assert!(stderr.contains("installer-media identity"), "{stderr}");
-        assert!(!fx.path("state/applied.json").exists());
+        for value in [Value::String("f".repeat(64)), Value::Null] {
+            let mut circular: Value = serde_json::from_slice(&clean_bom).unwrap();
+            circular["appliance"][media_field] = value;
+            let mut circular_bytes = serde_json::to_vec_pretty(&circular).unwrap();
+            circular_bytes.push(b'\n');
+            fs::write(&bom, circular_bytes).unwrap();
+            let (code, _, stderr) =
+                run(&mut command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
+            assert_eq!(code, 1, "{stderr}");
+            assert!(stderr.contains("installer-media identity"), "{stderr}");
+            assert!(!fx.path("state/applied.json").exists());
+        }
     }
     fs::write(&bom, clean_bom).unwrap();
 

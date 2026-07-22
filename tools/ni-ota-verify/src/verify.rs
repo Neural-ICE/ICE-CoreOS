@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::IgnoredAny, Deserialize, Deserializer, Serialize};
 
 use crate::config::{immutable_hardware_target, parse_compat_flag, Config};
 use crate::record::{self, ChannelRecord};
@@ -41,10 +41,17 @@ pub(crate) struct BomAppliance {
     /// Legacy lockfile-only media evidence. These fields are modeled solely so
     /// authority-bearing verification can reject a circular BOM that claims to
     /// authenticate the installer which embeds that same BOM/signature.
-    #[serde(default)]
-    pub raw_sha256: Option<String>,
-    #[serde(default)]
-    pub caibx: Option<String>,
+    #[serde(default, rename = "raw_sha256", deserialize_with = "field_present")]
+    pub raw_sha256_present: bool,
+    #[serde(default, rename = "caibx", deserialize_with = "field_present")]
+    pub caibx_present: bool,
+}
+
+fn field_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 impl BomCore {
@@ -52,7 +59,7 @@ impl BomCore {
         if self
             .appliance
             .as_ref()
-            .is_some_and(|appliance| appliance.raw_sha256.is_some() || appliance.caibx.is_some())
+            .is_some_and(|appliance| appliance.raw_sha256_present || appliance.caibx_present)
         {
             return Err(
                 "signed BOM contains installer-media identity; final media hashes belong only to the out-of-band final-media receipt"
