@@ -119,6 +119,7 @@ truncate -s "+${GROW}" "$RAW"
 
 echo "==> 3. relocate GPT backup header + append the ni-seed partition"
 sudo sgdisk -e "$RAW"
+sudo sgdisk -c 1:EFI-SYSTEM "$RAW"          # bootc raw ships unnamed GPT entries; the media gate matches PARTLABEL
 sudo sgdisk -n 0:0:0 -c 0:ni-seed -t 0:8300 "$RAW"          # new part = all free space
 SEEDNUM="$(sudo sgdisk -p "$RAW" | awk '/ni-seed/{n=$1} END{print n}')"
 [ -n "$SEEDNUM" ] || { echo "ni-seed partition not created" >&2; exit 1; }
