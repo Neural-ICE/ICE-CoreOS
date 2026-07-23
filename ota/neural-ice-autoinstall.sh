@@ -445,6 +445,13 @@ installer_device_root_dropin="$dep/etc/systemd/system/neural-ice-device-root.ser
   || die "installer device-root Live guard is missing from the target deployment"
 # bootc >= 1.16 remounts the target read-only while finalizing the install;
 # every post-bootc mutation of the deployment below needs it writable again.
+# Recovery: a remount failure dies BEFORE any mutation — the disk then holds a
+# fully deployed but unconfigured OS, and the recovery path is unchanged from
+# any post-bootc die: boot the one-shot media again and re-run the wipe
+# install. A later mutation failure leaves exactly the same states as before
+# this change. N-1: on bootc < 1.16 the target is still rw and the remount is
+# an idempotent no-op; the change affects only the installer env, never the
+# installed system or its upgrade path.
 mount -o remount,rw "$TGT" \
   || die "cannot remount the target read-write after bootc finalize"
 rm -f -- "$installer_device_root_dropin" \

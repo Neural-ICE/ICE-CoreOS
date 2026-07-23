@@ -16,7 +16,8 @@ Conflicts=getty@tty1.service
 Type=oneshot
 RemainAfterExit=true
 # The TPM char device is udev-driven; make sure it exists before preflight.
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -e /dev/tpmrm0 ] && exit 0; sleep 1; done; echo "no /dev/tpmrm0" >&2; exit 1'
+# Accept either node — the installer's own TPM preflight takes tpmrm0 OR tpm0.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do { [ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ]; } && exit 0; sleep 1; done; echo "no /dev/tpmrm0 or /dev/tpm0" >&2; exit 1'
 ExecStart=/usr/local/bin/neural-ice-autoinstall.sh
 # Interactive console: we must be able to DISPLAY and READ [Enter].
 StandardInput=tty-force
