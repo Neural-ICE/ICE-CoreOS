@@ -18,6 +18,11 @@ FROM ${BASE_IMAGE}
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
 COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-baseline-handoff
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
+# Install boots must never start getty@tty1 (its start job would resolve the
+# autoinstall Conflicts= by stopping the install mid-flight). Live boots keep it.
+RUN install -d -m 0755 /etc/systemd/system/getty@tty1.service.d
+COPY ota/neural-ice-getty-tty1-installer-skip.conf \
+     /etc/systemd/system/getty@tty1.service.d/10-installer-skip.conf
 COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
 COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service \
      /usr/lib/systemd/system/neural-ice-device-root.service
