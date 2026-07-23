@@ -115,7 +115,7 @@ if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" || -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
     -qx 'PRETTY_NAME="Neural ICE CoreOS (debug)"' /usr/lib/os-release \
     || { echo "ERROR: LAB-only ESP inputs require a debug base image" >&2; exit 1; }
 fi
-sudo podman build --platform linux/arm64 \
+sudo podman build --pull=never --platform linux/arm64 \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
