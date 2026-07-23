@@ -381,9 +381,22 @@ RUN set -euxo pipefail; \
 # --------------------------------------------------------------------------- #
 RUN set -euxo pipefail; \
     KVER="$(ls /usr/lib/modules | head -1)"; \
+    # Derive the firmware version from what the kernel generation actually
+    # staged (build-kernel.yml supports arbitrary nvidia_driver_version) — never
+    # pin it independently, or a valid non-595.58.03 build would fail here.
+    gsp="$(ls /usr/lib/firmware/nvidia/*/gsp_ga10x.bin | head -1)"; \
+    test -n "$gsp"; \
+    fwdir="$(dirname "$gsp")"; \
+    install -d -m 0755 /usr/lib/dracut/dracut.conf.d; \
+    { printf 'install_items+=" %s/gsp_ga10x.bin %s/gsp_tu10x.bin "\n' "$fwdir" "$fwdir"; \
+      printf 'force_drivers+=" nvidia nvidia_modeset nvidia_drm nvidia_uvm "\n'; } \
+        > /usr/lib/dracut/dracut.conf.d/91-neural-ice-nvidia-gsp.conf; \
     dracut --force --no-hostonly --kver "${KVER}" \
         "/usr/lib/modules/${KVER}/initramfs.img"; \
-    lsinitrd "/usr/lib/modules/${KVER}/initramfs.img" | grep -q 'gsp_ga10x.bin'
+    # Capture the full listing before matching: piping lsinitrd | grep -q would
+    # close the pipe early (broken pipe) and, under pipefail, fail the build.
+    listing="$(lsinitrd "/usr/lib/modules/${KVER}/initramfs.img")"; \
+    printf '%s\n' "$listing" | grep -q 'gsp_ga10x.bin'
 
 # OTA source self-description only. The producer passes its own immutable tag while
 # the native timer remains masked; the branded Fabric derivation replaces this with
