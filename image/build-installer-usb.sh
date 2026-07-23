@@ -56,6 +56,23 @@ cleanup_lab_baseline_stage() {
   || { echo "ERROR: BASE_IMAGE is required as a digest-pinned OCI reference" >&2; exit 1; }
 [[ "$TARGET_IMGREF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_IMGREF must be a digest-pinned OCI reference" >&2; exit 1; }
+# The installer records TARGET_IMGREF as the OTA origin WITHOUT fetching it
+# (bootc --skip-fetch-check: the install env is air-gapped by design). The
+# publication proof therefore lives HERE, at media staging, where the network
+# exists: a target that differs from the staged base must resolve in its
+# registry, or a mistyped/unpublished digest would be silently recorded as
+# the installed system's origin. Equality with BASE_IMAGE needs no fetch —
+# the staged base is already content-addressed locally.
+if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
+  if command -v skopeo >/dev/null 2>&1; then
+    sudo skopeo inspect --raw "docker://${TARGET_IMGREF}" >/dev/null \
+      || { echo "ERROR: TARGET_IMGREF does not resolve in its registry (unpublished or mistyped digest?): ${TARGET_IMGREF}" >&2; exit 1; }
+  else
+    sudo podman manifest inspect "docker://${TARGET_IMGREF}" >/dev/null 2>&1 \
+      || sudo podman image exists "$TARGET_IMGREF" \
+      || { echo "ERROR: TARGET_IMGREF does not resolve (no skopeo; podman could not find it): ${TARGET_IMGREF}" >&2; exit 1; }
+  fi
+fi
 debug_ssh_key_validate "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" \
   || { echo "ERROR: invalid debug SSH key input" >&2; exit 1; }
 debug_ssh_key_require_debug_target "$SSH_AUTHORIZED_KEYS_FILE" "$BASE_IMAGE" "$TARGET_IMGREF" \

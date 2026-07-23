@@ -3,14 +3,21 @@ Description=Neural ICE - automatic install to internal disk (GRUB "Install" entr
 Documentation=https://github.com/Neural-ICE/ICE-CoreOS
 # Runs ONLY when the GRUB "Install" entry was selected.
 ConditionKernelCommandLine=neuralice.autoinstall
-After=multi-user.target getty@tty1.service
-Wants=network-online.target
-# Takes over the tty1 console (otherwise getty fights for the keyboard -> read impossible).
+# basic.target, NOT multi-user.target: the live env's dbus stack is broken
+# (dbus-broker crash-loop) and wedges multi-user.target forever — the install
+# must not depend on it. Nothing in the install path needs dbus or network
+# (TPM via /dev/tpmrm0, podman runs systemd-decoupled, air-gapped by design).
+# getty@tty1 is condition-skipped on install boots (see the getty drop-in),
+# so it can never race us for the console mid-install.
+After=basic.target
 Conflicts=getty@tty1.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=true
+# The TPM char device is udev-driven; make sure it exists before preflight.
+# Accept either node — the installer's own TPM preflight takes tpmrm0 OR tpm0.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do { [ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ]; } && exit 0; sleep 1; done; echo "no /dev/tpmrm0 or /dev/tpm0" >&2; exit 1'
 ExecStart=/usr/local/bin/neural-ice-autoinstall.sh
 # Interactive console: we must be able to DISPLAY and READ [Enter].
 StandardInput=tty-force
@@ -22,4 +29,4 @@ TTYVHangup=yes
 TimeoutStartSec=0
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=basic.target
