@@ -25,7 +25,84 @@ set -euo pipefail
 
 readonly LOG_TAG="neural-ice-autoinstall"
 log()  { logger -t "$LOG_TAG" -- "$*"; printf '\n[%s] %s\n' "$LOG_TAG" "$*" > /dev/console 2>/dev/null || true; printf '[%s] %s\n' "$LOG_TAG" "$*" >&2; }
-die()  { log "FAILED: $*"; exit 1; }
+die()  { log "FAILED in phase ${PHASE_ID}/${PHASE_TOTAL} (${PHASE_LABEL}): $*"; exit 1; }
+
+# --------------------------------------------------------------------------- #
+# Console UX: the operator watches tty1 during a destructive install, so every
+# long phase announces itself ([N/8] banner), its duration is logged at the
+# transition, and otherwise-silent commands prove liveness with a periodic
+# tick. journald carries wall-clock timestamps; t+ is time since script start.
+# --------------------------------------------------------------------------- #
+readonly PHASE_TOTAL=8
+PHASE_ID=0; PHASE_LABEL="startup"; PHASE_T0=$SECONDS
+
+fmt_dur() { # $1=seconds -> "12s" / "3m05s"
+  if (( $1 >= 60 )); then printf '%dm%02ds' "$(( $1 / 60 ))" "$(( $1 % 60 ))"; else printf '%ds' "$1"; fi
+}
+
+phase() { # $1=number  $2=label — close the previous phase, open the next
+  if (( PHASE_ID > 0 )); then
+    log "[${PHASE_ID}/${PHASE_TOTAL}] done in $(fmt_dur $(( SECONDS - PHASE_T0 )))"
+  fi
+  PHASE_ID="$1"; PHASE_LABEL="$2"; PHASE_T0=$SECONDS
+  log "[${PHASE_ID}/${PHASE_TOTAL}] ${PHASE_LABEL} (t+$(fmt_dur "$SECONDS"))"
+}
+
+# One background reporter at a time; the EXIT trap reaps it on every path
+# (die included), so no stray ticker survives the installer.
+BG_PID=""
+bg_stop() {
+  if [[ -n "$BG_PID" ]]; then
+    kill "$BG_PID" 2>/dev/null || true
+    wait "$BG_PID" 2>/dev/null || true
+    BG_PID=""
+  fi
+}
+trap bg_stop EXIT
+
+heartbeat_start() { # $1=label — proof-of-life tick on the console every 20 s
+  bg_stop
+  (
+    hb=0
+    while sleep 20; do
+      hb=$(( hb + 20 ))
+      printf '[%s] … %s — still running (%s elapsed)\n' \
+        "$LOG_TAG" "$1" "$(fmt_dur "$hb")" > /dev/console 2>/dev/null || true
+    done
+  ) &
+  BG_PID=$!
+}
+
+# %/rate/ETA reporter for the seed staging. The copy itself stays cp -a: the
+# overlay store's hardlink/xattr semantics are load-bearing, and the bootc base
+# image ships neither rsync nor pv (verified; the installer adds no packages by
+# design — see Containerfile.installer). Progress is derived by polling the
+# destination growth against the precomputed source total.
+copy_progress_start() { # $1=total-bytes  $2=dst-dir
+  bg_stop
+  (
+    total="$1"; dst="$2"; t0=$SECONDS
+    base="$(du -sb "$dst" 2>/dev/null | awk '{print $1}')" || true
+    [[ "${base:-}" =~ ^[0-9]+$ ]] || base=0
+    while sleep 20; do
+      cur="$(du -sb "$dst" 2>/dev/null | awk '{print $1}')" || true
+      [[ "${cur:-}" =~ ^[0-9]+$ ]] || continue
+      copied=$(( cur - base ))
+      if (( copied < 0 )); then copied=0; fi
+      elapsed=$(( SECONDS - t0 ))
+      if (( elapsed <= 0 )); then continue; fi
+      rate=$(( copied / elapsed ))
+      eta="?"
+      if (( rate > 0 && total > copied )); then
+        eta="$(fmt_dur $(( (total - copied) / rate )))"
+      fi
+      log "$(awk -v c="$copied" -v t="$total" -v r="$rate" 'BEGIN {
+        printf "  seed: %3.0f%% — %.1f / %.1f GiB at %.0f MB/s", (t > 0 ? c * 100 / t : 0), c / 2^30, t / 2^30, r / 10^6
+      }') — ETA ${eta}"
+    done
+  ) &
+  BG_PID=$!
+}
 
 # OTA origin recorded on the installed system = the PUBLIC channel tag, so
 # `bootc upgrade` follows that channel from GHCR. Default = the imgref the CI baked into
@@ -61,6 +138,8 @@ systemd-cryptenroll --tpm2-device=list >/dev/null 2>&1 || die "systemd-cryptenro
 # the console — the operator must not be blind during a destructive install.
 plymouth quit 2>/dev/null || true
 chvt 1 2>/dev/null || true
+
+phase 1 "Preflight — TPM2 OK; detecting live media, options and target disk"
 
 # bootc install must set SELinux labels on the target (needs mac_admin), which
 # the enforcing live policy denies. The Install GRUB entry boots permissive
@@ -187,6 +266,8 @@ log "Dedicated TPM device-root preflight passed."
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 
+phase 2 "Partition + encrypt (GPT, 2× LUKS2, TPM2/PCR7 enroll)"
+
 # --------------------------------------------------------------------------- #
 # 3) Partition the target (GPT): ESP, /boot, LUKS system, LUKS data
 # --------------------------------------------------------------------------- #
@@ -270,11 +351,13 @@ BOOT_UUID="$(blkid -s UUID -o value "$BOOT")"
 # --------------------------------------------------------------------------- #
 # 5) Install the live image onto the encrypted root (native bootc method)
 # --------------------------------------------------------------------------- #
-log "Copying the booted image into podman storage (copy-to-storage)…"
+phase 3 "Copy the booted image into podman storage (copy-to-storage, ~10 GiB)"
 # NOTE: the live USB root is sized large enough (see image/config-installer.toml,
 # filesystem "/" minsize) to hold this image copy; copy-to-storage uses the
 # normal, correctly-SELinux-labelled /var/lib/containers + /var/tmp.
+heartbeat_start "bootc image copy-to-storage"
 bootc image copy-to-storage || die "bootc image copy-to-storage failed"
+bg_stop
 
 # bootc/ostree images symlink /mnt -> /var/mnt (dangling inside the install
 # container) so a bind onto /mnt fails ("creating /mnt: No such file"). Use a
@@ -292,7 +375,7 @@ mount --make-rshared "$TGT"
 sshkey_karg=()
 [[ -n "$SSHKEY_B64" ]] && sshkey_karg=(--karg "neuralice.sshkey=$SSHKEY_B64")
 
-log "bootc install to-filesystem (encrypted root, OTA origin: $IMGREF)…"
+phase 4 "bootc install to-filesystem (encrypted root, OTA origin: $IMGREF)"
 # --skip-fetch-check: offline/air-gapped install. The source is the local
 # containers-storage; the target imgref is only the future OTA origin, not
 # reachable from the installer env (no network) — verifying it would hang.
@@ -301,6 +384,9 @@ log "bootc install to-filesystem (encrypted root, OTA origin: $IMGREF)…"
 # systemd-coupled subsystems (systemd cgroup manager, netavark bridge,
 # journald log/event drivers) in futex_wait BEFORE bootc ever execs. The
 # install needs no container network; logs pass straight through to the tty.
+# bootc's own output streams to the tty (passthrough-tty) but has silent
+# stretches; the heartbeat distinguishes them from a real hang.
+heartbeat_start "bootc install to-filesystem"
 podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
   --net=host --log-driver=passthrough-tty --pid=host \
   --security-opt label=type:unconfined_t \
@@ -319,6 +405,7 @@ podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
     "${sshkey_karg[@]}" \
     "$TGT" \
   || die "bootc install to-filesystem failed"
+bg_stop
 
 # --------------------------------------------------------------------------- #
 # 5a) Firmware boot-menu hygiene (docs/INSTALLER-UX-HARDENING.md):
@@ -379,6 +466,7 @@ fi
 #     context= override, so per-file xattr labels persist).
 # --------------------------------------------------------------------------- #
 SEED_PART="/dev/disk/by-partlabel/ni-seed"
+phase 5 "Seed staging (preloaded store + models → encrypted data volume)"
 # The seed-store dir must exist on the data volume in ALL editions — containers-storage
 # HARD-FAILS on a missing additionalimagestores path (no silent skip). LIGHT gets an empty
 # store; PRELOADED fills it below. (tmpfiles.d also recreates it on every boot.)
@@ -386,9 +474,20 @@ mkdir -p /run/seed-dst
 mount /dev/mapper/data /run/seed-dst
 mkdir -p /run/seed-dst/seed-store
 if [ -b "$SEED_PART" ]; then
-  log "PRELOADED: staging seed (overlay store + base models) onto the data volume…"
   mkdir -p /run/seed-src
   mount -o ro "$SEED_PART" /run/seed-src
+  # Total size BEFORE the copy: this is the longest phase of the install
+  # (~90 % of wall-clock on a preloaded medium), so the console reporter can
+  # show real %/rate/ETA instead of leaving the operator blind.
+  seed_total=0
+  for _d in store models payload; do
+    if [ -d "/run/seed-src/$_d" ]; then
+      _sz="$(du -sb "/run/seed-src/$_d" | awk '{print $1}')"
+      seed_total=$(( seed_total + _sz ))
+    fi
+  done
+  log "PRELOADED: staging seed (overlay store + base models) onto the data volume — $(awk -v t="$seed_total" 'BEGIN{printf "%.1f", t / 2^30}') GiB total…"
+  copy_progress_start "$seed_total" /run/seed-dst
   if [ -d /run/seed-src/store ]; then
     cp -a /run/seed-src/store/. /run/seed-dst/seed-store/
     # Label for the container runtime. Prefer the read-only image-store type; fall back to the
@@ -413,9 +512,16 @@ if [ -b "$SEED_PART" ]; then
     cp -a /run/seed-src/payload/. /run/seed-dst/payload/
     log "  payload: staged (applied on first boot by neural-ice-payload-apply)"
   fi
+  bg_stop
+  # The sync flushes the seed write-back and can itself run for minutes on a
+  # ~200 GiB copy — keep proving liveness until it returns.
+  heartbeat_start "seed flush to disk (sync)"
   sync
+  bg_stop
   umount /run/seed-dst; umount /run/seed-src
   log "PRELOADED: seed staged."
+else
+  log "No seed partition on the media (LIGHT install) — empty seed store only."
 fi
 
 # --------------------------------------------------------------------------- #
@@ -429,7 +535,7 @@ fi
 #     2026-07-13). Label with setfiles -F against the deployment's own
 #     file_contexts, then VERIFY — an unlabeled install must not ship.
 # --------------------------------------------------------------------------- #
-log "SELinux: labeling deployment /etc,/var,/boot + data volume (target policy)…"
+phase 6 "Deployment prep + TPM device-root provisioning"
 command -v setfiles >/dev/null || die "setfiles not available in the installer image"
 # The deployment names are bootc/ostree-controlled and cannot contain hostile
 # shell characters; ls keeps the established first-deployment selection here.
@@ -475,6 +581,9 @@ if (( LAB_BASELINE_PRESENT == 1 )); then
     || die "cannot persist the optional LAB baseline receipt pair"
   log "Optional LAB baseline receipt pair persisted for post-install verification."
 fi
+phase 7 "SELinux labels (deployment /etc,/var,/boot + data volume, target policy)"
+# setfiles/chcon walk the whole staged data volume — silent but not hung.
+heartbeat_start "SELinux labeling (setfiles/chcon)"
 # Deployment /etc (the runtime /etc): -r makes paths match the policy as /etc/…
 setfiles -F -r "$dep" "$fc" "$dep/etc" || die "setfiles failed on deployment /etc"
 # Stateroot /var (the runtime /var): pre-created dirs get their policy labels.
@@ -499,6 +608,7 @@ umount /run/nid-root/var/lib/neural-ice/data
 chcon -R -t container_ro_file_t /run/seed-dst/seed-store 2>/dev/null \
   || chcon -R -t container_file_t /run/seed-dst/seed-store 2>/dev/null \
   || die "cannot label seed-store for the container runtime"
+bg_stop
 # VERIFY (fail-closed): the two labels whose absence bricked the enforcing boot.
 stat -c %C "$dep/etc" | grep -q ':etc_t:' \
   || die "deployment /etc is still not etc_t after setfiles — refusing to ship"
@@ -513,10 +623,13 @@ log "SELinux: labels applied and verified (deployment /etc = etc_t, data = polic
 #    (/etc/crypttab by GPT label) and the mount is a systemd.mount-extra karg
 #    (both supported bootc mechanisms) — nothing to do here but unmount.
 # --------------------------------------------------------------------------- #
+phase 8 "Finalize — flush, close volumes, escrow recovery keys"
+heartbeat_start "final flush (sync + close volumes)"
 sync
 umount -R "$TGT" 2>/dev/null || true
 cryptsetup close data 2>/dev/null || true
 cryptsetup close system 2>/dev/null || true
+bg_stop
 
 # --------------------------------------------------------------------------- #
 # 7) Escrow the recovery keys: back up to the USB ESP + show the CLIENT key.
@@ -558,6 +671,7 @@ fi
 # --------------------------------------------------------------------------- #
 # 8) Done: prompt the operator (show CLIENT recovery key), then reboot.
 # --------------------------------------------------------------------------- #
+log "[${PHASE_TOTAL}/${PHASE_TOTAL}] done — install completed in $(fmt_dur "$SECONDS") total"
 readonly TTY=/dev/tty1
 {
   printf '\n\n'
