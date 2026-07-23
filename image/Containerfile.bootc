@@ -367,6 +367,24 @@ RUN set -euxo pipefail; \
         systemctl mask getty@.service autovt@.service; \
     fi
 
+# --------------------------------------------------------------------------- #
+# 3c) GB10 GPU: regenerate the initramfs so it carries the GSP firmware.
+#     The stock kernel initramfs has the nvidia modules but NOT the 72 MB GSP
+#     firmware, so the early (initramfs) load races: when it loses, RmInitAdapter
+#     fails ENOENT, the GPU is dead all session, and — with no nvidia KMS —
+#     fbcon is stuck on simpledrm@800x600, collapsing the TUI to ~37x100. The
+#     91-…-nvidia-gsp.conf drop-in (shipped in the overlay above) adds the
+#     firmware + force_drivers; regenerate once here so the deterministic init
+#     is baked in (proven on the .72, 2026-07-23: GPU up + console 240x67).
+#     This re-enables the initramfs rewrite the branding step skipped — worth
+#     the build time and OTA delta for a GPU that actually initializes.
+# --------------------------------------------------------------------------- #
+RUN set -euxo pipefail; \
+    KVER="$(ls /usr/lib/modules | head -1)"; \
+    dracut --force --no-hostonly --kver "${KVER}" \
+        "/usr/lib/modules/${KVER}/initramfs.img"; \
+    lsinitrd "/usr/lib/modules/${KVER}/initramfs.img" | grep -q 'gsp_ga10x.bin'
+
 # OTA source self-description only. The producer passes its own immutable tag while
 # the native timer remains masked; the branded Fabric derivation replaces this with
 # the product reference and its signed controller stages the BOM digest.
