@@ -294,7 +294,8 @@ RUN set -euxo pipefail; \
     install -d -m 0755 "$dropdir"; \
     stores="$( { grep -hE '^[[:space:]]*additionalimagestores' \
         /usr/share/containers/storage.conf.d/*.conf 2>/dev/null || true; } \
-      | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' '\n' | tr -d ' \"' | grep -v '^$' )"; \
+      | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' '\n' | tr -d ' \"' \
+      | { grep -v '^$' || true; } )"; \
     { printf '# Neural ICE: the vendor drop-in overrides additionalimagestores from the\n'; \
       printf '# base storage.conf; re-list every vendor store plus the preloaded seed.\n'; \
       printf '[storage.options]\nadditionalimagestores = ['; \
