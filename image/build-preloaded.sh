@@ -119,6 +119,16 @@ truncate -s "+${GROW}" "$RAW"
 
 echo "==> 3. relocate GPT backup header + append the ni-seed partition"
 sudo sgdisk -e "$RAW"
+# bootc raw ships unnamed GPT entries; the media gate matches PARTLABEL.
+# Persistent-layout analysis (AGENTS.md §media): this names partition 1 of the
+# GENERATED media raw at build time — additive GPT metadata only (no offsets,
+# type GUIDs or data move; UEFI boots the ESP by type GUID, never by name).
+# Recovery: sgdisk failure fails the build before the media gate — nothing
+# ships. One-version rollback: media built WITHOUT this line is refused by the
+# media gate itself ("exactly one EFI-SYSTEM child partition") and never
+# ships; installed systems are untouched (the installer re-partitions the
+# internal disk with its own labels — this line concerns only the USB media).
+sudo sgdisk -c 1:EFI-SYSTEM "$RAW"
 sudo sgdisk -n 0:0:0 -c 0:ni-seed -t 0:8300 "$RAW"          # new part = all free space
 SEEDNUM="$(sudo sgdisk -p "$RAW" | awk '/ni-seed/{n=$1} END{print n}')"
 [ -n "$SEEDNUM" ] || { echo "ni-seed partition not created" >&2; exit 1; }
