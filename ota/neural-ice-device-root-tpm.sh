@@ -112,7 +112,9 @@ capture_identity() {
     || die "device-root name algorithm is not sha256"
   [[ "$(section_value attributes raw "$yaml" | tr '[:upper:]' '[:lower:]')" == "$ATTRIBUTES_RAW" ]] \
     || die "device-root attributes differ from the closed template"
-  [[ "$(grep -Ec '^authorization policy:[[:space:]]*$' "$yaml")" == 1 ]] \
+  # Newer tpm2-tools omit the "authorization policy:" line for an empty policy
+  # (older releases printed it blank); a populated policy shows a hex digest.
+  [[ "$(grep -Eic '^authorization policy:[[:space:]]*(0x)?[0-9a-f]' "$yaml")" == 0 ]] \
     || die "device-root authorization policy is not empty"
   [[ "$(section_value type raw "$yaml" | tr '[:upper:]' '[:lower:]')" == 0x23 ]] \
     || die "device-root type is not ECC"

@@ -293,12 +293,22 @@ sshkey_karg=()
 [[ -n "$SSHKEY_B64" ]] && sshkey_karg=(--karg "neuralice.sshkey=$SSHKEY_B64")
 
 log "bootc install to-filesystem (encrypted root, OTA origin: $IMGREF)…"
-podman run --rm --privileged --pid=host \
+# --skip-fetch-check: offline/air-gapped install. The source is the local
+# containers-storage; the target imgref is only the future OTA origin, not
+# reachable from the installer env (no network) — verifying it would hang.
+# systemd-decoupled podman flags: the live installer's dbus/journald stack is
+# broken (dbus-broker crash-loop), which wedges podman's default
+# systemd-coupled subsystems (systemd cgroup manager, netavark bridge,
+# journald log/event drivers) in futex_wait BEFORE bootc ever execs. The
+# install needs no container network; logs pass straight through to the tty.
+podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
+  --net=host --log-driver=passthrough-tty --pid=host \
   --security-opt label=type:unconfined_t \
   -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
   --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
   localhost/bootc \
   bootc install to-filesystem \
+    --skip-fetch-check \
     --source-imgref containers-storage:localhost/bootc \
     --target-imgref "$IMGREF" \
     --root-mount-spec "UUID=$SYS_FS_UUID" \
@@ -433,6 +443,10 @@ stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
 installer_device_root_dropin="$dep/etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf"
 [[ -f "$installer_device_root_dropin" && ! -L "$installer_device_root_dropin" ]] \
   || die "installer device-root Live guard is missing from the target deployment"
+# bootc >= 1.16 remounts the target read-only while finalizing the install;
+# every post-bootc mutation of the deployment below needs it writable again.
+mount -o remount,rw "$TGT" \
+  || die "cannot remount the target read-write after bootc finalize"
 rm -f -- "$installer_device_root_dropin" \
   || die "cannot remove the installer-only device-root Live guard"
 rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
