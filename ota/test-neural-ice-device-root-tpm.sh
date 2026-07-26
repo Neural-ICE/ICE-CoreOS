@@ -86,6 +86,10 @@ EOF
 cat > "$TOOLS/tpm2_flushcontext" <<'EOF'
 #!/usr/bin/env bash
 printf 'flushcontext %s\n' "$*" >> "$MOCK_STATE/calls"
+# Behind the kernel resource manager the transient object is already released
+# when evictcontrol returns, so the flush finds nothing and fails. Simulated on
+# demand: this is the real behaviour of /dev/tpmrm0, and it used to be fatal.
+[[ ! -e "$MOCK_STATE/flush-fail" ]] || exit 1
 EOF
 
 cat > "$TOOLS/tpm2_evictcontrol" <<'EOF'
@@ -264,6 +268,28 @@ run ensure --identity "$IDENTITY" >/dev/null
 touch "$STATE/getcap-fail"
 expect_refuse 'cannot enumerate persistent TPM handles' attest --identity "$IDENTITY"
 rm "$STATE/getcap-fail"
+
+# A flush that finds nothing to release must not fail provisioning. On a virgin
+# TPM behind /dev/tpmrm0 the transient context is auto-released by evictcontrol,
+# so the trailing flushcontext always fails — which used to abort the install of
+# every brand-new Spark (.72, 2026-07-23). The durable outcome is the eviction,
+# and it is asserted directly.
+touch "$STATE/flush-fail"
+rm -f "$STATE/present" "$IDENTITY"
+run ensure --identity "$IDENTITY" >/dev/null
+grep -q 'evictcontrol .* 0x81010005$' "$STATE/calls"
+grep -q '"handle":"0x81010005"' "$IDENTITY"
+# The mock models the TPM: present=1 means the handle is occupied.
+[[ "$(cat "$STATE/present")" == 1 ]]
+rm "$STATE/flush-fail"
+
+# ...but a genuine failure to persist is still fatal, flush or no flush.
+touch "$STATE/flush-fail" "$STATE/create-fail"
+rm -f "$STATE/present" "$IDENTITY"
+expect_refuse 'cannot create the device-root primary' ensure --identity "$IDENTITY"
+rm "$STATE/create-fail" "$STATE/flush-fail"
+rm -f "$IDENTITY"
+run ensure --identity "$IDENTITY" >/dev/null
 
 # Every exact public-area field and the persisted identity are fail-closed.
 for hostile in attributes curve scheme hierarchy policy kdf; do
