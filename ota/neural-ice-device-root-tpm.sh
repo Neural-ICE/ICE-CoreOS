@@ -17,6 +17,7 @@ readonly MAX_RECOVERY_AUTHORIZATION_BYTES=1024
 readonly MAX_RECOVERY_SIGNATURE_BYTES=1024
 
 die() { printf 'neural-ice-device-root: refused: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'neural-ice-device-root: %s\n' "$*" >&2; }
 [[ "$HANDLE" != "$FORBIDDEN_PKI_HANDLE" ]] || die "device-root handle overlaps the PKI root"
 
 if [[ -n "${NI_DEVICE_ROOT_TEST_TOOLS:-}" ]]; then
@@ -156,8 +157,18 @@ provision() {
     || die "cannot create the device-root primary"
   "$(tool tpm2_evictcontrol)" -Q -C o -c "$dir/device-root.ctx" "$HANDLE" \
     || die "cannot persist the device-root at $HANDLE"
-  "$(tool tpm2_flushcontext)" "$dir/device-root.ctx" \
-    || die "cannot flush the transient device-root context"
+  # Releasing the transient context is cleanup, not the outcome. Behind the
+  # kernel resource manager (/dev/tpmrm0 — the normal case on the appliance) the
+  # transient object is already gone by the time evictcontrol returns, so this
+  # flush fails with "Could not read serialized ESYS_TR from disk": a cleanup
+  # that finds nothing to clean. Treating that as fatal failed the install of
+  # every brand-new Spark, because a virgin TPM has a free handle and therefore
+  # always takes this path (grounded on .72, 2026-07-23).
+  "$(tool tpm2_flushcontext)" "$dir/device-root.ctx" 2>/dev/null \
+    || warn "transient device-root context was already released (resource manager)"
+  # Assert the outcome that actually matters instead. If the key is not at
+  # $HANDLE, provisioning failed however the cleanup went.
+  handle_present || die "device-root did not persist at $HANDLE"
 }
 
 with_workspace() {

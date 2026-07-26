@@ -203,6 +203,16 @@ if [[ -n "${_lab_usb_esp:-}" ]]; then
     _lab_esp_we_mounted=1
   fi
 
+  # Clear a residue from an earlier attempt in this same boot. The handoff
+  # refuses to overwrite an existing destination, so without this a RETRY of the
+  # installer dies at preflight with "snapshot destination already exists" —
+  # after any transient failure the operator could never simply relaunch
+  # (grounded 2026-07-23, .72). Both paths are under /run (tmpfs), so a residue
+  # can only ever come from this boot; nothing durable is discarded.
+  rm -rf -- "$LAB_BASELINE_SNAPSHOT"
+  rm -f -- "$LAB_BASELINE_SNAPSHOT".*.new \
+           /run/neural-ice-installer/.lab-baseline-snapshot.*.new
+
   _lab_snapshot_rc=0
   "$LAB_BASELINE_HANDOFF" snapshot "$_lab_esp_mp" "$LAB_BASELINE_SNAPSHOT" \
     || _lab_snapshot_rc=$?
