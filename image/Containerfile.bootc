@@ -379,13 +379,23 @@ RUN set -euxo pipefail; \
 #     This re-enables the initramfs rewrite the branding step skipped — worth
 #     the build time and OTA delta for a GPU that actually initializes.
 # --------------------------------------------------------------------------- #
+# No pipelines anywhere in this step. Under `set -o pipefail` a reader that
+# exits early (`head -1`, `grep -q`) sends SIGPIPE to the writer, the pipeline
+# reports 141 and `set -e` fails the build. The step already knew this about
+# `lsinitrd | grep -q` and captured the listing first — then reintroduced the
+# same hazard by piping `printf` into `grep -q`, which is exactly how the
+# 2026-07-27 build died at exit 141. Globs and a `case` remove the class of bug
+# rather than the one instance, and stay POSIX; `build-image` only runs on
+# manual dispatch, so a latent pipeline here costs a full build cycle — and a
+# blocked USB installer — to discover.
 RUN set -euxo pipefail; \
-    KVER="$(ls /usr/lib/modules | head -1)"; \
+    for d in /usr/lib/modules/*/; do KVER="$(basename "$d")"; break; done; \
+    test -n "${KVER:-}"; \
     # Derive the firmware version from what the kernel generation actually
     # staged (build-kernel.yml supports arbitrary nvidia_driver_version) — never
     # pin it independently, or a valid non-595.58.03 build would fail here.
-    gsp="$(ls /usr/lib/firmware/nvidia/*/gsp_ga10x.bin | head -1)"; \
-    test -n "$gsp"; \
+    for f in /usr/lib/firmware/nvidia/*/gsp_ga10x.bin; do gsp="$f"; break; done; \
+    test -n "${gsp:-}" && test -e "$gsp"; \
     fwdir="$(dirname "$gsp")"; \
     install -d -m 0755 /usr/lib/dracut/dracut.conf.d; \
     { printf 'install_items+=" %s/gsp_ga10x.bin %s/gsp_tu10x.bin "\n' "$fwdir" "$fwdir"; \
@@ -393,10 +403,11 @@ RUN set -euxo pipefail; \
         > /usr/lib/dracut/dracut.conf.d/91-neural-ice-nvidia-gsp.conf; \
     dracut --force --no-hostonly --kver "${KVER}" \
         "/usr/lib/modules/${KVER}/initramfs.img"; \
-    # Capture the full listing before matching: piping lsinitrd | grep -q would
-    # close the pipe early (broken pipe) and, under pipefail, fail the build.
     listing="$(lsinitrd "/usr/lib/modules/${KVER}/initramfs.img")"; \
-    printf '%s\n' "$listing" | grep -q 'gsp_ga10x.bin'
+    case "$listing" in \
+      *gsp_ga10x.bin*) ;; \
+      *) echo "gsp_ga10x.bin missing from the generated initramfs" >&2; exit 1 ;; \
+    esac
 
 # OTA source self-description only. The producer passes its own immutable tag while
 # the native timer remains masked; the branded Fabric derivation replaces this with
