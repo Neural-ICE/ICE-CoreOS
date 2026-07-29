@@ -48,7 +48,7 @@ RUN set -eux; \
 
 FROM quay.io/centos-bootc/centos-bootc:stream10
 
-ARG NVIDIA_DRIVER_VERSION=595.58.03
+ARG NVIDIA_DRIVER_VERSION=580.159.03
 
 # Appliance variant (A4): controls the security/console posture, NOT the release
 # channel (that's the image tag). Default = prod (secure, sealed).
@@ -67,7 +67,7 @@ ARG VARIANT=prod
 #    the globs stay anchored on `-6.12` so they select the 4k non-debug RPMs even
 #    if debug/64k variants are ever present. See ADR-0006.
 # --------------------------------------------------------------------------- #
-# The NVIDIA open r595 modules ship in kernel-modules-nvidia-open: built in-tree
+# The version-matched NVIDIA open modules ship in kernel-modules-nvidia-open: built in-tree
 # against THIS kernel and signed by its EPHEMERAL module key (same signer as the
 # in-tree modules), so they load under lockdown with nothing enrolled in db. The
 # RPM lands them in /usr/lib/modules/<kver>/extra/nvidia-open/ and runs depmod.
@@ -86,13 +86,13 @@ RUN set -euxo pipefail; \
     KVER="$(ls /usr/lib/modules | head -1)"; \
     modinfo /usr/lib/modules/${KVER}/extra/nvidia-open/nvidia.ko* | grep -E '^(version|vermagic|signer):'
 
-# GSP firmware + r595 userspace driver (extracted from the official .run bundle):
-#  - firmware -> /usr/lib/firmware/nvidia/595.58.03 (REQUIRED to initialize the GPU)
+# GSP firmware + userspace driver (extracted from the same official .run bundle):
+#  - firmware -> /usr/lib/firmware/nvidia/<version> (REQUIRED to initialize the GPU)
 #  - libs -> /usr/lib64 (+ SONAME symlinks); binaries -> /usr/bin
 #  - nvidia-modprobe setuid (creation of the /dev/nvidia* nodes)
 COPY image/nvidia-userspace/ /
 RUN set -euxo pipefail; \
-    V=595.58.03; cd /usr/lib64; \
+    V="${NVIDIA_DRIVER_VERSION}"; cd /usr/lib64; \
     for lib in libnvidia-ml libcuda libnvidia-cfg libnvidia-ptxjitcompiler; do \
         ln -sf "${lib}.so.${V}" "${lib}.so.1"; \
         ln -sf "${lib}.so.1"     "${lib}.so"; \
@@ -393,7 +393,7 @@ RUN set -euxo pipefail; \
     test -n "${KVER:-}"; \
     # Derive the firmware version from what the kernel generation actually
     # staged (build-kernel.yml supports arbitrary nvidia_driver_version) — never
-    # pin it independently, or a valid non-595.58.03 build would fail here.
+    # pin it independently, or a valid version-matched build would fail here.
     for f in /usr/lib/firmware/nvidia/*/gsp_ga10x.bin; do gsp="$f"; break; done; \
     test -n "${gsp:-}" && test -e "$gsp"; \
     fwdir="$(dirname "$gsp")"; \
@@ -433,7 +433,7 @@ RUN rm -rf /var/cache/* /var/lib/dnf /var/log/* /tmp/* 2>/dev/null || true
 RUN bootc container lint
 
 LABEL org.opencontainers.image.title="ICE-CoreOS" \
-      org.opencontainers.image.description="Immutable bootc GPU appliance OS for NVIDIA DGX Spark (GB10) — CentOS Stream 10 (el10), GB10 kernel (4k pages), NVIDIA r595, Secure Boot signed, TPM2/LUKS. OTA source." \
+      org.opencontainers.image.description="Immutable bootc GPU appliance OS for NVIDIA DGX Spark (GB10) — CentOS Stream 10 (el10), GB10 kernel (4k pages), version-matched NVIDIA open driver, Secure Boot signed, TPM2/LUKS. OTA source." \
       org.opencontainers.image.vendor="Neural ICE" \
       org.opencontainers.image.source="https://github.com/Neural-ICE/ICE-CoreOS" \
       org.opencontainers.image.licenses="Apache-2.0" \

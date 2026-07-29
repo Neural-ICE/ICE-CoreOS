@@ -6,10 +6,10 @@ index 883634d6a..9cc164509 100644
  Source107: nvidiajetsonsoc.x509
  Source108: nvidiabfdpu.x509
  
-+# Neural ICE: NVIDIA open GPU (r595) out-of-tree module source. Built in-tree
++# Neural ICE: NVIDIA open GPU out-of-tree module source. Built in-tree
 +# (see %build) and signed by this build's ephemeral module-signing key together
 +# with the in-tree modules, so no persistent module-signing key exists.
-+%global nvidia_open_ver 595.58.03
++%global nvidia_open_ver 580.159.03
 +Source9000: nvidia-open-gpu-%{nvidia_open_ver}.tar.xz
 +
  %if 0%{?fedora}%{?eln}
@@ -23,14 +23,14 @@ index 883634d6a..9cc164509 100644
 +# ephemeral module-signing key. Only built for the base (up) variant we ship.
 +%if %{with_up_base}
 +%package modules-nvidia-open
-+Summary: NVIDIA open GPU (r595) kernel modules for kernel %{KVERREL}
++Summary: NVIDIA open GPU kernel modules for kernel %{KVERREL}
 +Requires: %{name}-modules-core-uname-r = %{KVERREL}
 +Provides: %{name}-modules-nvidia-open-uname-r = %{KVERREL}
 +Provides: installonlypkg(kernel-module)
 +AutoReq: no
 +AutoProv: yes
 +%description modules-nvidia-open
-+The NVIDIA open GPU (r595) out-of-tree kernel modules, built against and signed
++The NVIDIA open GPU out-of-tree kernel modules, built against and signed
 +by the ephemeral per-build module-signing key of this exact %{KVERREL} kernel.
 +The private half of that key is discarded at the end of the build, so these
 +modules load only in this kernel and the key cannot be re-used to sign anything
@@ -58,7 +58,7 @@ index 883634d6a..9cc164509 100644
  %if %{with_up_base}
  BuildKernel %make_target %kernel_image %{_use_vdso}
 +
-+# Neural ICE: build the NVIDIA open GPU (r595) modules against the freshly built
++# Neural ICE: build the NVIDIA open GPU modules against the freshly built
 +# base kernel and stage them UNSIGNED under the module tree. __modsign_install_post
 +# signs them together with the in-tree modules using this build's ephemeral key.
 +%{log_msg "Building NVIDIA open GPU modules against %{KVERREL}"}

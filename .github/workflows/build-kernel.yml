@@ -33,7 +33,7 @@ jobs:
     env:
       KERNEL_REF: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}
       KERNEL_SOURCE_REVISION: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}
-      NVIDIA_DRIVER_VERSION: ${{ github.event.client_payload.nvidia_driver_version || '595.58.03' }}
+      NVIDIA_DRIVER_VERSION: ${{ github.event.client_payload.nvidia_driver_version || '580.159.03' }}
       ARTIFACTS_ROOT: ${{ vars.ARTIFACTS_DIR }}
       GENERATION_ID: ${{ github.run_id }}.${{ github.run_attempt }}
       SOURCE_REVISION: ${{ github.sha }}
@@ -44,19 +44,23 @@ jobs:
         run: |
           export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-$HOME/neural-ice/artifacts}"
           echo "ARTIFACTS_ROOT=$ARTIFACTS_ROOT" >> "$GITHUB_ENV"
-          # Option D builds the NVIDIA open modules in-tree (ephemeral-signed);
-          # point at the kernel-open source. Overridable; default derives from the
-          # driver version on the self-hosted runner.
-          export NVIDIA_OPEN_SRC="${NVIDIA_OPEN_SRC:-$HOME/nvidia-userspace-build/NVIDIA-Linux-aarch64-${NVIDIA_DRIVER_VERSION}/kernel-open}"
+          # Modules, userspace and firmware must come from the same extracted
+          # official .run bundle. Never consume the mutable legacy userspace path.
+          NVIDIA_DRIVER_ROOT="$HOME/nvidia-userspace-build/NVIDIA-Linux-aarch64-${NVIDIA_DRIVER_VERSION}"
+          export NVIDIA_OPEN_SRC="$NVIDIA_DRIVER_ROOT/kernel-open"
+          USERSPACE_SRC="$RUNNER_TEMP/ice-coreos-kernel-${GENERATION_ID}/nvidia-userspace"
           RPM_SRC="$RUNNER_TEMP/ice-coreos-kernel-${GENERATION_ID}/rpms"
           rm -rf "$(dirname "$RPM_SRC")"
           install -d -m 0755 "$RPM_SRC"
-          export RPM_SRC OUTPUT_DIR="$RPM_SRC"
+          ./ci/stage-nvidia-userspace.sh \
+            "$NVIDIA_DRIVER_ROOT" "$USERSPACE_SRC" "$NVIDIA_DRIVER_VERSION"
+          export RPM_SRC OUTPUT_DIR="$RPM_SRC" USERSPACE_SRC
           echo "RPM_SRC=$RPM_SRC" >> "$GITHUB_ENV"
+          echo "USERSPACE_SRC=$USERSPACE_SRC" >> "$GITHUB_ENV"
           ./build/build-kernel.sh aarch64
 
       - name: Publish kernel candidate
-        run: USERSPACE_SRC="$HOME/neural-ice/image/nvidia-userspace" ./ci/stage-artifacts.sh
+        run: ./ci/stage-artifacts.sh
 
       - name: Report published candidate
         run: |

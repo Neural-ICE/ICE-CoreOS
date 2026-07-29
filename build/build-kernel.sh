@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Neural ICE CoreOS — Deliverable 1
-# Compilation orchestrator: GB10 kernel (STANDARD 4k flavor) + NVIDIA r595
+# Compilation orchestrator: GB10 kernel (STANDARD 4k flavor) + NVIDIA open
 # driver, inside an isolated Podman container. 4k pages (NOT kernel-64k) for
 # userspace compatibility with the container AI stack (qdrant/vLLM/...). The GB10
 # SoC is not in the stock el10 kernel, hence we still build from the Red Hat
@@ -41,7 +41,7 @@ KERNEL_REPO="${KERNEL_REPO:-https://gitlab.com/redhat/edge/kernel/nvidia-gb10.gi
 # Full upstream commit only. A branch such as `latest` is mutable and cannot
 # identify the source of a persistent artifact generation.
 KERNEL_REF="${KERNEL_REF:-fa4faa0227e00c2291e47b120e71c7aed0fe27b7}"
-NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-595.58.03}"
+NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-580.159.03}"
 NVIDIA_OPEN_SRC="${NVIDIA_OPEN_SRC:-}"                 # path to NVIDIA .../kernel-open (Option D: modules built in-tree & ephemeral-signed)
 WORKSPACE="${WORKSPACE:-${HOME}/neural-ice-build}"     # persistent across runs (git cache)
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE}/output}"        # final RPMs collected here

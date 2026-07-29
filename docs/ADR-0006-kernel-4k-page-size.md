@@ -41,7 +41,7 @@ Hat `nvidia-gb10` tree (i.e. the `kernel*` RPMs, **not** `kernel-64k*`).
 Everything else is unchanged:
 
 - **Base** = CentOS Stream 10 bootc (ADR-0003), **OTA** = native `bootc upgrade`.
-- **NVIDIA r595 open driver** recompiled against the 4k kernel (identical
+- **Version-matched NVIDIA open driver** recompiled against the 4k kernel (identical
   vermagic coupling), baked + signed as before.
 - **Secure Boot** (ADR-0002): page size does **not** affect signing. The kernel
   is still self-compiled → still signed with the lab key (interim, MOK-enrolled)
