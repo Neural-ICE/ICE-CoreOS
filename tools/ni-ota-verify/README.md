@@ -10,6 +10,14 @@ The appliance is treated like a game console: it must verify every update
 no reach-back and no operator. This binary is that gate. It verifies **local
 files only**; fetching them is the OTA caller's job (see *Caller integration*).
 
+On a pristine state-v1 anchor, routine trusted-time challenge creation refuses.
+The bootstrap-only primitive requires the SHA-256 of an already verified
+`ota-licensing-bootstrap-v1` authorization and creates a separate fresh
+trusted-time nonce that cannot equal the persisted licensing nonce. That hash
+travels in the challenge, signed trusted-time assertion and committed
+trusted-time state; a missing or changed binding refuses before TPM/state
+mutation. No local bootstrap fallback is introduced by this layer.
+
 Authority-bearing BOMs describe the installed state, never the installer that
 may carry them. Delegated USB verification binds the exact booted OS digest,
 Fabric seed commit, signed bundle digest and image-attestation set. It refuses
