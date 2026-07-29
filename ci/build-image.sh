@@ -128,6 +128,14 @@ if [ -n "${ARTIFACT_GENERATION:-}" ] && [ "$ARTIFACT_GENERATION" != "$VERIFIED_A
   exit 3
 fi
 ARTIFACT_GENERATION="$VERIFIED_ARTIFACT_GENERATION"
+NVIDIA_DRIVER_VERSION="$(output_value nvidia_driver_version < image/generation.env)" || {
+  echo "ERROR: verified GB10 artifacts did not report exactly one NVIDIA driver version." >&2
+  exit 3
+}
+[[ "$NVIDIA_DRIVER_VERSION" =~ ^[0-9]+([.][0-9]+)+$ ]] || {
+  echo "ERROR: verified GB10 artifacts reported an invalid NVIDIA driver version." >&2
+  exit 3
+}
 
 # Console TUI: PRODUCT code — its source lives out of this vanilla OS repo.
 # The console TUI is product code (ICE-Console) composed onto this vanilla base by
@@ -156,6 +164,7 @@ BUILD_ARGS=(
   --platform "$PLATFORM"
   --build-arg "SSH_AUTHORIZED_KEY=${SSH_AUTHORIZED_KEY}"
   --build-arg "VARIANT=${VARIANT}"
+  --build-arg "NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}"
   --build-arg "OTA_IMGREF=${REF}:${SEMVER}"
   --build-arg "OS_VERSION=${SEMVER}"
   --label "org.opencontainers.image.source=${SOURCE_URL}"

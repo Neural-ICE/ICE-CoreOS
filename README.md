@@ -4,7 +4,7 @@ Immutable, container-native, **sovereign** operating system for **NVIDIA DGX Spa
 (GB10 Grace-Blackwell, ARM64) edge-AI appliances.
 
 ICE-CoreOS is a [bootc](https://bootc.dev) image built on **CentOS Stream 10**, with the
-GB10 kernel (**4 KiB pages**), the NVIDIA open driver (r595), a signed Secure Boot chain,
+GB10 kernel (**4 KiB pages**), a version-matched NVIDIA open driver, a signed Secure Boot chain,
 and optional **two-domain TPM2/LUKS full-disk encryption**. The OS updates over-the-air
 from a public container registry (`bootc upgrade`), atomically, with rollback.
 It is developed by [Neural ICE](https://github.com/Neural-ICE) and published as a
@@ -126,7 +126,7 @@ inputs; update them deliberately when the upstream kernel or driver is approved:
 gh api repos/Neural-ICE/ICE-CoreOS/dispatches \
   -f event_type=build-coreos-kernel \
   -F 'client_payload[kernel_ref]=fa4faa0227e00c2291e47b120e71c7aed0fe27b7' \
-  -F 'client_payload[nvidia_driver_version]=595.58.03'
+  -F 'client_payload[nvidia_driver_version]=580.159.03'
 ```
 
 For operator recovery on the Spark, reactivation of a retained generation is explicit,

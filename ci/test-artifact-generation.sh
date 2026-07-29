@@ -190,6 +190,8 @@ grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-id=neural-ice-secureboot-lab
   "$TMP/podman-debug.out" >/dev/null
 grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-sha256=$FAKE_TRUST_POLICY_SHA256" \
   "$TMP/podman-debug.out" >/dev/null
+grep -Fx -- "NVIDIA_DRIVER_VERSION=595.58.03" "$TMP/podman-debug.out" >/dev/null \
+  || fail "build did not derive the NVIDIA version from the verified generation"
 rm -f "$TMP/podman-prod.out"
 expect_failure env PODMAN_LOG="$TMP/podman-prod.out" PATH="$EVIL_BIN:$PATH" VARIANT=prod \
   "$TEST_REPO/ci/build-image.sh"

@@ -1,5 +1,5 @@
 # Neural ICE CoreOS — Deliverable 1
-# Isolated compilation environment (GB10 kernel + NVIDIA r595 driver).
+# Isolated compilation environment (GB10 kernel + version-matched NVIDIA open driver).
 #
 # Base: CentOS Stream 10 (ABI aligned with RHEL 10, like the nvidia-gb10 source).
 # Multi-arch: the SAME image builds natively on aarch64 (DGX Spark, <arm64-build-host>)
