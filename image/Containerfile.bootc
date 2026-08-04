@@ -344,14 +344,29 @@ RUN set -euxo pipefail; \
 #     crypt + tpm2 (LUKS/TPM unlock). Not regenerating the initramfs =
 #     faster builds + tiny OTA deltas (a config change no longer rewrites the
 #     ~180 MB initramfs image).
+#
+#     Quiet console (both variants). tty1 is the TUI's screen, but the kernel
+#     also prints there: without this, every printk bleeds through the TUI's
+#     panels and makes the appliance look broken. Observed on the debug variant
+#     of 0.50.3, where `quiet` is absent by design (we want the serial console
+#     verbose). Two complementary settings, because one alone is not enough:
+#       - karg `loglevel=3` silences the console from the very first printk,
+#         BEFORE any userspace runs — the boot flood is the worst offender;
+#       - `kernel.printk` keeps that level after boot, otherwise a later
+#         message (USB hotplug, NIC link change) reappears on top of the TUI.
+#     Both stop at console_loglevel=3: errors and worse still reach the screen,
+#     everything else stays in the journal. The serial console is unaffected in
+#     practice — `journalctl -k` remains complete either way.
 # --------------------------------------------------------------------------- #
 RUN set -euxo pipefail; \
     sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
     install -d -m 0755 /usr/lib/bootc/kargs.d; \
     case "${VARIANT}" in debug|prod) ;; *) echo "invalid VARIANT" >&2; exit 2 ;; esac; \
     printf '%s\n' "${VARIANT}" > /usr/lib/neural-ice/appliance-variant; \
+    install -d -m 0755 /usr/lib/sysctl.d; \
+    printf 'kernel.printk = 3 4 1 7\n' > /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf; \
     if [ "${VARIANT}" = "debug" ]; then \
-        printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0"]\n' \
+        printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0", "loglevel=3"]\n' \
             > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS (debug)"/' /usr/lib/os-release; \
         install -d /etc/systemd/system/serial-getty@ttyS0.service.d; \
