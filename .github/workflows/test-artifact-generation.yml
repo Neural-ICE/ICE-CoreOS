@@ -44,10 +44,12 @@ permissions:
 
 jobs:
   test:
-    # ICE-CoreOS is public: never execute code from an untrusted fork on an
-    # organization self-hosted runner.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64]
+    # This job runs on a GitHub-hosted runner, so a fork's code never touches
+    # Neural ICE infrastructure. The guard that used to skip fork pull requests
+    # entirely is therefore removed: on an open-core repository it did not just
+    # contain a risk, it denied external contributions any CI at all.
+    # `pull_request` from a fork gets a read-only token and no secrets.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
