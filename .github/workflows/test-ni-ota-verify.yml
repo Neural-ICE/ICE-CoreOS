@@ -51,6 +51,10 @@ jobs:
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --all-targets --all-features --locked -- -D warnings
+              # Valeur NEUTRE et volontairement fausse : la suite doit prouver le
+              # contrat, pas l identite du deploiement. L autorite reelle vient de
+              # la configuration du depot au moment de builder l image.
+              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
               cargo test --locked --features test-path-overrides
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
@@ -83,6 +87,10 @@ jobs:
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --all-targets --all-features --locked -- -D warnings
+              # Valeur NEUTRE et volontairement fausse : la suite doit prouver le
+              # contrat, pas l identite du deploiement. L autorite reelle vient de
+              # la configuration du depot au moment de builder l image.
+              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
               cargo test --locked --features test-path-overrides
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify

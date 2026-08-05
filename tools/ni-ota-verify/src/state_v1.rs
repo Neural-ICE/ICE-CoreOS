@@ -2685,7 +2685,9 @@ mod tests {
                 hardware_target: challenge.hardware_target.clone(),
                 issuance_id: "assertion-1".into(),
                 issued_at: "2026-07-22T00:00:00Z".into(),
-                issuer: "licensing.neural-ice.ch".into(),
+                issuer: crate::trusted_time::TRUSTED_TIME_ISSUER
+                    .expect("NI_TRUSTED_TIME_ISSUER must be set when building the test suite")
+                    .into(),
                 key_id: trusted.key_id.clone(),
                 nonce: challenge.nonce.clone(),
                 release_authorization_sha256: challenge.release_authorization_sha256.clone(),
