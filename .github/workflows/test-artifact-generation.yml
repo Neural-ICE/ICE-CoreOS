@@ -11,6 +11,11 @@ on:
       - "ci/test-stage-nvidia-userspace.sh"
       - "ci/build-image.sh"
       - "ci/test-build-image-dispatch-contract.sh"
+      - "ci/test-open-core-boundary.sh"
+      - "image/bootc-overlay/**"
+      - "image/build-preloaded.sh"
+      - "image/build-installer-usb.sh"
+      - "image/Containerfile.bootc"
       - "ci/verify-build-context.sh"
       - "secureboot/trust-policies/**"
       - "build/build-kernel.sh"
@@ -30,6 +35,11 @@ on:
       - "ci/test-stage-nvidia-userspace.sh"
       - "ci/build-image.sh"
       - "ci/test-build-image-dispatch-contract.sh"
+      - "ci/test-open-core-boundary.sh"
+      - "image/bootc-overlay/**"
+      - "image/build-preloaded.sh"
+      - "image/build-installer-usb.sh"
+      - "image/Containerfile.bootc"
       - "ci/verify-build-context.sh"
       - "secureboot/trust-policies/**"
       - "build/build-kernel.sh"
@@ -56,7 +66,7 @@ jobs:
           shellcheck ci/artifact-generation.sh ci/canonicalize-vmlinuz.sh \
             ci/stage-artifacts.sh ci/stage-nvidia-userspace.sh \
             ci/test-artifact-generation.sh ci/test-stage-nvidia-userspace.sh ci/build-image.sh \
-            ci/test-build-image-dispatch-contract.sh \
+            ci/test-build-image-dispatch-contract.sh ci/test-open-core-boundary.sh \
             ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
             build/build-kernel.sh
       - name: Test artifact generation and kernel packaging contract
@@ -64,4 +74,5 @@ jobs:
           ./ci/test-artifact-generation.sh
           ./ci/test-stage-nvidia-userspace.sh
           ./ci/test-build-image-dispatch-contract.sh
+          ./ci/test-open-core-boundary.sh
           ./ci/test-kernel-packaging-patch.sh
