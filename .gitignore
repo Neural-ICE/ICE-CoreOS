@@ -29,9 +29,6 @@ ignition/*.ign
 *.pem
 **/pki/*.crt
 !**/pki/ca.crt.example
-# The overlay placeholder CA is tracked (not a secret). This negation MUST come
-# after the broad **/pki/*.crt rule above (later rules win in .gitignore).
-!image/bootc-overlay/etc/neural-ice/pki/ca.crt
 *licence.json
 *.token
 

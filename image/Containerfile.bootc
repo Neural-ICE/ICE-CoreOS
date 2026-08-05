@@ -144,7 +144,7 @@ RUN set -euxo pipefail; \
     chmod 0755 /usr/libexec/neural-ice-device-root; \
     systemctl enable neural-ice-device-root.service; \
     chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \
-    chmod 0700 /etc/neural-ice/pki
+    install -d -m 0700 /etc/neural-ice/pki
 
 # --------------------------------------------------------------------------- #
 # 2b) OTA trust tooling (ICE-Fabric OTA signing plan — P0+P2).
