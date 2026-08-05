@@ -70,6 +70,27 @@ for needle in "${FORBIDDEN[@]}"; do
   done
 done
 
+# No certificate may ship in the overlay — not even a placeholder one.
+#
+# The one that used to, `etc/neural-ice/pki/ca.crt`, was 100 bytes reading
+# REMPLACER_PAR_LA_CA_DE_L_APPLIANCE_NEURAL_ICE. Nothing replaced it and nothing
+# read it: the sole reference in the tree was a chmod on its directory. A file
+# named `ca.crt` sitting exactly where a trust anchor belongs reads as a chain of
+# trust already in place. That is the same defect as the `image_pubkey` removed
+# earlier — a control that APPEARS configured and does not exist — and it is
+# worse than an absent file, which at least fails honestly.
+#
+# The directory stays: the image creates it 0700 and it is the injection point.
+# The value is per-appliance, produced at runtime, and never comes from this tree
+# — a real CA baked here would be a leak of deployment identity anyway.
+OVERLAY="image/bootc-overlay"
+if [ -d "$OVERLAY" ]; then
+  while IFS= read -r hit; do
+    [ -n "$hit" ] || continue
+    fail "a certificate ships in the open-core overlay: $hit"
+  done <<< "$(grep -rlF -- "BEGIN CERTIFICATE" "$OVERLAY" 2>/dev/null || true)"
+fi
+
 # The three fetch-side keys must stay UNSET in the vanilla overlay: the composer
 # supplies them. A commented example is fine; an active assignment is not.
 OTA_CONF="image/bootc-overlay/etc/neural-ice/ota.conf"
