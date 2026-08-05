@@ -121,7 +121,25 @@ fi
 
 # System (root) LUKS volume size. Data volume takes the remaining space.
 # Overridable via neuralice.systemsize=<GiB>.
-SYSTEM_GIB=300
+#
+# 100 GiB, chosen 2026-08-05 to hold BOTH the current layout and the target one,
+# so this value survives the migration to bootc logically bound images and does
+# not have to be revisited mid-flight.
+#
+#   today   ~8 GiB OS  + 66 GiB CH-CASELAW corpus            = ~74 GiB
+#   target  ~10 GiB OS + ~45 GiB bound images (2 generations) = ~55 GiB
+#
+# Measured on the 1 TB SKU (ni-coreos-93b9, 2026-08-05): 74 GiB used of the old
+# 300 GiB — 227 GiB immobilised on a 931 GiB disk, i.e. a quarter of the drive
+# doing nothing. On the 4 TB SKU 300 GiB was invisible; on 1 TB it is not.
+#
+# ⚠️ ORDER MATTERS during the migration. The corpus must leave the system volume
+# BEFORE the container images arrive on it: 66 + 45 = 111 GiB would overflow.
+# Corpus to the data volume first (Owner decision 2026-08-05), bound images after.
+#
+# The data volume takes everything else, so lowering this figure hands ~200 GiB
+# back to models and client documents — the only place that space is ever used.
+SYSTEM_GIB=100
 if grep -qE 'neuralice\.systemsize=([0-9]+)' /proc/cmdline; then
   SYSTEM_GIB="$(sed -n 's/.*neuralice\.systemsize=\([0-9]*\).*/\1/p' /proc/cmdline)"
 fi
