@@ -357,6 +357,24 @@ RUN set -euxo pipefail; \
 #     Both stop at console_loglevel=3: errors and worse still reach the screen,
 #     everything else stays in the journal. The serial console is unaffected in
 #     practice — `journalctl -k` remains complete either way.
+#
+#     Console resolution (debug variant only, for now). Without these two, the
+#     console stays on the UEFI-provided simpledrm framebuffer for the whole
+#     session and the TUI renders at 100x37 — i.e. 800x600, roughly double-size
+#     characters on a 1080p panel. Observed on the 2026-08-05 install:
+#         [2.03] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
+#         [2.03] Console: switching to colour frame buffer device 100x37
+#         [7.80] Initialized nvidia-drm 0.0.0 for 000f:01:00.0 on minor 1
+#     nvidia-drm comes up five seconds later on a DIFFERENT minor and never takes
+#     the console over. `modeset=1` lets it drive displays, `fbdev=1` makes it
+#     provide the fbdev console so fbcon rebinds to it.
+#     ⚠️ NOT the July GSP/initramfs race: gsp_ga10x.bin and gsp_tu10x.bin are both
+#     present in the initramfs (verified) and the GPU itself loads fine.
+#     ⚠️ Testing REQUIRES a cold boot — reloading the nvidia module by hand wedges
+#     the GSP.
+#     Deliberately debug-only until proven on the lab: if fbdev handover misbehaves
+#     the console is lost entirely, which is not a risk worth taking on a sealed
+#     prod appliance before evidence.
 # --------------------------------------------------------------------------- #
 RUN set -euxo pipefail; \
     sed -i 's/^NAME=.*/NAME="Neural ICE"/; s/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS"/' /usr/lib/os-release; \
@@ -366,7 +384,7 @@ RUN set -euxo pipefail; \
     install -d -m 0755 /usr/lib/sysctl.d; \
     printf 'kernel.printk = 3 4 1 7\n' > /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf; \
     if [ "${VARIANT}" = "debug" ]; then \
-        printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0", "loglevel=3"]\n' \
+        printf 'kargs = ["console=tty1", "console=ttyS0,115200", "enforcing=0", "consoleblank=0", "loglevel=3", "nvidia_drm.modeset=1", "nvidia_drm.fbdev=1"]\n' \
             > /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
         sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Neural ICE CoreOS (debug)"/' /usr/lib/os-release; \
         install -d /etc/systemd/system/serial-getty@ttyS0.service.d; \
