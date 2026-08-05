@@ -36,10 +36,25 @@ COPY tools/ni-ota-verify/ /build/
 # applies to the final binary, not to build scripts/proc-macros — the reliable
 # way to get crt-static without breaking the derive crates. No pipefail: the
 # Debian builder's /bin/sh is dash; every pipeline below is failure-guarded.
+# Ancre de confiance de l'heure fiable, injectee a la COMPILATION.
+#
+# Elle ne vit pas dans le source : ce depot est open-core, un tiers doit pouvoir
+# le builder contre sa propre autorite. Elle ne vit pas non plus dans un fichier
+# de configuration : une ancre de confiance que l'on peut rediriger en ecrivant
+# un fichier n'est pas une ancre. Elle est donc figee dans le binaire, comme
+# l'etait le litteral qu'elle remplace.
+#
+# `test -n` rend le build FAIL-CLOSED : sans valeur, pas d'image. Le verifieur
+# compilerait sans elle (option_env! rend None) mais n'accepterait plus aucune
+# assertion d'heure — un comportement correct pour un tiers, inacceptable pour
+# une image de production livree en silence.
+ARG NI_TRUSTED_TIME_ISSUER
 RUN set -eux; \
+    test -n "${NI_TRUSTED_TIME_ISSUER}"; \
     target="$(rustc -vV | sed -n 's/^host: //p')"; \
     test -n "$target"; \
     RUSTFLAGS="-C target-feature=+crt-static" \
+    NI_TRUSTED_TIME_ISSUER="${NI_TRUSTED_TIME_ISSUER}" \
         cargo build --release --locked --target "$target"; \
     install -D -m 0755 "target/${target}/release/ni-ota-verify" /out/ni-ota-verify; \
     ( ldd /out/ni-ota-verify 2>&1 || true ) \

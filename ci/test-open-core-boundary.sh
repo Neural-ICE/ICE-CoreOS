@@ -21,12 +21,13 @@
 #              at appliance composition) or by repository configuration — never by
 #              this source tree.
 #
-# Scope of THIS test: the shipped overlay, the image build inputs and the CI
-# entry points. `tools/ni-ota-verify/` is deliberately NOT covered yet — its
-# hardcoded trusted-time authority is a security control that must move to a
-# compile-time constant rather than simply disappear, and its test fixtures need
-# neutral values. Extending this test to that tree is the follow-up; leaving the
-# gap silent would be worse than naming it here.
+# Scope of THIS test: the shipped overlay, the image build inputs, the CI entry
+# points AND the verifier source. `tools/ni-ota-verify/` was excluded when this
+# test was written because its trusted-time authority was a hardcoded literal —
+# a security control that had to MOVE to a compile-time constant rather than
+# simply disappear. That move is done: the authority is now
+# `option_env!("NI_TRUSTED_TIME_ISSUER")`, supplied by repository configuration
+# at image build, absent (and therefore trusting nobody) for anyone else.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +44,8 @@ FORBIDDEN=(
 
 # Paths that must stay free of them: what the image ships, and what builds it.
 COVERED=(
+  "tools/ni-ota-verify/src"
+  "tools/ni-ota-verify/tests"
   "image/bootc-overlay"
   "image/build-preloaded.sh"
   "image/build-installer-usb.sh"

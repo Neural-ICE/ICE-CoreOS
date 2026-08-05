@@ -94,6 +94,14 @@ jobs:
           # Debug remains keyless. The installer injects the operator key from
           # EFI:/ice-coreos/authorized_keys; no CI signing/key secret is baked.
           SSH_AUTHORIZED_KEY: ""
+          # Trusted-time authority, baked into the verifier at compile time.
+          # It comes from repository CONFIGURATION, never from this source tree:
+          # that is what keeps the open-core neutral — a third party cloning this
+          # repository has no variable set, so `option_env!` yields None and the
+          # verifier trusts nobody, which is the correct default for a build that
+          # was never told whom to trust. `ci/build-image.sh` refuses an empty
+          # value, so a Neural ICE image is never published without one.
+          NI_TRUSTED_TIME_ISSUER: ${{ vars.NI_TRUSTED_TIME_ISSUER }}
         run: |
           set -o pipefail
           ./ci/build-image.sh | tee build.out

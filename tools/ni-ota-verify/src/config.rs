@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn parses_the_staged_ota_conf_shape() {
         let cfg = parse(
-            "# comment\nenforce=0\nnv_index=0x01500001\nstate_nv_index=0x01500002\nregistry=registry.neural-ice.ch\n\
+            "# comment\nenforce=0\nnv_index=0x01500001\nstate_nv_index=0x01500002\nregistry=registry.example.test\n\
              root_pubkey=/etc/neural-ice/keys/ota-root.pub\nstate_dir=/var/lib/neural-ice/ota\n",
         )
         .unwrap();

@@ -12,10 +12,39 @@ use crate::delegated::contract::{
     timestamp, ContractError, Snapshot,
 };
 use crate::delegated::{verify_signature, AuthenticatedSnapshot};
+
 use crate::runner;
 use crate::state::FileStateStore;
 
+/// Expected trusted-time authority, fixed at COMPILE time.
+///
+/// This is a trust anchor: it names who may tell this appliance what time it is.
+/// It used to be a string literal in this file, which put a specific deployment's
+/// identity into an open-core OS — a third party could not build this verifier
+/// against their own authority without editing the source.
+///
+/// It is deliberately NOT read from `ota.conf` or any other file. A trust anchor
+/// that can be redirected by whoever writes a configuration file is not a trust
+/// anchor. Baked at compile time, it keeps exactly the property the literal had:
+/// nothing on the running system can point it elsewhere.
+///
+/// **Absent at build time, the verifier accepts NO trusted-time assertion.** That
+/// is the intended failure mode: a build that was never told whom to trust must
+/// not trust anyone. The image build supplies it (see `image/Containerfile.bootc`);
+/// the test suite supplies a neutral value of its own.
+pub(crate) const TRUSTED_TIME_ISSUER: Option<&str> = option_env!("NI_TRUSTED_TIME_ISSUER");
+
 const TIME_DOMAIN: &[u8] = b"neural-ice:ota:trusted-time:v2\0";
+
+/// Compare l'émetteur annoncé à l'ancre de confiance compilée.
+///
+/// Isolé de `validate` pour une seule raison : une constante de compilation ne
+/// se fait pas varier dans un test. Extraire la comparaison rend le fail-closed
+/// **démontrable** — `issuer_is_trusted(None, _)` est faux quelle que soit
+/// l'entrée — au lieu d'être seulement affirmé dans un commentaire.
+fn issuer_is_trusted(anchor: Option<&str>, issuer: &str) -> bool {
+    anchor == Some(issuer)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -182,7 +211,7 @@ fn validate(
     expected: &ExpectedTrustedTime<'_>,
 ) -> Result<(), ContractError> {
     if value.schema != "neural-ice-ota-trusted-time-v2"
-        || value.issuer != "licensing.neural-ice.ch"
+        || !issuer_is_trusted(TRUSTED_TIME_ISSUER, &value.issuer)
         || value.signing_role != "trusted-time"
         || !signature_profile(&value.signature_algorithm, &value.signature_encoding)
         || !safe_uint(value.assertion_seq)
@@ -353,6 +382,23 @@ fn hash(bytes: &[u8]) -> Result<String, ContractError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unset_trust_anchor_refuses_every_issuer() {
+        // Fail-closed MONTRE : un binaire a qui l'on n'a jamais dit qui croire
+        // ne croit personne. C'est le mode de defaillance voulu quand
+        // NI_TRUSTED_TIME_ISSUER est absent a la compilation.
+        assert!(!issuer_is_trusted(None, "licensing.example.test"));
+        assert!(!issuer_is_trusted(None, ""));
+    }
+
+    #[test]
+    fn the_trust_anchor_matches_only_itself() {
+        assert!(issuer_is_trusted(Some("a.example.test"), "a.example.test"));
+        assert!(!issuer_is_trusted(Some("a.example.test"), "b.example.test"));
+        assert!(!issuer_is_trusted(Some("a.example.test"), "A.example.test"));
+    }
+
     use super::*;
     use crate::delegated::contract::{canonical_hash, parse_canonical};
     use std::path::PathBuf;
@@ -369,7 +415,9 @@ mod tests {
             hardware_target: "nvidia-gb10-arm64".into(),
             issuance_id: "time-0001".into(),
             issued_at: "2026-07-22T00:00:00Z".into(),
-            issuer: "licensing.neural-ice.ch".into(),
+            issuer: TRUSTED_TIME_ISSUER
+                .expect("NI_TRUSTED_TIME_ISSUER must be set when building the test suite")
+                .into(),
             key_id: "trusted-time-v1".into(),
             nonce: "a".repeat(64),
             release_authorization_sha256: "b".repeat(64),

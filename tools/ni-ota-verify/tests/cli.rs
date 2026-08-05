@@ -16,7 +16,7 @@ use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ni-ota-verify");
 const TEST_OS_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const TEST_OS_REF: &str = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TEST_OS_REF: &str = "registry.example.test/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_SEED_REF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const TEST_BUNDLE_DIGEST: &str =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -99,7 +99,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                "# test ota.conf\nenforce={enforce}\nregistry=registry.neural-ice.ch\n\
+                "# test ota.conf\nenforce={enforce}\nregistry=registry.example.test\n\
                  root_pubkey={}\nstate_dir={}\n{extra}",
                 self.path("ota-root.pub").display(),
                 state_dir.display()
@@ -116,7 +116,7 @@ impl Fixture {
         fs::write(
             &path,
             format!(
-                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},"version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
+                r#"{{"appliance":{{"images":{{"icecore":{{"digest":"reg/x@sha256:aa"}}}},"os_base":{{"digest":"sha256:{TEST_OS_DIGEST}","image":"registry.example.test/neural-ice/neural-ice-appliance"}},"version":"{train}"}},"bundle_seq":{seq},"compat_min":1,"compat_version":3,"created":"2026-07-11T00:00:00Z","hardware_target":"nvidia-gb10-arm64","key_version":1,"sources":{{"seed":{{"ref":"{TEST_SEED_REF}","repo":"ICE-Fabric"}}}},"train":"{train}"}}"#
             ),
         )
         .unwrap();
@@ -2208,7 +2208,7 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
 
     let bom = fx.path("bom.json");
     let mut bom_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-        "appliance": {"os_base": {"digest": format!("sha256:{TEST_OS_DIGEST}"), "image": "registry.neural-ice.ch/neural-ice/neural-ice-appliance"}},
+        "appliance": {"os_base": {"digest": format!("sha256:{TEST_OS_DIGEST}"), "image": "registry.example.test/neural-ice/neural-ice-appliance"}},
         "bundle_seq": 19,
         "compat_min": 5,
         "compat_version": 5,
@@ -2434,7 +2434,7 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert!(stderr.contains("DER"), "{stderr}");
     fs::write(fx.path("attestation.sig"), signature).unwrap();
 
-    let wrong_os = "registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let wrong_os = "registry.example.test/neural-ice/neural-ice-appliance@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     let (code, _, stderr) = run(&mut command(wrong_os, TEST_SEED_REF, TEST_BUNDLE_DIGEST));
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("booted OS ref"), "{stderr}");

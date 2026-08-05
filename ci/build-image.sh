@@ -167,6 +167,9 @@ BUILD_ARGS=(
   --build-arg "NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}"
   --build-arg "OTA_IMGREF=${REF}:${SEMVER}"
   --build-arg "OS_VERSION=${SEMVER}"
+  # Ancre de confiance de l heure fiable : elle vient de la CONFIGURATION du
+  # depot, jamais du source — c est ce qui garde l open-core neutre.
+  --build-arg "NI_TRUSTED_TIME_ISSUER=${NI_TRUSTED_TIME_ISSUER}"
   --label "org.opencontainers.image.source=${SOURCE_URL}"
   --label "org.opencontainers.image.version=${SEMVER}"
   --label "ch.neural-ice.artifact-generation=${ARTIFACT_GENERATION}"
