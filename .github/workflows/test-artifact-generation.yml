@@ -16,6 +16,11 @@ on:
       - "build/build-kernel.sh"
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
+      - "ci/test-gb10-console-boot.sh"
+      - "image/Containerfile.bootc"
+      - "image/bootc-overlay/etc/modules-load.d/nvidia.conf"
+      - "image/bootc-overlay/etc/vconsole.conf"
+      - "image/bootc-overlay/usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
       - ".github/workflows/test-artifact-generation.yml"
@@ -35,6 +40,11 @@ on:
       - "build/build-kernel.sh"
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
+      - "ci/test-gb10-console-boot.sh"
+      - "image/Containerfile.bootc"
+      - "image/bootc-overlay/etc/modules-load.d/nvidia.conf"
+      - "image/bootc-overlay/etc/vconsole.conf"
+      - "image/bootc-overlay/usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
       - ".github/workflows/test-artifact-generation.yml"
@@ -58,6 +68,7 @@ jobs:
             ci/test-artifact-generation.sh ci/test-stage-nvidia-userspace.sh ci/build-image.sh \
             ci/test-build-image-dispatch-contract.sh \
             ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
+            ci/test-gb10-console-boot.sh \
             build/build-kernel.sh
       - name: Test artifact generation and kernel packaging contract
         run: |
@@ -65,3 +76,4 @@ jobs:
           ./ci/test-stage-nvidia-userspace.sh
           ./ci/test-build-image-dispatch-contract.sh
           ./ci/test-kernel-packaging-patch.sh
+          ./ci/test-gb10-console-boot.sh

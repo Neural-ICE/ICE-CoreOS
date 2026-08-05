@@ -401,14 +401,18 @@ RUN set -euxo pipefail; \
     fi
 
 # --------------------------------------------------------------------------- #
-# 3c) GB10 GPU: regenerate the initramfs so it carries the GSP firmware.
+# 3c) GB10 GPU + console: regenerate the initramfs so it carries the GSP
+#     firmware, the initial nvidia_drm KMS/fbdev options and the vconsole font.
 #     The stock kernel initramfs has the nvidia modules but NOT the 72 MB GSP
 #     firmware, so the early (initramfs) load races: when it loses, RmInitAdapter
 #     fails ENOENT, the GPU is dead all session, and — with no nvidia KMS —
 #     fbcon is stuck on simpledrm@800x600, collapsing the TUI to ~37x100. The
 #     91-…-nvidia-gsp.conf drop-in (shipped in the overlay above) adds the
-#     firmware + force_drivers; regenerate once here so the deterministic init
-#     is baked in (proven on the .72, 2026-07-23: GPU up + console 240x67).
+#     firmware + force_drivers. The immutable modprobe and vconsole defaults
+#     are explicitly installed too: nvidia_drm must load first with
+#     modeset=1/fbdev=1 and tty1 must use default8x16. Regenerate once here so
+#     the deterministic initial state is baked in (proven by live hotfix on
+#     the .72, 2026-07-29: modeset=Y, fbdev=Y, console 240x67).
 #     This re-enables the initramfs rewrite the branding step skipped — worth
 #     the build time and OTA delta for a GPU that actually initializes.
 # --------------------------------------------------------------------------- #
@@ -430,17 +434,25 @@ RUN set -euxo pipefail; \
     for f in /usr/lib/firmware/nvidia/*/gsp_ga10x.bin; do gsp="$f"; break; done; \
     test -n "${gsp:-}" && test -e "$gsp"; \
     fwdir="$(dirname "$gsp")"; \
+    for f in /usr/lib/kbd/consolefonts/default8x16.*; do console_font="$f"; break; done; \
+    test -n "${console_font:-}" && test -e "$console_font"; \
+    test "$(tail -n 1 /usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf)" = \
+        "options nvidia_drm modeset=1 fbdev=1"; \
+    test "$(cat /etc/vconsole.conf)" = "FONT=default8x16"; \
     install -d -m 0755 /usr/lib/dracut/dracut.conf.d; \
-    { printf 'install_items+=" %s/gsp_ga10x.bin %s/gsp_tu10x.bin "\n' "$fwdir" "$fwdir"; \
+    { printf 'install_items+=" %s/gsp_ga10x.bin %s/gsp_tu10x.bin /usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf /etc/vconsole.conf %s "\n' \
+          "$fwdir" "$fwdir" "$console_font"; \
       printf 'force_drivers+=" nvidia nvidia_modeset nvidia_drm nvidia_uvm "\n'; } \
         > /usr/lib/dracut/dracut.conf.d/91-neural-ice-nvidia-gsp.conf; \
     dracut --force --no-hostonly --kver "${KVER}" \
         "/usr/lib/modules/${KVER}/initramfs.img"; \
     listing="$(lsinitrd "/usr/lib/modules/${KVER}/initramfs.img")"; \
-    case "$listing" in \
-      *gsp_ga10x.bin*) ;; \
-      *) echo "gsp_ga10x.bin missing from the generated initramfs" >&2; exit 1 ;; \
-    esac
+    for required in gsp_ga10x.bin 90-neural-ice-nvidia-drm.conf vconsole.conf default8x16; do \
+        case "$listing" in \
+          *"$required"*) ;; \
+          *) echo "$required missing from the generated initramfs" >&2; exit 1 ;; \
+        esac; \
+    done
 
 # OTA source self-description only. The producer passes its own immutable tag while
 # the native timer remains masked; the branded Fabric derivation replaces this with
