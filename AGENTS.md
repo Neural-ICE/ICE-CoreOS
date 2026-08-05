@@ -11,6 +11,7 @@ Racine du vault : `/data/github/@Neural-ICE_Dev/ICE-Obsidian/Neural-ICE_Dev/`
 | Lire | Chemin, relatif à cette racine |
 |---|---|
 | **Le point d'entrée agent** — catalogue de tout | `index.md` |
+| 🔴 **Comment coder ici** — politique normative | `wiki/how-to/how-to-bonnes-pratiques-vibecoding.md` |
 | Le schéma qui gouverne l'ensemble | `AGENTS.md` |
 | **Ce repo** — état vérifié, pièges, contrats | `wiki/composants/ice-coreos.md` |
 | **Les écarts ouverts** sur ce périmètre | `wiki/ecarts/` — filtrer sur `repos: [ICE-CoreOS]` |
@@ -24,10 +25,20 @@ Racine du vault : `/data/github/@Neural-ICE_Dev/ICE-Obsidian/Neural-ICE_Dev/`
 
 **1 · 🔒 Avant de coder — prendre sa zone.**
 Lire `/data/github/@Neural-ICE_Dev/raw_mission_report_to_ingest/`.
-Si un `ZONE-*.claim.md` couvre tes fichiers, **s'arrêter** — la collision se juge **au fichier**, pas
-au repo. Sinon, y **poser le tien** (`ZONE-<goal>-<session>.claim.md`), et le **supprimer à la fin**.
+Si un `ZONE-*.claim.md` **liste un fichier que tu vas écrire**, s'arrêter — la collision se juge
+**au fichier**, pas au repo. Sinon, y poser le tien, `ZONE-<goal>-<session>.claim.md`, et le
+**supprimer à la fin** :
 
-**2 · 🔴 Ne JAMAIS écrire dans le vault Obsidian.**
+```yaml
+goal: <identifiant de la /goal>      # ce qui est tenu
+session: <identifiant de session>    # unicité — deux runs ne s'écrasent pas
+repo: ICE-CoreOS
+pathspecs: [<chemins écrits, relatifs au repo>]   # ce que LIT l'agent suivant
+debut: AAAA-MM-JJThh:mm
+fin_prevue: AAAA-MM-JJ
+```
+
+**2 · 🔴 Ne JAMAIS écrire dans le vault Obsidian** — ni page, ni écart, ni mission, ni `log.md`.
 À la fin, déposer un rapport dans `/data/github/@Neural-ICE_Dev/raw_mission_report_to_ingest/` :
 ce qui est **livré** (commit, branche, PR) · les **preuves** (commande exacte + sortie) · **ce qui
 n'est PAS fait et pourquoi** · les **écarts** rencontrés · les **décisions prises faute d'arbitrage**.
@@ -37,6 +48,3 @@ Ne pas les deviner : ils portent une contrainte **d'unicité par session**.
 
 > **Un rapport propose la clôture, il ne la prononce pas.** Le vault est intégré par une seule
 > instance, **après vérification du code**. Le niveau V1/V2 **se prouve, il ne se déclare pas**.
-
-Format et gabarits : `raw_mission_report_to_ingest/README.md`.
-Doctrine : `wiki/how-to/how-to-agents-md-minimal-et-rapports-de-mission.md`.
