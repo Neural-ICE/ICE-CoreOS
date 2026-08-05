@@ -15,7 +15,7 @@
 # Run on an ARM64 build host with the seed staged locally. Needs sudo (losetup/mount/mkfs).
 #   SEED_IMAGES=$HOME/ice-seed/images \
 #   SEED_MODELS=$HOME/ice-seed/models \
-#   BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<digest> \
+#   BASE_IMAGE=<registry>/<org>/<appliance-image>@sha256:<digest> \
 #   SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
 #   SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
 #   LAB_BASELINE_BOM_FILE=/path/to/<train>.bom.json \
