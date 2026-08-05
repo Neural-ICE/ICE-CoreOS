@@ -26,7 +26,7 @@ permissions:
 jobs:
   test:
     if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -57,7 +57,7 @@ jobs:
     # Spark build runner already exposes passwordless sudo to its bounded CI
     # jobs, so use it only for the positive root-owned persistence contract.
     if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, ARM64, spark]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     permissions:
       contents: read
