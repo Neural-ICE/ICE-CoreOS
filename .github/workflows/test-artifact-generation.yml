@@ -12,6 +12,8 @@ on:
       - "ci/build-image.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
+      - "ci/test-oci-signature-policy.sh"
+      - "image/policy/render-container-policy.sh"
       - "image/bootc-overlay/**"
       - "image/build-preloaded.sh"
       - "image/build-installer-usb.sh"
@@ -36,6 +38,8 @@ on:
       - "ci/build-image.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
+      - "ci/test-oci-signature-policy.sh"
+      - "image/policy/render-container-policy.sh"
       - "image/bootc-overlay/**"
       - "image/build-preloaded.sh"
       - "image/build-installer-usb.sh"
@@ -69,12 +73,25 @@ jobs:
             ci/stage-artifacts.sh ci/stage-nvidia-userspace.sh \
             ci/test-artifact-generation.sh ci/test-stage-nvidia-userspace.sh ci/build-image.sh \
             ci/test-build-image-dispatch-contract.sh ci/test-open-core-boundary.sh \
+            ci/test-oci-signature-policy.sh image/policy/render-container-policy.sh \
             ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
             build/build-kernel.sh
+      # skopeo is the containers/image policy engine itself: the signature-policy
+      # test does not simulate a verdict, it asks the same code the appliance
+      # runs. Installed explicitly rather than assumed present on the runner
+      # image — a test that silently skips when its tool is missing is a gate
+      # that reports green while guarding nothing.
+      - name: Install the container tooling the signature-policy test needs
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
       - name: Test artifact generation and kernel packaging contract
         run: |
           ./ci/test-artifact-generation.sh
           ./ci/test-stage-nvidia-userspace.sh
           ./ci/test-build-image-dispatch-contract.sh
           ./ci/test-open-core-boundary.sh
+          ./ci/test-oci-signature-policy.sh
           ./ci/test-kernel-packaging-patch.sh

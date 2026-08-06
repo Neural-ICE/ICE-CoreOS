@@ -47,6 +47,10 @@ COVERED=(
   "tools/ni-ota-verify/src"
   "tools/ni-ota-verify/tests"
   "image/bootc-overlay"
+  # Installed into the image as /usr/libexec/neural-ice-render-container-policy:
+  # the composer's injection point for the container signature policy. It is the
+  # file most likely to acquire a "helpful" default registry scope.
+  "image/policy"
   "image/build-preloaded.sh"
   "image/build-installer-usb.sh"
   "image/Containerfile.bootc"
