@@ -138,13 +138,40 @@ RUN curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-co
 
 COPY image/bootc-overlay/            /
 COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
+# Container-image signature policy: the MECHANISM, never the identity.
+# The overlay ships /etc/containers/policy.json with a default of `reject`, so
+# this OS pulls NOTHING until a composer declares which repository it trusts and
+# under which public key. Those are deployment identity and never live in this
+# open-core tree (FAB-0032); the composer supplies them by calling the renderer
+# installed just below, from its own derivation:
+#
+#   RUN /usr/libexec/neural-ice-render-container-policy \
+#         --signed-scope <registry>/<org>=/etc/containers/keys/<key>.pub
+#
+# The renderer — not the composer's diligence — is what guarantees the default
+# stays `reject`. Contract and proofs: ci/test-oci-signature-policy.sh.
+COPY image/policy/render-container-policy.sh /usr/libexec/neural-ice-render-container-policy
 RUN test "$(cat /usr/lib/neural-ice/hardware-target)" = nvidia-gb10-arm64
 
 RUN set -euxo pipefail; \
     chmod 0755 /usr/libexec/neural-ice-device-root; \
+    chmod 0755 /usr/libexec/neural-ice-render-container-policy; \
     systemctl enable neural-ice-device-root.service; \
     chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \
-    install -d -m 0700 /etc/neural-ice/pki
+    install -d -m 0700 /etc/neural-ice/pki; \
+    install -d -m 0755 /etc/containers/keys
+
+# The image REFUSES TO BUILD if the shipped policy is not fail-closed, and if
+# the renderer is not the thing that produced it. A signature policy is a
+# control whose failure mode is silence: a permissive default looks exactly like
+# a strict one until an unsigned image is pulled and nothing happens. The two
+# assertions below cost nothing and turn that silence into a build failure —
+# same reason `test -n "${NI_TRUSTED_TIME_ISSUER}"` guards stage 0.
+RUN set -euxo pipefail; \
+    grep -q '"reject"' /etc/containers/policy.json; \
+    ! grep -q 'insecureAcceptAnything' /etc/containers/policy.json; \
+    /usr/libexec/neural-ice-render-container-policy --policy-out - --registries-d-out '' \
+        | diff -u /etc/containers/policy.json -
 
 # --------------------------------------------------------------------------- #
 # 2b) OTA trust tooling (ICE-Fabric OTA signing plan — P0+P2).
