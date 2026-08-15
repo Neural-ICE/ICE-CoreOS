@@ -13,6 +13,8 @@ on:
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-oci-signature-policy.sh"
+      - "ci/test-no-shim-chained-updater.sh"
+      - "secureboot/shim-review-answers.draft.md"
       - "image/policy/render-container-policy.sh"
       - "image/bootc-overlay/**"
       - "image/build-preloaded.sh"
@@ -39,6 +41,8 @@ on:
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-oci-signature-policy.sh"
+      - "ci/test-no-shim-chained-updater.sh"
+      - "secureboot/shim-review-answers.draft.md"
       - "image/policy/render-container-policy.sh"
       - "image/bootc-overlay/**"
       - "image/build-preloaded.sh"
@@ -95,3 +99,4 @@ jobs:
           ./ci/test-open-core-boundary.sh
           ./ci/test-oci-signature-policy.sh
           ./ci/test-kernel-packaging-patch.sh
+          ./ci/test-no-shim-chained-updater.sh
