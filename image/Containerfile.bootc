@@ -87,6 +87,30 @@ ARG VARIANT=prod
 # in-tree modules), so they load under lockdown with nothing enrolled in db. The
 # RPM lands them in /usr/lib/modules/<kver>/extra/nvidia-open/ and runs depmod.
 # ATOMIC kernel<->driver coupling: no loose .ko, no privileged injector, no GHCR pull.
+# The base ships `fwupd-efi`, whose only payload is the shim-chained EFI updater
+# `fwupdaa64.efi`. It is DEAD WEIGHT here: fwupd itself reports "Updated via
+# capsule-on-disk" for all four ESRT devices on this hardware, so the capsule
+# path does not go through that binary. Measured on the published image:
+#
+#   $ rpm -qf /usr/libexec/fwupd/efi/fwupdaa64.efi   -> fwupd-efi-1.8-1.el10.aarch64
+#   $ rpm -q --whatrequires fwupd-efi                -> no package requires fwupd-efi
+#   $ rpm -ql fwupd-efi   -> the two .efi files, a pkgconfig stub and docs
+#
+# Removing it also makes a statement we make to third parties TRUE rather than
+# merely defensible: `secureboot/shim-review-answers.draft.md:244` says "no fwupd
+# EFI binary is shipped". The binary never sat on the ESP and is signed by the
+# CentOS CA — our shim would refuse it — so the claim was arguable. It is now a
+# fact, which is the only form worth putting in front of reviewers.
+#
+# The readback is fail-closed on purpose: a base image that ever reinstates the
+# package as a dependency must break the BUILD, not surface at a shim review.
+RUN set -euxo pipefail; \
+    dnf -y remove --noautoremove fwupd-efi; \
+    ! rpm -q fwupd-efi; \
+    ! test -e /usr/libexec/fwupd/efi/fwupdaa64.efi; \
+    ! test -e /usr/libexec/fwupd/efi/fwupdaa64.efi.signed; \
+    test -x /usr/bin/fwupdmgr
+
 COPY image/rpms/ /tmp/rpms/
 RUN set -euxo pipefail; \
     dnf -y remove --noautoremove kernel kernel-core kernel-modules kernel-modules-core; \
