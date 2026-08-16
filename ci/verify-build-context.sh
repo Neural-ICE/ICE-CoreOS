@@ -35,15 +35,33 @@ output_value() {
   awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; found++} END {exit found == 1 ? 0 : 1}'
 }
 
-[[ "$#" == 2 ]] || die "usage: $0 CONTEXT_DIR {debug|prod}"
+[[ "$#" == 2 ]] || die "usage: $0 CONTEXT_DIR {debug|sealed-lab|prod}"
 context="$1"
 variant="$2"
 [[ -d "$context" && ! -L "$context" ]] || die "build context must be a real directory"
 
+# POSTURE and TRUST ANCHOR are independent properties, and this mapping used to
+# conflate them: `prod` meant BOTH "sealed appliance" and "Microsoft-signed
+# chain". The combination Neural ICE actually ships first — a SEALED appliance
+# whose Secure Boot key is enrolled by hand — was therefore inexpressible, and
+# the only way to demonstrate a sealed unit was to call it `prod` and mean
+# something else by it.
+#
+#   debug       sshd + serial console + SELinux permissive   · lab anchor
+#   sealed-lab  no shell anywhere, SELinux enforcing         · lab anchor
+#   prod        no shell anywhere, SELinux enforcing         · Microsoft-signed
+#
+# `sealed-lab` is NOT a relaxation of `prod`: the posture is byte-identical (the
+# Containerfile seals everything that is not `debug`). It differs only in which
+# anchor it will accept, and it says so in its name rather than in a footnote.
+#
+# The guard against it reaching customers is STRUCTURAL, not declarative:
+# ICE-Fabric maps it to the `beta-debug` OTA channel, so a lab-anchored build
+# has no path to `beta` or `stable`. Nothing has to remember to check.
 case "$variant" in
-  debug) expected_policy_id=neural-ice-secureboot-lab-v1 ;;
+  debug | sealed-lab) expected_policy_id=neural-ice-secureboot-lab-v1 ;;
   prod) expected_policy_id=neural-ice-secureboot-prod-v1 ;;
-  *) die "invalid VARIANT '$variant' (debug|prod); no default is permitted" ;;
+  *) die "invalid VARIANT '$variant' (debug|sealed-lab|prod); no default is permitted" ;;
 esac
 
 policy_bin="$POLICY_ROOT/$expected_policy_id"
