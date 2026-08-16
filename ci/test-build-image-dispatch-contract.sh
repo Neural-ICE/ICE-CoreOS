@@ -54,3 +54,69 @@ push_count="$(grep -Fc -- '"${PODMAN[@]}" push ' "$BUILDER")"
 [[ "$push_count" == 1 ]] || fail "expected exactly one registry push, found $push_count"
 
 echo "build-image dispatch contract tests: PASS"
+
+# --------------------------------------------------------------------------- #
+# The variant set is validated in THREE independent places, and nothing made
+# them agree. `sealed-lab` was added to two of them and the build failed at the
+# third — 26 seconds in, on the real runner, with `invalid VARIANT`. The cost was
+# a wasted dispatch; the cost of the same gap on a variant that only diverges
+# LATER would be an image built under the wrong posture.
+#
+# This asserts the three sites accept exactly the same set, whatever that set is.
+# --------------------------------------------------------------------------- #
+# The three shell sites are EXERCISED, not grepped. Grepping proved vacuous
+# twice: first the prose explaining a variant satisfied it as well as the code,
+# then — after stripping comments — the variant's own name inside the rejection
+# MESSAGE kept satisfying it. A name can appear in a file that refuses it.
+#
+# An accepted variant fails LATER (missing artifacts, missing context); a
+# rejected one fails ON THE VARIANT. That difference is the contract.
+for variant in prod sealed-lab debug; do
+  # These probes are MEANT to fail — that is the measurement. Without `|| true`
+  # `set -e` kills the suite on the first one, and a pipe to tail then hides the
+  # exit code so it looks green.
+  out="$(VARIANT="$variant" ARTIFACTS_DIR=/nonexistent timeout 20 "$BUILDER" 2>&1 | head -1)" || true
+  case "$out" in
+    *"invalid VARIANT"*)
+      echo "ci/build-image.sh REFUSES variant '$variant' — the variant sites disagree, and the build dies 26s in on the real runner" >&2
+      exit 1 ;;
+  esac
+  ctx="$(mktemp -d)"
+  out="$(timeout 20 "$REPO_ROOT/ci/verify-build-context.sh" "$ctx" "$variant" 2>&1 | head -1)" || true
+  rmdir "$ctx" 2>/dev/null || true
+  case "$out" in
+    *"invalid VARIANT"*)
+      echo "ci/verify-build-context.sh REFUSES variant '$variant'" >&2
+      exit 1 ;;
+  esac
+done
+
+# …and the check is non-vacuous only if an UNKNOWN variant is still refused.
+out="$(VARIANT=definitely-not-a-variant ARTIFACTS_DIR=/nonexistent timeout 20 "$BUILDER" 2>&1 | head -1)" || true
+case "$out" in
+  *"invalid VARIANT"*) : ;;
+  *) echo "ci/build-image.sh ACCEPTED an unknown variant — the gate is open" >&2; exit 1 ;;
+esac
+
+# The two declarative sites can only be read, not run.
+variant_sites=(
+  ".github/workflows/build-image.yml"
+  "image/Containerfile.bootc"
+)
+for variant in prod sealed-lab debug; do
+  for site in "${variant_sites[@]}"; do
+    [ -f "$REPO_ROOT/$site" ] || { echo "missing variant site: $site" >&2; exit 1; }
+    # Comment lines are STRIPPED first. Grepping the whole file made this check
+    # vacuous: the prose explaining a variant satisfied it just as well as the
+    # code implementing it, and a mutation that deleted the executable line
+    # passed because the comment above it survived. Measured, not assumed.
+    # NOT `sed … | grep -q`. Under `set -o pipefail`, grep -q exits on the first
+    # match, sed dies of SIGPIPE, and the pipeline reports 141 — so a MATCH reads
+    # as an ABSENCE. Measured here: every variant reported "unknown" while the
+    # code contained it. Capture first, then match.
+    site_code="$(sed 's/[[:space:]]*#.*$//' "$REPO_ROOT/$site")"
+    grep -Fq -- "$variant" <<<"$site_code" \
+      || { echo "variant '$variant' is unknown to the CODE of $site — the variant sites disagree, and a build will fail at whichever one was missed" >&2; exit 1; }
+  done
+done
+echo "variant sites agree on prod|sealed-lab|debug: PASS"
