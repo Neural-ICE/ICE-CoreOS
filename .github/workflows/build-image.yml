@@ -32,8 +32,8 @@ jobs:
             echo "::error::manual debug builds must run from refs/heads/main"; exit 2
           fi
           case "$VARIANT" in
-            debug|prod) ;;
-            *) echo "::error::the requested variant must be exactly debug or prod"; exit 2 ;;
+            debug|sealed-lab|prod) ;;
+            *) echo "::error::the requested variant must be exactly debug, sealed-lab or prod"; exit 2 ;;
           esac
 
   build:

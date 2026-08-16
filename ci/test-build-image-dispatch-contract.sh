@@ -19,7 +19,7 @@ refute_fixed() {
 
 # The UI path has no knobs: it is forced to debug and rejects a branch selected
 # in the workflow_dispatch branch picker. repository_dispatch keeps its explicit
-# debug|prod API for the default-branch producer.
+# debug|sealed-lab|prod API for the default-branch producer.
 require_fixed "  workflow_dispatch:" "$WORKFLOW"
 require_fixed "  repository_dispatch:" "$WORKFLOW"
 require_fixed "VARIANT: \${{ github.event_name == 'workflow_dispatch' && 'debug' || github.event.client_payload.variant }}" "$WORKFLOW"
