@@ -15,7 +15,7 @@ esac
 # Env:
 #   REGISTRY            registry/namespace      (default ghcr.io/neural-ice)
 #   IMAGE               package name            (default neural-ice-coreos)
-#   VARIANT             prod | debug             (required; debug => -debug tags,
+#   VARIANT             prod | sealed-lab | debug  (required; suffixes the tags,
 #                                                 sshd on, serial console, permissive)
 #   BUILD_ID            unique build identity    (required when PUSH=1)
 #   SOURCE_REVISION     source commit SHA         (required when PUSH=1; defaults to GITHUB_SHA)
@@ -54,7 +54,16 @@ output_value() {
   awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; found++} END {exit found == 1 ? 0 : 1}'
 }
 
-case "$VARIANT" in prod) SUFFIX="" ;; debug) SUFFIX="-debug" ;; *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|debug)" >&2; exit 2 ;; esac
+# The tag suffix follows the VARIANT. `sealed-lab` carries the sealed posture of
+# `prod` on the LAB Secure Boot anchor, so it must be distinguishable from both:
+# from `prod` because its chain is only trusted where the key was enrolled by
+# hand, and from `debug` because it has no shell at all.
+case "$VARIANT" in
+  prod)       SUFFIX="" ;;
+  sealed-lab) SUFFIX="-sealed-lab" ;;
+  debug)      SUFFIX="-debug" ;;
+  *) echo "ERROR: invalid VARIANT '$VARIANT' (prod|sealed-lab|debug)" >&2; exit 2 ;;
+esac
 case "$PUSH" in 0|1) ;; *) echo "ERROR: PUSH must be 0 or 1" >&2; exit 2 ;; esac
 case "${PODMAN_SUDO:-0}" in 0|1) ;; *) echo "ERROR: PODMAN_SUDO must be 0 or 1" >&2; exit 2 ;; esac
 
