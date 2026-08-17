@@ -321,7 +321,9 @@ pub(crate) fn validate_release_for_time_challenge<'a>(
     immutable_variant: &str,
 ) -> Result<&'a DelegatedKey, String> {
     validate_release_contract(value, snapshot, snapshot_hash, immutable_target)?;
-    if value.variant != immutable_variant || !matches!(immutable_variant, "debug" | "prod") {
+    if value.variant != immutable_variant
+        || !matches!(immutable_variant, "debug" | "prod" | "sealed-lab")
+    {
         return Err("release variant differs from immutable host variant".into());
     }
     authorized_key(
@@ -352,7 +354,7 @@ fn validate_release_contract(
         || !safe_uint(value.compat_min)
         || !safe_uint(value.compat_max)
         || value.compat_min > value.compat_max
-        || !matches!(value.variant.as_str(), "debug" | "prod")
+        || !matches!(value.variant.as_str(), "debug" | "prod" | "sealed-lab")
         || !target(&value.hardware_target)
         || value.hardware_target != immutable_target
         || !ident(&value.issuance_id)
