@@ -16,6 +16,10 @@ on:
     paths:
       - 'tools/ni-ota-verify/**'
       - '.github/workflows/test-ni-ota-verify.yml'
+  pull_request:
+    paths:
+      - 'tools/ni-ota-verify/**'
+      - '.github/workflows/test-ni-ota-verify.yml'
   workflow_dispatch:
 
 concurrency:
@@ -26,6 +30,41 @@ permissions:
   contents: read
 
 jobs:
+  # Pull requests run the SAME checks on a GitHub-hosted runner.
+  #
+  # The self-hosted jobs below stay main-only on purpose: a pull request can edit
+  # the workflow definition itself, and a persistent runner would then execute
+  # author-controlled commands on Neural ICE infrastructure. That control is not
+  # relaxed here — it is respected by sending pull requests somewhere disposable.
+  #
+  # Until this existed, the verifier that decides whether an appliance accepts an
+  # update was only tested AFTER merge. A defect reached main before anyone could
+  # see it, and on an open-core repository external contributions had no CI at all.
+  pull-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Verify, lint and test in the pinned Rust toolchain
+        working-directory: tools/ni-ota-verify
+        env:
+          # NEUTRAL and deliberately wrong: the suite must prove the contract, not
+          # the identity of a deployment. The real authority comes from the
+          # repository configuration at image build time.
+          NI_TRUSTED_TIME_ISSUER: trusted-time.example.test
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt clippy
+          cargo fmt --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --locked --features test-path-overrides
+          cargo build --release --locked
+          ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
+
   linux-x86_64:
     if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]

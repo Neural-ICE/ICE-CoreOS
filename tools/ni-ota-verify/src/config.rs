@@ -67,7 +67,15 @@ pub(crate) fn immutable_appliance_variant() -> Result<String, InternalError> {
         ))
     })?;
     match variant.trim() {
-        "debug" | "prod" => Ok(variant.trim().to_owned()),
+        // `sealed-lab` was added to the build on 2026-08-17 (ICE-Fabric#318) and
+        // this allowlist was not: a sealed appliance therefore failed every
+        // delegated path with "invalid immutable appliance variant" — the image
+        // writes ${VARIANT} verbatim (Containerfile.bootc:454). Recognising it
+        // relaxes no trust decision: the callers still require the signed release
+        // variant to EQUAL the host's, so a sealed unit accepts only sealed
+        // releases. Refusing to recognise it made the binding unreachable, which
+        // is strictly worse than making it work.
+        "debug" | "prod" | "sealed-lab" => Ok(variant.trim().to_owned()),
         _ => Err(InternalError(format!(
             "invalid immutable appliance variant in {}",
             path.display()
@@ -297,6 +305,38 @@ mod tests {
 
     fn parse(text: &str) -> Result<Config, InternalError> {
         Config::parse(text, Path::new("test.conf"))
+    }
+
+    /// The build writes ${VARIANT} verbatim (Containerfile.bootc:454). When
+    /// `sealed-lab` was added on 2026-08-17 this allowlist was not, so a sealed
+    /// appliance failed EVERY delegated path with "invalid immutable appliance
+    /// variant" — the posture binding was unreachable on exactly the units built
+    /// to be sealed.
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn every_shipped_variant_is_recognised_and_nothing_else_is() {
+        let dir = std::env::temp_dir().join(format!("ni-variant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("appliance-variant");
+        std::env::set_var("NI_OTA_APPLIANCE_VARIANT_FILE", &file);
+
+        for shipped in ["debug", "prod", "sealed-lab"] {
+            std::fs::write(&file, format!("{shipped}\n")).unwrap();
+            assert_eq!(
+                immutable_appliance_variant().unwrap(),
+                shipped,
+                "{shipped} is a variant the build emits and the verifier must recognise"
+            );
+        }
+        for bogus in ["", "sealed", "SEALED-LAB", "debug prod", "../etc/passwd"] {
+            std::fs::write(&file, bogus).unwrap();
+            assert!(
+                immutable_appliance_variant().is_err(),
+                "an unrecognised variant must refuse, not be coerced: {bogus:?}"
+            );
+        }
+        std::env::remove_var("NI_OTA_APPLIANCE_VARIANT_FILE");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
