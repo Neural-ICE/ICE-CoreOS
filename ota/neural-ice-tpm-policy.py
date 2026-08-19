@@ -197,6 +197,121 @@ def cmd_show(args):
     return 0
 
 
+def selector(ev):
+    """`kind:name` for an addressable event, else None.
+
+    `db` is measured TWICE and differently: once as driver config (what is
+    enrolled) and once as authority (which certificate actually validated the
+    loaded binary). Both move at an anchor switch and they are not the same
+    value, so a selector that only carried the name would be ambiguous exactly
+    where it matters most."""
+    if ev["type"] == EV_EFI_VARIABLE_DRIVER_CONFIG:
+        kind = "config"
+    elif ev["type"] == EV_EFI_VARIABLE_AUTHORITY:
+        kind = "authority"
+    else:
+        return None
+    name = variable_name(ev)
+    return f"{kind}:{name}" if name else None
+
+
+def substitute(events, pcr_index, alg, overrides):
+    """Replace the digest of the named events. Refuses anything ambiguous."""
+    remaining = dict(overrides)
+    applied = []
+    for ev in events:
+        if ev["pcr"] != pcr_index:
+            continue
+        sel = selector(ev)
+        if sel is None or sel not in remaining:
+            continue
+        new = remaining.pop(sel)
+        if len(new) != len(ev["digests"][alg]):
+            raise EventLogError(f"{sel}: replacement digest is {len(new)} bytes, "
+                                f"the log carries {len(ev['digests'][alg])}")
+        applied.append((sel, ev["digests"][alg], new))
+        ev["digests"][alg] = new
+    if remaining:
+        raise EventLogError("these selectors match no event in this log: "
+                            + ", ".join(sorted(remaining))
+                            + " — run `show` to see what this machine measures. "
+                              "Predicting from a substitution that silently did "
+                              "nothing returns the CURRENT value dressed as a "
+                              "future one.")
+    return applied
+
+
+def pcr_policy_digest(pcr_index, value, alg="sha256"):
+    """The TPM policyDigest a PolicyPCR session reaches for this PCR value.
+
+        policyDigest = H( 0…0 || TPM_CC_PolicyPCR || TPML_PCR_SELECTION || H(value) )
+
+    This is what the Owner signs: the authorisation names a policy digest, never
+    a PCR value directly."""
+    if pcr_index > 23:
+        raise EventLogError("PCR index outside the 0..23 the selection encodes")
+    alg_id = next(k for k, v in ALGS.items() if v[0] == alg)
+    select = bytearray(3)
+    select[pcr_index // 8] |= 1 << (pcr_index % 8)
+    # TPML_PCR_SELECTION: count, then {hashAlg, sizeofSelect, pcrSelect}
+    selection = struct.pack(">I", 1) + struct.pack(">H", alg_id) + bytes([3]) + bytes(select)
+    digest_tpm = hashlib.new(alg, value).digest()
+    zero = b"\x00" * hashlib.new(alg).digest_size
+    TPM_CC_PolicyPCR = 0x0000017F
+    return hashlib.new(alg, zero + struct.pack(">I", TPM_CC_PolicyPCR)
+                       + selection + digest_tpm).digest()
+
+
+def cmd_predict(args):
+    blob = open(args.eventlog, "rb").read()
+    events = parse_eventlog(blob)
+
+    # The self-check is not optional here. A prediction is only as trustworthy as
+    # the parser's ability to reproduce the present, so it is re-proven on the
+    # untouched log before anything is substituted.
+    computed, _ = replay(events, args.pcr, args.alg)
+    measured = live_pcr(args.pcr, args.alg)
+    if computed != measured:
+        print("🔴 the replay does not reproduce the live PCR; refusing to predict",
+              file=sys.stderr)
+        return 1
+    print(f"  current   : {measured.hex()}")
+
+    overrides = {}
+    for item in args.set or []:
+        if "=" not in item:
+            raise EventLogError(f"--set expects kind:name=<hex>, got {item!r}")
+        sel, hexval = item.split("=", 1)
+        try:
+            overrides[sel.strip()] = bytes.fromhex(hexval.strip())
+        except ValueError:
+            raise EventLogError(f"{sel}: replacement is not hex")
+    if not overrides:
+        raise EventLogError("no --set given: predicting an unchanged state would "
+                            "return the current value, which authorises nothing new")
+
+    applied = substitute(events, args.pcr, args.alg, overrides)
+    for sel, old, new in applied:
+        print(f"  replaced  : {sel}\n              {old.hex()}\n           -> {new.hex()}")
+    predicted, _ = replay(events, args.pcr, args.alg)
+    if predicted == measured:
+        print("\n🔴 the prediction equals the current value — the substitution "
+              "changed nothing measurable. Refusing: this would authorise the "
+              "present while claiming to authorise a future state.", file=sys.stderr)
+        return 1
+    print(f"\n  predicted : {predicted.hex()}")
+    print(f"  policy    : {pcr_policy_digest(args.pcr, predicted, args.alg).hex()}"
+          "   <- what the Owner signs")
+    return 0
+
+
+def cmd_policy_digest(args):
+    """Exposed on its own so it can be checked against tpm2_createpolicy."""
+    value = bytes.fromhex(args.value)
+    print(pcr_policy_digest(args.pcr, value, args.alg).hex())
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -206,9 +321,16 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selfcheck", help="prove the replay reproduces the live PCR")
     sub.add_parser("show", help="list what this PCR measures, by variable name")
+    sp = sub.add_parser("predict", help="value this PCR takes under a future state")
+    sp.add_argument("--set", action="append", metavar="kind:name=HEX",
+                    help="replace a measurement, e.g. authority:db=<sha256 hex>")
+    pd = sub.add_parser("policy-digest",
+                        help="policyDigest for a PCR value (check vs tpm2_createpolicy)")
+    pd.add_argument("--value", required=True, metavar="HEX")
     args = p.parse_args()
     try:
-        return {"selfcheck": cmd_selfcheck, "show": cmd_show}[args.cmd](args)
+        return {"selfcheck": cmd_selfcheck, "show": cmd_show,
+                "predict": cmd_predict, "policy-digest": cmd_policy_digest}[args.cmd](args)
     except EventLogError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
