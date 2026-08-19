@@ -16,6 +16,10 @@ on:
       - 'image/test-preloaded-sizing.sh'
       - 'image/test-preloaded-output-set.sh'
       - 'image/test-debug-ssh-key.sh'
+      # The first-boot service is the far end of the same chain the suite
+      # exercises: the medium carries the key, this serves it. Leaving it out
+      # means a change that silently stops serving the key triggers nothing.
+      - 'image/firstboot/neural-ice-firstboot-sshkey.sh'
       - 'image/verify-preloaded-media.py'
       - 'image/test-seed-tree-manifest.py'
       - 'image/test-verify-preloaded-media.sh'
