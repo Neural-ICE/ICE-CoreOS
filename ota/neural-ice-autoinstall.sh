@@ -591,6 +591,32 @@ mount -o remount,rw "$TGT" \
 rm -f -- "$installer_device_root_dropin" \
   || die "cannot remove the installer-only device-root Live guard"
 rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
+
+# The medium runs with a permissive container-signature policy so bootc can read
+# its own local image through whatever transport it picks -- containers-storage
+# while the media is written, oci:/proc/self/fd/N during copy-to-storage. See
+# image/Containerfile.installer. That permissiveness MUST NOT reach the installed
+# appliance: the deployment is written from the medium's own image, so without
+# this the appliance would boot accepting any unsigned local image.
+#
+# The strict grafted policy travelled beside it, verbatim. Restoring it here is
+# what keeps the exception scoped to the medium, and it is the same shape as the
+# device-root guard removed just above: installer-only state, undone before the
+# target ever boots.
+strict_policy=/usr/lib/neural-ice-policy-strict.json
+[[ -f "$strict_policy" && ! -L "$strict_policy" ]] \
+  || die "the strict container policy is absent from this medium; refusing to install an appliance that would keep the permissive one"
+install -d -m 0755 -- "$dep/etc/containers" \
+  || die "cannot prepare /etc/containers on the target deployment"
+install -m 0644 -- "$strict_policy" "$dep/etc/containers/policy.json" \
+  || die "cannot restore the strict container policy onto the target deployment"
+# Assert the restored file, not the copy: a policy that silently stayed
+# permissive is exactly the failure this block exists to prevent, and it would
+# only surface as an appliance that trusts unsigned images.
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("default")==[{"type":"reject"}] and "docker" in d.get("transports",{}) else 1)' \
+  "$dep/etc/containers/policy.json" \
+  || die "the container policy restored onto the target is not the fail-closed grafted one"
+echo "[neural-ice-autoinstall] Strict container signature policy restored on the target deployment."
 setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null | head -1)"
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"

@@ -39,6 +39,70 @@ RUN set -euxo pipefail; \
     # idempotent first-boot/runtime attestation.
     systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service
 
+# The base may be a composed APPLIANCE image, which carries bound-image links in
+# /usr/lib/bootc/bound-images.d (ICE-Fabric #293). `bootc install to-filesystem`
+# resolves them while writing this medium, against an image store that only
+# exists on an INSTALLED system, and the media build dies:
+#
+#   resolving bound image …/working-memory@sha256:…: can't stat imageStore dir
+#   /var/lib/neural-ice/data/seed-store: no such file or directory
+#
+# The preloaded path never hit this because it stages a seed store of its own, so
+# the defect only surfaces on the LIGHT medium -- the architecture we are moving
+# to (no models embedded, ADR-0040).
+#
+# ⚠️ WHAT THIS COSTS, precisely. That directory holds SYMLINKS into
+# /usr/share/containers/systemd/neural-ice-bound-images/, and those 22 .image
+# quadlets are NOT removed -- verified on the built installer image: 0 entries in
+# bound-images.d, 22 quadlets still present. So the installed appliance keeps
+# every image definition and podman still manages them. What is lost is the bootc
+# LIFECYCLE COUPLING #293 established: an OS rollback no longer rolls back the
+# application bytes with it.
+#
+# 🔴 That is a real deviation, not a no-op, and it lands on the INSTALLED system:
+# the autoinstaller writes the deployment from this medium's own image
+# (--source-imgref containers-storage:localhost/bootc), not from TARGET_IMGREF,
+# which is only recorded as the future OTA origin. An earlier revision of this
+# comment claimed the opposite and was wrong.
+#
+# It is accepted for a lab appliance whose rollbacks are supervised, and it is
+# closed by making the medium install the APPLIANCE image rather than its own --
+# which needs that image staged on the medium, and is the next change here.
+RUN rm -rf /usr/lib/bootc/bound-images.d
+
+# The grafted container signature policy is fail-closed and, by design, emits
+# only the `docker` transport (image/policy/render-container-policy.sh: it
+# "cannot emit insecureAcceptAnything anywhere"). Every LOCAL transport therefore
+# falls to `default: reject`, and every step that reads a local image dies:
+#
+#   bootc-image-builder, writing this medium : containers-storage:…  rejected
+#   the autoinstaller, copy-to-storage       : oci:/proc/self/fd/3   rejected
+#
+# Enumerating transports is whack-a-mole -- the next bootc release picks another.
+# The medium instead runs permissive and the STRICT policy travels beside it, to
+# be restored onto the installed deployment by neural-ice-autoinstall before
+# first boot. That is what keeps this exception to the medium, which is what was
+# authorised: the appliance boots with the graft it was composed with.
+#
+# The signed docker scopes are preserved in the permissive policy too, so even
+# here a registry pull is still verified against image-ci.
+RUN python3 -c "import json,shutil; p='/etc/containers/policy.json'; d=json.load(open(p)); \
+assert d.get('default')==[{'type':'reject'}], 'base policy is not fail-closed; refusing to relax an unknown policy'; \
+assert 'docker' in d.get('transports',{}), 'base policy carries no signed docker scopes; refusing to relax an ungrafted policy'; \
+shutil.copyfile(p,'/usr/lib/neural-ice-policy-strict.json'); \
+d['default']=[{'type':'insecureAcceptAnything'}]; \
+json.dump(d, open(p,'w'), indent=4, sort_keys=True)"
+
+# Assert both halves rather than trusting the edit: the medium is permissive,
+# the strict original is preserved verbatim for the autoinstaller to restore,
+# and the signed docker scopes survive in both.
+RUN python3 -c "import json; live=json.load(open('/etc/containers/policy.json')); strict=json.load(open('/usr/lib/neural-ice-policy-strict.json')); \
+assert live['default']==[{'type':'insecureAcceptAnything'}]; \
+assert strict['default']==[{'type':'reject'}]; \
+assert 'registry.neural-ice.ch/neural-ice' in live['transports']['docker']; \
+assert strict['transports']==live['transports']; \
+print('installer policy: medium permissive, strict original preserved for the target')"
+
 # Branding (os-release, Plymouth, kargs) is inherited from the canonical image.
 LABEL org.opencontainers.image.title="Neural ICE CoreOS (DGX Spark installer)" \
       neural-ice.role="installer-dualmode"
