@@ -28,7 +28,15 @@ require_fixed "runs-on: [self-hosted, Linux, X64]" "$WORKFLOW"
 require_fixed "permissions: {}" "$WORKFLOW"
 require_fixed 'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUEST_REF" != refs/heads/main ]; then' "$WORKFLOW"
 require_fixed "needs: validate-request" "$WORKFLOW"
-require_fixed "runs-on: [self-hosted, Linux, ARM64, spark]" "$WORKFLOW"
+# `gb10` is part of the contract, not decoration: seven runners answer `spark`
+# and only spark-63 holds the immutable artifact store this job materialises
+# from. Asserting the label here is what keeps the pin from being dropped as
+# noise -- it was previously a comment in the workflow and a lottery in fact.
+require_fixed "runs-on: [self-hosted, Linux, ARM64, spark, gb10]" "$WORKFLOW"
+# build-kernel shares that store (same concurrency group) and so shares the pin.
+# Asserting only one of the pair is how the other drifts back.
+require_fixed "runs-on: [self-hosted, Linux, ARM64, spark, gb10]" \
+  "$REPO_ROOT/.github/workflows/build-kernel.yml"
 
 # The producer authenticates only to GHCR. Product mirroring and channel/alias
 # mutation remain outside this repo, in the signed ICE-Fabric release train.
