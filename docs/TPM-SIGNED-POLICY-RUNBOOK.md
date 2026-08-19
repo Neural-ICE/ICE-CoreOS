@@ -223,6 +223,31 @@ independent, which no flag description suggests.
 
 The signature is supplied at **unlock**, from the path in §5.
 
+## 🔴 5quater · What the proof does NOT cover — the systemd version
+
+**Everything proven in §9 ran on `spark-63`, which is Ubuntu 24.04 (DGX OS) and
+whose cryptsetup token plugin announces itself as:**
+
+```
+Token handler systemd-tpm2-1.0 systemd-v255 (255.4-1ubuntu8.16)
+```
+
+**The appliance ships systemd 257.** The source read in §5bis is v257; the
+behaviour measured in §5ter and §9 is v255. They agreed everywhere they were both
+observable, but that is not the same as having been checked on 257.
+
+⚠️ **Re-run `ota/test-tpm-signed-policy.sh` on the appliance image before treating
+any of this as established for what we ship.** The flags in §5ter are the most
+likely thing to move between versions: `--tpm2-pcrs=` emptying the hash bank is a
+behaviour, not a documented contract.
+
+**Known difference already observed on 255**: with TWO tpm2 tokens enrolled (the
+transition slot of §8), `systemd-cryptsetup` did not open the volume — it reported
+both tokens "unusable for segment 0 with desired keyslot priority 2", then tried
+token 0 alone. Enrolment is fine (3 keyslots, 2 tokens in the header); it is the
+unlock path that did not iterate. **Whether 257 iterates is untested**, and the
+transition slot is worth little if it does not.
+
 ## 6 · Verification clause (FAB-0046)
 
 A control that proves the policy **in force** is the expected one. Not that the
@@ -299,8 +324,11 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 | 2026-08-19 | the signed digest is the plain PolicyPCR value | ✅ `f064008d…` == systemd's own `approved_policy`, and confirmed by reading `tpm2_calculate_policy_pcr()` |
 | 2026-08-19 | an unauthorised state is refused | ✅ |
 | 2026-08-19 | the recovery passphrase opens a volume whose policy fails | ✅ |
-| 2026-08-19 | the flag combination | ✅ settled — §5ter |
+| 2026-08-19 | the flag combination | ✅ settled — §5ter, **on systemd 255** (§5quater) |
 | 2026-08-19 | 🎯 **a pre-authorised future state unlocks, no re-enrolment** | ✅ **the mechanism holds** |
+| 2026-08-19 | transition slot enrolled beside the live one | ✅ 3 keyslots, 2 tokens |
+| 2026-08-19 | unlocking with two policy tokens | ❌ refused on systemd 255 — §5quater |
+| | the whole harness re-run on systemd 257 | **not done — §5quater** |
 | | §7 recovery proven end to end AT BOOT, on an installed machine | not done — the test volume cannot show it |
 | | §6 clause executed | not done |
 | | third LUKS slot | not done |

@@ -174,8 +174,78 @@ printf '%s' "$PASS" | cryptsetup open "$LOOP" nitest - 2>/dev/null \
 ok "recovery passphrase opens it: a wrong policy costs an unlock, never the data"
 cryptsetup close nitest
 
+say "10. the transition slot — a new policy enrolled while the old one still opens"
+# mission-0024 objective 5, and it is independent of everything above: rotating a
+# policy must never be a cutover. On a machine nobody can reach, "enrol the new
+# one, hope, then discover" is not a procedure — the old slot has to keep working
+# until the new one is observed to work.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$W/priv2.pem" 2>/dev/null
+openssl rsa -in "$W/priv2.pem" -pubout -out "$W/pub2.pem" 2>/dev/null
+NOW2="$(pcr_now)"
+POL2="$(python3 "$TOOL" --pcr "$PCR" policy-digest --value "$NOW2")"
+python3 "$TOOL" sign-request --pol "$POL2" --out "$W/p2.bin" >/dev/null
+# A real rotation has BOTH keys authorising the state the machine is in: that is
+# precisely what lets the old slot keep working while the new one is proven. The
+# earlier revision of this step signed the current state with the NEW key only,
+# which is a cutover wearing a rotation's clothes — and the volume refused, as it
+# should have.
+openssl dgst -sha256 -sign "$W/priv2.pem" -out "$W/p2.bin.sig" "$W/p2.bin"
+openssl dgst -sha256 -sign "$W/priv.pem"  -out "$W/p2.old.sig" "$W/p2.bin"
+python3 "$TOOL" --pcr "$PCR" emit --pubkey "$W/pub2.pem" --pol "$POL2" \
+  --sig "$W/p2.bin.sig" --out "$W/sig2.json" >/dev/null
+python3 "$TOOL" --pcr "$PCR" emit --pubkey "$W/pub.pem" --pol "$POL2" \
+  --sig "$W/p2.old.sig" --merge "$W/sig2.json" --out "$W/sig2.json" >/dev/null
+
+# Both signature files must be readable at once, so the union goes to the path
+# systemd reads. A rotation where only the NEW key is authorised is the cutover
+# we are trying to avoid.
+python3 - "$W/sig.json" "$W/sig2.json" "$W/both.json" <<'PYMERGE'
+import json, sys
+a, b, out = (json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3])
+for alg, entries in b.items():
+    a.setdefault(alg, []).extend(entries)
+json.dump(a, open(out, "w"), separators=(",", ":"))
+PYMERGE
+install -m 0644 "$W/both.json" /run/systemd/tpm2-pcr-signature.json
+
+PASSWORD="$PASS" systemd-cryptenroll "$LOOP" \
+  --tpm2-device=auto --tpm2-pcrs= \
+  --tpm2-public-key="$W/pub2.pem" --tpm2-public-key-pcrs="$PCR" >/dev/null 2>&1 \
+  || bad "the second policy could not be enrolled beside the first"
+SLOTS="$(cryptsetup luksDump "$LOOP" | grep -cE '^  [0-9]+: luks2')"
+[[ "$SLOTS" -ge 3 ]] || bad "expected at least 3 keyslots, found $SLOTS"
+ok "$SLOTS keyslots: recovery, the old policy, and the new one — no cutover"
+
+say "11. both policies open the volume"
+systemd-cryptsetup attach nitest "$LOOP" - "tpm2-device=auto,headless=1" >/dev/null 2>&1 \
+  || bad "the volume does not open while two policies are enrolled"
+ok "opens — both policies authorise the current state, so the machine is safe\n     to leave here until the new key is proven"
+cryptsetup close nitest
+
+say "12. retire the old policy, keep the new"
+# systemd-cryptenroll --wipe-slot takes the slot number; slot 1 is the first
+# policy enrolled in step 4.
+PASSWORD="$PASS" systemd-cryptenroll "$LOOP" --wipe-slot=1 >/dev/null 2>&1 \
+  || bad "could not retire the old policy slot"
+SLOTS="$(cryptsetup luksDump "$LOOP" | grep -cE '^  [0-9]+: luks2')"
+systemd-cryptsetup attach nitest "$LOOP" - "tpm2-device=auto,headless=1" >/dev/null 2>&1 \
+  || bad "the volume stopped opening once the old policy was retired"
+ok "$SLOTS keyslots left, and it still opens on the new policy alone"
+cryptsetup close nitest
+
+say "13. the FAB-0046 clause, executed"
+# The clause asserts on the header of a real device. Running it here is what makes
+# it a control rather than a paragraph.
+if "$ROOT/ota/neural-ice-tpm-policy-check.sh" "$LOOP"; then
+  ok "the clause passes on a correctly enrolled volume"
+else
+  bad "the clause fails on a volume this harness just proved correct — the clause is wrong"
+fi
+
 printf '\n\033[1m== proven on this host\033[0m\n'
 printf '  a future state, signed in advance, opens without re-enrolment\n'
+printf '  a policy can be rotated through a transition slot, with no cutover\n'
+printf '  the FAB-0046 clause passes on a correct volume\n'
 printf '  an unauthorised state is refused\n'
 printf '  recovery restores access when the policy fails\n'
 printf '\n  \033[33mNOT proven here: systemd-cryptsetup opening the ROOT at boot from\n'
