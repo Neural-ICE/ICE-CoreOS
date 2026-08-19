@@ -110,10 +110,23 @@ else
   sudo podman pull "$BASE_IMAGE"
 fi
 if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" || -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
-  sudo podman run --rm --network none --read-only \
-    --entrypoint /usr/bin/grep "$BASE_IMAGE" \
-    -qx 'PRETTY_NAME="Neural ICE CoreOS (debug)"' /usr/lib/os-release \
-    || { echo "ERROR: LAB-only ESP inputs require a debug base image" >&2; exit 1; }
+  # The discriminator is the Secure Boot ANCHOR, not the debug posture.
+  #
+  # It used to be the "(debug)" PRETTY_NAME, which conflated two things: a debug
+  # image (sshd unmasked, SELinux permissive, serial root autologin) and a build
+  # we are allowed to hand an ESP key to. Since the first-boot service serves a
+  # provisioned key on a SEALED image, `sealed-lab` is now the build we actually
+  # install -- and the old check refused exactly that, which is what made the
+  # medium's key unusable for anything but a debug box.
+  #
+  # What must stay closed is the CUSTOMER surface: a prod-anchored image must
+  # never be openable by a crafted medium. Gating on the lab anchor keeps that
+  # shut while letting the sealed lab build take the key, and it needs no update
+  # when prod-v1 finally exists -- prod simply never matches.
+  anchor="$(sudo podman image inspect "$BASE_IMAGE" \
+    --format '{{index .Labels "ch.neural-ice.signed-boot-trust-policy-id"}}' 2>/dev/null || true)"
+  [[ "$anchor" == neural-ice-secureboot-lab-v1 ]] \
+    || { echo "ERROR: LAB-only ESP inputs require a lab-anchored base image (got '${anchor:-no anchor label}')" >&2; exit 1; }
 fi
 sudo podman build --pull=never --platform linux/arm64 \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
