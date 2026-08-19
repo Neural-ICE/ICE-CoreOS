@@ -56,6 +56,39 @@ RUN set -euxo pipefail; \
 # which has no seed store to offer at build time.
 RUN rm -rf /usr/lib/bootc/bound-images.d
 
+# The grafted container signature policy is fail-closed and, by design, emits
+# only the `docker` transport (image/policy/render-container-policy.sh: it
+# "cannot emit insecureAcceptAnything anywhere"). Anything read through
+# `containers-storage` therefore falls to `default: reject`.
+#
+# Both `bootc install to-filesystem` calls read their SOURCE that way: the one
+# bootc-image-builder makes while writing this medium, and the one the
+# autoinstaller makes on the appliance -- it installs from the local store
+# offline (`--skip-fetch-check`), never from a registry. So the medium could
+# neither be built nor perform an install:
+#
+#   Running image containers-storage:…@… is rejected by policy
+#
+# This was invisible until now because the previous medium predates the graft.
+#
+# Accepting `containers-storage` HERE, and only here, moves the trust boundary
+# for local content to "who built the medium" -- physical and organisational,
+# the same boundary as the operator key on the ESP. The `docker` transport keeps
+# its signed scopes, so any registry pull stays verified, and the INSTALLED
+# appliance is untouched: its policy comes from the appliance image, not from
+# this one.
+#
+# The clean end state is signing the seed store's contents and emitting a
+# `containers-storage` scope that verifies those signatures. That is a project,
+# not a line: until then this is the documented, bounded exception.
+RUN python3 -c "import json; p='/etc/containers/policy.json'; d=json.load(open(p)); assert d.get('default')==[{'type':'reject'}], 'base policy is not fail-closed; refusing to relax an unknown policy'; assert 'docker' in d.get('transports',{}), 'base policy carries no signed docker scopes; refusing to relax an ungrafted policy'; d['transports']['containers-storage']={'':[{'type':'insecureAcceptAnything'}]}; json.dump(d, open(p,'w'), indent=4, sort_keys=True)"
+
+# Assert the result rather than trusting the edit: the docker scopes must still
+# be there, the default must still be reject, and only containers-storage may
+# have moved. A silent policy edit is exactly the failure this file exists to
+# avoid.
+RUN python3 -c "import json; d=json.load(open('/etc/containers/policy.json')); assert d['default']==[{'type':'reject'}]; assert 'registry.neural-ice.ch/neural-ice' in d['transports']['docker']; assert d['transports']['containers-storage']=={'':[{'type':'insecureAcceptAnything'}]}; print('installer policy: docker scopes intact, containers-storage accepted, default still reject')"
+
 # Branding (os-release, Plymouth, kargs) is inherited from the canonical image.
 LABEL org.opencontainers.image.title="Neural ICE CoreOS (DGX Spark installer)" \
       neural-ice.role="installer-dualmode"
