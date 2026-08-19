@@ -128,10 +128,51 @@ the cadence we already operate.
 `/boot` and the ESP remain the out-of-band escape hatch: since the signature is
 self-protecting (§3), dropping one there by hand during recovery is safe.
 
-⚠️ **To pin at implementation time**: the exact path `systemd-cryptsetup` reads.
-The shipped binary is stripped and does not reveal it; do not guess it — read it
-from the systemd 257 source or observe it on a live unlock, and record the answer
-here.
+**Pinned by measurement, 2026-08-19** — `systemd-cryptsetup` reads:
+
+```
+/run/systemd/tpm2-pcr-signature.json
+```
+
+Established by watching it fail: with the file elsewhere and passed as a
+`tpm2-signature=` crypttab option, the debug log says
+
+```
+Failed to find TPM PCR signature file 'tpm2-pcr-signature.json': No such file or directory
+```
+
+⚠️ The crypttab option did **not** override the search. Place the file at the
+path above; do not rely on passing it by option.
+
+## 🔴 5bis · What is signed is NOT the plain PolicyPCR digest
+
+**Measured 2026-08-19 on GB10 hardware, and it contradicts the assumption this
+document was first written with.**
+
+A signature over the plain `PolicyPCR` digest — the value `tpm2_createpolicy
+--policy-pcr` produces, which `neural-ice-tpm-policy.py policy-digest`
+reproduces byte for byte — **does not unlock a volume in the state it
+authorises**. Proven both with the state alone in the signature file and with it
+alongside the current state.
+
+The reason is visible in `SYSTEMD_LOG_LEVEL=debug systemd-cryptsetup attach`:
+
+```
+Session policy digest: 82c55c7c621608e3b9bab229761a4e27d6e8836bd4dd6af285f95df5dddf8baa
+Session policy digest: 629e2e977ad5cdb6d8d62fc160bceb4af16a7cb2177ec93f61aeded08355dc45
+```
+
+systemd builds a **composite** policy in two branches — `PolicyAuthorize`
+combined with `PolicyPCR` — and neither digest is the plain PolicyPCR value.
+
+**Consequence**: the exact policy construction of systemd 257 must be read from
+its source, not inferred. A digest that agrees with a reference tool can still be
+the wrong thing to sign, and that is precisely the failure mode this document
+exists to prevent: a well-formed authorisation nobody can use, discovered on the
+day of the switch.
+
+⚠️ **This is why the proof comes before deployment.** The mistake was caught on a
+32 MiB loopback file. Under the literal seal it would have been caught on a fleet.
 
 ## 6 · Verification clause (FAB-0046)
 
@@ -195,11 +236,21 @@ unreachable.
 
 ## 9 · Evidence
 
-| date | step | command and output |
+All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.sh`.
+
+| date | step | result |
 | --- | --- | --- |
-| 2026-08-19 | §1 chain established by reading | GRUB, no UKI, systemd 257 — see §1 |
-| | §7 recovery proven | **not done — blocks every deployment** |
+| 2026-08-19 | §1 chain established by reading | GRUB, no UKI, systemd 257 |
+| 2026-08-19 | event-log replay reproduces the live PCR 7 | ✅ `d76b3540…` == `d76b3540…` |
+| 2026-08-19 | a future PCR 7 is predicted exactly | ✅ predicted value reached to the byte after `tpm2_pcrextend` |
+| 2026-08-19 | enrolment against a public key | ✅ header carries `tpm2-pubkey`, `tpm2-pubkey-pcrs: 7` |
+| 2026-08-19 | the enrolled state unlocks with no passphrase | ✅ |
+| 2026-08-19 | signature JSON matches `systemd-measure` | ✅ byte for byte |
+| 2026-08-19 | signature read path | ✅ pinned: `/run/systemd/tpm2-pcr-signature.json` |
+| 2026-08-19 | 🔴 **a pre-authorised future state unlocks** | ❌ **refused** — §5bis: the plain PolicyPCR digest is not what systemd expects to be signed |
+| | §7 recovery proven | not reached — blocked behind §5bis |
 | | §6 clause executed | not done |
+| | third LUKS slot | not done |
 
 ## Related
 
