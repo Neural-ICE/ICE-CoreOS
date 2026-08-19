@@ -1,6 +1,9 @@
 # TPM signed policy — replacing the literal PCR 7 seal
 
-> **Status**: target architecture. The mechanism below is established by reading
+> **Status**: mechanism PROVEN on GB10 hardware 2026-08-19 (§9). What remains is
+> proving it at boot on an installed machine, and wiring it into the installer.
+>
+> Previously: established by reading
 > the shipped image (see §1); the tooling is under construction. Nothing here is
 > deployed yet.
 >
@@ -174,32 +177,51 @@ find_signature(json, pcr_selection, fp, approved_policy)
 from a failing test before the cause was known, and it was wrong. Recorded here
 rather than quietly deleted: the failure was real, the explanation was not.
 
-## 🔴 5ter · The default that defeats the whole mechanism
+## 🔴 5ter · Two flags decide whether this works at all
 
-`systemd-cryptenroll` seals against **PCR 7 literally, by default**. Enrolling
-with only `--tpm2-public-key-pcrs=7` therefore produces a keyslot bound to BOTH:
+**The working combination, proven end to end 2026-08-19 on GB10 hardware:**
+
+```bash
+systemd-cryptenroll "$DEV" \
+  --tpm2-device=auto \
+  --tpm2-pcrs=                     # EMPTY — and this is not optional
+  --tpm2-public-key=owner.pub \
+  --tpm2-public-key-pcrs=7
+                                   # and NO --tpm2-signature here
+install -m 0644 sig.json /run/systemd/tpm2-pcr-signature.json
+```
+
+Neither flag is obvious, and each fails in a different, silent way.
+
+**`--tpm2-pcrs=` must be EMPTY.** Its default is `7`, so an enrolment that only
+sets `--tpm2-public-key-pcrs=7` binds the keyslot to BOTH:
 
 ```
 PolicyAuthorize(pubkey)     ← the signed policy we want
-PolicyPCR(7) literal        ← silently added by the DEFAULT --tpm2-pcrs=7
+PolicyPCR(7) literal        ← added silently by the default
 ```
 
-The literal half fails the moment PCR 7 moves, whatever the signature says. The
-debug log shows it as `Policy hash mismatch` — the sealing policy rebuilt at
-unlock no longer equals the one stored in the token.
+The literal half fails the moment PCR 7 moves, whatever the signature authorises
+(`Policy hash mismatch` in the log). **The default silently reintroduces the exact
+fragility this document exists to remove**, and works perfectly until the day the
+state changes — which is the worst possible failure schedule.
 
-**So the default silently reintroduces exactly the fragility this document exists
-to remove**, and it does so in a way that works perfectly until the day the state
-changes.
+**`--tpm2-signature` must NOT be passed at enrolment.** It makes `cryptenroll`
+verify by unsealing immediately, and once `--tpm2-pcrs` is empty that self-check
+reads the PCRs with an unset hash bank:
 
-⚠️ Passing `--tpm2-pcrs=` empty is NOT sufficient on its own: the enrolment then
-fails its own unseal self-check with `Failed to unseal secret using TPM2: State
-not recoverable`. **The correct flag combination is not yet established** — this
-is the open item, and the only one left before the mechanism can be proven end to
-end.
+```
+Reading PCR selection: [n/a(7)]
+Failed to read TPM2 PCRs: hash algorithm not supported or not appropriate
+Failed to unseal secret using TPM2: State not recoverable
+```
 
-**This is why the proof comes before deployment.** Two ways to ship a policy that
-looks right and locks a fleet, both caught on a 32 MiB loopback file.
+⚠️ The enrolment itself is sound; only its optional verification is not. The error
+names unsealing, so it reads as "the policy is broken" when nothing is. Emptying
+the literal mask clears the bank the *signed* branch also needed — the two are not
+independent, which no flag description suggests.
+
+The signature is supplied at **unlock**, from the path in §5.
 
 ## 6 · Verification clause (FAB-0046)
 
@@ -277,9 +299,9 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 | 2026-08-19 | the signed digest is the plain PolicyPCR value | ✅ `f064008d…` == systemd's own `approved_policy`, and confirmed by reading `tpm2_calculate_policy_pcr()` |
 | 2026-08-19 | an unauthorised state is refused | ✅ |
 | 2026-08-19 | the recovery passphrase opens a volume whose policy fails | ✅ |
-| 2026-08-19 | 🔴 **a pre-authorised future state unlocks** | ❌ **refused** — §5ter: `--tpm2-pcrs` defaults to 7, adding a literal seal alongside the signed one |
-| | correct flag combination | **open — the only thing between here and the mechanism working** |
-| | §7 recovery proven end to end at boot | not reached |
+| 2026-08-19 | the flag combination | ✅ settled — §5ter |
+| 2026-08-19 | 🎯 **a pre-authorised future state unlocks, no re-enrolment** | ✅ **the mechanism holds** |
+| | §7 recovery proven end to end AT BOOT, on an installed machine | not done — the test volume cannot show it |
 | | §6 clause executed | not done |
 | | third LUKS slot | not done |
 

@@ -28,6 +28,7 @@ cleanup() {
   [[ -e /dev/mapper/nitest ]] && cryptsetup close nitest 2>/dev/null || true
   [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null || true
   rm -rf "$W"
+  rm -f /run/systemd/tpm2-pcr-signature.json
 }
 trap cleanup EXIT
 
@@ -99,11 +100,33 @@ printf '%s' "$PASS" | cryptsetup luksFormat --type luks2 --batch-mode \
   --pbkdf pbkdf2 --pbkdf-force-iterations 1000 "$LOOP" - 2>/dev/null
 ok "volume created, slot 0 = recovery passphrase"
 
+# Two flags here are load-bearing and neither is obvious.
+#
+# --tpm2-pcrs= EMPTY: without it systemd-cryptenroll ALSO seals against PCR 7
+# literally (that is its default), so the keyslot ends up bound to
+# PolicyAuthorize(pubkey) AND PolicyPCR(7)-literal. The literal half then fails
+# the moment PCR 7 moves, whatever the signature authorises -- the default
+# silently reintroduces the exact fragility this mechanism removes.
+#
+# NO --tpm2-signature: passing it makes cryptenroll verify the enrolment by
+# unsealing immediately, and that self-check reads the PCRs with an unset hash
+# bank once --tpm2-pcrs is empty:
+#
+#   Reading PCR selection: [n/a(7)]
+#   Failed to read TPM2 PCRs: hash algorithm not supported or not appropriate
+#   Failed to unseal secret using TPM2: State not recoverable
+#
+# The enrolment itself is fine; only its optional verification is not. The
+# signature is supplied at UNLOCK, from /run/systemd/tpm2-pcr-signature.json.
 PASSWORD="$PASS" systemd-cryptenroll "$LOOP" \
-  --tpm2-device=auto --tpm2-public-key="$W/pub.pem" --tpm2-public-key-pcrs="$PCR" \
-  --tpm2-signature="$W/sig.json" >/dev/null 2>&1 \
+  --tpm2-device=auto --tpm2-pcrs= \
+  --tpm2-public-key="$W/pub.pem" --tpm2-public-key-pcrs="$PCR" >/dev/null 2>&1 \
   || bad "enrolment against the signed policy failed"
-ok "slot 1 = signed policy, bound to the public key (not to a PCR value)"
+ok "slot 1 = signed policy, bound to the public key alone (no literal PCR seal)"
+
+install -d -m 0755 /run/systemd
+install -m 0644 "$W/sig.json" /run/systemd/tpm2-pcr-signature.json
+ok "signature placed where systemd-cryptsetup looks for it"
 
 # Assert on what the header actually says, and PRINT it: the token type string
 # is a cryptsetup/systemd implementation detail that has changed across releases,
@@ -116,7 +139,7 @@ ok "the header carries a TPM2 token"
 
 say "5. state A — it opens"
 systemd-cryptsetup attach nitest "$LOOP" - \
-  "tpm2-device=auto,tpm2-signature=$W/sig.json,headless=1" >/dev/null 2>&1 \
+  "tpm2-device=auto,headless=1" >/dev/null 2>&1 \
   || bad "the volume does not open in the state it was enrolled in"
 ok "opened with no passphrase, in state A"
 cryptsetup close nitest
@@ -129,7 +152,7 @@ ok "PCR 7 moved to exactly the predicted value"
 
 say "7. 🎯 THE POINT — it still opens, with no re-enrolment"
 if systemd-cryptsetup attach nitest "$LOOP" - \
-     "tpm2-device=auto,tpm2-signature=$W/sig.json,headless=1" >/dev/null 2>&1; then
+     "tpm2-device=auto,headless=1" >/dev/null 2>&1; then
   ok "opened in a state it was NEVER sealed to, because the Owner authorised it in advance"
   cryptsetup close nitest
 else
@@ -139,7 +162,7 @@ fi
 say "8. an UNauthorised state — it must refuse"
 tpm2_pcrextend "$PCR:sha256=$(printf 'unauthorised' | sha256sum | cut -d' ' -f1)" >/dev/null
 if systemd-cryptsetup attach nitest "$LOOP" - \
-     "tpm2-device=auto,tpm2-signature=$W/sig.json,headless=1" >/dev/null 2>&1; then
+     "tpm2-device=auto,headless=1" >/dev/null 2>&1; then
   cryptsetup close nitest
   bad "a state nobody authorised opened the volume — the policy is not binding"
 fi
