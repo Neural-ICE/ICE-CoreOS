@@ -10,6 +10,18 @@ on:
       - "ci/test-artifact-generation.sh"
       - "ci/test-stage-nvidia-userspace.sh"
       - "ci/build-image.sh"
+      # The two files that decide whether an appliance installs at all were
+      # covered by NO pull-request check: three defects shipped through them on
+      # 2026-08-19 and CI never looked. Adding them here is the cheapest gate
+      # that exists — the media build is the real test, but it costs 20 minutes
+      # and a build host, so it cannot be the FIRST thing that notices.
+      - "image/Containerfile.installer"
+      - "image/build-installer-usb.sh"
+      - "image/lib/debug-ssh-key.sh"
+      - "ota/neural-ice-autoinstall.sh"
+      - "ota/neural-ice-tpm-policy.py"
+      - "ota/neural-ice-tpm-policy-check.sh"
+      - "ota/test-tpm-signed-policy.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-oci-signature-policy.sh"
@@ -79,7 +91,27 @@ jobs:
             ci/test-build-image-dispatch-contract.sh ci/test-open-core-boundary.sh \
             ci/test-oci-signature-policy.sh image/policy/render-container-policy.sh \
             ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
-            build/build-kernel.sh
+            build/build-kernel.sh \
+            image/build-installer-usb.sh image/lib/debug-ssh-key.sh \
+            ota/neural-ice-autoinstall.sh ota/neural-ice-tpm-policy-check.sh \
+            ota/test-tpm-signed-policy.sh
+      - name: Validate the installer image recipe and the TPM tooling
+        run: |
+          # A Containerfile has no linter here, so assert the properties that
+          # actually broke. Each line below corresponds to a defect that reached
+          # a build host on 2026-08-19.
+          f=image/Containerfile.installer
+          grep -q 'rm -rf /usr/lib/bootc/bound-images.d' "$f" \
+            || { echo "::error::the installer must drop the appliance bound-image links, or bootc-image-builder cannot write the medium"; exit 1; }
+          grep -q 'neural-ice-policy-strict.json' "$f" \
+            || { echo "::error::the strict container policy must be preserved for the autoinstaller to restore onto the target"; exit 1; }
+          grep -q "insecureAcceptAnything" "$f" \
+            || { echo "::error::the medium must be able to read its own local image, or bootc install fails on every local transport"; exit 1; }
+          grep -q 'neural-ice-policy-strict.json' ota/neural-ice-autoinstall.sh \
+            || { echo "::error::the autoinstaller must restore the strict policy: the deployment is written from the medium's own image, so the permissive one would otherwise reach the appliance"; exit 1; }
+          python3 -m py_compile ota/neural-ice-tpm-policy.py
+          echo "installer recipe and TPM tooling: the properties that broke are asserted"
+
       # skopeo is the containers/image policy engine itself: the signature-policy
       # test does not simulate a verdict, it asks the same code the appliance
       # runs. Installed explicitly rather than assumed present on the runner
