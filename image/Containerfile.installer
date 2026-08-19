@@ -39,6 +39,23 @@ RUN set -euxo pipefail; \
     # idempotent first-boot/runtime attestation.
     systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service
 
+# The base may be a composed APPLIANCE image, which carries bound-image links
+# in /usr/lib/bootc/bound-images.d (ICE-Fabric #293). Those bind the appliance's
+# 22 workload images to an image store that only exists on an INSTALLED system,
+# at /var/lib/neural-ice/data/seed-store. `bootc install to-filesystem` resolves
+# them while writing the media, where no such store exists, and the media build
+# dies:
+#
+#   resolving bound image …/working-memory@sha256:…: can't stat imageStore dir
+#   /var/lib/neural-ice/data/seed-store: no such file or directory
+#
+# The installer medium is not the appliance: it never runs those workloads. The
+# INSTALLED system does, and it is written from TARGET_IMGREF -- the appliance
+# image, whose links stay intact. Dropping them here therefore removes nothing
+# the installed appliance needs, and unblocks the light (non-preloaded) media,
+# which has no seed store to offer at build time.
+RUN rm -rf /usr/lib/bootc/bound-images.d
+
 # Branding (os-release, Plymouth, kargs) is inherited from the canonical image.
 LABEL org.opencontainers.image.title="Neural ICE CoreOS (DGX Spark installer)" \
       neural-ice.role="installer-dualmode"
