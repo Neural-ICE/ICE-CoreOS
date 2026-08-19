@@ -144,35 +144,62 @@ Failed to find TPM PCR signature file 'tpm2-pcr-signature.json': No such file or
 ⚠️ The crypttab option did **not** override the search. Place the file at the
 path above; do not rely on passing it by option.
 
-## 🔴 5bis · What is signed is NOT the plain PolicyPCR digest
+## 5bis · What is signed — settled, after one wrong turn
 
-**Measured 2026-08-19 on GB10 hardware, and it contradicts the assumption this
-document was first written with.**
-
-A signature over the plain `PolicyPCR` digest — the value `tpm2_createpolicy
---policy-pcr` produces, which `neural-ice-tpm-policy.py policy-digest`
-reproduces byte for byte — **does not unlock a volume in the state it
-authorises**. Proven both with the state alone in the signature file and with it
-alongside the current state.
-
-The reason is visible in `SYSTEMD_LOG_LEVEL=debug systemd-cryptsetup attach`:
+**The signed value IS the plain `PolicyPCR` digest**, computed from a zero
+starting digest over the public-key PCRs. Confirmed twice over, 2026-08-19:
 
 ```
-Session policy digest: 82c55c7c621608e3b9bab229761a4e27d6e8836bd4dd6af285f95df5dddf8baa
-Session policy digest: 629e2e977ad5cdb6d8d62fc160bceb4af16a7cb2177ec93f61aeded08355dc45
+this tool, policy-digest --value 6039b234…  f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4
+systemd's own approved_policy               f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4
 ```
 
-systemd builds a **composite** policy in two branches — `PolicyAuthorize`
-combined with `PolicyPCR` — and neither digest is the plain PolicyPCR value.
+and by reading `tpm2_calculate_policy_pcr()` in systemd v257, which computes
 
-**Consequence**: the exact policy construction of systemd 257 must be read from
-its source, not inferred. A digest that agrees with a reference tool can still be
-the wrong thing to sign, and that is precisely the failure mode this document
-exists to prevent: a well-formed authorisation nobody can use, discovered on the
-day of the switch.
+```
+hash   = H(concatenated PCR values)
+digest = H(previous ‖ TPM2_CC_PolicyPCR ‖ TPML_PCR_SELECTION ‖ hash)
+```
 
-⚠️ **This is why the proof comes before deployment.** The mistake was caught on a
-32 MiB loopback file. Under the literal seal it would have been caught on a fleet.
+— the same construction, and `tpm2_build_sealing_policy()` confirms the rest:
+
+```
+signature_hash = sha256(approved_policy)        → so `openssl dgst -sha256 -sign`
+.sigAlg = TPM2_ALG_RSASSA                       → PKCS#1 v1.5, NOT PSS
+find_signature(json, pcr_selection, fp, approved_policy)
+                                                → the JSON entry is matched on all three
+```
+
+⚠️ **An earlier revision of this section claimed the opposite.** It was written
+from a failing test before the cause was known, and it was wrong. Recorded here
+rather than quietly deleted: the failure was real, the explanation was not.
+
+## 🔴 5ter · The default that defeats the whole mechanism
+
+`systemd-cryptenroll` seals against **PCR 7 literally, by default**. Enrolling
+with only `--tpm2-public-key-pcrs=7` therefore produces a keyslot bound to BOTH:
+
+```
+PolicyAuthorize(pubkey)     ← the signed policy we want
+PolicyPCR(7) literal        ← silently added by the DEFAULT --tpm2-pcrs=7
+```
+
+The literal half fails the moment PCR 7 moves, whatever the signature says. The
+debug log shows it as `Policy hash mismatch` — the sealing policy rebuilt at
+unlock no longer equals the one stored in the token.
+
+**So the default silently reintroduces exactly the fragility this document exists
+to remove**, and it does so in a way that works perfectly until the day the state
+changes.
+
+⚠️ Passing `--tpm2-pcrs=` empty is NOT sufficient on its own: the enrolment then
+fails its own unseal self-check with `Failed to unseal secret using TPM2: State
+not recoverable`. **The correct flag combination is not yet established** — this
+is the open item, and the only one left before the mechanism can be proven end to
+end.
+
+**This is why the proof comes before deployment.** Two ways to ship a policy that
+looks right and locks a fleet, both caught on a 32 MiB loopback file.
 
 ## 6 · Verification clause (FAB-0046)
 
@@ -247,10 +274,25 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 | 2026-08-19 | the enrolled state unlocks with no passphrase | ✅ |
 | 2026-08-19 | signature JSON matches `systemd-measure` | ✅ byte for byte |
 | 2026-08-19 | signature read path | ✅ pinned: `/run/systemd/tpm2-pcr-signature.json` |
-| 2026-08-19 | 🔴 **a pre-authorised future state unlocks** | ❌ **refused** — §5bis: the plain PolicyPCR digest is not what systemd expects to be signed |
-| | §7 recovery proven | not reached — blocked behind §5bis |
+| 2026-08-19 | the signed digest is the plain PolicyPCR value | ✅ `f064008d…` == systemd's own `approved_policy`, and confirmed by reading `tpm2_calculate_policy_pcr()` |
+| 2026-08-19 | an unauthorised state is refused | ✅ |
+| 2026-08-19 | the recovery passphrase opens a volume whose policy fails | ✅ |
+| 2026-08-19 | 🔴 **a pre-authorised future state unlocks** | ❌ **refused** — §5ter: `--tpm2-pcrs` defaults to 7, adding a literal seal alongside the signed one |
+| | correct flag combination | **open — the only thing between here and the mechanism working** |
+| | §7 recovery proven end to end at boot | not reached |
 | | §6 clause executed | not done |
 | | third LUKS slot | not done |
+
+### What to try next, in order
+
+1. `--tpm2-pcrs=` empty **plus** whatever `systemd-cryptenroll` needs to skip its
+   post-enrolment unseal self-check — that check runs in the current state and may
+   simply need the signature file present at the default path *at enrolment time*
+   as well as at unlock.
+2. Failing that, enrol with `--tpm2-pcrs=` empty on a volume whose signature file
+   already covers the current state, and read the self-check's own debug output
+   rather than its summary line.
+3. Only then re-run `ota/test-tpm-signed-policy.sh` end to end.
 
 ## Related
 
