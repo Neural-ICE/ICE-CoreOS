@@ -28,7 +28,13 @@ permissions:
 
 jobs:
   kernel:
-    runs-on: [self-hosted, Linux, ARM64, spark]
+    # `gb10` is what pins this to the ONE host holding the immutable artifact
+    # store the step above materialises from. Seven runners answer `spark`;
+    # only spark-63 answers `gb10`. Without it the job is a lottery that fails
+    # with "current is not an atomic generation pointer" on any other machine --
+    # the runner-local dependency was stated in the comment above and enforced
+    # nowhere.
+    runs-on: [self-hosted, Linux, ARM64, spark, gb10]
     timeout-minutes: 600
     env:
       KERNEL_REF: ${{ github.event.client_payload.kernel_ref || 'fa4faa0227e00c2291e47b120e71c7aed0fe27b7' }}

@@ -44,7 +44,13 @@ jobs:
     concurrency:
       group: coreos-gb10-artifacts-nvidia-gb10-arm64
       cancel-in-progress: false
-    runs-on: [self-hosted, Linux, ARM64, spark]
+    # `gb10` is what pins this to the ONE host holding the immutable artifact
+    # store the step above materialises from. Seven runners answer `spark`;
+    # only spark-63 answers `gb10`. Without it the job is a lottery that fails
+    # with "current is not an atomic generation pointer" on any other machine --
+    # the runner-local dependency was stated in the comment above and enforced
+    # nowhere.
+    runs-on: [self-hosted, Linux, ARM64, spark, gb10]
     timeout-minutes: 120
     permissions:
       contents: read
