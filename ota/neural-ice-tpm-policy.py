@@ -305,6 +305,88 @@ def cmd_predict(args):
     return 0
 
 
+def pubkey_fingerprint(pubkey_pem):
+    """`pkfp` as systemd computes it.
+
+    ⚠️ sha256 of the RSAPublicKey DER (PKCS#1) — NOT of the SubjectPublicKeyInfo,
+    which is what `openssl pkey -pubout -outform DER` produces and what a
+    reasonable person assumes. Established empirically against a signature file
+    produced by systemd-measure; the wrong encoding yields a JSON systemd
+    silently declines to use."""
+    der = subprocess.run(["openssl", "rsa", "-pubin", "-in", pubkey_pem,
+                          "-RSAPublicKey_out", "-outform", "DER"],
+                         capture_output=True, check=True).stdout
+    return hashlib.sha256(der).hexdigest()
+
+
+def cmd_sign_request(args):
+    """Emit the exact bytes the Owner signs, and the command to sign them.
+
+    The private key never reaches this tool. It lives on the Owner's token, and
+    signing a policy is Owner-reserved by mission-0024."""
+    pol = bytes.fromhex(args.pol)
+    with open(args.out, "wb") as f:
+        f.write(pol)
+    print(f"  wrote {args.out} ({len(pol)} bytes) — the policy digest to authorise")
+    print("\n  sign it, on the Owner's machine, with the Owner's key:")
+    print(f"    openssl dgst -sha256 -sign <owner-key> -out {args.out}.sig {args.out}")
+    print("\n  the signature covers sha256(policy digest); systemd verifies it "
+          "with the public key whose fingerprint the JSON carries")
+    return 0
+
+
+def cmd_emit(args):
+    """Build the systemd signature JSON, refusing to emit one that cannot work."""
+    import base64
+    import json
+    import os
+
+    pol = bytes.fromhex(args.pol)
+    sig = open(args.sig, "rb").read()
+
+    # Verify before emitting. A signature file that does not verify produces an
+    # appliance that falls back to its recovery key at the worst moment, and the
+    # JSON looks perfectly well-formed either way.
+    with open("/tmp/.ni-pol.bin", "wb") as f:
+        f.write(pol)
+    try:
+        ok = subprocess.run(["openssl", "dgst", "-sha256", "-verify", args.pubkey,
+                             "-signature", args.sig, "/tmp/.ni-pol.bin"],
+                            capture_output=True).returncode == 0
+    finally:
+        os.unlink("/tmp/.ni-pol.bin")
+    if not ok:
+        print("🔴 the signature does not verify against this public key over this "
+              "policy digest; refusing to emit a file the appliance would reject",
+              file=sys.stderr)
+        return 1
+
+    entry = {"pcrs": [args.pcr], "pkfp": pubkey_fingerprint(args.pubkey),
+             "pol": pol.hex(), "sig": base64.b64encode(sig).decode()}
+
+    doc = {args.alg: []}
+    if args.merge:
+        doc = json.load(open(args.merge))
+        doc.setdefault(args.alg, [])
+        # Authorising several states at once is the whole point: the previous
+        # state stays valid, so a machine that has not switched yet still opens,
+        # and a switch that goes wrong can be walked back.
+        if any(e.get("pol") == entry["pol"] for e in doc[args.alg]):
+            print(f"  policy {entry['pol'][:16]}… already authorised; unchanged")
+            print(json.dumps(doc, separators=(",", ":")))
+            return 0
+    doc[args.alg].append(entry)
+
+    out = json.dumps(doc, separators=(",", ":"))
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(out)
+        print(f"  wrote {args.out} — {len(doc[args.alg])} authorised state(s)")
+    else:
+        print(out)
+    return 0
+
+
 def cmd_policy_digest(args):
     """Exposed on its own so it can be checked against tpm2_createpolicy."""
     value = bytes.fromhex(args.value)
@@ -327,10 +409,21 @@ def main():
     pd = sub.add_parser("policy-digest",
                         help="policyDigest for a PCR value (check vs tpm2_createpolicy)")
     pd.add_argument("--value", required=True, metavar="HEX")
+    sr = sub.add_parser("sign-request",
+                        help="write the bytes the Owner signs (no private key here)")
+    sr.add_argument("--pol", required=True, metavar="HEX")
+    sr.add_argument("--out", required=True)
+    em = sub.add_parser("emit", help="build the systemd signature JSON")
+    em.add_argument("--pubkey", required=True, help="Owner public key, PEM")
+    em.add_argument("--pol", required=True, metavar="HEX")
+    em.add_argument("--sig", required=True, help="detached signature file")
+    em.add_argument("--merge", help="existing JSON to add this state to")
+    em.add_argument("--out")
     args = p.parse_args()
     try:
         return {"selfcheck": cmd_selfcheck, "show": cmd_show,
-                "predict": cmd_predict, "policy-digest": cmd_policy_digest}[args.cmd](args)
+                "predict": cmd_predict, "policy-digest": cmd_policy_digest,
+                "sign-request": cmd_sign_request, "emit": cmd_emit}[args.cmd](args)
     except EventLogError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
