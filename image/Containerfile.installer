@@ -58,36 +58,36 @@ RUN rm -rf /usr/lib/bootc/bound-images.d
 
 # The grafted container signature policy is fail-closed and, by design, emits
 # only the `docker` transport (image/policy/render-container-policy.sh: it
-# "cannot emit insecureAcceptAnything anywhere"). Anything read through
-# `containers-storage` therefore falls to `default: reject`.
+# "cannot emit insecureAcceptAnything anywhere"). Every LOCAL transport therefore
+# falls to `default: reject`, and every step that reads a local image dies:
 #
-# Both `bootc install to-filesystem` calls read their SOURCE that way: the one
-# bootc-image-builder makes while writing this medium, and the one the
-# autoinstaller makes on the appliance -- it installs from the local store
-# offline (`--skip-fetch-check`), never from a registry. So the medium could
-# neither be built nor perform an install:
+#   bootc-image-builder, writing this medium : containers-storage:…  rejected
+#   the autoinstaller, copy-to-storage       : oci:/proc/self/fd/3   rejected
 #
-#   Running image containers-storage:…@… is rejected by policy
+# Enumerating transports is whack-a-mole -- the next bootc release picks another.
+# The medium instead runs permissive and the STRICT policy travels beside it, to
+# be restored onto the installed deployment by neural-ice-autoinstall before
+# first boot. That is what keeps this exception to the medium, which is what was
+# authorised: the appliance boots with the graft it was composed with.
 #
-# This was invisible until now because the previous medium predates the graft.
-#
-# Accepting `containers-storage` HERE, and only here, moves the trust boundary
-# for local content to "who built the medium" -- physical and organisational,
-# the same boundary as the operator key on the ESP. The `docker` transport keeps
-# its signed scopes, so any registry pull stays verified, and the INSTALLED
-# appliance is untouched: its policy comes from the appliance image, not from
-# this one.
-#
-# The clean end state is signing the seed store's contents and emitting a
-# `containers-storage` scope that verifies those signatures. That is a project,
-# not a line: until then this is the documented, bounded exception.
-RUN python3 -c "import json; p='/etc/containers/policy.json'; d=json.load(open(p)); assert d.get('default')==[{'type':'reject'}], 'base policy is not fail-closed; refusing to relax an unknown policy'; assert 'docker' in d.get('transports',{}), 'base policy carries no signed docker scopes; refusing to relax an ungrafted policy'; d['transports']['containers-storage']={'':[{'type':'insecureAcceptAnything'}]}; json.dump(d, open(p,'w'), indent=4, sort_keys=True)"
+# The signed docker scopes are preserved in the permissive policy too, so even
+# here a registry pull is still verified against image-ci.
+RUN python3 -c "import json,shutil; p='/etc/containers/policy.json'; d=json.load(open(p)); \
+assert d.get('default')==[{'type':'reject'}], 'base policy is not fail-closed; refusing to relax an unknown policy'; \
+assert 'docker' in d.get('transports',{}), 'base policy carries no signed docker scopes; refusing to relax an ungrafted policy'; \
+shutil.copyfile(p,'/usr/lib/neural-ice-policy-strict.json'); \
+d['default']=[{'type':'insecureAcceptAnything'}]; \
+json.dump(d, open(p,'w'), indent=4, sort_keys=True)"
 
-# Assert the result rather than trusting the edit: the docker scopes must still
-# be there, the default must still be reject, and only containers-storage may
-# have moved. A silent policy edit is exactly the failure this file exists to
-# avoid.
-RUN python3 -c "import json; d=json.load(open('/etc/containers/policy.json')); assert d['default']==[{'type':'reject'}]; assert 'registry.neural-ice.ch/neural-ice' in d['transports']['docker']; assert d['transports']['containers-storage']=={'':[{'type':'insecureAcceptAnything'}]}; print('installer policy: docker scopes intact, containers-storage accepted, default still reject')"
+# Assert both halves rather than trusting the edit: the medium is permissive,
+# the strict original is preserved verbatim for the autoinstaller to restore,
+# and the signed docker scopes survive in both.
+RUN python3 -c "import json; live=json.load(open('/etc/containers/policy.json')); strict=json.load(open('/usr/lib/neural-ice-policy-strict.json')); \
+assert live['default']==[{'type':'insecureAcceptAnything'}]; \
+assert strict['default']==[{'type':'reject'}]; \
+assert 'registry.neural-ice.ch/neural-ice' in live['transports']['docker']; \
+assert strict['transports']==live['transports']; \
+print('installer policy: medium permissive, strict original preserved for the target')"
 
 # Branding (os-release, Plymouth, kargs) is inherited from the canonical image.
 LABEL org.opencontainers.image.title="Neural ICE CoreOS (DGX Spark installer)" \
