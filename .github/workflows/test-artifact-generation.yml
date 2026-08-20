@@ -25,6 +25,11 @@ on:
       - "build/build-kernel.sh"
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
+      - "ci/test-gb10-console-boot.sh"
+      - "image/Containerfile.bootc"
+      - "image/bootc-overlay/etc/modules-load.d/nvidia.conf"
+      - "image/bootc-overlay/etc/vconsole.conf"
+      - "image/bootc-overlay/usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
       - ".github/workflows/test-artifact-generation.yml"
@@ -53,6 +58,11 @@ on:
       - "build/build-kernel.sh"
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
+      - "ci/test-gb10-console-boot.sh"
+      - "image/Containerfile.bootc"
+      - "image/bootc-overlay/etc/modules-load.d/nvidia.conf"
+      - "image/bootc-overlay/etc/vconsole.conf"
+      - "image/bootc-overlay/usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf"
       - ".github/workflows/build-kernel.yml"
       - ".github/workflows/build-image.yml"
       - ".github/workflows/test-artifact-generation.yml"
@@ -79,6 +89,7 @@ jobs:
             ci/test-build-image-dispatch-contract.sh ci/test-open-core-boundary.sh \
             ci/test-oci-signature-policy.sh image/policy/render-container-policy.sh \
             ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
+            ci/test-gb10-console-boot.sh \
             build/build-kernel.sh
       # skopeo is the containers/image policy engine itself: the signature-policy
       # test does not simulate a verdict, it asks the same code the appliance
@@ -100,3 +111,4 @@ jobs:
           ./ci/test-oci-signature-policy.sh
           ./ci/test-kernel-packaging-patch.sh
           ./ci/test-no-shim-chained-updater.sh
+          ./ci/test-gb10-console-boot.sh
