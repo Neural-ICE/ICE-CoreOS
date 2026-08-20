@@ -183,16 +183,17 @@ grep -qE '^start --no-block sshd\.service$' "$started/systemctl.log" \
   || { echo "sshd is started synchronously from a unit ordered before it — this deadlocks" >&2; exit 1; }
 
 # And behaviourally: with the deadlock modelled, the script must still finish.
+# The stub sleeps 30s on a blocking start, so elapsed time is the assertion --
+# no nested quoting, and it measures the property rather than describing it.
 dl="$work/root-deadlock"
-NI_TEST_SSHD_DEADLOCK=1 timeout 20 bash -c '
-  run_firstboot() { :; }
-' 2>/dev/null || true
-NI_TEST_SSHD_DEADLOCK=1 timeout 25 env \
-  NI_TEST_SYSTEMCTL_LOG="$dl/systemctl.log" \
-  NEURALICE_FIRSTBOOT_ROOT="$dl" NEURALICE_FIRSTBOOT_CMDLINE="$dl/cmdline" \
-  PATH="$stub_dir:$PATH" sh -c 'mkdir -p "$NEURALICE_FIRSTBOOT_ROOT" && printf "%s\n" "root=/dev/sda neuralice.sshkey='"$(base64 -w0 < "$key")"' quiet" > "$NEURALICE_FIRSTBOOT_CMDLINE" && bash '"$FIRSTBOOT" \
-  || { echo "the firstboot script did not finish within 25s under a modelled deadlock" >&2; exit 1; }
-grep -q DEADLOCK "$dl/systemctl.log" 2>/dev/null \
-  && { echo "the script still issued a blocking start" >&2; exit 1; }
+export NI_TEST_SSHD_DEADLOCK=1
+_t0=$(date +%s)
+run_firstboot "$dl" "root=/dev/sda neuralice.sshkey=$(base64 -w0 < "$key") quiet"
+_elapsed=$(( $(date +%s) - _t0 ))
+unset NI_TEST_SSHD_DEADLOCK
+[ "$_elapsed" -lt 20 ] \
+  || { echo "firstboot blocked ${_elapsed}s under a modelled deadlock — the start is not queued" >&2; exit 1; }
+! grep -q DEADLOCK "$dl/systemctl.log" 2>/dev/null \
+  || { echo "the script issued a blocking start" >&2; exit 1; }
 
 echo "DEBUG_SSH_KEY_TEST_OK"
