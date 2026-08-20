@@ -44,5 +44,27 @@ else
   printf '  ok    the script does not end on a conditional && list\n'
 fi
 
+# --------------------------------------------------------------------------- #
+# The registry install source (FAB-0040 light medium).
+#
+# This path installs bytes that arrived over the network, so every guard below
+# is the difference between "digest-pinned and signature-verified" and "whatever
+# the LAN served".
+check "the install source is an explicit kernel argument"    -F 'neuralice.source='
+check "the appliance image is an explicit kernel argument"   -F 'neuralice.osimage='
+check "the appliance image must be digest-pinned"            -F '@sha256:[0-9a-f]{64}$'
+check "a registry install requires a signed docker scope"    -F 'refusing a registry install that nothing would verify'
+check "the pulled digest is re-checked after the pull"       -F 'is not the requested one'
+check "bootc consumes the resolved source, not a literal"    -F -e '--source-imgref "$source_imgref"'
+
+# The default MUST remain the medium. This is the single property that keeps the
+# USB path -- the one that installs appliances today -- untouched by all of the
+# above.
+if grep -qE '^INSTALL_SOURCE=medium$' "$S"; then
+  printf '  ok    the default install source is the medium (USB path unchanged)\n'
+else
+  printf '  FAIL  the default install source must be `medium`; a registry default would break every offline install\n'; fail=1
+fi
+
 [ "$fail" = 0 ] || { echo "install registry mirror: FAILED"; exit 1; }
 echo "install registry mirror: OK"
