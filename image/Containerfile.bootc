@@ -393,6 +393,86 @@ RUN set -euxo pipefail; \
                      avahi-daemon.service; \
     systemctl set-default multi-user.target
 
+# --- No unbidden egress ---------------------------------------------------- #
+# The CentOS Stream bootc base ships agents that talk to third parties on their
+# own schedule. This OS is built for appliances that run on a customer's
+# premises, often air-gapped, under the plain promise that nothing leaves the
+# machine unless the operator asked for it. None of these serve the appliance.
+#
+# LIVE in the base image, verified on a running install:
+#   insights-client   uploads a system profile to Red Hat Insights.
+#                     insights-client-boot.service is ENABLED and runs at boot.
+#   subscription-manager  rhsmcertd is ENABLED and RUNNING: periodic entitlement
+#                     refresh against subscription servers.
+#   rhc + yggdrasil   Red Hat Connector and the daemon behind it. rhcd.service is
+#                     an alias for yggdrasil.service, and /etc/yggdrasil ships
+#                     server = ["wss://connect.cloud.redhat.com:443"] — a
+#                     persistent management channel to Red Hat's cloud. The unit
+#                     is disabled in the base, but the configured endpoint and
+#                     the binary are both present. rhc-server.socket IS enabled;
+#                     it listens on a LOCAL unix socket, not a network port, so
+#                     the channel is yggdrasil dialling out rather than anything
+#                     dialling in. Said precisely because the difference matters
+#                     to whoever audits this.
+#   rpm-ostree countme  weekly install census to the upstream counting endpoint.
+#   debuginfod        /etc/profile.d/debuginfod.sh exports DEBUGINFOD_URLS =
+#                     https://debuginfod.centos.org/, so any gdb or perf session
+#                     on an appliance sends build-IDs of what is being inspected.
+#
+# NOT live, masked anyway: fwupd-refresh.timer is ENABLED, but its only remote
+# (LVFS) ships Enabled=false with AutomaticReports=false, so it fetches nothing
+# today. Masking it is defence in depth against a later enabled remote, and it
+# removes a weekly job that can only ever be a no-op or a leak.
+#
+# REMOVED where the package can go, MASKED where it cannot. Removing beats
+# masking: a mask is a symlink that a preset or a careless operator can undo,
+# whereas a binary that is not installed cannot run at all. rpm-ostree cannot be
+# removed (bootc is built on it), and fwupd is deliberately kept — the daemon
+# that applies firmware locally is useful; only its metadata refresh is stopped.
+#
+# The dependency web was checked before deleting: nothing requires
+# insights-client, subscription-manager is required only by insights-client and
+# rhc, and yggdrasil only by rhc. The four come out together and nothing else
+# follows — confirmed by running the removal against this exact base image.
+RUN set -euxo pipefail; \
+    dnf -y remove insights-client rhc subscription-manager yggdrasil; \
+    dnf clean all; \
+    # Unowned leftover: rhcd.service is an alias symlink that belongs to no
+    # package, so the removal does not take it and it survives pointing at a
+    # target that is now gone. Found by the assertion below, not by guessing.
+    rm -f /usr/lib/systemd/system/rhcd.service; \
+    # debuginfod: drop the configured URL rather than the tooling. Symbol
+    # fetching stays available to anyone who sets DEBUGINFOD_URLS deliberately.
+    rm -f /etc/debuginfod/elfutils.urls; \
+    for p in /usr/bin/insights-client /usr/bin/rhc /usr/bin/rhsmcertd \
+             /usr/bin/yggd /etc/yggdrasil; do \
+      test ! -e "$p" \
+        || { echo "FATAL: $p survived the removal" >&2; exit 1; }; \
+    done; \
+    for u in insights-client-boot.service rhc-server.socket rhcd.service \
+             yggdrasil.service; do \
+      ! systemctl list-unit-files "$u" 2>/dev/null | grep -qE "^${u}[[:space:]]" \
+        || { echo "FATAL: unit $u still present after package removal" >&2; exit 1; }; \
+    done; \
+    ! grep -rq "debuginfod.centos.org" /etc 2>/dev/null \
+      || { echo "FATAL: a debuginfod endpoint is still configured under /etc" >&2; exit 1; }
+
+# Masked, not disabled: masking survives a base-image update that re-enables a
+# unit by preset. Each is asserted PRESENT before masking and MASKED after —
+# `systemctl mask` happily creates a symlink for a name that does not exist, so
+# masking a unit upstream has renamed would pass while the real channel stayed
+# open. A loud failure here means the base changed and this list needs
+# re-reading, which is the correct outcome rather than a nuisance.
+RUN set -euxo pipefail; \
+    for u in rpm-ostree-countme.timer rpm-ostree-countme.service \
+             fwupd-refresh.timer fwupd-refresh.service; do \
+      systemctl list-unit-files "$u" | grep -qE "^${u}[[:space:]]" \
+        || { echo "FATAL: $u is not in the base image — upstream renamed or dropped it; re-read the egress list" >&2; exit 1; }; \
+      systemctl mask "$u"; \
+      test "$(systemctl is-enabled "$u")" = masked \
+        || { echo "FATAL: $u did not end up masked" >&2; exit 1; }; \
+    done
+
 # Immutable source artifacts do not follow themselves: CI publishes a run-unique tag,
 # so the native bootc timer is masked above. The branded Fabric layer keeps updates under
 # the signed train controller, which stages exact digests with bootc switch --retain.
