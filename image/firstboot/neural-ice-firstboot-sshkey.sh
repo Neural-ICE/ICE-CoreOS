@@ -61,17 +61,24 @@ if [ -n "$key" ]; then
     logger -t neural-ice-firstboot "unmasked sshd: an operator key was provisioned by the installation medium"
   fi
   systemctl enable sshd.service 2>/dev/null || true
-  systemctl start sshd.service 2>/dev/null || true
+  # --no-block, and it is load-bearing. This unit is ordered Before=sshd.service,
+  # so a SYNCHRONOUS `systemctl start sshd` deadlocks: systemd holds the sshd job
+  # until this service finishes, and this service waits for that job. Measured on
+  # GB10 2026-08-20 -- the unit sat in `activating (start)` with
+  # `systemctl start sshd.service` as its only live child, and sshd never came up.
+  # The previous `enable --now` did not deadlock only because it started nothing;
+  # replacing a no-op with a blocking call traded one failure for a worse one.
+  systemctl start --no-block sshd.service 2>/dev/null || true
 
   # ASSERT THE EFFECT, NOT THE COMMAND. Every step above can return 0 while
   # leaving sshd down, and a debug medium whose whole purpose is remote access
   # must not report success in that state.
-  if [ "$(systemctl is-active sshd.service 2>/dev/null)" != active ]; then
-    logger -t neural-ice-firstboot "sshd is not active after unmask+start; retrying once after a settle"
-    sleep 2
-    systemctl daemon-reload
-    systemctl restart sshd.service 2>/dev/null || true
-  fi
+  # The start is QUEUED, not awaited, so poll rather than read a state that
+  # cannot be true yet. Bounded, and it runs only on a debug medium.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(systemctl is-active sshd.service 2>/dev/null)" = active ] && break
+    sleep 1
+  done
   if [ "$(systemctl is-active sshd.service 2>/dev/null)" = active ]; then
     logger -t neural-ice-firstboot "sshd is active; the provisioned operator key is usable"
   else
