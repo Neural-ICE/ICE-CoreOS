@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Prove the signed TPM policy on a real TPM, without an appliance.
+#
+# mission-0024 asks for three things a test volume CAN establish:
+#
+#   - a signed policy authorising a FUTURE state opens the volume once the
+#     machine reaches that state, with no re-enrolment and nobody on site
+#   - a state that was NOT authorised is refused
+#   - the recovery path restores access to a volume whose policy fails
+#
+# and one it cannot: that `systemd-cryptsetup` opens the ROOT filesystem this
+# way at boot, before any system exists. That needs an installed machine and is
+# explicitly out of scope here — see docs/TPM-SIGNED-POLICY-RUNBOOK.md §7.
+#
+# ⚠️ THIS EXTENDS PCR 7 ON THE HOST. PCR 7 cannot be reset without a reboot, so
+# after this run the host's PCR 7 no longer matches its boot-time Secure Boot
+# state. Harmless where nothing seals against it; a reboot restores it. The
+# script refuses to run on a host whose PCR 7 is already sealing something.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TOOL="$ROOT/ota/neural-ice-tpm-policy.py"
+W="$(mktemp -d /var/tmp/ni-tpm-proof.XXXXXX)"
+LOOP=""
+PCR=7
+
+cleanup() {
+  [[ -e /dev/mapper/nitest ]] && cryptsetup close nitest 2>/dev/null || true
+  [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null || true
+  rm -rf "$W"
+  rm -f /run/systemd/tpm2-pcr-signature.json
+}
+trap cleanup EXIT
+
+say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32m✅ %s\033[0m\n' "$*"; }
+bad()  { printf '  \033[31m🔴 %s\033[0m\n' "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || bad "run as root: LUKS and the TPM both need it"
+for t in cryptsetup systemd-cryptenroll tpm2_pcrread tpm2_pcrextend openssl python3; do
+  command -v "$t" >/dev/null || bad "missing $t"
+done
+
+# --- refuse to disturb a host that seals against PCR 7 ----------------------- #
+# Extending PCR 7 on a machine whose own root is sealed to it would lock that
+# machine out at the next boot. The check is cheap and the failure is not.
+if command -v lsblk >/dev/null; then
+  while read -r dev; do
+    [[ -b "$dev" ]] || continue
+    if cryptsetup isLuks "$dev" 2>/dev/null &&
+       cryptsetup luksDump "$dev" 2>/dev/null | grep -q 'systemd-tpm2'; then
+      bad "$dev on this host is sealed to the TPM. Extending PCR 7 here would
+       lock it out at the next boot. Run this on a host that seals nothing."
+    fi
+  done < <(lsblk -pnro NAME 2>/dev/null)
+fi
+ok "no volume on this host seals against the TPM — safe to extend PCR 7"
+
+pcr_now() { tpm2_pcrread "sha256:$PCR" | sed -n 's/.*0x\([0-9A-Fa-f]*\).*/\1/p' | head -1 | tr 'A-F' 'a-f'; }
+
+say "1. a throwaway Owner key (the real one never leaves the Owner's token)"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$W/priv.pem" 2>/dev/null
+openssl rsa -in "$W/priv.pem" -pubout -out "$W/pub.pem" 2>/dev/null
+ok "keypair generated"
+
+say "2. predict the state PCR 7 will reach, BEFORE reaching it"
+A="$(pcr_now)"
+EXT=$(printf 'neural-ice-signed-policy-proof' | sha256sum | cut -d' ' -f1)
+# tpm2_pcrextend performs PCR := H(PCR ‖ digest). Predicting B is therefore
+# arithmetic, which is the point: the authorisation is computed and signed while
+# the machine is still in A.
+B="$(python3 -c "
+import hashlib,sys
+print(hashlib.sha256(bytes.fromhex(sys.argv[1])+bytes.fromhex(sys.argv[2])).hexdigest())" "$A" "$EXT")"
+printf '  current  A = %s\n  predicted B = %s\n' "$A" "$B"
+
+POL_A="$(python3 "$TOOL" --pcr "$PCR" policy-digest --value "$A")"
+POL_B="$(python3 "$TOOL" --pcr "$PCR" policy-digest --value "$B")"
+printf '  policy(A) = %s\n  policy(B) = %s\n' "$POL_A" "$POL_B"
+
+say "3. the Owner signs BOTH states — the current one and the one to come"
+for p in "$POL_A" "$POL_B"; do
+  python3 "$TOOL" sign-request --pol "$p" --out "$W/$p.bin" >/dev/null
+  openssl dgst -sha256 -sign "$W/priv.pem" -out "$W/$p.bin.sig" "$W/$p.bin"
+done
+python3 "$TOOL" --pcr "$PCR" emit --pubkey "$W/pub.pem" --pol "$POL_A" \
+  --sig "$W/$POL_A.bin.sig" --out "$W/sig.json" >/dev/null
+python3 "$TOOL" --pcr "$PCR" emit --pubkey "$W/pub.pem" --pol "$POL_B" \
+  --sig "$W/$POL_B.bin.sig" --merge "$W/sig.json" --out "$W/sig.json" >/dev/null
+ok "$(python3 -c "import json;print(len(json.load(open('$W/sig.json'))['sha256']))") states authorised by one signature file"
+
+say "4. a LUKS volume enrolled against the signed policy"
+truncate -s 64M "$W/vol.img"
+LOOP="$(losetup --find --show "$W/vol.img")"
+PASS=recovery-passphrase-for-this-proof
+# A deliberately weak KDF: this volume exists for seconds and holds nothing. The
+# default argon2id is memory-hard by design and would dominate the run time of a
+# proof that is about the POLICY, not about passphrase strength.
+printf '%s' "$PASS" | cryptsetup luksFormat --type luks2 --batch-mode \
+  --pbkdf pbkdf2 --pbkdf-force-iterations 1000 "$LOOP" - 2>/dev/null
+ok "volume created, slot 0 = recovery passphrase"
+
+# Two flags here are load-bearing and neither is obvious.
+#
+# --tpm2-pcrs= EMPTY: without it systemd-cryptenroll ALSO seals against PCR 7
+# literally (that is its default), so the keyslot ends up bound to
+# PolicyAuthorize(pubkey) AND PolicyPCR(7)-literal. The literal half then fails
+# the moment PCR 7 moves, whatever the signature authorises -- the default
+# silently reintroduces the exact fragility this mechanism removes.
+#
+# NO --tpm2-signature: passing it makes cryptenroll verify the enrolment by
+# unsealing immediately, and that self-check reads the PCRs with an unset hash
+# bank once --tpm2-pcrs is empty:
+#
+#   Reading PCR selection: [n/a(7)]
+#   Failed to read TPM2 PCRs: hash algorithm not supported or not appropriate
+#   Failed to unseal secret using TPM2: State not recoverable
+#
+# The enrolment itself is fine; only its optional verification is not. The
+# signature is supplied at UNLOCK, from /run/systemd/tpm2-pcr-signature.json.
+PASSWORD="$PASS" systemd-cryptenroll "$LOOP" \
+  --tpm2-device=auto --tpm2-pcrs= \
+  --tpm2-public-key="$W/pub.pem" --tpm2-public-key-pcrs="$PCR" >/dev/null 2>&1 \
+  || bad "enrolment against the signed policy failed"
+ok "slot 1 = signed policy, bound to the public key alone (no literal PCR seal)"
+
+install -d -m 0755 /run/systemd
+install -m 0644 "$W/sig.json" /run/systemd/tpm2-pcr-signature.json
+ok "signature placed where systemd-cryptsetup looks for it"
+
+# Assert on what the header actually says, and PRINT it: the token type string
+# is a cryptsetup/systemd implementation detail that has changed across releases,
+# so a hard-coded name is a check that breaks on upgrade rather than on a defect.
+TOKENS="$(cryptsetup luksDump "$LOOP" | sed -n '/^Tokens:/,/^Digests:/p')"
+printf '%s\n' "$TOKENS" | sed 's/^/    /'
+printf '%s' "$TOKENS" | grep -qi 'tpm2' \
+  || bad "the header carries no TPM2 token — the enrolment did not take"
+ok "the header carries a TPM2 token"
+
+say "5. state A — it opens"
+systemd-cryptsetup attach nitest "$LOOP" - \
+  "tpm2-device=auto,headless=1" >/dev/null 2>&1 \
+  || bad "the volume does not open in the state it was enrolled in"
+ok "opened with no passphrase, in state A"
+cryptsetup close nitest
+
+say "6. move the machine to state B — the pre-authorised one"
+tpm2_pcrextend "$PCR:sha256=$EXT" >/dev/null
+NOW="$(pcr_now)"
+[[ "$NOW" == "$B" ]] || bad "PCR 7 is $NOW, the prediction said $B — the arithmetic is wrong"
+ok "PCR 7 moved to exactly the predicted value"
+
+say "7. 🎯 THE POINT — it still opens, with no re-enrolment"
+if systemd-cryptsetup attach nitest "$LOOP" - \
+     "tpm2-device=auto,headless=1" >/dev/null 2>&1; then
+  ok "opened in a state it was NEVER sealed to, because the Owner authorised it in advance"
+  cryptsetup close nitest
+else
+  bad "the pre-authorised state did not open — the mechanism does not hold"
+fi
+
+say "8. an UNauthorised state — it must refuse"
+tpm2_pcrextend "$PCR:sha256=$(printf 'unauthorised' | sha256sum | cut -d' ' -f1)" >/dev/null
+if systemd-cryptsetup attach nitest "$LOOP" - \
+     "tpm2-device=auto,headless=1" >/dev/null 2>&1; then
+  cryptsetup close nitest
+  bad "a state nobody authorised opened the volume — the policy is not binding"
+fi
+ok "refused — a signature covering other states does not open this one"
+
+say "9. recovery — the volume is not lost"
+printf '%s' "$PASS" | cryptsetup open "$LOOP" nitest - 2>/dev/null \
+  || bad "the recovery passphrase does not open a volume whose policy fails"
+ok "recovery passphrase opens it: a wrong policy costs an unlock, never the data"
+cryptsetup close nitest
+
+say "10. the transition slot — a new policy enrolled while the old one still opens"
+# mission-0024 objective 5, and it is independent of everything above: rotating a
+# policy must never be a cutover. On a machine nobody can reach, "enrol the new
+# one, hope, then discover" is not a procedure — the old slot has to keep working
+# until the new one is observed to work.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$W/priv2.pem" 2>/dev/null
+openssl rsa -in "$W/priv2.pem" -pubout -out "$W/pub2.pem" 2>/dev/null
+NOW2="$(pcr_now)"
+POL2="$(python3 "$TOOL" --pcr "$PCR" policy-digest --value "$NOW2")"
+python3 "$TOOL" sign-request --pol "$POL2" --out "$W/p2.bin" >/dev/null
+# A real rotation has BOTH keys authorising the state the machine is in: that is
+# precisely what lets the old slot keep working while the new one is proven. The
+# earlier revision of this step signed the current state with the NEW key only,
+# which is a cutover wearing a rotation's clothes — and the volume refused, as it
+# should have.
+openssl dgst -sha256 -sign "$W/priv2.pem" -out "$W/p2.bin.sig" "$W/p2.bin"
+openssl dgst -sha256 -sign "$W/priv.pem"  -out "$W/p2.old.sig" "$W/p2.bin"
+python3 "$TOOL" --pcr "$PCR" emit --pubkey "$W/pub2.pem" --pol "$POL2" \
+  --sig "$W/p2.bin.sig" --out "$W/sig2.json" >/dev/null
+python3 "$TOOL" --pcr "$PCR" emit --pubkey "$W/pub.pem" --pol "$POL2" \
+  --sig "$W/p2.old.sig" --merge "$W/sig2.json" --out "$W/sig2.json" >/dev/null
+
+# Both signature files must be readable at once, so the union goes to the path
+# systemd reads. A rotation where only the NEW key is authorised is the cutover
+# we are trying to avoid.
+python3 - "$W/sig.json" "$W/sig2.json" "$W/both.json" <<'PYMERGE'
+import json, sys
+a, b, out = (json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3])
+for alg, entries in b.items():
+    a.setdefault(alg, []).extend(entries)
+json.dump(a, open(out, "w"), separators=(",", ":"))
+PYMERGE
+install -m 0644 "$W/both.json" /run/systemd/tpm2-pcr-signature.json
+
+PASSWORD="$PASS" systemd-cryptenroll "$LOOP" \
+  --tpm2-device=auto --tpm2-pcrs= \
+  --tpm2-public-key="$W/pub2.pem" --tpm2-public-key-pcrs="$PCR" >/dev/null 2>&1 \
+  || bad "the second policy could not be enrolled beside the first"
+SLOTS="$(cryptsetup luksDump "$LOOP" | grep -cE '^  [0-9]+: luks2')"
+[[ "$SLOTS" -ge 3 ]] || bad "expected at least 3 keyslots, found $SLOTS"
+ok "$SLOTS keyslots: recovery, the old policy, and the new one — no cutover"
+
+say "11. both policies open the volume"
+systemd-cryptsetup attach nitest "$LOOP" - "tpm2-device=auto,headless=1" >/dev/null 2>&1 \
+  || bad "the volume does not open while two policies are enrolled"
+ok "opens — both policies authorise the current state, so the machine is safe\n     to leave here until the new key is proven"
+cryptsetup close nitest
+
+say "12. retire the old policy, keep the new"
+# systemd-cryptenroll --wipe-slot takes the slot number; slot 1 is the first
+# policy enrolled in step 4.
+PASSWORD="$PASS" systemd-cryptenroll "$LOOP" --wipe-slot=1 >/dev/null 2>&1 \
+  || bad "could not retire the old policy slot"
+SLOTS="$(cryptsetup luksDump "$LOOP" | grep -cE '^  [0-9]+: luks2')"
+systemd-cryptsetup attach nitest "$LOOP" - "tpm2-device=auto,headless=1" >/dev/null 2>&1 \
+  || bad "the volume stopped opening once the old policy was retired"
+ok "$SLOTS keyslots left, and it still opens on the new policy alone"
+cryptsetup close nitest
+
+say "13. the FAB-0046 clause, executed"
+# The clause asserts on the header of a real device. Running it here is what makes
+# it a control rather than a paragraph.
+if "$ROOT/ota/neural-ice-tpm-policy-check.sh" "$LOOP"; then
+  ok "the clause passes on a correctly enrolled volume"
+else
+  bad "the clause fails on a volume this harness just proved correct — the clause is wrong"
+fi
+
+printf '\n\033[1m== proven on this host\033[0m\n'
+printf '  a future state, signed in advance, opens without re-enrolment\n'
+printf '  a policy can be rotated through a transition slot, with no cutover\n'
+printf '  the FAB-0046 clause passes on a correct volume\n'
+printf '  an unauthorised state is refused\n'
+printf '  recovery restores access when the policy fails\n'
+printf '\n  \033[33mNOT proven here: systemd-cryptsetup opening the ROOT at boot from\n'
+printf '  the initramfs. That needs an installed machine.\033[0m\n'
+printf '\n  PCR 7 on this host is now extended; a reboot restores it.\n'
