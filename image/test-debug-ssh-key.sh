@@ -75,10 +75,33 @@ FIRSTBOOT="$ROOT/image/firstboot/neural-ice-firstboot-sshkey.sh"
 
 stub_dir="$work/stub"
 mkdir -p "$stub_dir"
+# A STATEFUL stub. The previous one answered `exit 0` to everything, so
+# `is-active` returned nothing and no test could tell a started sshd from an
+# unstarted one -- which is exactly how the real defect shipped: on GB10,
+# 2026-08-20, `enable --now` returned success one second into the first boot and
+# sshd did not come up until the NEXT reboot. A stub that cannot express
+# "succeeded but had no effect" cannot catch a bug whose whole shape is that.
+#
+# NI_TEST_SSHD_STUBBORN=1 models precisely that: start/restart return 0 and
+# change nothing.
 cat > "$stub_dir/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$NI_TEST_SYSTEMCTL_LOG"
-[ "${1:-}" = is-enabled ] && { printf 'masked\n'; exit 0; }
+state_file="${NI_TEST_SYSTEMCTL_LOG%.log}.sshd-state"
+[ -f "$state_file" ] || printf 'masked\n' > "$state_file"
+case "${1:-}" in
+  is-enabled) cat "$state_file"; exit 0 ;;
+  is-active)  [ "$(cat "$state_file")" = active ] && { printf 'active\n'; exit 0; }
+              printf 'inactive\n'; exit 3 ;;
+  unmask)     printf 'disabled\n' > "$state_file"; exit 0 ;;
+  enable)     [ "$(cat "$state_file")" = masked ] || printf 'enabled\n' > "$state_file"; exit 0 ;;
+  start|restart)
+              # The manager refuses to start a unit it still believes is masked,
+              # and says nothing about it.
+              [ "$(cat "$state_file")" = masked ] && exit 0
+              [ "${NI_TEST_SSHD_STUBBORN:-0}" = 1 ] && exit 0
+              printf 'active\n' > "$state_file"; exit 0 ;;
+esac
 exit 0
 STUB
 printf '#!/usr/bin/env bash\nexit 0\n' > "$stub_dir/logger"
@@ -120,5 +143,28 @@ run_firstboot "$sealed" "root=/dev/sda quiet"
 run_firstboot "$provisioned" "root=/dev/sda neuralice.sshkey=$(base64 -w0 < "$key") quiet"
 [ ! -s "$provisioned/systemctl.log" ] \
   || { echo "first-boot provisioning ran a second time" >&2; exit 1; }
+
+# THE DEFECT THIS FILE DID NOT CATCH, now pinned.
+#
+# On GB10 (2026-08-20) sshd was unmasked one second into the first boot and never
+# started: `enable --now` returned success while the manager still held its
+# in-memory MASKED view, so the `|| logger` branch never fired and remote debug
+# was unavailable for the whole first boot. The script must ASSERT that sshd is
+# active, not that a command exited 0.
+started="$work/root-started"
+run_firstboot "$started" "root=/dev/sda neuralice.sshkey=$(base64 -w0 < "$key") quiet"
+grep -qx 'daemon-reload' "$started/systemctl.log" \
+  || { echo "sshd was unmasked without making the unmask visible to the manager" >&2; exit 1; }
+[ "$(cat "$started/systemctl.sshd-state" 2>/dev/null)" = active ] \
+  || { echo "sshd is not active after first-boot provisioning" >&2; exit 1; }
+
+# And when starting genuinely has no effect, the script must SAY so rather than
+# reporting a usable key. This is the case the old one-liner reported as success.
+stubborn="$work/root-stubborn"
+NI_TEST_SSHD_STUBBORN=1 run_firstboot "$stubborn" "root=/dev/sda neuralice.sshkey=$(base64 -w0 < "$key") quiet"
+[ "$(cat "$stubborn/systemctl.sshd-state" 2>/dev/null)" != active ] \
+  || { echo "the stubborn-sshd case did not model a failure" >&2; exit 1; }
+grep -qE '^(restart|is-active)' "$stubborn/systemctl.log" \
+  || { echo "the script never checked whether sshd actually came up" >&2; exit 1; }
 
 echo "DEBUG_SSH_KEY_TEST_OK"

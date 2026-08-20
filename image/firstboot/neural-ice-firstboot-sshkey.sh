@@ -50,10 +50,33 @@ if [ -n "$key" ]; then
   # no karg, and never reaches this branch -- sshd stays masked on it.
   if [ "$(systemctl is-enabled sshd.service 2>/dev/null)" = masked ]; then
     systemctl unmask sshd.service
+    # `unmask` removes the /etc symlink, but systemd keeps its in-memory view
+    # until it is told to look again. Without this reload the unit is still
+    # MASKED as far as the manager is concerned, so the start below is a no-op
+    # THAT RETURNS SUCCESS -- measured on GB10 2026-08-20: sshd was unmasked one
+    # second into the first boot, never started, and only came up on the next
+    # reboot. The `|| logger` on the old one-liner never fired, because nothing
+    # had failed; only the effect was missing.
+    systemctl daemon-reload
     logger -t neural-ice-firstboot "unmasked sshd: an operator key was provisioned by the installation medium"
   fi
-  systemctl enable --now sshd.service || \
-    logger -t neural-ice-firstboot "WARNING: sshd could not be started; the provisioned key is unusable"
+  systemctl enable sshd.service 2>/dev/null || true
+  systemctl start sshd.service 2>/dev/null || true
+
+  # ASSERT THE EFFECT, NOT THE COMMAND. Every step above can return 0 while
+  # leaving sshd down, and a debug medium whose whole purpose is remote access
+  # must not report success in that state.
+  if [ "$(systemctl is-active sshd.service 2>/dev/null)" != active ]; then
+    logger -t neural-ice-firstboot "sshd is not active after unmask+start; retrying once after a settle"
+    sleep 2
+    systemctl daemon-reload
+    systemctl restart sshd.service 2>/dev/null || true
+  fi
+  if [ "$(systemctl is-active sshd.service 2>/dev/null)" = active ]; then
+    logger -t neural-ice-firstboot "sshd is active; the provisioned operator key is usable"
+  else
+    logger -t neural-ice-firstboot "WARNING: sshd is NOT active after provisioning an operator key — remote debug is unavailable on this boot"
+  fi
 fi
 
 : > "$marker"

@@ -2,6 +2,30 @@
 name: test-preloaded-media
 
 on:
+  # Also on pull_request: this suite is what proves the debug medium can be
+  # reached at all, and until now it only ran AFTER a merge to main -- so a
+  # firstboot script that unmasks sshd without starting it reached main
+  # unchallenged, and the defect surfaced on installed hardware instead.
+  pull_request:
+    paths:
+      - 'image/build-preloaded.sh'
+      - 'image/build-installer-usb.sh'
+      - 'image/lib/debug-ssh-key.sh'
+      - 'image/lib/preloaded-sizing.sh'
+      - 'image/lib/preloaded-output-set.sh'
+      - 'image/payload/neural-ice-payload-apply.service'
+      - 'image/seed-tree-manifest.py'
+      - 'image/test-preloaded-sizing.sh'
+      - 'image/test-preloaded-output-set.sh'
+      - 'image/test-debug-ssh-key.sh'
+      # The first-boot service is the far end of the same chain the suite
+      # exercises: the medium carries the key, this serves it. Leaving it out
+      # means a change that silently stops serving the key triggers nothing.
+      - 'image/firstboot/neural-ice-firstboot-sshkey.sh'
+      - 'image/verify-preloaded-media.py'
+      - 'image/test-seed-tree-manifest.py'
+      - 'image/test-verify-preloaded-media.sh'
+      - '.github/workflows/test-preloaded-media.yml'
   push:
     branches:
       - main
@@ -35,7 +59,14 @@ concurrency:
 
 jobs:
   linux-x86_64-portable:
-    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
+    # `github.ref == refs/heads/main` skipped every pull request, so widening the
+    # trigger alone changed nothing -- the jobs still opted out. Keep the
+    # repository guard (forks must not schedule our self-hosted runners) and
+    # admit pull requests targeting main.
+    if: >-
+      github.repository == 'Neural-ICE/ICE-CoreOS'
+      && (github.ref == 'refs/heads/main'
+          || (github.event_name == 'pull_request' && github.base_ref == 'main'))
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
@@ -62,7 +93,14 @@ jobs:
             image/test-preloaded-output-set.sh \
             image/test-verify-preloaded-media.sh
   linux-arm64:
-    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
+    # `github.ref == refs/heads/main` skipped every pull request, so widening the
+    # trigger alone changed nothing -- the jobs still opted out. Keep the
+    # repository guard (forks must not schedule our self-hosted runners) and
+    # admit pull requests targeting main.
+    if: >-
+      github.repository == 'Neural-ICE/ICE-CoreOS'
+      && (github.ref == 'refs/heads/main'
+          || (github.event_name == 'pull_request' && github.base_ref == 'main'))
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 20
     steps:
