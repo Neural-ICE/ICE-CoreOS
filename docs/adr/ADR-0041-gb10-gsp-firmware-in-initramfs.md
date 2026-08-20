@@ -51,3 +51,12 @@ build-time assertion. Do not "optimize" it away.
 Applied at runtime on the .72 (same dracut conf + `rpm-ostree initramfs
 --enable` + reboot): `nvidia-smi` → NVIDIA GB10, console → 240x67, single DRM
 driver = nvidia. Durable across reboots.
+
+## Follow-up: KMS/fbdev options are a separate invariant
+
+The 2026-07-29 R580 live validation found a second path to the same 100x37
+symptom: GSP initialization succeeded, but `nvidia_drm` had loaded with
+`modeset=N`. ADR-0043 therefore complements this ADR with immutable initial-load
+options (`modeset=1 fbdev=1`) and `FONT=default8x16`, all embedded in the same
+regenerated initramfs. Future initramfs changes must preserve both invariants:
+GSP firmware availability and early NVIDIA DRM console configuration.
