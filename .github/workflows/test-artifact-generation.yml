@@ -101,7 +101,7 @@ jobs:
             build/build-kernel.sh \
             image/build-installer-usb.sh image/lib/debug-ssh-key.sh \
             ota/neural-ice-autoinstall.sh \
-            ci/test-gb10-console-boot.sh
+            ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh
       - name: Validate the installer image recipe
         run: |
           # A Containerfile has no linter here, so assert the properties that
@@ -139,3 +139,4 @@ jobs:
           ./ci/test-kernel-packaging-patch.sh
           ./ci/test-no-shim-chained-updater.sh
           ./ci/test-gb10-console-boot.sh
+          ./ci/test-install-registry-mirror.sh

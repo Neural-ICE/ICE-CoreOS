@@ -119,6 +119,100 @@ if grep -qE 'neuralice\.imgref=([^ ]+)' /proc/cmdline; then
   IMGREF="$(sed -n 's/.*neuralice\.imgref=\([^ ]*\).*/\1/p' /proc/cmdline)"
 fi
 
+# --------------------------------------------------------------------------- #
+# Optional LAN registry mirror, for the deployment-bench path (FAB-0040).
+#
+# `neuralice.mirror=<host[:port]>` points container pulls at a LAN mirror while
+# LEAVING THE IMAGE REFERENCE UNCHANGED. That last part is the whole point: the
+# medium built for a bench and the medium shipped to a customer are the same
+# bytes, and the customer needs no action -- with no mirror reachable, pulls
+# fall back to the primary registry on their own.
+#
+# WHY A MIRROR AND NOT A DNS OVERRIDE. Pointing registry.neural-ice.ch at a LAN
+# host would force that host to present a TLS certificate for that name: either
+# the production private key travels to a bench, or a private CA has to be
+# trusted by the image -- and that one would travel all the way to the customer.
+# A mirror needs neither.
+#
+# WHAT KEEPS A HOSTILE MIRROR HARMLESS, per containers-registries.conf(5):
+#   - pull-from-mirror = "digest-only": the mirror is consulted ONLY for
+#     digest-pinned pulls, so the digest -- not the server -- is the authority;
+#   - the signature policy is evaluated against the ORIGINAL scope, so bytes
+#     served by the mirror must still satisfy the cosign verification configured
+#     for registry.neural-ice.ch. A bad mirror can only cause a loud failure.
+# This is FAB-0040 D2's property ("the authority does not come from the
+# transport") applied to the OCI transport that missions A/B/C established.
+#
+# SCOPE: the live installer environment only. The deployment is written from the
+# image, whose /usr/etc holds no such drop-in, so this cannot reach the target --
+# and phase 6 asserts that rather than trusting it.
+INSTALL_MIRROR=""
+if grep -qE 'neuralice\.mirror=[^ ]+' /proc/cmdline; then
+  INSTALL_MIRROR="$(sed -n 's/.*neuralice\.mirror=\([^ ]*\).*/\1/p' /proc/cmdline)"
+  # Reject anything that is not a bare host[:port]. This value is interpolated
+  # into TOML: a scheme, a path or a quote would either break the file or smuggle
+  # a second directive into it.
+  [[ "$INSTALL_MIRROR" =~ ^[A-Za-z0-9._-]+(:[0-9]{1,5})?$ ]] \
+    || die "neuralice.mirror must be a bare host[:port], got: $INSTALL_MIRROR"
+  install -d -m 0755 /etc/containers/registries.conf.d
+  for _scope in neural-ice vendor; do
+    cat >> /etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf <<EOF
+[[registry]]
+location = "registry.neural-ice.ch/$_scope"
+
+  [[registry.mirror]]
+  location = "$INSTALL_MIRROR/$_scope"
+  insecure = true
+  pull-from-mirror = "digest-only"
+
+EOF
+  done
+  log "LAN registry mirror enabled for this install only: $INSTALL_MIRROR (digest-only, image references unchanged)"
+fi
+
+# --------------------------------------------------------------------------- #
+# Install source: the medium's own image (default) or a registry pull.
+#
+# `--source-imgref containers-storage:localhost/bootc` means THE INSTALLED SYSTEM
+# IS THE MEDIUM'S OWN IMAGE. `--target-imgref` only records the future OTA
+# origin. That is why the medium has to carry every byte it installs, and why a
+# preloaded medium is ~222 GiB.
+#
+# `neuralice.source=registry` installs the APPLIANCE image instead, pulled by
+# digest. Combined with neuralice.mirror= this is the deployment-bench model of
+# FAB-0040: a light medium boots, and the bytes come off the LAN.
+#
+# ⚠️ DEFAULT IS `medium`. Without the karg not one line of the USB path changes.
+INSTALL_SOURCE=medium
+if grep -qE 'neuralice\.source=[^ ]+' /proc/cmdline; then
+  INSTALL_SOURCE="$(sed -n 's/.*neuralice\.source=\([^ ]*\).*/\1/p' /proc/cmdline)"
+  case "$INSTALL_SOURCE" in
+    medium|registry) : ;;
+    *) die "neuralice.source must be medium or registry, got: $INSTALL_SOURCE" ;;
+  esac
+fi
+
+# The appliance image to install when INSTALL_SOURCE=registry. It MUST be
+# digest-pinned: the digest is what makes a LAN mirror safe to use, so accepting
+# a tag here would quietly undo the property the mirror depends on.
+OS_IMAGE=""
+if grep -qE 'neuralice\.osimage=[^ ]+' /proc/cmdline; then
+  OS_IMAGE="$(sed -n 's/.*neuralice\.osimage=\([^ ]*\).*/\1/p' /proc/cmdline)"
+fi
+if [ "$INSTALL_SOURCE" = registry ]; then
+  [ -n "$OS_IMAGE" ] \
+    || die "neuralice.source=registry requires neuralice.osimage=<ref>@sha256:<64-hex>"
+  [[ "$OS_IMAGE" =~ ^[A-Za-z0-9./_:-]+@sha256:[0-9a-f]{64}$ ]] \
+    || die "neuralice.osimage must be digest-pinned (a tag would defeat the mirror's safety), got: $OS_IMAGE"
+  # Fail-closed on the property that actually protects this path. The medium
+  # runs a permissive DEFAULT so it can read its own local image, but it keeps
+  # the signed `docker` scopes; a registry pull is still verified against
+  # image-ci. If those scopes are gone, the pull would silently accept anything
+  # the network served -- refuse rather than install it.
+  python3 -c 'import json,sys; d=json.load(open("/etc/containers/policy.json")); sys.exit(0 if "registry.neural-ice.ch/neural-ice" in d.get("transports",{}).get("docker",{}) else 1)' \
+    || die "this medium carries no signed docker scope for registry.neural-ice.ch; refusing a registry install that nothing would verify"
+fi
+
 # System (root) LUKS volume size. Data volume takes the remaining space.
 # Overridable via neuralice.systemsize=<GiB>.
 #
@@ -403,7 +497,7 @@ mount --make-rshared "$TGT"
 sshkey_karg=()
 [[ -n "$SSHKEY_B64" ]] && sshkey_karg=(--karg "neuralice.sshkey=$SSHKEY_B64")
 
-phase 4 "bootc install to-filesystem (encrypted root, OTA origin: $IMGREF)"
+phase 4 "bootc install to-filesystem (encrypted root, source: $INSTALL_SOURCE, OTA origin: $IMGREF)"
 # --skip-fetch-check: offline/air-gapped install. The source is the local
 # containers-storage; the target imgref is only the future OTA origin, not
 # reachable from the installer env (no network) — verifying it would hang.
@@ -414,6 +508,38 @@ phase 4 "bootc install to-filesystem (encrypted root, OTA origin: $IMGREF)"
 # install needs no container network; logs pass straight through to the tty.
 # bootc's own output streams to the tty (passthrough-tty) but has silent
 # stretches; the heartbeat distinguishes them from a real hang.
+# Resolve the source. On the registry path the image is pulled into
+# containers-storage FIRST, so the signature policy and the digest are both
+# checked before bootc is handed anything -- and so bootc still reads from a
+# local store, exactly as on the medium path.
+source_imgref="containers-storage:localhost/bootc"
+if [ "$INSTALL_SOURCE" = registry ]; then
+  log "Pulling the appliance image from the registry: $OS_IMAGE"
+  [ -n "$INSTALL_MIRROR" ] && log "  (a LAN mirror is configured: $INSTALL_MIRROR — the reference above is unchanged)"
+  heartbeat_start "podman pull $OS_IMAGE"
+  podman --cgroup-manager=cgroupfs --events-backend=file pull "$OS_IMAGE" \
+    || die "cannot pull the appliance image; with a mirror configured, check that it holds this digest"
+  bg_stop
+  # Assert the digest that landed, not the one requested: a mirror that served
+  # something else must stop the install, not rename it.
+  #
+  # Both `.Digest` and `.RepoDigests` are consulted on purpose. The GB10
+  # appliance is a SINGLE arm64 manifest today, so `.Digest` is the requested
+  # digest -- but the multi-arch doctrine says images become indexes, and for an
+  # index `.Digest` is the PLATFORM manifest while `.RepoDigests` keeps the
+  # index digest that was asked for. Checking only one of the two would either
+  # break the day the appliance goes multi-arch, or pass vacuously today.
+  want="${OS_IMAGE##*@}"
+  got="$(podman image inspect "$OS_IMAGE" --format '{{.Digest}}' 2>/dev/null)" \
+    || die "the pulled appliance image cannot be inspected"
+  repodigests="$(podman image inspect "$OS_IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null || true)"
+  if [ "$got" != "$want" ] && ! printf '%s' "$repodigests" | grep -Fq "@$want"; then
+    die "the pulled image digest ($got) is not the requested one ($want)"
+  fi
+  source_imgref="containers-storage:$OS_IMAGE"
+  log "  verified: $got"
+fi
+
 heartbeat_start "bootc install to-filesystem"
 podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
   --net=host --log-driver=passthrough-tty --pid=host \
@@ -423,7 +549,7 @@ podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
   localhost/bootc \
   bootc install to-filesystem \
     --skip-fetch-check \
-    --source-imgref containers-storage:localhost/bootc \
+    --source-imgref "$source_imgref" \
     --target-imgref "$IMGREF" \
     --root-mount-spec "UUID=$SYS_FS_UUID" \
     --boot-mount-spec "UUID=$BOOT_UUID" \
@@ -617,6 +743,31 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get
   "$dep/etc/containers/policy.json" \
   || die "the container policy restored onto the target is not the fail-closed grafted one"
 echo "[neural-ice-autoinstall] Strict container signature policy restored on the target deployment."
+# The mirror is an INSTALL-TIME convenience and must not survive onto the
+# appliance: an installed machine that keeps pointing at a bench would silently
+# stop being air-gapped the day that bench is gone -- or, worse, keep trusting a
+# host nobody maintains. The deployment is written from the image, so no drop-in
+# should be there; assert it instead of trusting the mechanism.
+#
+# This is the lesson of [[control-validates-can-not-is]]: the block above DEMANDS
+# a strict policy, and without this one nothing would have CHECKED that the
+# mirror stayed behind.
+shopt -s nullglob
+_leaked=("$dep"/etc/containers/registries.conf.d/*neural-ice-install-mirror*)
+shopt -u nullglob
+if (( ${#_leaked[@]} )); then
+  rm -f -- "${_leaked[@]}" \
+    || die "an install-time registry mirror reached the target and could not be removed: ${_leaked[*]}"
+  log "WARNING: an install-time mirror drop-in reached the target deployment and was removed (${#_leaked[@]} file(s)); this should be impossible -- investigate the image build"
+fi
+# An `if`, not `[[ -n "$X" ]] && echo`. The `&&` form is safe HERE -- `set -e`
+# exempts a failing command that is not the last of a `&&` list, verified by
+# experiment on 2026-08-20 -- but it stops being safe the moment such a line
+# becomes the last statement of the script, and this block sits near the end.
+# The `if` costs one line and removes the dependence on that positional detail.
+if [[ -n "$INSTALL_MIRROR" ]]; then
+  echo "[neural-ice-autoinstall] Install-time LAN mirror ($INSTALL_MIRROR) did not travel to the target; it pulls from registry.neural-ice.ch."
+fi
 setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null | head -1)"
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"
