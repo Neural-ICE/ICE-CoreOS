@@ -59,7 +59,14 @@ concurrency:
 
 jobs:
   linux-x86_64-portable:
-    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
+    # `github.ref == refs/heads/main` skipped every pull request, so widening the
+    # trigger alone changed nothing -- the jobs still opted out. Keep the
+    # repository guard (forks must not schedule our self-hosted runners) and
+    # admit pull requests targeting main.
+    if: >-
+      github.repository == 'Neural-ICE/ICE-CoreOS'
+      && (github.ref == 'refs/heads/main'
+          || (github.event_name == 'pull_request' && github.base_ref == 'main'))
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
@@ -86,7 +93,14 @@ jobs:
             image/test-preloaded-output-set.sh \
             image/test-verify-preloaded-media.sh
   linux-arm64:
-    if: github.repository == 'Neural-ICE/ICE-CoreOS' && github.ref == 'refs/heads/main'
+    # `github.ref == refs/heads/main` skipped every pull request, so widening the
+    # trigger alone changed nothing -- the jobs still opted out. Keep the
+    # repository guard (forks must not schedule our self-hosted runners) and
+    # admit pull requests targeting main.
+    if: >-
+      github.repository == 'Neural-ICE/ICE-CoreOS'
+      && (github.ref == 'refs/heads/main'
+          || (github.event_name == 'pull_request' && github.base_ref == 'main'))
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 20
     steps:
