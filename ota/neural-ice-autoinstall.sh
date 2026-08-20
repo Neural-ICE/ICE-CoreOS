@@ -119,6 +119,57 @@ if grep -qE 'neuralice\.imgref=([^ ]+)' /proc/cmdline; then
   IMGREF="$(sed -n 's/.*neuralice\.imgref=\([^ ]*\).*/\1/p' /proc/cmdline)"
 fi
 
+# --------------------------------------------------------------------------- #
+# Optional LAN registry mirror, for the deployment-bench path (FAB-0040).
+#
+# `neuralice.mirror=<host[:port]>` points container pulls at a LAN mirror while
+# LEAVING THE IMAGE REFERENCE UNCHANGED. That last part is the whole point: the
+# medium built for a bench and the medium shipped to a customer are the same
+# bytes, and the customer needs no action -- with no mirror reachable, pulls
+# fall back to the primary registry on their own.
+#
+# WHY A MIRROR AND NOT A DNS OVERRIDE. Pointing registry.neural-ice.ch at a LAN
+# host would force that host to present a TLS certificate for that name: either
+# the production private key travels to a bench, or a private CA has to be
+# trusted by the image -- and that one would travel all the way to the customer.
+# A mirror needs neither.
+#
+# WHAT KEEPS A HOSTILE MIRROR HARMLESS, per containers-registries.conf(5):
+#   - pull-from-mirror = "digest-only": the mirror is consulted ONLY for
+#     digest-pinned pulls, so the digest -- not the server -- is the authority;
+#   - the signature policy is evaluated against the ORIGINAL scope, so bytes
+#     served by the mirror must still satisfy the cosign verification configured
+#     for registry.neural-ice.ch. A bad mirror can only cause a loud failure.
+# This is FAB-0040 D2's property ("the authority does not come from the
+# transport") applied to the OCI transport that missions A/B/C established.
+#
+# SCOPE: the live installer environment only. The deployment is written from the
+# image, whose /usr/etc holds no such drop-in, so this cannot reach the target --
+# and phase 6 asserts that rather than trusting it.
+INSTALL_MIRROR=""
+if grep -qE 'neuralice\.mirror=[^ ]+' /proc/cmdline; then
+  INSTALL_MIRROR="$(sed -n 's/.*neuralice\.mirror=\([^ ]*\).*/\1/p' /proc/cmdline)"
+  # Reject anything that is not a bare host[:port]. This value is interpolated
+  # into TOML: a scheme, a path or a quote would either break the file or smuggle
+  # a second directive into it.
+  [[ "$INSTALL_MIRROR" =~ ^[A-Za-z0-9._-]+(:[0-9]{1,5})?$ ]] \
+    || die "neuralice.mirror must be a bare host[:port], got: $INSTALL_MIRROR"
+  install -d -m 0755 /etc/containers/registries.conf.d
+  for _scope in neural-ice vendor; do
+    cat >> /etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf <<EOF
+[[registry]]
+location = "registry.neural-ice.ch/$_scope"
+
+  [[registry.mirror]]
+  location = "$INSTALL_MIRROR/$_scope"
+  insecure = true
+  pull-from-mirror = "digest-only"
+
+EOF
+  done
+  log "LAN registry mirror enabled for this install only: $INSTALL_MIRROR (digest-only, image references unchanged)"
+fi
+
 # System (root) LUKS volume size. Data volume takes the remaining space.
 # Overridable via neuralice.systemsize=<GiB>.
 #
@@ -617,6 +668,31 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get
   "$dep/etc/containers/policy.json" \
   || die "the container policy restored onto the target is not the fail-closed grafted one"
 echo "[neural-ice-autoinstall] Strict container signature policy restored on the target deployment."
+# The mirror is an INSTALL-TIME convenience and must not survive onto the
+# appliance: an installed machine that keeps pointing at a bench would silently
+# stop being air-gapped the day that bench is gone -- or, worse, keep trusting a
+# host nobody maintains. The deployment is written from the image, so no drop-in
+# should be there; assert it instead of trusting the mechanism.
+#
+# This is the lesson of [[control-validates-can-not-is]]: the block above DEMANDS
+# a strict policy, and without this one nothing would have CHECKED that the
+# mirror stayed behind.
+shopt -s nullglob
+_leaked=("$dep"/etc/containers/registries.conf.d/*neural-ice-install-mirror*)
+shopt -u nullglob
+if (( ${#_leaked[@]} )); then
+  rm -f -- "${_leaked[@]}" \
+    || die "an install-time registry mirror reached the target and could not be removed: ${_leaked[*]}"
+  log "WARNING: an install-time mirror drop-in reached the target deployment and was removed (${#_leaked[@]} file(s)); this should be impossible -- investigate the image build"
+fi
+# An `if`, not `[[ -n "$X" ]] && echo`. The `&&` form is safe HERE -- `set -e`
+# exempts a failing command that is not the last of a `&&` list, verified by
+# experiment on 2026-08-20 -- but it stops being safe the moment such a line
+# becomes the last statement of the script, and this block sits near the end.
+# The `if` costs one line and removes the dependence on that positional detail.
+if [[ -n "$INSTALL_MIRROR" ]]; then
+  echo "[neural-ice-autoinstall] Install-time LAN mirror ($INSTALL_MIRROR) did not travel to the target; it pulls from registry.neural-ice.ch."
+fi
 setype="$(sed -n 's/^SELINUXTYPE=//p' "$dep/usr/etc/selinux/config" 2>/dev/null | head -1)"
 : "${setype:=targeted}"
 fc="$dep/usr/etc/selinux/$setype/contexts/files/file_contexts"
