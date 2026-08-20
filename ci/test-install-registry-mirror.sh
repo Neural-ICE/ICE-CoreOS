@@ -9,6 +9,12 @@
 #
 # Property 3 is the one that needs a TEST rather than a comment: it is asserted
 # by a block that runs once, at install time, on hardware nobody watches.
+# shellcheck disable=SC2016
+# Every `$` below is deliberately literal: this file greps the installer for the
+# exact source text of its guards, so `"$dep"` and `"$source_imgref"` must reach
+# grep unexpanded. Expanding them would silently turn each check into a search
+# for the empty string -- which always matches, and would make this whole file
+# pass while constraining nothing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 S=ota/neural-ice-autoinstall.sh
