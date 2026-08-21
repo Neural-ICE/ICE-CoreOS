@@ -156,7 +156,7 @@ Recovery is to boot the retained newer deployment or use the separately signed
 offline recovery path; a controller must not infer support by scraping usage
 text or retry without the digest gate.
 
-### ADR-0039 delegation-snapshot trust gate
+### ICE-Fabric ADR-0039 delegation-snapshot trust gate
 
 `verify-delegation-snapshot` is the first device-side delegated-signing gate.
 It accepts the exact closed Fabric v1 snapshot bytes only:

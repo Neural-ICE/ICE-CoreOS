@@ -1,4 +1,4 @@
-//! ADR-0039 closed delegation-snapshot contract primitives.
+//! ICE-Fabric ADR-0039 closed delegation-snapshot contract primitives.
 //! Fetching and trusted-time acquisition stay outside this local-only verifier.
 
 use std::collections::HashSet;

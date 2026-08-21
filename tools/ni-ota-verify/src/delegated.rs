@@ -1,4 +1,4 @@
-//! ADR-0039 delegation-snapshot command and secure Cosign transport.
+//! ICE-Fabric ADR-0039 delegation-snapshot command and secure Cosign transport.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
