@@ -63,12 +63,26 @@ cleanup_lab_baseline_stage() {
 # registry, or a mistyped/unpublished digest would be silently recorded as
 # the installed system's origin. Equality with BASE_IMAGE needs no fetch —
 # the staged base is already content-addressed locally.
+# WHERE the proof resolves. This repository is OPEN CORE and must not know where
+# any private registry lives -- a boundary test enforces it. The caller, which
+# does know, may therefore supply TARGET_PROOF_REF: the same digest reachable
+# from the build plane. Unset, the proof resolves TARGET_IMGREF itself, which is
+# the behaviour a public consumer gets.
+#
+# What the proof still catches either way is what it was written for: an
+# unpublished or mistyped digest resolves nowhere. What a build-plane probe does
+# not catch is a private mirror misconfigured for that repository -- which
+# belongs in an explicit warm-up before a demo or an update, not here.
+TARGET_PROOF_REF="${TARGET_PROOF_REF:-$TARGET_IMGREF}"
+[[ "$TARGET_PROOF_REF" =~ @sha256:[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: TARGET_PROOF_REF must be a digest-pinned OCI reference" >&2; exit 1; }
+
 if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
   if command -v skopeo >/dev/null 2>&1; then
-    sudo skopeo inspect --raw "docker://${TARGET_IMGREF}" >/dev/null \
-      || { echo "ERROR: TARGET_IMGREF does not resolve in its registry (unpublished or mistyped digest?): ${TARGET_IMGREF}" >&2; exit 1; }
+    sudo skopeo inspect --raw "docker://${TARGET_PROOF_REF}" >/dev/null \
+      || { echo "ERROR: TARGET_IMGREF does not resolve (unpublished or mistyped digest?): ${TARGET_IMGREF} — probed as ${TARGET_PROOF_REF}" >&2; exit 1; }
   else
-    sudo podman manifest inspect "docker://${TARGET_IMGREF}" >/dev/null 2>&1 \
+    sudo podman manifest inspect "docker://${TARGET_PROOF_REF}" >/dev/null 2>&1 \
       || sudo podman image exists "$TARGET_IMGREF" \
       || { echo "ERROR: TARGET_IMGREF does not resolve (no skopeo; podman could not find it): ${TARGET_IMGREF}" >&2; exit 1; }
   fi

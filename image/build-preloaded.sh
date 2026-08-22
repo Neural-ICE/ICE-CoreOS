@@ -38,6 +38,8 @@ SEED_MODELS="${SEED_MODELS:-${HOME}/ice-seed/models}"
 # as part of the seed rather than assumed to be small.
 SEED_PAYLOAD="${SEED_PAYLOAD:-}"
 BASE_IMAGE="${BASE_IMAGE:-}"
+TARGET_IMGREF="${TARGET_IMGREF:-}"
+TARGET_PROOF_REF="${TARGET_PROOF_REF:-}"
 OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
 LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
@@ -64,7 +66,14 @@ fi
 echo "==> 1. build the base installer raw FROM ${BASE_IMAGE}  (uncompressed)"
 # OUT means "output NAME" here but "bib output DIR" in build-installer-usb.sh —
 # drop it from the child env so an exported OUT never leaks in as a bogus bib dir.
-env -u OUT BASE_IMAGE="$BASE_IMAGE" OUT_NAME="$OUT" ./image/build-installer-usb.sh
+# TARGET_IMGREF is the OTA origin RECORDED on the installed system; BASE_IMAGE
+# is what the medium is BUILT from. They differ on purpose: the build plane
+# reads GHCR, the appliance pulls the sovereign. Forwarding it here is what
+# lets a media build need no appliance credential at all -- the medium carries
+# nothing about any appliance, so building it must not require one.
+env -u OUT BASE_IMAGE="$BASE_IMAGE" TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}" \
+  TARGET_PROOF_REF="${TARGET_PROOF_REF:-${TARGET_IMGREF:-$BASE_IMAGE}}" \
+  OUT_NAME="$OUT" ./image/build-installer-usb.sh
 RAW="${REPO_ROOT}/${OUT}.img"
 [ -f "$RAW" ] || { echo "base raw not produced ($RAW)" >&2; exit 1; }
 
