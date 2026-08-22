@@ -79,10 +79,15 @@ TARGET_PROOF_REF="${TARGET_PROOF_REF:-$TARGET_IMGREF}"
 
 if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
   if command -v skopeo >/dev/null 2>&1; then
-    sudo skopeo inspect --raw "docker://${TARGET_PROOF_REF}" >/dev/null \
+    # No sudo: this is a registry READ, and root holds none of the caller's
+    # credentials. `sudo` resets the environment, so $REGISTRY_AUTH_FILE and
+    # $DOCKER_CONFIG never reach it and the probe fails "unauthorized" on an
+    # image the caller can read perfectly well. MEASURED 2026-08-22, at the last
+    # step of a media build.
+    skopeo inspect --raw "docker://${TARGET_PROOF_REF}" >/dev/null \
       || { echo "ERROR: TARGET_IMGREF does not resolve (unpublished or mistyped digest?): ${TARGET_IMGREF} — probed as ${TARGET_PROOF_REF}" >&2; exit 1; }
   else
-    sudo podman manifest inspect "docker://${TARGET_PROOF_REF}" >/dev/null 2>&1 \
+    podman manifest inspect "docker://${TARGET_PROOF_REF}" >/dev/null 2>&1 \
       || sudo podman image exists "$TARGET_IMGREF" \
       || { echo "ERROR: TARGET_IMGREF does not resolve (no skopeo; podman could not find it): ${TARGET_IMGREF}" >&2; exit 1; }
   fi
@@ -121,7 +126,15 @@ echo "==> build installer image  FROM ${BASE_IMAGE}"
 if sudo podman image exists "$BASE_IMAGE"; then
   echo "    (using local content-addressed ${BASE_IMAGE})"
 else
-  sudo podman pull "$BASE_IMAGE"
+  # `sudo` resets the environment, so root sees neither $REGISTRY_AUTH_FILE nor
+  # $DOCKER_CONFIG and pulls anonymously -- which fails "unauthorized" on a
+  # private base the caller can read perfectly well. The path is expanded by the
+  # caller's shell BEFORE sudo, and root can read the file, so passing it
+  # explicitly is what carries the credential across the privilege boundary.
+  # MEASURED 2026-08-22, at the last step of a media build.
+  pull_auth=()
+  [[ -n "${REGISTRY_AUTH_FILE:-}" ]] && pull_auth=(--authfile "$REGISTRY_AUTH_FILE")
+  sudo podman pull "${pull_auth[@]}" "$BASE_IMAGE"
 fi
 if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" || -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
   # The discriminator is the Secure Boot ANCHOR, not the debug posture.
