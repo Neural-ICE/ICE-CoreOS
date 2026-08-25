@@ -100,7 +100,7 @@ linklocal_address() {
 # The management profile is left EXACTLY as shipped: it keeps priority 100 and
 # always wins whenever a DHCP server answers.
 configure_linklocal_fallback() {
-    local iface="$1" suffix="$2" addr file tmp
+    local iface="$1" suffix="$2" addr file tmp mode
     addr="$(linklocal_address "$suffix")" || { log "WARN: cannot derive link-local address from '$suffix'"; return 1; }
     file="${NM_CONN_DIR}/fallback-${iface}.nmconnection"
     # Written to a temporary name that does NOT end in .nmconnection (NetworkManager
@@ -143,6 +143,23 @@ EOF
     fi
     if [ -e "$file" ] && cmp -s "$tmp" "$file"; then
         rm -f "$tmp"
+        # Same bytes is not the same file. NetworkManager's keyfile plugin
+        # IGNORES a profile that non-root can read, so a mode drifted to 0644
+        # would make this branch log "already current" on every boot while the
+        # fallback does not exist at all. Repair metadata before declaring it.
+        mode="$(stat -c %a "$file" 2>/dev/null || echo unknown)"
+        if [ "$mode" != "600" ]; then
+            if chmod 0600 "$file"; then
+                log "repaired link-local profile mode: $file ($mode -> 600)"
+                reload_networkmanager
+            else
+                log "WARN: could not repair the mode of $file (currently $mode)"
+                return 1
+            fi
+        fi
+        if command -v restorecon >/dev/null 2>&1; then
+            restorecon -F "$file" >/dev/null 2>&1 || true
+        fi
         log "link-local fallback already current: $file ($addr/16)"
         return 0
     fi

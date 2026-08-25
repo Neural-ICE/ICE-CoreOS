@@ -55,6 +55,10 @@ poser_bouchons() { # $1 = etat rendu par `systemctl is-active` (0 = actif)
   cat > "$bac/bin/nmcli" <<EOF
 #!/bin/sh
 echo "nmcli \$*" >> "$bac/appels"
+case "\$*" in
+  *"connection show --active"*) [ -f "$bac/actives" ] && cat "$bac/actives" ; exit 0 ;;
+  *"connection up"*) [ -f "$bac/dhcp-absent" ] && exit 4 ; exit 0 ;;
+esac
 exit 0
 EOF
   cat > "$bac/bin/systemctl" <<EOF
@@ -177,6 +181,24 @@ egal "aucun rechargement si NetworkManager ne tourne pas" "$(grep -c '^nmcli con
 [ -f "$bac/nm/fallback-${IFACE}.nmconnection" ] || fail "le profil doit être rendu même sans NetworkManager"
 ok "le profil est rendu quand même — il sera lu au prochain démarrage"
 
+# ============ 6bis. un profil au bon contenu mais au mauvais mode est réparé
+# NetworkManager IGNORE un keyfile lisible par un non-root : sans réparation, le
+# script dirait « already current » à chaque démarrage pendant que le secours
+# n'existe pas.
+echo "== 6bis. contenu identique, mode dérivé : le fichier est réparé =="
+monter_bac "$MAC"; poser_bouchons 0
+jouer >/dev/null 2>&1 || fail "premier rendu en échec"
+profil="$bac/nm/fallback-${IFACE}.nmconnection"
+empreinte="$(sha256sum "$profil" | cut -d' ' -f1)"
+chmod 0644 "$profil"
+: > "$bac/appels"
+jouer >"$bac/log6b" 2>&1 || fail "run après dérive de mode en échec"
+egal "mode réparé"                 "$(stat -c %a "$profil")" "600"
+egal "contenu inchangé"            "$(sha256sum "$profil" | cut -d' ' -f1)" "$empreinte"
+egal "NetworkManager re-prévenu"   "$(grep -c '^nmcli connection reload$' "$bac/appels")" "1"
+grep -q "repaired link-local profile mode" "$bac/log6b" || fail "la réparation doit être journalisée"
+ok "la réparation est dite explicitement"
+
 # ==================== 7. une écriture qui échoue n'installe RIEN de tronqué
 # Cette fonction est appelée à gauche d'un `||`, ce qui DÉSACTIVE errexit dans
 # tout son corps : sans vérification explicite à chaque pas, un `cat` en échec
@@ -225,5 +247,59 @@ monter_bac "$MAC"; poser_bouchons 3; echouer_sur mv '*'
 jouer >"$bac/log7c" 2>&1 || fail "le script doit continuer si mv échoue"
 egal "mv en échec : aucun profil"      "$(compter_profils)" "0"
 egal "mv en échec : aucun temporaire"  "$(find "$bac/nm" -name '*.tmp.*' | wc -l)" "0"
+
+# ================= 8. le retour au DHCP quand le secours tient l interface
+# NetworkManager ne préempte JAMAIS une connexion active : `autoconnect` ne
+# choisit qu'à périphérique libre, et `autoconnect-priority` ne fait qu'ordonner
+# les candidats à cet instant. Sans mécanisme explicite, une appliance démarrée
+# sans DHCP garde son adresse lien-local même quand un serveur apparaît.
+RETRY=image/mdns/neural-ice-dhcp-retry.sh
+[ -f "$RETRY" ] || fail "script de retour au DHCP introuvable : $RETRY"
+echo "== 8. retour au DHCP =="
+
+rejouer_retry() {
+  env NEURAL_ICE_NM_CONN_DIR="$bac/nm" NEURAL_ICE_SYS_NET="$bac/sys" \
+      NEURAL_ICE_RUN_DIR="$bac/run" NEURAL_ICE_AVAHI_CONF="$bac/etc/avahi.conf" \
+      NEURAL_ICE_HOSTNAME_INIT="$SCRIPT" PATH="$bac/bin:$PATH" \
+      bash "$RETRY"
+}
+
+monter_bac "$MAC"; poser_bouchons 0
+printf 'fallback-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
+: > "$bac/appels"
+rejouer_retry >"$bac/log8a" 2>&1 || fail "le retour au DHCP ne doit pas échouer"
+egal "reconnexion demandée quand le secours tient" \
+  "$(grep -c "^nmcli connection up mgmt-${IFACE}$" "$bac/appels")" "1"
+
+printf 'mgmt-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
+: > "$bac/appels"
+rejouer_retry >"$bac/log8b" 2>&1 || fail "run avec DHCP actif en échec"
+egal "aucune reconnexion quand le DHCP tient déjà" \
+  "$(grep -c '^nmcli connection up' "$bac/appels")" "0"
+
+# Le nom du profil se lit DANS le fichier, il n est pas supposé « mgmt-<iface> ».
+sed -i "s/^id=mgmt-${IFACE}$/id=administration/" "$bac/nm/mgmt-${IFACE}.nmconnection"
+printf 'fallback-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
+: > "$bac/appels"
+rejouer_retry >"$bac/log8c" 2>&1 || fail "run avec un id renommé en échec"
+egal "le profil est nommé d après son fichier" \
+  "$(grep -c '^nmcli connection up administration$' "$bac/appels")" "1"
+sed -i "s/^id=administration$/id=mgmt-${IFACE}/" "$bac/nm/mgmt-${IFACE}.nmconnection"
+
+# NetworkManager arrêté : rien du tout.
+poser_bouchons 3
+printf 'fallback-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
+: > "$bac/appels"
+rejouer_retry >"$bac/log8d" 2>&1 || fail "run NM arrêté en échec"
+egal "aucune reconnexion si NetworkManager est arrêté" \
+  "$(grep -c '^nmcli connection up' "$bac/appels")" "0"
+
+# Le DHCP est toujours absent : l échec doit être dit, pas masqué.
+poser_bouchons 0; touch "$bac/dhcp-absent"
+printf 'fallback-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
+rejouer_retry >"$bac/log8e" 2>&1 || fail "un échec de reconnexion ne doit pas faire échouer l unité"
+grep -q "still no DHCP" "$bac/log8e" || fail "l échec de reconnexion doit être journalisé"
+ok "un DHCP toujours absent est dit, et l unité sort proprement"
+rm -f "$bac/dhcp-absent"
 
 printf '\nPASS — %d contrôles\n' "$n"

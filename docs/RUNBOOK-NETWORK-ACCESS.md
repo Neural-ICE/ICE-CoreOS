@@ -84,6 +84,30 @@ the **name**, not for whatever address the link happens to give out, so it keeps
 working on the fallback address — verified: `200` by name forced onto a
 `169.254` address, `421` on the bare address.
 
+## Coming back to DHCP
+
+NetworkManager does **not** preempt an active connection: `autoconnect` only
+picks a profile when the device is free, and `autoconnect-priority` merely orders
+the candidates at that moment. An appliance that came up on a DHCP-less link
+therefore **keeps** its link-local address even once a DHCP server appears —
+until a carrier bounce, a reboot, or an explicit reconnection.
+
+`neural-ice-dhcp-retry.timer` is that explicit reconnection. Every 15 minutes it
+checks the management NIC and, **only** if the fallback is the active profile,
+asks NetworkManager to bring the DHCP profile up.
+
+The attempt is not free: NM drops the fallback, waits out `ipv4.dhcp-timeout`
+(45 s by default) and, on failure, re-activates the fallback — roughly a minute
+answering on neither address. That is the trade: a short periodic outage on a
+machine already off its normal address, in exchange for an automatic return to
+the LAN. When the fallback is not active the unit exits immediately and costs
+nothing.
+
+To force it rather than wait:
+
+    sudo systemctl start neural-ice-dhcp-retry.service
+    journalctl -u neural-ice-dhcp-retry.service -n 5
+
 ## What is deliberately not solved here
 
 `avahi-resolve` publishes only the **routable** address when a routable and a

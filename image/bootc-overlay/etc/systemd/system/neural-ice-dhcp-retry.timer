@@ -1,0 +1,17 @@
+# Every attempt costs about a minute without any address when DHCP is still
+# absent (NetworkManager drops the fallback, waits out ipv4.dhcp-timeout, then
+# re-activates it). Fifteen minutes keeps that cost near 7% on a machine that is
+# ALREADY unreachable at its normal address, and zero the rest of the time —
+# when the fallback is not active the unit exits immediately.
+
+[Unit]
+Description=Neural ICE — periodically try to return to DHCP
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
