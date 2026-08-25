@@ -47,6 +47,25 @@ EOF
   printf 'inconnu'                 > "$bac/etc/proc-hostname"
 }
 
+# Bouchons de commandes EXTERNES (frontière du script, pas son intérieur) : ils
+# consignent leurs appels pour qu'on puisse exiger que NetworkManager soit
+# rechargé quand le profil change, et seulement là.
+poser_bouchons() { # $1 = etat rendu par `systemctl is-active` (0 = actif)
+  mkdir -p "$bac/bin"
+  cat > "$bac/bin/nmcli" <<EOF
+#!/bin/sh
+echo "nmcli \$*" >> "$bac/appels"
+exit 0
+EOF
+  cat > "$bac/bin/systemctl" <<EOF
+#!/bin/sh
+echo "systemctl \$*" >> "$bac/appels"
+exit $1
+EOF
+  chmod +x "$bac/bin/nmcli" "$bac/bin/systemctl"
+  : > "$bac/appels"
+}
+
 jouer() { # exécute le script entier dans le bac
   env NEURAL_ICE_NM_CONN_DIR="$bac/nm" \
       NEURAL_ICE_SYS_NET="$bac/sys" \
@@ -55,6 +74,7 @@ jouer() { # exécute le script entier dans le bac
       NEURAL_ICE_ETC_HOSTNAME="$bac/etc/hostname" \
       NEURAL_ICE_ETC_HOSTS="$bac/etc/hosts" \
       NEURAL_ICE_PROC_HOSTNAME="$bac/etc/proc-hostname" \
+      PATH="$bac/bin:$PATH" \
       bash "$SCRIPT"
 }
 
@@ -122,5 +142,24 @@ jouer >/dev/null 2>&1 || fail "run sur la seconde MAC en échec"
 egal "adresse dérivée de la seconde MAC" \
   "$(sed -n 's|^address1=||p' "$bac/nm/fallback-${IFACE}.nmconnection")" "169.254.10.11/16"
 egal "nom d'hôte de la seconde MAC" "$(cat "$bac/etc/hostname")" "ni-coreos-0a0b"
+
+# ======================================== 6. NetworkManager est bien prévenu
+# Mesuré sur ni-coreos-93b9 le 25.08 : un keyfile fraîchement écrit reste
+# INVISIBLE pour un NetworkManager déjà lancé — `nmcli con show` répond
+# « no such connection profile » — jusqu'à un rechargement.
+echo "== 6. NetworkManager est rechargé quand, et seulement quand, le profil change =="
+monter_bac "$MAC"; poser_bouchons 0
+jouer >/dev/null 2>&1 || fail "run avec bouchons en échec"
+egal "rechargement demandé au premier rendu" "$(grep -c '^nmcli connection reload$' "$bac/appels")" "1"
+
+: > "$bac/appels"
+jouer >/dev/null 2>&1 || fail "second run avec bouchons en échec"
+egal "aucun rechargement quand rien ne change" "$(grep -c '^nmcli connection reload$' "$bac/appels")" "0"
+
+monter_bac "$MAC"; poser_bouchons 3   # NetworkManager déclaré inactif
+jouer >/dev/null 2>&1 || fail "run NM inactif en échec"
+egal "aucun rechargement si NetworkManager ne tourne pas" "$(grep -c '^nmcli connection reload$' "$bac/appels")" "0"
+[ -f "$bac/nm/fallback-${IFACE}.nmconnection" ] || fail "le profil doit être rendu même sans NetworkManager"
+ok "le profil est rendu quand même — il sera lu au prochain démarrage"
 
 printf '\nPASS — %d contrôles\n' "$n"

@@ -22,10 +22,10 @@
 set -euo pipefail
 
 readonly PREFIX="ni-coreos"
-# Racines paramétrables pour que la CI puisse EXÉCUTER ce script sur un faux
-# système de fichiers. Les valeurs par défaut sont celles de production : rien
-# ne change sur l'appliance, et aucun branchement de test ne vit dans le corps
-# des fonctions — seules les racines, qui sont des entrées, sont substituables.
+# Filesystem roots, overridable so CI can EXECUTE this script against a fake
+# tree. The defaults are the production paths: nothing changes on an appliance,
+# and no test branch lives inside any function — only the roots, which are
+# inputs, are substitutable.
 readonly NM_CONN_DIR="${NEURAL_ICE_NM_CONN_DIR:-/etc/NetworkManager/system-connections}"
 readonly SYS_NET="${NEURAL_ICE_SYS_NET:-/sys/class/net}"
 readonly RUN_DIR="${NEURAL_ICE_RUN_DIR:-/run/neural-ice}"
@@ -120,7 +120,31 @@ EOF
         return 0
     fi
     mv -f "$tmp" "$file"
+    # The file inherits the directory's SELinux type, which is what the policy
+    # enforces, but normalise the whole label anyway so a future policy keyed on
+    # the user part cannot start rejecting a profile we rendered ourselves.
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -F "$file" >/dev/null 2>&1 || true
+    fi
     log "rendered link-local fallback: $file ($addr/16, priority 10)"
+    reload_networkmanager
+}
+
+# NetworkManager reads keyfiles when it starts. This script normally runs
+# Before=NetworkManager.service, so nothing more is needed on a boot. It also
+# runs on a LIVE system though — a re-render after an update — and there a
+# freshly written keyfile is INVISIBLE to NM: measured on ni-coreos-93b9 the
+# 2026-08-25, `nmcli con show fallback-<iface>` answered "no such connection
+# profile" until a reload. The reload is not disruptive: across it the active
+# DHCP connection kept its state and its address.
+reload_networkmanager() {
+    command -v nmcli >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
+    if nmcli connection reload >/dev/null 2>&1; then
+        log "asked NetworkManager to re-read its profiles"
+    else
+        log "WARN: nmcli connection reload failed (profile lands at next boot)"
+    fi
 }
 
 # Deterministically resolve the RJ45 management interface name.
@@ -177,9 +201,9 @@ main() {
     log "published short hostname to $MDNS_FILE"
     configure_avahi_interface "$iface"
 
-    # Joignabilité sans DHCP. Volontairement non fatal : sur le premier démarrage
-    # enforçant de la .72 (2026-07-13) une étape en échec avait interrompu le
-    # script et fait sauter les suivantes. Le nom d'hôte prime sur le secours.
+    # Reachability on a DHCP-less link. Deliberately non-fatal: on the first
+    # enforcing boot of the .72 (2026-07-13) a failing step aborted this script
+    # and dropped everything after it. The hostname outranks the fallback.
     configure_linklocal_fallback "$iface" "$suffix" \
         || log "WARN: link-local fallback profile not rendered (continuing)"
 
@@ -211,8 +235,8 @@ main() {
     fi
 }
 
-# Exécuté seulement en tant que programme : `source` ce fichier expose les
-# fonctions à la CI sans toucher au nom d'hôte de la machine qui teste.
+# Only when run as a program: sourcing this file exposes the functions to CI
+# without touching the hostname of the machine running the tests.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"
 fi
