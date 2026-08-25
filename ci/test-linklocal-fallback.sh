@@ -91,8 +91,23 @@ egal "93b9 (l'appliance de démonstration)" "$(derive 93b9)" "169.254.147.185"
 egal "0a0b"                                "$(derive 0a0b)" "169.254.10.11"
 egal "00ff — RFC 3927 interdit 169.254.0.x" "$(derive 00ff)" "169.254.1.255"
 egal "ffab — RFC 3927 interdit 169.254.255.x" "$(derive ffab)" "169.254.254.171"
-if derive abc >/dev/null 2>&1; then fail "un suffixe de 3 caractères doit être refusé"; fi
+if derive abc  >/dev/null 2>&1; then fail "un suffixe de 3 caractères doit être refusé"; fi
+if derive zzzz >/dev/null 2>&1; then fail "un suffixe non hexadécimal doit être refusé"; fi
 ok "un suffixe mal formé est refusé"
+
+# Le repliement RFC 3927 est INÉVITABLE : 65536 suffixes pour 254*256 = 65024
+# adresses utilisables. On l'épingle pour qu'il reste un choix documenté et non
+# une surprise — et pour qu'un changement d'algorithme se voie ici.
+egal "00ff et 01ff partagent leur adresse (replié)" "$(derive 00ff)" "$(derive 01ff)"
+egal "ffab et feab partagent leur adresse (replié)" "$(derive ffab)" "$(derive feab)"
+collisions=0
+for x in 0a0b 93b9 7f10 c0de; do
+  for y in 0a0c 93ba 7f11 c0df; do
+    [ "$x" = "$y" ] && continue
+    [ "$(derive "$x")" = "$(derive "$y")" ] && collisions=$((collisions+1))
+  done
+done
+egal "hors bande repliée, aucune collision" "$collisions" "0"
 
 # ================================================ 2. le profil est bien rendu
 echo "== 2. le profil est rendu par une exécution COMPLÈTE du script =="
@@ -161,5 +176,54 @@ jouer >/dev/null 2>&1 || fail "run NM inactif en échec"
 egal "aucun rechargement si NetworkManager ne tourne pas" "$(grep -c '^nmcli connection reload$' "$bac/appels")" "0"
 [ -f "$bac/nm/fallback-${IFACE}.nmconnection" ] || fail "le profil doit être rendu même sans NetworkManager"
 ok "le profil est rendu quand même — il sera lu au prochain démarrage"
+
+# ==================== 7. une écriture qui échoue n'installe RIEN de tronqué
+# Cette fonction est appelée à gauche d'un `||`, ce qui DÉSACTIVE errexit dans
+# tout son corps : sans vérification explicite à chaque pas, un `cat` en échec
+# tomberait jusqu'au `mv` et installerait un profil vide, journalisé comme rendu.
+echo "== 7. un échec d'écriture ne laisse ni profil tronqué ni temporaire =="
+
+compter_profils() { local f n=0; for f in "$bac"/nm/fallback-*; do [ -e "$f" ] && n=$((n+1)); done; printf '%d' "$n"; }
+
+
+monter_bac "$MAC"
+chmod 500 "$bac/nm"                       # plus de création possible dans le répertoire
+jouer >"$bac/log7a" 2>&1 || fail "le script doit CONTINUER malgré l'échec du profil"
+chmod 700 "$bac/nm"
+egal "aucun profil installé"        "$(compter_profils)" "0"
+egal "aucun temporaire laissé"      "$(find "$bac/nm" -name '*.tmp.*' | wc -l)" "0"
+egal "le nom d'hôte est fait quand même" "$(cat "$bac/etc/hostname")" "ni-coreos-93b9"
+grep -q "WARN" "$bac/log7a" || fail "l'échec doit être journalisé"
+ok "l'échec est bruyant et non fatal"
+
+echouer_sur() { # $1 = commande a faire echouer, $2 = condition sur \$1
+  mkdir -p "$bac/bin"
+  cat > "$bac/bin/$1" <<EOF
+#!/bin/sh
+case "\$1" in $2) exit 1 ;; esac
+exec /usr/bin/$1 "\$@"
+EOF
+  chmod +x "$bac/bin/$1"
+}
+
+monter_bac "$MAC"; poser_bouchons 3; echouer_sur chmod '0600'
+jouer >"$bac/log7b" 2>&1 || fail "le script doit continuer si chmod échoue"
+egal "chmod en échec : aucun profil"   "$(compter_profils)" "0"
+egal "chmod en échec : aucun temporaire" "$(find "$bac/nm" -name '*.tmp.*' | wc -l)" "0"
+
+# Le vrai chemin appelle la dérivation sous `||`, donc SANS errexit : une erreur
+# arithmétique n'arrête alors plus rien. C'est la garde explicite qui refuse, et
+# c'est ici — pas en appelant la fonction directement — qu'on peut le voir.
+monter_bac "zz:zz:zz:zz:zz:zz"; poser_bouchons 3
+jouer >"$bac/log7d" 2>&1 || fail "un suffixe non hexadécimal ne doit pas faire échouer le script"
+egal "suffixe non hexadécimal : aucun profil" "$(compter_profils)" "0"
+egal "suffixe non hexadécimal : aucun temporaire" "$(find "$bac/nm" -name '*.tmp.*' | wc -l)" "0"
+grep -q "WARN" "$bac/log7d" || fail "le refus doit être journalisé"
+ok "le refus passe par la garde, pas par un hasard arithmétique"
+
+monter_bac "$MAC"; poser_bouchons 3; echouer_sur mv '*'
+jouer >"$bac/log7c" 2>&1 || fail "le script doit continuer si mv échoue"
+egal "mv en échec : aucun profil"      "$(compter_profils)" "0"
+egal "mv en échec : aucun temporaire"  "$(find "$bac/nm" -name '*.tmp.*' | wc -l)" "0"
 
 printf '\nPASS — %d contrôles\n' "$n"

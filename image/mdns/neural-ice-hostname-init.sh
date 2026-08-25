@@ -54,16 +54,30 @@ configure_avahi_interface() {
 }
 
 # IPv4 link-local address DERIVED from the same two MAC octets as the hostname:
-# `ni-coreos-93b9` -> 169.254.147.185. Unique per appliance, and computable from
-# the name alone — an operator who knows the name knows the fallback address
-# without having to discover it.
-# RFC 3927 §2.1 reserves 169.254.0.0/24 and 169.254.255.0/24, so the third octet
-# is clamped into 1..254.
+# `ni-coreos-93b9` -> 0x93 = 147, 0xb9 = 185 -> 169.254.147.185. The rule is
+# deliberately one an operator can do in their head, because the whole point is
+# to know the address WITHOUT reaching the machine.
+#
+# RFC 3927 §2.1 reserves 169.254.0.0/24 and 169.254.255.0/24, so a third octet of
+# 0 becomes 1 and 255 becomes 254.
+#
+# That folding is NOT avoidable: 65536 possible suffixes, 254*256 = 65024 usable
+# addresses — by the pigeonhole principle no mapping can be injective, and every
+# alternative (modular reduction, octet swapping) folds the same 512 suffixes
+# while destroying the mental rule above. So the folding is stated instead of
+# claimed away: `00xx` shares its address with `01xx`, and `ffxx` with `fexx`.
+# 512 suffixes out of 65536 — 0.8% — and only ever a problem if two appliances
+# whose management MACs differ in exactly that way sit on the same DHCP-less
+# segment. Pinned by ci/test-linklocal-fallback.sh so it cannot drift silently.
 linklocal_address() {
     local suffix="$1" a b
     [ "${#suffix}" -eq 4 ] || return 1
-    a=$((16#${suffix:0:2}))
-    b=$((16#${suffix:2:2}))
+    # Refuse a malformed suffix EXPLICITLY. `set -u` would also block the printf
+    # below on the unset locals, so no test can tell the two apart — but relying
+    # on that is relying on a side effect: a later edit giving `a` a default
+    # would remove the refusal without touching anything that looks like a check.
+    a=$((16#${suffix:0:2})) 2>/dev/null || return 1
+    b=$((16#${suffix:2:2})) 2>/dev/null || return 1
     [ "$a" -eq 0 ] && a=1
     [ "$a" -eq 255 ] && a=254
     printf '%s.%d.%d' "$LL_NET" "$a" "$b"
@@ -91,8 +105,12 @@ configure_linklocal_fallback() {
     file="${NM_CONN_DIR}/fallback-${iface}.nmconnection"
     # Written to a temporary name that does NOT end in .nmconnection (NetworkManager
     # ignores it) then moved into place, so NM never observes a half-written profile.
-    tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
-    cat > "$tmp" <<EOF
+    tmp="$(mktemp "${file}.tmp.XXXXXX")" || { log "WARN: cannot create a temporary file in ${NM_CONN_DIR}"; return 1; }
+    # Every step below checks explicitly. This function is called as the left
+    # side of `||`, which DISABLES errexit inside it: without these checks a
+    # `cat` that fails on a full disk would fall through to chmod and mv, install
+    # a truncated profile, log it as rendered and return success.
+    if ! cat > "$tmp" <<EOF
 [connection]
 # Neural ICE — link-local fallback on the management NIC. RENDERED at boot by
 # neural-ice-hostname-init.sh; do not edit, the next boot overwrites it.
@@ -113,13 +131,26 @@ address1=${addr}/16
 [ipv6]
 method=link-local
 EOF
-    chmod 0600 "$tmp"
+    then
+        rm -f "$tmp"
+        log "WARN: could not write the link-local profile body (disk full?)"
+        return 1
+    fi
+    if ! chmod 0600 "$tmp"; then
+        rm -f "$tmp"
+        log "WARN: could not restrict the link-local profile to 0600"
+        return 1
+    fi
     if [ -e "$file" ] && cmp -s "$tmp" "$file"; then
         rm -f "$tmp"
         log "link-local fallback already current: $file ($addr/16)"
         return 0
     fi
-    mv -f "$tmp" "$file"
+    if ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        log "WARN: could not install the link-local profile at $file"
+        return 1
+    fi
     # The file inherits the directory's SELinux type, which is what the policy
     # enforces, but normalise the whole label anyway so a future policy keyed on
     # the user part cannot start rejecting a profile we rendered ourselves.

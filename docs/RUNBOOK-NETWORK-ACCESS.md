@@ -47,8 +47,21 @@ alone is enough:
     ni-coreos-93b9   ->  0x93 = 147, 0xb9 = 185  ->  169.254.147.185
 
 RFC 3927 §2.1 reserves `169.254.0.0/24` and `169.254.255.0/24`, so a third octet
-of 0 becomes 1 and 255 becomes 254. Two appliances therefore never collide unless
-their management MACs share both octets.
+of 0 becomes 1 and 255 becomes 254.
+
+That folding cannot be avoided. There are 65536 possible suffixes and
+254 × 256 = 65024 usable addresses, so by the pigeonhole principle **no** mapping
+is injective; alternatives such as a modular reduction fold exactly as many
+suffixes while destroying the mental rule above. So the folding is stated rather
+than claimed away:
+
+* `00xx` shares its address with `01xx`;
+* `ffxx` shares its address with `fexx`;
+* every other suffix — 65024 of 65536, **99.2 %** — is unique.
+
+It matters only if two appliances whose management MACs differ in exactly that
+way sit on the same DHCP-less segment. `ci/test-linklocal-fallback.sh` pins both
+collision pairs so the behaviour cannot drift into an accident.
 
 ## Direct cable to a laptop
 
