@@ -1,0 +1,33 @@
+# Neural ICE CoreOS — return to DHCP when the link-local fallback is holding the
+# management NIC. NetworkManager never preempts an active connection, so without
+# this an appliance that booted on a DHCP-less link stays on its link-local
+# address even after a DHCP server appears.
+
+[Unit]
+Description=Neural ICE — return to DHCP if the link-local fallback holds the management NIC
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+After=NetworkManager.service
+ConditionPathExists=/usr/local/bin/neural-ice-hostname-init.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neural-ice-dhcp-retry.sh
+StandardOutput=journal
+StandardError=journal
+
+# === Security hardening ===
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+# NOT ProtectSystem=strict: nmcli talks to NetworkManager over D-Bus and needs
+# its runtime state. NOT PrivateNetwork: reading /sys/class/net is the point.

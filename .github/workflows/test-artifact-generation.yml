@@ -35,6 +35,14 @@ on:
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
       - "ci/test-gb10-console-boot.sh"
+      # Le script qui nomme la machine rend AUSSI son profil réseau de secours :
+      # sans lui, une appliance sur un lien sans DHCP n'a aucune adresse et
+      # n'est joignable par aucun chemin (ICE-Fabric #447). Il n'était couvert
+      # par aucune vérification de pull-request.
+      - "image/mdns/**"
+      - "ci/test-linklocal-fallback.sh"
+      - "image/bootc-overlay/etc/systemd/system/neural-ice-dhcp-retry.service"
+      - "image/bootc-overlay/etc/systemd/system/neural-ice-dhcp-retry.timer"
       - "image/Containerfile.bootc"
       - "image/bootc-overlay/etc/modules-load.d/nvidia.conf"
       - "image/bootc-overlay/etc/vconsole.conf"
@@ -68,6 +76,14 @@ on:
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
       - "ci/test-gb10-console-boot.sh"
+      # Le script qui nomme la machine rend AUSSI son profil réseau de secours :
+      # sans lui, une appliance sur un lien sans DHCP n'a aucune adresse et
+      # n'est joignable par aucun chemin (ICE-Fabric #447). Il n'était couvert
+      # par aucune vérification de pull-request.
+      - "image/mdns/**"
+      - "ci/test-linklocal-fallback.sh"
+      - "image/bootc-overlay/etc/systemd/system/neural-ice-dhcp-retry.service"
+      - "image/bootc-overlay/etc/systemd/system/neural-ice-dhcp-retry.timer"
       - "image/Containerfile.bootc"
       - "image/bootc-overlay/etc/modules-load.d/nvidia.conf"
       - "image/bootc-overlay/etc/vconsole.conf"
@@ -101,7 +117,9 @@ jobs:
             build/build-kernel.sh \
             image/build-installer-usb.sh image/lib/debug-ssh-key.sh \
             ota/neural-ice-autoinstall.sh \
-            ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh
+            ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh \
+            image/mdns/neural-ice-hostname-init.sh image/mdns/neural-ice-dhcp-retry.sh \
+            ci/test-linklocal-fallback.sh
       - name: Validate the installer image recipe
         run: |
           # A Containerfile has no linter here, so assert the properties that
@@ -140,3 +158,4 @@ jobs:
           ./ci/test-no-shim-chained-updater.sh
           ./ci/test-gb10-console-boot.sh
           ./ci/test-install-registry-mirror.sh
+          ./ci/test-linklocal-fallback.sh
