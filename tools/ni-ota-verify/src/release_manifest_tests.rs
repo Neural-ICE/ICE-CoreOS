@@ -210,6 +210,22 @@ fn enforces_oci_repository_path_component_grammar() {
 }
 
 #[test]
+fn rejects_restart_scopes_without_a_concrete_systemd_unit_name() {
+    for unit in [
+        ".service",
+        "@worker.service",
+        "icecore@.service",
+        "a@b@c.service",
+    ] {
+        assert!(!super::systemd_unit(unit), "accepted {unit}");
+    }
+
+    for unit in ["icecore-api.service", "icecore@worker-1.service"] {
+        assert!(super::systemd_unit(unit), "refused {unit}");
+    }
+}
+
+#[test]
 fn rejects_malformed_content_media_types() {
     let current = manifest(1);
     for media_type in [

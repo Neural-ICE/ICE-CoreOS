@@ -452,12 +452,25 @@ fn repository_component(value: &str) -> bool {
 }
 
 fn systemd_unit(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 160
-        && value.ends_with(".service")
-        && value
+    if value.len() > 160 {
+        return false;
+    }
+    let Some(stem) = value.strip_suffix(".service") else {
+        return false;
+    };
+    if stem.is_empty()
+        || !stem
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"@_.-".contains(&byte))
+    {
+        return false;
+    }
+    match stem.split_once('@') {
+        Some((prefix, instance)) => {
+            !prefix.is_empty() && !instance.is_empty() && !instance.contains('@')
+        }
+        None => true,
+    }
 }
 
 fn media_type(value: &str) -> bool {
