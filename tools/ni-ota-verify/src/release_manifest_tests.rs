@@ -16,7 +16,8 @@ fn manifest(seq: u64) -> Value {
             "activation_contract": "model-pointer-v1",
             "digest": format!("sha256:{}", "2".repeat(64)),
             "id": "gemma-4",
-            "media_type": "application/vnd.neural-ice.model.v1"
+            "media_type": "application/vnd.neural-ice.model.v1",
+            "repository": "registry.neural-ice.ch/neural-ice/models/gemma-4"
         }],
         "hardware_target": "nvidia-gb10-arm64",
         "host": {
@@ -136,6 +137,10 @@ fn refuses_inventory_or_contract_changes_without_host_change() {
 
     candidate = manifest(2);
     candidate["content"][0]["activation_contract"] = json!("model-pointer-v2");
+    assert!(refused(&current, &candidate));
+
+    candidate = manifest(2);
+    candidate["content"][0]["repository"] = json!("registry.neural-ice.ch/other/models/gemma-4");
     assert!(refused(&current, &candidate));
 }
 

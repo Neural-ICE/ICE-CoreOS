@@ -290,7 +290,8 @@ fn release_manifest(seq: u64) -> Value {
             "activation_contract": "model-pointer-v1",
             "digest": format!("sha256:{}", "2".repeat(64)),
             "id": "gemma-4",
-            "media_type": "application/vnd.neural-ice.model.v1"
+            "media_type": "application/vnd.neural-ice.model.v1",
+            "repository": "registry.neural-ice.ch/neural-ice/models/gemma-4"
         }],
         "hardware_target": "nvidia-gb10-arm64",
         "host": {

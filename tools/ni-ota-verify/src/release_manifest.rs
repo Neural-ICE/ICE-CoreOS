@@ -72,6 +72,7 @@ struct ComponentArtifact {
 #[serde(deny_unknown_fields)]
 struct ContentArtifact {
     id: String,
+    repository: String,
     media_type: String,
     digest: String,
     activation_contract: String,
@@ -301,6 +302,7 @@ fn validate(manifest: &ReleaseManifest) -> Result<(), PlanError> {
     for content in &manifest.content {
         if content.id.as_str() <= prior
             || !ident(&content.id)
+            || !repository(&content.repository)
             || !media_type(&content.media_type)
             || !digest(&content.digest)
             || !ident(&content.activation_contract)
@@ -341,6 +343,7 @@ fn validate_content_only_delta(
     }
     for (old, new) in current.iter().zip(candidate) {
         if old.id != new.id
+            || old.repository != new.repository
             || old.media_type != new.media_type
             || old.activation_contract != new.activation_contract
         {
