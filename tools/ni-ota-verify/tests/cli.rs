@@ -276,6 +276,40 @@ fn sha256_of(path: &Path) -> String {
         .to_string()
 }
 
+fn release_manifest(seq: u64) -> Value {
+    serde_json::json!({
+        "components": [{
+            "configuration_contract": "icecore-v1",
+            "digest": format!("sha256:{}", "1".repeat(64)),
+            "id": "ice-ac1",
+            "reboot_required": false,
+            "repository": "registry.neural-ice.ch/neural-ice/ice-ac1",
+            "restart_units": ["icecore-api.service"]
+        }],
+        "content": [{
+            "activation_contract": "model-pointer-v1",
+            "digest": format!("sha256:{}", "2".repeat(64)),
+            "id": "gemma-4",
+            "media_type": "application/vnd.neural-ice.model.v1"
+        }],
+        "hardware_target": "nvidia-gb10-arm64",
+        "host": {
+            "compatibility_contract": "host-v1",
+            "digest": format!("sha256:{}", "3".repeat(64)),
+            "repository": "registry.neural-ice.ch/neural-ice/appliance"
+        },
+        "release_id": format!("release-{seq}"),
+        "release_seq": seq,
+        "schema": "neural-ice-release-manifest-v1"
+    })
+}
+
+fn write_canonical_json(path: &Path, value: &Value) {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    fs::write(path, bytes).unwrap();
+}
+
 fn wait_for_path(path: &Path) {
     // The full CLI suite runs many subprocess-heavy tests in parallel on
     // self-hosted runners. Keep this bounded while allowing scheduling jitter.
@@ -2041,6 +2075,52 @@ fn capabilities_are_canonical_bounded_and_argument_free() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn plan_release_cli_emits_one_deterministic_transaction_or_refusal() {
+    let fx = Fixture::new("plan-release");
+    let current_path = fx.path("current-release.json");
+    let candidate_path = fx.path("candidate-release.json");
+    let current = release_manifest(7);
+    let mut candidate = release_manifest(8);
+    candidate["components"][0]["digest"] = Value::String(format!("sha256:{}", "4".repeat(64)));
+    candidate["content"][0]["digest"] = Value::String(format!("sha256:{}", "5".repeat(64)));
+    write_canonical_json(&current_path, &current);
+    write_canonical_json(&candidate_path, &candidate);
+
+    let mut command = Command::new(BIN);
+    command
+        .arg("plan-release")
+        .args(["--current".as_ref(), current_path.as_os_str()])
+        .args(["--candidate".as_ref(), candidate_path.as_os_str()]);
+    let (code, plan, stderr) = run(&mut command);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(plan["schema"], "neural-ice-release-plan-v1");
+    assert_eq!(plan["transaction"], "component");
+    assert_eq!(plan["changed_components"], serde_json::json!(["ice-ac1"]));
+    assert_eq!(plan["changed_content"], serde_json::json!(["gemma-4"]));
+    assert_eq!(plan["current_manifest_sha256"], sha256_of(&current_path));
+    assert_eq!(
+        plan["candidate_manifest_sha256"],
+        sha256_of(&candidate_path)
+    );
+
+    candidate["release_seq"] = Value::from(7_u64);
+    candidate["release_id"] = Value::String("release-7".into());
+    write_canonical_json(&candidate_path, &candidate);
+    let mut refusal = Command::new(BIN);
+    refusal
+        .arg("plan-release")
+        .args(["--current".as_ref(), current_path.as_os_str()])
+        .args(["--candidate".as_ref(), candidate_path.as_os_str()]);
+    let (code, verdict, stderr) = run(&mut refusal);
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(verdict["verdict"], "refuse");
+    assert_eq!(
+        verdict["reason"],
+        "same release sequence identifies different manifests"
+    );
 }
 
 #[test]

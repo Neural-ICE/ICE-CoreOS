@@ -108,8 +108,37 @@ ni-ota-verify verify-delegation-snapshot \
   --trusted-now <YYYY-MM-DDTHH:MM:SSZ> \
   [--accepted-snapshot <path> --accepted-delegation-seq <n> \
    --accepted-delegation-sha256 <64hex>] [--config …]
+ni-ota-verify plan-release --current <verified-manifest-path> \
+                           --candidate <verified-manifest-path>
 ni-ota-verify capabilities
 ```
+
+### Release transaction planner
+
+`plan-release` is a local-only, side-effect-free classifier. Its caller must
+first verify both canonical manifest byte streams under the accepted delegated
+release authority; this command does not fetch or verify signatures. It hashes
+the exact verified inputs and emits one closed transaction class:
+
+- `host`: the bootc digest or a host compatibility contract changed; reboot is
+  required;
+- `component`: only one or more existing OCI component digests changed;
+- `content`: only one or more existing model/data content digests changed;
+- `noop`: the candidate carries no payload change.
+
+The result contains exactly one class. `host` dominates mixed deltas because
+the host contract must be activated; otherwise `component` dominates
+`content`, while both sorted changed-ID lists remain present so the later
+transaction coordinator cannot silently omit the content part of a mixed
+release.
+
+An inventory addition/removal or a component/content activation contract
+change cannot be inferred safe and is refused unless the host manifest also
+changes. Hardware-target mismatches, rollbacks, split views at the same
+sequence, unknown fields, non-canonical JSON and non-digest references are
+also refused. Repository names in the signed manifest remain canonical
+`registry.neural-ice.ch/...` identities: a LAN cache or `.niupdate` transport
+must provide the same manifest and blob bytes without rewriting that identity.
 
 Config (`/etc/neural-ice/ota.conf`) supplies `enforce`, `root_pubkey`,
 `state_dir` and optionally `device_channel` / `device_compat_min` /

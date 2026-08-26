@@ -28,6 +28,7 @@ mod commit;
 mod config;
 mod delegated;
 mod record;
+mod release_manifest;
 mod runner;
 mod state;
 mod state_v1;
@@ -83,6 +84,8 @@ const USAGE: &str = "usage:
                        --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
                        --trusted-now <UTC-seconds>
                        [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify plan-release --current <verified-manifest-path>
+                       --candidate <verified-manifest-path>
   ni-ota-verify capabilities
   ni-ota-verify --version";
 
@@ -108,6 +111,7 @@ fn run() -> u8 {
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
+        Some("plan-release") => release_manifest::run(&args[1..]),
         Some("capabilities") if args.len() == 1 => {
             let capability_ready =
                 match state_v1::capability_ready(std::path::Path::new(DEFAULT_CONFIG)) {
