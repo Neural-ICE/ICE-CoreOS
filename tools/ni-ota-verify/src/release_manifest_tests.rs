@@ -188,6 +188,28 @@ fn rejects_artifacts_outside_the_canonical_registry_namespace() {
 }
 
 #[test]
+fn enforces_oci_repository_path_component_grammar() {
+    for repository in [
+        "registry.neural-ice.ch/neural-ice/.",
+        "registry.neural-ice.ch/neural-ice/foo.-bar",
+        "registry.neural-ice.ch/neural-ice/foo___bar",
+        "registry.neural-ice.ch/neural-ice/foo/--bar",
+        "registry.neural-ice.ch/neural-ice/foo/bar-",
+    ] {
+        assert!(!super::repository(repository), "accepted {repository}");
+    }
+
+    for repository in [
+        "registry.neural-ice.ch/neural-ice/foo.bar",
+        "registry.neural-ice.ch/neural-ice/foo_bar",
+        "registry.neural-ice.ch/neural-ice/foo__bar",
+        "registry.neural-ice.ch/neural-ice/foo--bar/baz9",
+    ] {
+        assert!(super::repository(repository), "refused {repository}");
+    }
+}
+
+#[test]
 fn rejects_malformed_content_media_types() {
     let current = manifest(1);
     for media_type in [

@@ -404,15 +404,51 @@ fn repository(value: &str) -> bool {
     value.len() <= 255
         && value
             .strip_prefix(CANONICAL_REPOSITORY_PREFIX)
-            .is_some_and(|path| !path.is_empty())
-        && !value.ends_with('/')
-        && !value.contains("//")
-        && !value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "..")
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-/".contains(&byte)
-        })
+            .is_some_and(|path| !path.is_empty() && path.split('/').all(repository_component))
+}
+
+// OCI Distribution repository names are slash-separated path components. Each
+// component starts and ends with lowercase alphanumeric text; separators are a
+// dot, one or two underscores, or one-or-more dashes.
+fn repository_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len()
+            && (bytes[index].is_ascii_lowercase() || bytes[index].is_ascii_digit())
+        {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return true;
+        }
+
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' => {
+                index += 1;
+                if index < bytes.len() && bytes[index] == b'_' {
+                    index += 1;
+                }
+            }
+            b'-' => {
+                while index < bytes.len() && bytes[index] == b'-' {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if index == bytes.len()
+            || !bytes[index].is_ascii_lowercase() && !bytes[index].is_ascii_digit()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn systemd_unit(value: &str) -> bool {
