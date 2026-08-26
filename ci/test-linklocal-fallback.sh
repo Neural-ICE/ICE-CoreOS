@@ -257,6 +257,17 @@ RETRY=image/mdns/neural-ice-dhcp-retry.sh
 [ -f "$RETRY" ] || fail "script de retour au DHCP introuvable : $RETRY"
 echo "== 8. retour au DHCP =="
 
+# Le one-shot reste disponible pour une action explicite, mais il ne doit pas
+# être planifié : chaque tentative DHCP fait tomber le fallback pendant le
+# timeout. Une appliance hors ligne garde donc son adresse sans interruption.
+[ ! -e image/bootc-overlay/etc/systemd/system/neural-ice-dhcp-retry.timer ] || \
+  fail "un timer DHCP disruptif ne doit pas être livré"
+if sed -n '/systemctl enable/,/systemctl set-default/p' image/Containerfile.bootc \
+  | grep -Fq 'neural-ice-dhcp-retry.timer'; then
+  fail "le retry DHCP disruptif ne doit pas être activé dans l'image"
+fi
+ok "aucun retry DHCP périodique n'est livré ni activé"
+
 rejouer_retry() {
   env NEURAL_ICE_NM_CONN_DIR="$bac/nm" NEURAL_ICE_SYS_NET="$bac/sys" \
       NEURAL_ICE_RUN_DIR="$bac/run" NEURAL_ICE_AVAHI_CONF="$bac/etc/avahi.conf" \
