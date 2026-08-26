@@ -167,3 +167,38 @@ fn rejects_unknown_fields_invalid_digests_and_noncanonical_json() {
         Err(PlanError::Refusal(_))
     ));
 }
+
+#[test]
+fn rejects_artifacts_outside_the_canonical_registry_namespace() {
+    let current = manifest(1);
+    for path in [
+        &["host", "repository"][..],
+        &["components", "0", "repository"][..],
+        &["content", "0", "repository"][..],
+    ] {
+        let mut candidate = manifest(2);
+        let value = if path[0] == "host" {
+            &mut candidate[path[0]][path[1]]
+        } else {
+            &mut candidate[path[0]][path[1].parse::<usize>().unwrap()][path[2]]
+        };
+        *value = json!("registry.example.invalid/neural-ice/payload");
+        assert!(refused(&current, &candidate));
+    }
+}
+
+#[test]
+fn rejects_malformed_content_media_types() {
+    let current = manifest(1);
+    for media_type in [
+        "application/",
+        "/json",
+        "application/vnd/neural-ice",
+        "application//json",
+        "application/json; charset=utf-8",
+    ] {
+        let mut candidate = manifest(2);
+        candidate["content"][0]["media_type"] = json!(media_type);
+        assert!(refused(&current, &candidate), "accepted {media_type}");
+    }
+}

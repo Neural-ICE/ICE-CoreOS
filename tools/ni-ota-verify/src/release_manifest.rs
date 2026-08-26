@@ -26,6 +26,7 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_COMPONENTS: usize = 256;
 const MAX_CONTENT: usize = 1024;
 const MAX_RESTART_UNITS: usize = 32;
+const CANONICAL_REPOSITORY_PREFIX: &str = "registry.neural-ice.ch/neural-ice/";
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0x800;
 #[cfg(target_os = "macos")]
@@ -400,9 +401,10 @@ fn digest(value: &str) -> bool {
 }
 
 fn repository(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && !value.starts_with('/')
+    value.len() <= 255
+        && value
+            .strip_prefix(CANONICAL_REPOSITORY_PREFIX)
+            .is_some_and(|path| !path.is_empty())
         && !value.ends_with('/')
         && !value.contains("//")
         && !value
@@ -423,12 +425,21 @@ fn systemd_unit(value: &str) -> bool {
 }
 
 fn media_type(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 127
-        && value.contains('/')
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".+-/".contains(&byte)
-        })
+    if value.len() > 127 {
+        return false;
+    }
+    let Some((kind, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && !subtype.contains('/')
+        && kind.bytes().all(media_type_token_byte)
+        && subtype.bytes().all(media_type_token_byte)
+}
+
+fn media_type_token_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$&^_.+-".contains(&byte)
 }
 
 fn sorted_unique(values: &[String]) -> bool {
