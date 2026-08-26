@@ -44,13 +44,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      RUST_IMAGE: docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
       - name: Verify, lint and test in the pinned Rust toolchain
-        working-directory: tools/ni-ota-verify
         env:
           # NEUTRAL and deliberately wrong: the suite must prove the contract, not
           # the identity of a deployment. The real authority comes from the
@@ -58,12 +59,21 @@ jobs:
           NI_TRUSTED_TIME_ISSUER: trusted-time.example.test
         run: |
           set -euo pipefail
-          rustup component add rustfmt clippy
-          cargo fmt --check
-          cargo clippy --all-targets --all-features --locked -- -D warnings
-          cargo test --locked --features test-path-overrides
-          cargo build --release --locked
-          ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -w /src/tools/ni-ota-verify \
+            -e CARGO_HOME=/tmp/cargo-home \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e NI_TRUSTED_TIME_ISSUER \
+            "$RUST_IMAGE" \
+            bash -euo pipefail -c '
+              rustup component add rustfmt clippy
+              cargo fmt --check
+              cargo clippy --all-targets --all-features --locked -- -D warnings
+              cargo test --locked --features test-path-overrides
+              cargo build --release --locked
+              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
+            '
 
   linux-x86_64:
     if: github.ref == 'refs/heads/main'
