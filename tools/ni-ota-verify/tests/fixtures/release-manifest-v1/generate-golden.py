@@ -413,6 +413,27 @@ PLAN_CASES = [
 ]
 
 
+def fabric_source_hashes() -> dict[str, str]:
+    """Hash all three pinned Fabric sources, refusing to skip a missing one.
+
+    The schema is authority, not decoration: it is what a producer validates
+    against. Recording provenance only for the files that happened to be present
+    would let vectors be regenerated from a partial checkout and still look
+    fully attributed.
+    """
+
+    missing = [name for name in FABRIC_SOURCES if not (FABRIC_DIR / name).is_file()]
+    if missing:
+        raise SystemExit(
+            f"refusing to record partial Fabric provenance; missing from "
+            f"{FABRIC_DIR}: {', '.join(missing)}"
+        )
+    return {
+        name: hashlib.sha256((FABRIC_DIR / name).read_bytes()).hexdigest()
+        for name in FABRIC_SOURCES
+    }
+
+
 def plan_bytes(plan) -> str:
     return (
         json.dumps(
@@ -462,11 +483,7 @@ def main() -> int:
         "provenance": {
             "produced_by": "ICE-Fabric release-manifest/{contract,classifier}.py",
             "fabric_sha": FABRIC_SHA,
-            "fabric_source_sha256": {
-                name: hashlib.sha256((FABRIC_DIR / name).read_bytes()).hexdigest()
-                for name in FABRIC_SOURCES
-                if (FABRIC_DIR / name).is_file()
-            },
+            "fabric_source_sha256": fabric_source_hashes(),
             "regenerate": (
                 "PYTHONPATH=<fabric release-manifest checkout at fabric_sha> python3 "
                 "tools/ni-ota-verify/tests/fixtures/release-manifest-v1/"

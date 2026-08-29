@@ -37,6 +37,7 @@ mod trusted_time;
 mod verify;
 
 use std::collections::HashMap;
+use std::io::Read;
 
 pub(crate) const EXIT_PASS: u8 = 0;
 pub(crate) const EXIT_REFUSE: u8 = 1;
@@ -195,8 +196,21 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
         ));
     }
 
+    // Read at most ONE BYTE past the contract's limit. That is enough for the
+    // parser to produce its own bounded refusal, and never enough for the size
+    // of an attacker-supplied local file to decide this process's memory:
+    // `std::fs::read` reserves capacity from the file's length, so a sparse or
+    // hostile multi-gigabyte manifest would be allocated in full before the
+    // limit was ever consulted. The bound is the canonical one, imported rather
+    // than restated, so it cannot drift away from `parse`.
     let read = |path: &String| -> Result<Vec<u8>, InternalError> {
-        std::fs::read(path).map_err(|e| InternalError(format!("cannot read {path}: {e}")))
+        let file = std::fs::File::open(path)
+            .map_err(|e| InternalError(format!("cannot read {path}: {e}")))?;
+        let mut buffer = Vec::new();
+        file.take(release_manifest::MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut buffer)
+            .map_err(|e| InternalError(format!("cannot read {path}: {e}")))?;
+        Ok(buffer)
     };
     let current = read(current_path)?;
     let candidate = read(candidate_path)?;

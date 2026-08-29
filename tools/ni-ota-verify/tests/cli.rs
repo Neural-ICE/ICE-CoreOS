@@ -6,7 +6,7 @@
 #![cfg(all(unix, feature = "test-path-overrides"))]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -2765,5 +2765,171 @@ fn release_plan_digest_cannot_be_forged_through_path() {
     assert_ne!(
         plan["current_manifest_digest"],
         plan["candidate_manifest_digest"]
+    );
+}
+
+/// Address-space ceiling for the bounded-read test, in KiB (256 MiB).
+///
+/// Far above what the planner needs (two ~1 MiB buffers) and far below the
+/// apparent size of the fixture, so "allocated the whole file" and "read a
+/// bounded prefix" cannot both survive it.
+const RM_ADDRESS_SPACE_LIMIT_KIB: u64 = 262_144;
+/// Apparent size of the sparse oversize fixture: 8 GiB, zero blocks on disk.
+const RM_SPARSE_FIXTURE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Sentinel exit status for "the ceiling could not be applied".
+///
+/// Outside the binary's own contract (0 pass, 1 refuse, 2 internal), so it can
+/// never be confused with a verdict.
+const RM_LIMIT_UNAVAILABLE: i32 = 111;
+
+/// Run the binary with a hard address-space limit, so an allocation
+/// proportional to the input size fails instead of merely being slow.
+///
+/// The ceiling IS the experiment: without it an unbounded read reaches the same
+/// refusal text, so the whole regression is vacuous. `ulimit` therefore has to
+/// be fatal — a bare `ulimit -v N; exec "$@"` only warns on a shell that
+/// refuses the option and then runs the binary with no limit at all, which
+/// would make the 8 GiB fixture pass for the wrong reason.
+///
+/// Two guards, both before `exec`: the request must succeed, and reading the
+/// limit back must show it actually took. On failure the shell exits with the
+/// sentinel and the binary never starts.
+fn run_with_address_space_limit(args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let script = format!(
+        "ulimit -v {RM_ADDRESS_SPACE_LIMIT_KIB} 2>/dev/null || exit {RM_LIMIT_UNAVAILABLE}\n\
+         [ \"$(ulimit -v 2>/dev/null)\" = \"{RM_ADDRESS_SPACE_LIMIT_KIB}\" ] \
+         || exit {RM_LIMIT_UNAVAILABLE}\n\
+         exec \"$@\"\n"
+    );
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script).arg("sh").arg(BIN);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().expect("binary runs");
+    assert_ne!(
+        out.status.code(),
+        Some(RM_LIMIT_UNAVAILABLE),
+        "could not apply a {RM_ADDRESS_SPACE_LIMIT_KIB} KiB address-space limit; \
+         refusing to run the bounded-read regression without a memory ceiling, \
+         because it would pass whether or not the manifest was read as a \
+         bounded prefix"
+    );
+    out
+}
+
+/// An oversize manifest must be refused BY THE CONTRACT, without ever being
+/// allocated in full.
+///
+/// Regression: the CLI used `std::fs::read`, which reserves capacity from the
+/// file's length. A hostile or sparse multi-gigabyte local manifest was
+/// therefore allocated in full BEFORE `parse` consulted `MAX_MANIFEST_BYTES` —
+/// the bound existed but ran too late to protect anything. Reading one byte
+/// past the limit is enough for the normal parser to produce its own bounded
+/// refusal.
+///
+/// The proof is the memory ceiling, not the verdict: an unbounded read reaches
+/// the same refusal text if it survives, so only the ceiling distinguishes the
+/// two. Under this limit the unbounded version dies with
+/// `internal error: cannot read ...: out of memory` (exit 2).
+#[test]
+fn release_plan_refuses_an_oversize_manifest_without_loading_it() {
+    let fx = Fixture::new("release-plan-oversize");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+
+    // Sparse: 8 GiB of addressable zeros that occupy no disk.
+    let huge = fx.path("huge.json");
+    let file = fs::File::create(&huge).unwrap();
+    file.set_len(RM_SPARSE_FIXTURE_BYTES).unwrap();
+    drop(file);
+
+    let meta = fs::metadata(&huge).unwrap();
+    assert_eq!(meta.len(), RM_SPARSE_FIXTURE_BYTES);
+    assert!(
+        meta.blocks() * 512 < 16 * 1024 * 1024,
+        "the fixture must stay sparse; it occupies {} bytes on disk",
+        meta.blocks() * 512
+    );
+    assert!(
+        meta.len() > RM_ADDRESS_SPACE_LIMIT_KIB * 1024 * 4,
+        "the fixture must be far larger than the address-space limit"
+    );
+
+    let device: Vec<&std::ffi::OsStr> = vec![
+        "--hardware-target".as_ref(),
+        "nvidia-gb10-arm64".as_ref(),
+        "--reader-version".as_ref(),
+        "1".as_ref(),
+        "--supported-contracts".as_ref(),
+        RM_CONTRACTS.as_ref(),
+    ];
+
+    // Control: the SAME limit must not by itself break an ordinary run. If this
+    // regressed, the assertion below would pass for the wrong reason.
+    let mut control: Vec<&std::ffi::OsStr> = vec![
+        "release-plan".as_ref(),
+        "--current".as_ref(),
+        base.as_ref(),
+        "--candidate".as_ref(),
+        base.as_ref(),
+    ];
+    control.extend_from_slice(&device);
+    let out = run_with_address_space_limit(&control);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the address-space limit must leave a normal plan working: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The oversize candidate: a contract refusal, not a tooling failure.
+    let mut oversize: Vec<&std::ffi::OsStr> = vec![
+        "release-plan".as_ref(),
+        "--current".as_ref(),
+        base.as_ref(),
+        "--candidate".as_ref(),
+        huge.as_ref(),
+    ];
+    oversize.extend_from_slice(&device);
+    let out = run_with_address_space_limit(&oversize);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("out of memory"),
+        "the manifest was allocated in full instead of read as a bounded prefix: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected a contract refusal (1), not a tooling failure: {stderr}"
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["classification"], "refusal");
+    assert_eq!(
+        plan["refusal_reason"],
+        "candidate manifest refused: release manifest exceeds the byte limit"
+    );
+
+    // The same bound applies to the installed manifest, not just the candidate.
+    let mut current_side: Vec<&std::ffi::OsStr> = vec![
+        "release-plan".as_ref(),
+        "--current".as_ref(),
+        huge.as_ref(),
+        "--candidate".as_ref(),
+        base.as_ref(),
+    ];
+    current_side.extend_from_slice(&device);
+    let out = run_with_address_space_limit(&current_side);
+    assert_eq!(out.status.code(), Some(1));
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        plan["refusal_reason"],
+        "current manifest refused: release manifest exceeds the byte limit"
     );
 }

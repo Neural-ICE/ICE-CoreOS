@@ -205,6 +205,27 @@ fn plan_vectors_cover_every_classification() {
 /// The vectors must stay pinned to the Fabric revision this reader was written
 /// against; a bare regeneration against a moved contract is a decision, not a
 /// refresh.
+/// All three pinned sources are named, including the schema.
+///
+/// `release-manifest-v1.schema.json` is authority, not decoration: it is what a
+/// producer validates against. Leaving it unasserted meant the schema could
+/// move under a still-green suite, and the generator would silently omit it
+/// from provenance if it were absent from the checkout.
+const FABRIC_SOURCE_SHA256: &[(&str, &str)] = &[
+    (
+        "classifier.py",
+        "f0cacd3c934e51f54e56d199835e8059b6dbfcc9c1fa2b0ba0324d684b3d5b05",
+    ),
+    (
+        "contract.py",
+        "426010e504af53352fcf51d4dc1cabfc7da575d7e608e971d7e4a5e9adfa47a5",
+    ),
+    (
+        "release-manifest-v1.schema.json",
+        "dd6f5e94855adcd0bb82a91588d44cf239ef408f1efbb004fdd0fa7f14450b66",
+    ),
+];
+
 #[test]
 fn golden_vectors_record_their_fabric_provenance() {
     let golden = golden();
@@ -212,17 +233,27 @@ fn golden_vectors_record_their_fabric_provenance() {
         golden["provenance"]["fabric_sha"].as_str().unwrap(),
         "e08446d6fc899f670b962f1e013bbf46e7e91497"
     );
+
+    let recorded = golden["provenance"]["fabric_source_sha256"]
+        .as_object()
+        .expect("provenance records the Fabric source hashes");
+    for (name, expected) in FABRIC_SOURCE_SHA256 {
+        assert_eq!(
+            recorded
+                .get(*name)
+                .unwrap_or_else(|| panic!("provenance omits the pinned source {name}"))
+                .as_str()
+                .unwrap(),
+            *expected,
+            "{name} moved under the pinned Fabric revision"
+        );
+    }
+    // Exact, not merely sufficient: a source dropped from provenance is drift.
     assert_eq!(
-        golden["provenance"]["fabric_source_sha256"]["contract.py"]
-            .as_str()
-            .unwrap(),
-        "426010e504af53352fcf51d4dc1cabfc7da575d7e608e971d7e4a5e9adfa47a5"
-    );
-    assert_eq!(
-        golden["provenance"]["fabric_source_sha256"]["classifier.py"]
-            .as_str()
-            .unwrap(),
-        "f0cacd3c934e51f54e56d199835e8059b6dbfcc9c1fa2b0ba0324d684b3d5b05"
+        recorded.len(),
+        FABRIC_SOURCE_SHA256.len(),
+        "provenance must name exactly the pinned Fabric sources, found {:?}",
+        recorded.keys().collect::<Vec<_>>()
     );
 }
 
