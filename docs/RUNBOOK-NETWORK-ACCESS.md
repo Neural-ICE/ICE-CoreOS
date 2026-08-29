@@ -92,18 +92,15 @@ the candidates at that moment. An appliance that came up on a DHCP-less link
 therefore **keeps** its link-local address even once a DHCP server appears —
 until a carrier bounce, a reboot, or an explicit reconnection.
 
-`neural-ice-dhcp-retry.timer` is that explicit reconnection. Every 15 minutes it
-checks the management NIC and, **only** if the fallback is the active profile,
-asks NetworkManager to bring the DHCP profile up.
+There is deliberately no periodic retry. A DHCP attempt is not free: NM drops
+the fallback, waits out `ipv4.dhcp-timeout` (45 s by default) and, on failure,
+re-activates the fallback — roughly a minute answering on neither address. An
+offline-first appliance must keep its working address instead of interrupting
+it on a timer.
 
-The attempt is not free: NM drops the fallback, waits out `ipv4.dhcp-timeout`
-(45 s by default) and, on failure, re-activates the fallback — roughly a minute
-answering on neither address. That is the trade: a short periodic outage on a
-machine already off its normal address, in exchange for an automatic return to
-the LAN. When the fallback is not active the unit exits immediately and costs
-nothing.
-
-To force it rather than wait:
+A carrier bounce or reboot makes the interface free again, so NetworkManager
+tries the higher-priority DHCP profile before the fallback. To request the same
+transition without touching the cable, trigger the one-shot explicitly:
 
     sudo systemctl start neural-ice-dhcp-retry.service
     journalctl -u neural-ice-dhcp-retry.service -n 5

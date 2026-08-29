@@ -13,9 +13,9 @@
 # The attempt is not free: NetworkManager drops the fallback, waits out
 # `ipv4.dhcp-timeout` (45 s by default) and, on failure, autoconnects the
 # fallback again — roughly a minute during which the appliance answers on
-# neither address. Hence the deliberately long timer period: this trades a
-# short, periodic outage on a machine that is ALREADY off its normal address for
-# an automatic return to the LAN, and does nothing at all the rest of the time.
+# neither address. It must therefore remain an explicit operator action, never
+# a timer: an offline-first appliance keeps a working address until a reboot,
+# carrier bounce or deliberate request to try DHCP again.
 set -uo pipefail
 
 # The management NIC is resolved by exactly the same rule as the hostname, so

@@ -329,8 +329,9 @@ COPY image/payload/neural-ice-payload-apply.service /usr/lib/systemd/system/neur
 # The unit ships in the /etc overlay; avahi (installed above) publishes the name.
 COPY image/mdns/neural-ice-hostname-init.sh /usr/local/bin/neural-ice-hostname-init.sh
 # NetworkManager never preempts an active connection, so a box that came up on a
-# DHCP-less link keeps its link-local address even once DHCP appears. This timer
-# is the explicit reconnection that gets it back onto the LAN.
+# DHCP-less link keeps its link-local address even once DHCP appears. Keep an
+# explicit operator-triggered reconnection, but never schedule it: trying DHCP
+# drops the working fallback for the duration of the DHCP timeout.
 COPY image/mdns/neural-ice-dhcp-retry.sh /usr/local/bin/neural-ice-dhcp-retry.sh
 # PRELOADED edition: the installer stages a ready-built podman overlay store onto the encrypted
 # data volume; we register it as a READ-ONLY additional image store so the appliance's images are
@@ -394,7 +395,6 @@ RUN set -euxo pipefail; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
                      neural-ice-firstboot-sshkey.service \
                      neural-ice-hostname-init.service \
-                     neural-ice-dhcp-retry.timer \
                      neural-ice-payload-apply.service \
                      avahi-daemon.service; \
     systemctl set-default multi-user.target
