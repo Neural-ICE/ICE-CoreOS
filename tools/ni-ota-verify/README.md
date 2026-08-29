@@ -563,15 +563,25 @@ divergence between CoreOS and Fabric is a red test rather than a field incident.
 The generator is **not** run by CI (the pinned Rust image has no Python); it is
 the documented, re-runnable procedure behind the committed vectors:
 
-```
-ICE_FABRIC_SHA=e08446d6fc899f670b962f1e013bbf46e7e91497
-mkdir -p /tmp/fabric-v1 && cd /tmp/fabric-v1
-for f in contract.py classifier.py release-manifest-v1.schema.json; do
-  gh api "repos/Neural-ICE/ICE-Fabric/contents/release-manifest/$f?ref=$ICE_FABRIC_SHA" \
-    --jq .content | base64 -d > "$f"
-done
-PYTHONPATH=/tmp/fabric-v1 python3 \
-  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/generate-golden.py
+```bash
+# Requires Bash: `pipefail` is not POSIX. Without it `gh api … | base64 -d`
+# reports only base64's status, so an API failure (auth, rate limit, a moved
+# ref) silently leaves a truncated or empty source file and the vectors get
+# regenerated from nothing. Run from the CoreOS repository root; the procedure
+# never changes directory, so the generator's relative path stays resolvable.
+(
+  set -euo pipefail
+  ICE_FABRIC_SHA=e08446d6fc899f670b962f1e013bbf46e7e91497
+  FABRIC_DIR="$(mktemp -d)"
+  trap 'rm -rf -- "$FABRIC_DIR"' EXIT
+  for f in contract.py classifier.py release-manifest-v1.schema.json; do
+    gh api "repos/Neural-ICE/ICE-Fabric/contents/release-manifest/$f?ref=$ICE_FABRIC_SHA" \
+      --jq .content | base64 -d > "$FABRIC_DIR/$f"
+  done
+  PYTHONPATH="$FABRIC_DIR" python3 \
+    tools/ni-ota-verify/tests/fixtures/release-manifest-v1/generate-golden.py
+  git diff --stat tools/ni-ota-verify/tests/fixtures/release-manifest-v1/
+)
 ```
 
 Regenerating is a no-op unless the Fabric contract itself moved. A dirty
