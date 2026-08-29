@@ -19,6 +19,12 @@ test-path-overrides = []
 p256 = { version = "=0.13.2", default-features = false, features = ["arithmetic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# In-process SHA-256 for the release-manifest canonical digest ONLY (MIT OR
+# Apache-2.0). The other artifact hashes still shell out to coreutils, but a
+# manifest digest decides anti-rollback: routing it through PATH would let a
+# planted `sha256sum` collapse two different manifests onto one digest and turn
+# a rollback into a no-op. Signature crypto remains the image's pinned cosign.
+sha2 = { version = "0.10.9", default-features = false }
 
 [profile.release]
 # Static single-purpose OS binary: small and self-contained beats fast-to-build.

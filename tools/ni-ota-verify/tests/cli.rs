@@ -6,7 +6,7 @@
 #![cfg(all(unix, feature = "test-path-overrides"))]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -2470,4 +2470,466 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("binding mismatch"), "{stderr}");
     assert!(!fx.path("state/applied.json").exists());
+}
+
+// ---------------------------------------------------------------------------
+// release-plan — the release-manifest v1 reader through the real binary
+// ---------------------------------------------------------------------------
+
+const RM_GOLDEN: &str = include_str!("fixtures/release-manifest-v1/golden.json");
+
+/// Write a committed manifest vector into the fixture directory.
+fn write_manifest(fx: &Fixture, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = fx.path(&format!("{name}.json"));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn release_plan_command(
+    fx: &Fixture,
+    current: &Path,
+    candidate: &Path,
+    contracts: &str,
+) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.arg("release-plan")
+        .arg("--current")
+        .arg(current)
+        .arg("--candidate")
+        .arg(candidate)
+        .arg("--hardware-target")
+        .arg("nvidia-gb10-arm64")
+        .arg("--reader-version")
+        .arg("1")
+        .arg("--supported-contracts")
+        .arg(contracts)
+        .current_dir(&fx.dir)
+        .stdin(Stdio::null());
+    cmd
+}
+
+const RM_CONTRACTS: &str = "component-oci-v1,content-oci-v1,evidence-v1,host-bootc-v1";
+
+/// The CLI emits exactly the canonical plan the golden vectors pin, and maps a
+/// classified transition to 0 and a contract refusal to 1 — an OTA caller must
+/// never read "refusal" as "nothing to do".
+#[test]
+fn release_plan_emits_golden_plans_with_the_documented_exit_codes() {
+    let fx = Fixture::new("release-plan");
+    let golden: Value = serde_json::from_str(RM_GOLDEN).unwrap();
+
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+    let component_content = write_manifest(
+        &fx,
+        "component-content",
+        include_bytes!("fixtures/release-manifest-v1/manifests/component-content.json"),
+    );
+    let host = write_manifest(
+        &fx,
+        "host",
+        include_bytes!("fixtures/release-manifest-v1/manifests/host.json"),
+    );
+    let rollback = write_manifest(
+        &fx,
+        "rollback",
+        include_bytes!("fixtures/release-manifest-v1/manifests/rollback.json"),
+    );
+    let release_seq = write_manifest(
+        &fx,
+        "release-seq",
+        include_bytes!("fixtures/release-manifest-v1/manifests/release-seq.json"),
+    );
+
+    for (case, candidate, expected_code) in [
+        ("noop-identical", &base, 0),
+        ("component-content", &component_content, 0),
+        ("host", &host, 0),
+        ("rollback", &rollback, 1),
+        ("candidate-release-seq", &release_seq, 1),
+    ] {
+        let out = release_plan_command(&fx, &base, candidate, RM_CONTRACTS)
+            .output()
+            .expect("binary runs");
+        assert_eq!(
+            out.status.code(),
+            Some(expected_code),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            golden["plans"][case]["plan"].as_str().unwrap(),
+            "{case}: CLI plan diverges from the Fabric golden vector"
+        );
+    }
+}
+
+/// Device capability is an explicit argument, never sniffed: the SAME manifest
+/// pair refuses on a device that does not support a required contract.
+#[test]
+fn release_plan_takes_device_capability_from_its_arguments() {
+    let fx = Fixture::new("release-plan-device");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+    let candidate = write_manifest(
+        &fx,
+        "component-content",
+        include_bytes!("fixtures/release-manifest-v1/manifests/component-content.json"),
+    );
+
+    let out = release_plan_command(&fx, &base, &candidate, "component-oci-v1,host-bootc-v1")
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(1));
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["classification"], "refusal");
+    assert_eq!(
+        plan["refusal_reason"],
+        "current manifest incompatible: device does not support required contracts: content-oci-v1"
+    );
+}
+
+/// A missing flag, an unreadable manifest or a malformed reader version is
+/// broken tooling, not a verdict: exit 2, and no plan on stdout.
+#[test]
+fn release_plan_maps_tooling_failures_to_internal_error() {
+    let fx = Fixture::new("release-plan-internal");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+
+    // Missing --candidate.
+    let mut cmd = Command::new(BIN);
+    cmd.arg("release-plan")
+        .arg("--current")
+        .arg(&base)
+        .arg("--hardware-target")
+        .arg("nvidia-gb10-arm64")
+        .arg("--reader-version")
+        .arg("1")
+        .arg("--supported-contracts")
+        .arg(RM_CONTRACTS)
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+
+    // Unreadable candidate.
+    let out = release_plan_command(&fx, &base, &fx.path("absent.json"), RM_CONTRACTS)
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+
+    // Non-numeric reader version. Built from scratch with EXACTLY ONE
+    // --reader-version: appending a second one to a complete command would be
+    // rejected as a duplicate flag and this case would pass without ever
+    // exercising the number parse. The diagnostic is asserted for that reason.
+    let mut cmd = Command::new(BIN);
+    cmd.arg("release-plan")
+        .arg("--current")
+        .arg(&base)
+        .arg("--candidate")
+        .arg(&base)
+        .arg("--hardware-target")
+        .arg("nvidia-gb10-arm64")
+        .arg("--reader-version")
+        .arg("one")
+        .arg("--supported-contracts")
+        .arg(RM_CONTRACTS)
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--reader-version must be a non-negative integer"),
+        "expected the malformed-number diagnostic, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("given twice"),
+        "this case must exercise the number parse, not the duplicate-flag guard: {stderr}"
+    );
+}
+
+/// The duplicate-flag guard is a separate control: an OTA path must never limp
+/// on a repeated flag, whichever value would have won.
+#[test]
+fn release_plan_refuses_a_repeated_flag() {
+    let fx = Fixture::new("release-plan-dup-flag");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+
+    let mut cmd = release_plan_command(&fx, &base, &base, RM_CONTRACTS);
+    let out = cmd
+        .arg("--reader-version")
+        .arg("2")
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("flag --reader-version given twice"),
+        "expected the duplicate-flag diagnostic, got: {stderr}"
+    );
+}
+
+/// The release-manifest digest must be immune to a hostile `PATH`.
+///
+/// Regression: while the canonical digest was computed by shelling out to
+/// `sha256sum`, a planted binary returning a constant made every manifest hash
+/// alike. Two DIFFERENT canonical manifests sharing one `bundle_seq` then
+/// compared equal and classified as `no-op` — anti-rollback defeated by a
+/// PATH entry, with no signature involved.
+#[test]
+fn release_plan_digest_cannot_be_forged_through_path() {
+    let fx = Fixture::new("release-plan-path");
+
+    // A `sha256sum` that answers with a constant digest for any input.
+    let fake = fx.path("fakebin");
+    fs::create_dir_all(&fake).unwrap();
+    let sha = fake.join("sha256sum");
+    fs::write(
+        &sha,
+        "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '%s  -\\n' \
+         0000000000000000000000000000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    fs::set_permissions(&sha, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The stub really does lie, so the test proves the planner, not the stub.
+    let probe = Command::new(&sha)
+        .stdin(Stdio::null())
+        .output()
+        .expect("stub runs");
+    assert!(String::from_utf8_lossy(&probe.stdout).starts_with(&"0".repeat(64)));
+
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+    // Same bundle_seq, different canonical manifest: must stay a refusal.
+    let divergent = write_manifest(
+        &fx,
+        "same-seq-divergent",
+        include_bytes!("fixtures/release-manifest-v1/manifests/same-seq-divergent.json"),
+    );
+
+    let mut cmd = release_plan_command(&fx, &base, &divergent, RM_CONTRACTS);
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            fake.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    let out = cmd.output().expect("binary runs");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a hostile PATH must not turn a divergence into a pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["classification"], "refusal");
+    assert_eq!(
+        plan["refusal_reason"],
+        "the same bundle_seq identifies a different canonical manifest"
+    );
+    // The digests are the real ones, and they still differ.
+    let golden: Value = serde_json::from_str(RM_GOLDEN).unwrap();
+    assert_eq!(
+        plan["current_manifest_digest"],
+        golden["manifests"]["base"]["digest"]
+    );
+    assert_eq!(
+        plan["candidate_manifest_digest"],
+        golden["manifests"]["same-seq-divergent"]["digest"]
+    );
+    assert_ne!(
+        plan["current_manifest_digest"],
+        plan["candidate_manifest_digest"]
+    );
+}
+
+/// Address-space ceiling for the bounded-read test, in KiB (256 MiB).
+///
+/// Far above what the planner needs (two ~1 MiB buffers) and far below the
+/// apparent size of the fixture, so "allocated the whole file" and "read a
+/// bounded prefix" cannot both survive it.
+const RM_ADDRESS_SPACE_LIMIT_KIB: u64 = 262_144;
+/// Apparent size of the sparse oversize fixture: 8 GiB, zero blocks on disk.
+const RM_SPARSE_FIXTURE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Sentinel exit status for "the ceiling could not be applied".
+///
+/// Outside the binary's own contract (0 pass, 1 refuse, 2 internal), so it can
+/// never be confused with a verdict.
+const RM_LIMIT_UNAVAILABLE: i32 = 111;
+
+/// Run the binary with a hard address-space limit, so an allocation
+/// proportional to the input size fails instead of merely being slow.
+///
+/// The ceiling IS the experiment: without it an unbounded read reaches the same
+/// refusal text, so the whole regression is vacuous. `ulimit` therefore has to
+/// be fatal — a bare `ulimit -v N; exec "$@"` only warns on a shell that
+/// refuses the option and then runs the binary with no limit at all, which
+/// would make the 8 GiB fixture pass for the wrong reason.
+///
+/// Two guards, both before `exec`: the request must succeed, and reading the
+/// limit back must show it actually took. On failure the shell exits with the
+/// sentinel and the binary never starts.
+fn run_with_address_space_limit(args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let script = format!(
+        "ulimit -v {RM_ADDRESS_SPACE_LIMIT_KIB} 2>/dev/null || exit {RM_LIMIT_UNAVAILABLE}\n\
+         [ \"$(ulimit -v 2>/dev/null)\" = \"{RM_ADDRESS_SPACE_LIMIT_KIB}\" ] \
+         || exit {RM_LIMIT_UNAVAILABLE}\n\
+         exec \"$@\"\n"
+    );
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script).arg("sh").arg(BIN);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().expect("binary runs");
+    assert_ne!(
+        out.status.code(),
+        Some(RM_LIMIT_UNAVAILABLE),
+        "could not apply a {RM_ADDRESS_SPACE_LIMIT_KIB} KiB address-space limit; \
+         refusing to run the bounded-read regression without a memory ceiling, \
+         because it would pass whether or not the manifest was read as a \
+         bounded prefix"
+    );
+    out
+}
+
+/// An oversize manifest must be refused BY THE CONTRACT, without ever being
+/// allocated in full.
+///
+/// Regression: the CLI used `std::fs::read`, which reserves capacity from the
+/// file's length. A hostile or sparse multi-gigabyte local manifest was
+/// therefore allocated in full BEFORE `parse` consulted `MAX_MANIFEST_BYTES` —
+/// the bound existed but ran too late to protect anything. Reading one byte
+/// past the limit is enough for the normal parser to produce its own bounded
+/// refusal.
+///
+/// The proof is the memory ceiling, not the verdict: an unbounded read reaches
+/// the same refusal text if it survives, so only the ceiling distinguishes the
+/// two. Under this limit the unbounded version dies with
+/// `internal error: cannot read ...: out of memory` (exit 2).
+#[test]
+fn release_plan_refuses_an_oversize_manifest_without_loading_it() {
+    let fx = Fixture::new("release-plan-oversize");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+
+    // Sparse: 8 GiB of addressable zeros that occupy no disk.
+    let huge = fx.path("huge.json");
+    let file = fs::File::create(&huge).unwrap();
+    file.set_len(RM_SPARSE_FIXTURE_BYTES).unwrap();
+    drop(file);
+
+    let meta = fs::metadata(&huge).unwrap();
+    assert_eq!(meta.len(), RM_SPARSE_FIXTURE_BYTES);
+    assert!(
+        meta.blocks() * 512 < 16 * 1024 * 1024,
+        "the fixture must stay sparse; it occupies {} bytes on disk",
+        meta.blocks() * 512
+    );
+    assert!(
+        meta.len() > RM_ADDRESS_SPACE_LIMIT_KIB * 1024 * 4,
+        "the fixture must be far larger than the address-space limit"
+    );
+
+    let device: Vec<&std::ffi::OsStr> = vec![
+        "--hardware-target".as_ref(),
+        "nvidia-gb10-arm64".as_ref(),
+        "--reader-version".as_ref(),
+        "1".as_ref(),
+        "--supported-contracts".as_ref(),
+        RM_CONTRACTS.as_ref(),
+    ];
+
+    // Control: the SAME limit must not by itself break an ordinary run. If this
+    // regressed, the assertion below would pass for the wrong reason.
+    let mut control: Vec<&std::ffi::OsStr> = vec![
+        "release-plan".as_ref(),
+        "--current".as_ref(),
+        base.as_ref(),
+        "--candidate".as_ref(),
+        base.as_ref(),
+    ];
+    control.extend_from_slice(&device);
+    let out = run_with_address_space_limit(&control);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the address-space limit must leave a normal plan working: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The oversize candidate: a contract refusal, not a tooling failure.
+    let mut oversize: Vec<&std::ffi::OsStr> = vec![
+        "release-plan".as_ref(),
+        "--current".as_ref(),
+        base.as_ref(),
+        "--candidate".as_ref(),
+        huge.as_ref(),
+    ];
+    oversize.extend_from_slice(&device);
+    let out = run_with_address_space_limit(&oversize);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("out of memory"),
+        "the manifest was allocated in full instead of read as a bounded prefix: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected a contract refusal (1), not a tooling failure: {stderr}"
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["classification"], "refusal");
+    assert_eq!(
+        plan["refusal_reason"],
+        "candidate manifest refused: release manifest exceeds the byte limit"
+    );
+
+    // The same bound applies to the installed manifest, not just the candidate.
+    let mut current_side: Vec<&std::ffi::OsStr> = vec![
+        "release-plan".as_ref(),
+        "--current".as_ref(),
+        huge.as_ref(),
+        "--candidate".as_ref(),
+        base.as_ref(),
+    ];
+    current_side.extend_from_slice(&device);
+    let out = run_with_address_space_limit(&current_side);
+    assert_eq!(out.status.code(), Some(1));
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        plan["refusal_reason"],
+        "current manifest refused: release manifest exceeds the byte limit"
+    );
 }
