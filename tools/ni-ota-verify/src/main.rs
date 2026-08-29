@@ -28,6 +28,7 @@ mod commit;
 mod config;
 mod delegated;
 mod record;
+mod release_manifest;
 mod runner;
 mod state;
 mod state_v1;
@@ -83,6 +84,9 @@ const USAGE: &str = "usage:
                        --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
                        --trusted-now <UTC-seconds>
                        [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify release-plan --current <path> --candidate <path>
+                       --hardware-target <id> --reader-version <n>
+                       --supported-contracts <id[,id...]>
   ni-ota-verify capabilities
   ni-ota-verify --version";
 
@@ -108,6 +112,7 @@ fn run() -> u8 {
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
+        Some("release-plan") => release_plan(&args[1..]),
         Some("capabilities") if args.len() == 1 => {
             let capability_ready =
                 match state_v1::capability_ready(std::path::Path::new(DEFAULT_CONFIG)) {
@@ -142,6 +147,80 @@ fn run() -> u8 {
             EXIT_INTERNAL
         }
     }
+}
+
+/// `release-plan` — the only I/O the release-manifest reader gets: read two
+/// local files, hand the bytes to the pure planner, print the canonical plan.
+///
+/// Device capabilities are explicit arguments, never sniffed from the
+/// environment, so an operator can reproduce a device's plan off-device from
+/// the same two manifests.
+///
+/// No download, staging, activation, `bootc` or reboot happens here or
+/// downstream of here: a plan is a statement about two documents.
+///
+/// Exit codes follow the binary's contract: 0 when a transition was
+/// classified, 1 when the contract refused it, 2 for tooling failure.
+fn release_plan(args: &[String]) -> Result<u8, InternalError> {
+    let flags = parse_flags(
+        args,
+        &[
+            "current",
+            "candidate",
+            "hardware-target",
+            "reader-version",
+            "supported-contracts",
+        ],
+    )?;
+    let required = |name: &str| -> Result<&String, InternalError> {
+        flags
+            .get(name)
+            .ok_or_else(|| InternalError(format!("release-plan needs --{name}\n{USAGE}")))
+    };
+
+    let current_path = required("current")?;
+    let candidate_path = required("candidate")?;
+    let hardware_target = required("hardware-target")?.clone();
+    let reader_version: u64 = required("reader-version")?.parse().map_err(|_| {
+        InternalError("--reader-version must be a non-negative integer".to_string())
+    })?;
+    let supported_contracts: std::collections::BTreeSet<String> = required("supported-contracts")?
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if supported_contracts.is_empty() {
+        return Err(InternalError(
+            "--supported-contracts must list at least one contract".to_string(),
+        ));
+    }
+
+    let read = |path: &String| -> Result<Vec<u8>, InternalError> {
+        std::fs::read(path).map_err(|e| InternalError(format!("cannot read {path}: {e}")))
+    };
+    let current = read(current_path)?;
+    let candidate = read(candidate_path)?;
+
+    // Pure: no network, no staging, no activation, and the canonical digest is
+    // hashed in-process so nothing on PATH can influence the verdict.
+    let plan = release_manifest::classify(
+        &current,
+        &candidate,
+        &release_manifest::DeviceCompatibility {
+            hardware_target,
+            reader_version,
+            supported_contracts,
+        },
+    );
+    // stdout carries the plan even on a refusal: the reason is the useful part.
+    print!("{}", String::from_utf8_lossy(&plan.to_canonical_json()));
+    Ok(
+        if plan.classification == release_manifest::Classification::Refusal {
+            EXIT_REFUSE
+        } else {
+            EXIT_PASS
+        },
+    )
 }
 
 /// Strict flag parser (std only): every flag takes exactly one value, unknown

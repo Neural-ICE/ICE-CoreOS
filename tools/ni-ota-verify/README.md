@@ -487,6 +487,97 @@ the older BOM; recovery is a forward repair with a higher signed sequence (or
 the existing equal-sequence, byte-identical BOM repair carve-out). Thus neither
 bootstrap nor concurrent commits can regress the anti-rollback state.
 
+## Release-manifest v1 planner (`release-plan`)
+
+A **pure reader**: two already-authenticated manifests in, one plan out. It
+downloads nothing, stages nothing, activates nothing, and never runs `bootc` or
+a reboot. `required_entitlement` is carried as a signed fact for a later gate —
+reading it is not enforcing it. Signature verification stays where it already
+is (`verify`, `verify-delegated-*`); this subcommand assumes its inputs were
+authenticated by the caller.
+
+### One contract, not two
+
+The authority is ICE-Fabric `release-manifest/{contract.py,classifier.py,
+release-manifest-v1.schema.json}` at
+`e08446d6fc899f670b962f1e013bbf46e7e91497`. CoreOS implements that contract; it
+does not define a dialect of it. Concretely:
+
+- the sequence field is `bundle_seq`. There is no `release_seq`, and no alias
+  for one — an alias would be a second manifest grammar under one signature;
+- classification is exactly `no-op`, `component-content`, `host`, `refusal`.
+  Components and content share **one** class, so a bundle touching both still
+  has an engine;
+- `registry.neural-ice.ch/vendor/...` is a first-class namespace alongside
+  `neural-ice/`;
+- identity is the SHA-256 of the **canonical** bytes (sorted keys, compact
+  separators, normalized set-like arrays, one trailing LF), never of the input
+  bytes. Re-indenting a manifest must not mint a new release. That hash is
+  computed in-process, so nothing on `PATH` can influence anti-rollback;
+- the identifier and systemd-unit grammars mirror Fabric's patterns exactly,
+  including the 128-byte identifier bound and the unit's 128-byte **stem** bound
+  and "stem ends alphanumeric" rule (`foo-.service` is refused);
+- `compatibility`, `evidence`, `required_entitlement`, `restart_scope` and
+  `reboot_required` are required fields, not optional extras.
+
+### Semantics
+
+Both manifests are checked against the device (`hardware_target`,
+`minimum_reader` vs the reader version, `required_contracts` vs what the device
+supports) before any transition is considered. `bundle_seq` is anti-rollback:
+strictly lower refuses, and equality is admitted **only** for the byte-identical
+canonical manifest — a re-apply, never a different release wearing the same
+sequence.
+
+Without an explicit host payload delta only digests may move; a membership or
+contract change refuses and asks for the host engine. A `compatibility` edit on
+its own is still a host transition, so it cannot smuggle a structural change
+past that requirement.
+
+`restart_scope` on a replacement is the union of the **installed** and
+**candidate** payload scopes: the units that must be stopped as well as the ones
+that must be started. `reboot_required` is the OR over the same set.
+
+### Usage
+
+```
+ni-ota-verify release-plan --current <path> --candidate <path> \
+    --hardware-target nvidia-gb10-arm64 --reader-version 1 \
+    --supported-contracts host-bootc-v1,component-oci-v1,content-oci-v1
+```
+
+Device capability is passed explicitly and never sniffed from the environment,
+so an operator can reproduce a device's plan off-device from the same two files.
+The canonical plan document goes to stdout in every case — on a refusal the
+reason is the useful part. Exit codes follow the binary's contract: `0` a
+transition was classified, `1` the contract refused it, `2` tooling failure.
+
+### Cross-contract golden vectors
+
+`tests/fixtures/release-manifest-v1/golden.json` is **Fabric's own output**, not
+this implementation's: `generate-golden.py` runs the pinned Python contract over
+the committed manifest vectors and records the canonical bytes, digests, refusal
+texts and plans. The Rust tests then assert byte-for-byte equality, so a
+divergence between CoreOS and Fabric is a red test rather than a field incident.
+
+The generator is **not** run by CI (the pinned Rust image has no Python); it is
+the documented, re-runnable procedure behind the committed vectors:
+
+```
+ICE_FABRIC_SHA=e08446d6fc899f670b962f1e013bbf46e7e91497
+mkdir -p /tmp/fabric-v1 && cd /tmp/fabric-v1
+for f in contract.py classifier.py release-manifest-v1.schema.json; do
+  gh api "repos/Neural-ICE/ICE-Fabric/contents/release-manifest/$f?ref=$ICE_FABRIC_SHA" \
+    --jq .content | base64 -d > "$f"
+done
+PYTHONPATH=/tmp/fabric-v1 python3 \
+  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/generate-golden.py
+```
+
+Regenerating is a no-op unless the Fabric contract itself moved. A dirty
+`git diff` there means the two repositories disagree and the pin has to be
+re-decided — not refreshed silently.
+
 ## Caller integration (the OTA path, ICE-Fabric side)
 
 ```
@@ -522,11 +613,37 @@ ota.conf), seeded from the P2 record — a new store impl, not a logic change.
 ## Development
 
 ```
+umask 077                                   # REQUIRED — see below
+export NI_TRUSTED_TIME_ISSUER=trusted-time.example.test   # REQUIRED — see below
+
 cargo test --locked --all-targets           # default-feature unit tests
 cargo test --locked --features test-path-overrides  # unit + CLI tests; cosign is stubbed
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Dependencies are deliberately minimal (`serde`, `serde_json`, std — no async
-runtime, no network crates); `Cargo.lock` is committed so the in-image build
-(`--locked`, static crt-static) stays reproducible.
+Both environment settings are load-bearing, not decoration:
+
+- **`umask 077`** — the CLI tests build their fixtures under `TMPDIR`. Under a
+  **group-writable** umask (`0002`, the default on Debian/Ubuntu user accounts)
+  the verifier correctly fail-closes on a state directory reachable through a
+  group/world-writable parent, and **37 of the 66 CLI tests fail** for that
+  reason alone. That is the control working, not a regression. Measured on this
+  tree: `umask 0002` → 37 failed; `umask 022` → 0 failed; `umask 077` → 0
+  failed. Any non-group-writable umask suffices; CI gets one from running
+  containerized as root.
+- **`NI_TRUSTED_TIME_ISSUER`** — deliberately a wrong, neutral value. The suite
+  must prove the contract, not the identity of a deployment; the real authority
+  comes from the repository configuration at image build time.
+
+Dependencies are deliberately minimal. The direct ones are exactly four —
+`p256` (P-256 public-key handling for the delegation snapshot), `serde`,
+`serde_json` and `sha2` — plus std. No async runtime and no network crates:
+fetching is the OTA caller's job. `Cargo.lock` is committed so the in-image
+build (`--locked`, static crt-static) stays reproducible.
+
+`sha2` (MIT OR Apache-2.0) exists for exactly one caller: the release-manifest
+canonical digest, which is hashed in-process. Every other artifact hash still
+shells out to coreutils. The asymmetry is deliberate — that one digest decides
+anti-rollback, so resolving `sha256sum` through `PATH` would let a planted
+binary return a constant, collapse two different manifests onto one digest and
+classify a divergence as `no-op`. Signature crypto remains the pinned cosign.

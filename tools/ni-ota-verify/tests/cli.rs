@@ -2471,3 +2471,299 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert!(stderr.contains("binding mismatch"), "{stderr}");
     assert!(!fx.path("state/applied.json").exists());
 }
+
+// ---------------------------------------------------------------------------
+// release-plan — the release-manifest v1 reader through the real binary
+// ---------------------------------------------------------------------------
+
+const RM_GOLDEN: &str = include_str!("fixtures/release-manifest-v1/golden.json");
+
+/// Write a committed manifest vector into the fixture directory.
+fn write_manifest(fx: &Fixture, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = fx.path(&format!("{name}.json"));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn release_plan_command(
+    fx: &Fixture,
+    current: &Path,
+    candidate: &Path,
+    contracts: &str,
+) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.arg("release-plan")
+        .arg("--current")
+        .arg(current)
+        .arg("--candidate")
+        .arg(candidate)
+        .arg("--hardware-target")
+        .arg("nvidia-gb10-arm64")
+        .arg("--reader-version")
+        .arg("1")
+        .arg("--supported-contracts")
+        .arg(contracts)
+        .current_dir(&fx.dir)
+        .stdin(Stdio::null());
+    cmd
+}
+
+const RM_CONTRACTS: &str = "component-oci-v1,content-oci-v1,evidence-v1,host-bootc-v1";
+
+/// The CLI emits exactly the canonical plan the golden vectors pin, and maps a
+/// classified transition to 0 and a contract refusal to 1 — an OTA caller must
+/// never read "refusal" as "nothing to do".
+#[test]
+fn release_plan_emits_golden_plans_with_the_documented_exit_codes() {
+    let fx = Fixture::new("release-plan");
+    let golden: Value = serde_json::from_str(RM_GOLDEN).unwrap();
+
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+    let component_content = write_manifest(
+        &fx,
+        "component-content",
+        include_bytes!("fixtures/release-manifest-v1/manifests/component-content.json"),
+    );
+    let host = write_manifest(
+        &fx,
+        "host",
+        include_bytes!("fixtures/release-manifest-v1/manifests/host.json"),
+    );
+    let rollback = write_manifest(
+        &fx,
+        "rollback",
+        include_bytes!("fixtures/release-manifest-v1/manifests/rollback.json"),
+    );
+    let release_seq = write_manifest(
+        &fx,
+        "release-seq",
+        include_bytes!("fixtures/release-manifest-v1/manifests/release-seq.json"),
+    );
+
+    for (case, candidate, expected_code) in [
+        ("noop-identical", &base, 0),
+        ("component-content", &component_content, 0),
+        ("host", &host, 0),
+        ("rollback", &rollback, 1),
+        ("candidate-release-seq", &release_seq, 1),
+    ] {
+        let out = release_plan_command(&fx, &base, candidate, RM_CONTRACTS)
+            .output()
+            .expect("binary runs");
+        assert_eq!(
+            out.status.code(),
+            Some(expected_code),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            golden["plans"][case]["plan"].as_str().unwrap(),
+            "{case}: CLI plan diverges from the Fabric golden vector"
+        );
+    }
+}
+
+/// Device capability is an explicit argument, never sniffed: the SAME manifest
+/// pair refuses on a device that does not support a required contract.
+#[test]
+fn release_plan_takes_device_capability_from_its_arguments() {
+    let fx = Fixture::new("release-plan-device");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+    let candidate = write_manifest(
+        &fx,
+        "component-content",
+        include_bytes!("fixtures/release-manifest-v1/manifests/component-content.json"),
+    );
+
+    let out = release_plan_command(&fx, &base, &candidate, "component-oci-v1,host-bootc-v1")
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(1));
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["classification"], "refusal");
+    assert_eq!(
+        plan["refusal_reason"],
+        "current manifest incompatible: device does not support required contracts: content-oci-v1"
+    );
+}
+
+/// A missing flag, an unreadable manifest or a malformed reader version is
+/// broken tooling, not a verdict: exit 2, and no plan on stdout.
+#[test]
+fn release_plan_maps_tooling_failures_to_internal_error() {
+    let fx = Fixture::new("release-plan-internal");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+
+    // Missing --candidate.
+    let mut cmd = Command::new(BIN);
+    cmd.arg("release-plan")
+        .arg("--current")
+        .arg(&base)
+        .arg("--hardware-target")
+        .arg("nvidia-gb10-arm64")
+        .arg("--reader-version")
+        .arg("1")
+        .arg("--supported-contracts")
+        .arg(RM_CONTRACTS)
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+
+    // Unreadable candidate.
+    let out = release_plan_command(&fx, &base, &fx.path("absent.json"), RM_CONTRACTS)
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+
+    // Non-numeric reader version. Built from scratch with EXACTLY ONE
+    // --reader-version: appending a second one to a complete command would be
+    // rejected as a duplicate flag and this case would pass without ever
+    // exercising the number parse. The diagnostic is asserted for that reason.
+    let mut cmd = Command::new(BIN);
+    cmd.arg("release-plan")
+        .arg("--current")
+        .arg(&base)
+        .arg("--candidate")
+        .arg(&base)
+        .arg("--hardware-target")
+        .arg("nvidia-gb10-arm64")
+        .arg("--reader-version")
+        .arg("one")
+        .arg("--supported-contracts")
+        .arg(RM_CONTRACTS)
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--reader-version must be a non-negative integer"),
+        "expected the malformed-number diagnostic, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("given twice"),
+        "this case must exercise the number parse, not the duplicate-flag guard: {stderr}"
+    );
+}
+
+/// The duplicate-flag guard is a separate control: an OTA path must never limp
+/// on a repeated flag, whichever value would have won.
+#[test]
+fn release_plan_refuses_a_repeated_flag() {
+    let fx = Fixture::new("release-plan-dup-flag");
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+
+    let mut cmd = release_plan_command(&fx, &base, &base, RM_CONTRACTS);
+    let out = cmd
+        .arg("--reader-version")
+        .arg("2")
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("flag --reader-version given twice"),
+        "expected the duplicate-flag diagnostic, got: {stderr}"
+    );
+}
+
+/// The release-manifest digest must be immune to a hostile `PATH`.
+///
+/// Regression: while the canonical digest was computed by shelling out to
+/// `sha256sum`, a planted binary returning a constant made every manifest hash
+/// alike. Two DIFFERENT canonical manifests sharing one `bundle_seq` then
+/// compared equal and classified as `no-op` — anti-rollback defeated by a
+/// PATH entry, with no signature involved.
+#[test]
+fn release_plan_digest_cannot_be_forged_through_path() {
+    let fx = Fixture::new("release-plan-path");
+
+    // A `sha256sum` that answers with a constant digest for any input.
+    let fake = fx.path("fakebin");
+    fs::create_dir_all(&fake).unwrap();
+    let sha = fake.join("sha256sum");
+    fs::write(
+        &sha,
+        "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '%s  -\\n' \
+         0000000000000000000000000000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    fs::set_permissions(&sha, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The stub really does lie, so the test proves the planner, not the stub.
+    let probe = Command::new(&sha)
+        .stdin(Stdio::null())
+        .output()
+        .expect("stub runs");
+    assert!(String::from_utf8_lossy(&probe.stdout).starts_with(&"0".repeat(64)));
+
+    let base = write_manifest(
+        &fx,
+        "base",
+        include_bytes!("fixtures/release-manifest-v1/manifests/base.json"),
+    );
+    // Same bundle_seq, different canonical manifest: must stay a refusal.
+    let divergent = write_manifest(
+        &fx,
+        "same-seq-divergent",
+        include_bytes!("fixtures/release-manifest-v1/manifests/same-seq-divergent.json"),
+    );
+
+    let mut cmd = release_plan_command(&fx, &base, &divergent, RM_CONTRACTS);
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            fake.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    let out = cmd.output().expect("binary runs");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a hostile PATH must not turn a divergence into a pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["classification"], "refusal");
+    assert_eq!(
+        plan["refusal_reason"],
+        "the same bundle_seq identifies a different canonical manifest"
+    );
+    // The digests are the real ones, and they still differ.
+    let golden: Value = serde_json::from_str(RM_GOLDEN).unwrap();
+    assert_eq!(
+        plan["current_manifest_digest"],
+        golden["manifests"]["base"]["digest"]
+    );
+    assert_eq!(
+        plan["candidate_manifest_digest"],
+        golden["manifests"]["same-seq-divergent"]["digest"]
+    );
+    assert_ne!(
+        plan["current_manifest_digest"],
+        plan["candidate_manifest_digest"]
+    );
+}

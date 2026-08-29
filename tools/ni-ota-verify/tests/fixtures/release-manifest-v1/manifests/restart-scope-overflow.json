@@ -1,0 +1,105 @@
+{
+  "schema": "neural-ice-release-manifest-v1",
+  "release_id": "ice-appliance-0.51.0",
+  "bundle_seq": 41,
+  "hardware_target": "nvidia-gb10-arm64",
+  "compatibility": {
+    "minimum_reader": 1,
+    "required_contracts": [
+      "host-bootc-v1",
+      "content-oci-v1",
+      "component-oci-v1"
+    ]
+  },
+  "host": {
+    "repository": "registry.neural-ice.ch/neural-ice/neural-ice-appliance",
+    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "contract": "host-bootc-v1",
+    "restart_scope": [
+      "unit-00.service",
+      "unit-01.service",
+      "unit-02.service",
+      "unit-03.service",
+      "unit-04.service",
+      "unit-05.service",
+      "unit-06.service",
+      "unit-07.service",
+      "unit-08.service",
+      "unit-09.service",
+      "unit-10.service",
+      "unit-11.service",
+      "unit-12.service",
+      "unit-13.service",
+      "unit-14.service",
+      "unit-15.service",
+      "unit-16.service",
+      "unit-17.service",
+      "unit-18.service",
+      "unit-19.service",
+      "unit-20.service",
+      "unit-21.service",
+      "unit-22.service",
+      "unit-23.service",
+      "unit-24.service",
+      "unit-25.service",
+      "unit-26.service",
+      "unit-27.service",
+      "unit-28.service",
+      "unit-29.service",
+      "unit-30.service",
+      "unit-31.service",
+      "unit-32.service"
+    ],
+    "reboot_required": true,
+    "required_entitlement": "ICE-CORE"
+  },
+  "components": [
+    {
+      "component_id": "icecore-api",
+      "repository": "registry.neural-ice.ch/neural-ice/icecore-api",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "contract": "component-oci-v1",
+      "restart_scope": [
+        "icecore-api.service"
+      ],
+      "reboot_required": false,
+      "required_entitlement": "ICE-CORE"
+    },
+    {
+      "component_id": "agentic-core",
+      "repository": "registry.neural-ice.ch/vendor/agentic-core",
+      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "contract": "component-oci-v1",
+      "restart_scope": [
+        "ghostunnel-agentic-core.service",
+        "agentic-core.service"
+      ],
+      "reboot_required": false,
+      "required_entitlement": "ICE-AGENTIC"
+    }
+  ],
+  "content": [
+    {
+      "content_id": "model-gemma",
+      "media_type": "application/vnd.oci.image.manifest.v1+json",
+      "repository": "registry.neural-ice.ch/vendor/models/gemma",
+      "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "contract": "content-oci-v1",
+      "restart_scope": [
+        "sglang-inference.service"
+      ],
+      "reboot_required": false,
+      "required_entitlement": "ICE-INFERENCE"
+    }
+  ],
+  "evidence": [
+    {
+      "kind": "bom",
+      "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "kind": "attestation",
+      "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+    }
+  ]
+}
