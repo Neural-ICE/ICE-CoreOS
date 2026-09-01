@@ -102,8 +102,10 @@ RAW="${REPO_ROOT}/${OUT}.img"
 # again on the FINISHED raw. These are the values it checks against, produced by
 # the build that sealed them; they are read here and forwarded, never recomputed.
 SEALED_CORE_FACTS="${RAW}.sealed-core.json"
-[ -f "$SEALED_CORE_FACTS" ] && [ ! -L "$SEALED_CORE_FACTS" ] \
-  || { echo "the base media build declared no sealed-core facts at $SEALED_CORE_FACTS; refusing to finalize a medium whose boot path nothing would re-inspect" >&2; exit 1; }
+if [ ! -f "$SEALED_CORE_FACTS" ] || [ -L "$SEALED_CORE_FACTS" ]; then
+  echo "the base media build declared no sealed-core facts at $SEALED_CORE_FACTS; refusing to finalize a medium whose boot path nothing would re-inspect" >&2
+  exit 1
+fi
 # A command substitution, not a process substitution: `mapfile` always succeeds,
 # so a python failure behind `< <(...)` would be silently read as an empty array.
 SEALED_CORE_ARG_TEXT="$(python3 - "$SEALED_CORE_FACTS" <<'PY'

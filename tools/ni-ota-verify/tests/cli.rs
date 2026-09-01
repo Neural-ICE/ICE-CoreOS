@@ -380,6 +380,20 @@ impl Fixture {
     /// what makes the liveness challenge a real end-to-end exercise of
     /// `raw_signature_to_der` and the verification that follows it.
     fn write_tpm_mocks(&self, public_area_sha256: &str, counter: u64, profile_binding: &str) {
+        let name_bytes = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).unwrap();
+                    format!("\\0{:03o}", u8::from_str_radix(pair, 16).unwrap())
+                })
+                .collect::<String>()
+        };
+        let exact_name = name_bytes(public_area_sha256);
+        let mut wrong_name_sha256 = public_area_sha256.to_owned();
+        let last = wrong_name_sha256.pop().unwrap();
+        wrong_name_sha256.push(if last == '0' { '1' } else { '0' });
+        let wrong_name = name_bytes(&wrong_name_sha256);
         let readpublic = self.path("tpm2_readpublic");
         fs::write(
             &readpublic,
@@ -402,7 +416,11 @@ done
 if [ "${{NI_TEST_TPM_ABSENT:-}}" = 1 ]; then exit 1; fi
 if [ "$mode" = name ]; then
   printf '\000\013' > "$out"
-  printf '%s' '{public_area_sha256}' | xxd -r -p >> "$out"
+  if [ "${{NI_TEST_TPM_NAME_MISMATCH:-}}" = 1 ]; then
+    printf '%b' '{wrong_name}' >> "$out"
+  else
+    printf '%b' '{exact_name}' >> "$out"
+  fi
 else
   cp '{spki}' "$out"
 fi
@@ -2666,6 +2684,17 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
         "sha256:9999999999999999999999999999999999999999999999999999999999999999"
     );
 
+    // Exact TPM Name oracle: the positive invocation above used the full
+    // 0x000b || SHA-256(public-area) value. Changing one nibble while keeping
+    // the same SPKI and signing key must fail before either delegated path can
+    // accept the release.
+    let (code, _, stderr) = command_on_machine(&cfg, "NI_TEST_TPM_NAME_MISMATCH", "1");
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("different Name than the anchor records"),
+        "{stderr}"
+    );
+
     let receipt_bytes = fs::read(&receipt).unwrap();
     fs::write(&receipt, []).unwrap();
     let (code, _, stderr) = command(&cfg);
@@ -3229,6 +3258,16 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(verdict["mode"], "delegated-usb-beta");
     assert_eq!(verdict["bom_sha256"], bom_hash);
+    assert!(!fx.path("state/applied.json").exists());
+
+    let mut wrong_name = command(TEST_OS_REF, TEST_SEED_REF, TEST_BUNDLE_DIGEST);
+    wrong_name.env("NI_TEST_TPM_NAME_MISMATCH", "1");
+    let (code, _, stderr) = run(&mut wrong_name);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("different Name than the anchor records"),
+        "{stderr}"
+    );
     assert!(!fx.path("state/applied.json").exists());
 
     let clean_bom = fs::read(&bom).unwrap();

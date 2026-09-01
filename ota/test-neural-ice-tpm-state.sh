@@ -352,8 +352,9 @@ for command in counter-read freshness-read profile-read; do
 done
 st profile-bind customer-locked "$TARGET" "$POLICY" >/dev/null 2>&1 \
   && fail "profile-bind created missing provisioning state"
-[ ! -d "$NV/01500004" ] && [ ! -d "$NV/01500005" ] \
-  || fail "a runtime command created state"
+if [ -d "$NV/01500004" ] || [ -d "$NV/01500005" ]; then
+  fail "a runtime command created state"
+fi
 
 EXPECT="$(st profile-digest customer-locked "$TARGET" "$POLICY")"
 : > "$OWNER_AUTH_MARK"
