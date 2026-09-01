@@ -678,6 +678,7 @@ RUN set -euxo pipefail; \
       *) echo "SIGNED_BOOT_TRUST_POLICY_ID must name a neural-ice-secureboot-* trust policy" >&2; exit 2 ;; \
     esac; \
     chmod 0444 /usr/lib/neural-ice/access-policy \
+               /usr/lib/neural-ice/hardware-target \
                /usr/lib/neural-ice/signed-boot-trust-policy-id \
                /usr/lib/neural-ice/lib/hardware-identity.sh \
                /usr/lib/neural-ice/lib/access-policy.sh \
@@ -685,6 +686,11 @@ RUN set -euxo pipefail; \
                /usr/lib/neural-ice/lib/installer-trust.sh \
                /usr/lib/neural-ice/lib/release-authorization.sh \
                /usr/lib/neural-ice/lib/installer-ssh-key.sh; \
+    for marker in /usr/lib/neural-ice/access-policy \
+                  /usr/lib/neural-ice/hardware-target \
+                  /usr/lib/neural-ice/signed-boot-trust-policy-id; do \
+        test "$(stat -c '%u:%g:%a' "$marker")" = 0:0:444; \
+    done; \
     # Read the marker BACK and restate the mapping independently. This is not
     # redundancy for its own sake: the library above is the single source of
     # truth precisely so it can be changed in one place, and a mapping that can

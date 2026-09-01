@@ -24,7 +24,10 @@ if [[ -n "${NI_FIRSTBOOT_TPM_TESTING:-}" ]]; then
   readonly TPM2_READPUBLIC="${NI_FIRSTBOOT_TPM_TEST_TPM2_READPUBLIC:-/usr/bin/tpm2_readpublic}"
   readonly LUKS_EVIDENCE="${NI_FIRSTBOOT_TPM_TEST_LUKS_EVIDENCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/neural-ice-luks-token-evidence.py}"
   readonly RUN_ROOT="${NI_FIRSTBOOT_TPM_TEST_RUN_ROOT:?}"
-  readonly TEST_MODE=1
+  readonly REQUIRED_OWNER_UID="$EUID"
+  readonly VALIDATE_FILE_METADATA="${NI_FIRSTBOOT_TPM_TEST_VALIDATE_FILE_METADATA:-0}"
+  [[ "$VALIDATE_FILE_METADATA" == 0 || "$VALIDATE_FILE_METADATA" == 1 ]] \
+    || die "test metadata validation selector must be 0 or 1"
 else
   [[ "$EUID" -eq 0 ]] || die "must run as root"
   readonly STATE_DIR=/var/lib/neural-ice/ota
@@ -41,7 +44,8 @@ else
   readonly TPM2_READPUBLIC=/usr/bin/tpm2_readpublic
   readonly LUKS_EVIDENCE=/usr/libexec/neural-ice-luks-token-evidence
   readonly RUN_ROOT=/run/neural-ice-owner-ceremony
-  readonly TEST_MODE=0
+  readonly REQUIRED_OWNER_UID=0
+  readonly VALIDATE_FILE_METADATA=1
 fi
 
 readonly INTENT="$STATE_DIR/owner-ceremony-intent-v1"
@@ -56,15 +60,31 @@ for executable in "$TPM_STATE" "$DEVICE_ROOT_TOOL" "$PROFILE_ANCHOR" \
 done
 
 secure_file() {
-  [[ -f "$1" && ! -L "$1" ]] || die "required evidence is not a regular file: $1"
-  if [[ "$TEST_MODE" == 0 ]]; then
-    [[ "$(stat -c '%u:%a' -- "$1")" == 0:600 ]] \
-      || die "required evidence is not root-owned mode 0600: $1"
+  [[ -f "$1" && ! -L "$1" ]] || die "required mutable evidence is not a regular file: $1"
+  if [[ "$VALIDATE_FILE_METADATA" == 1 ]]; then
+    [[ "$(stat -c '%u' -- "$1")" == "$REQUIRED_OWNER_UID" ]] \
+      || die "required mutable evidence has the wrong owner: $1"
+    [[ "$(stat -c '%a' -- "$1")" == 600 ]] \
+      || die "required mutable evidence is not mode 0600: $1"
   fi
 }
 
-for required in "$INTENT" "$INSTALL_IDENTITY" "$DEVICE_ROOT" "$SRK_PUBLIC" \
-  "$ACCESS_POLICY" "$HARDWARE_TARGET_PATH" "$TRUST_POLICY_PATH"; do secure_file "$required"; done
+immutable_marker() {
+  [[ -f "$1" && ! -L "$1" ]] || die "required immutable marker is not a regular file: $1"
+  if [[ "$VALIDATE_FILE_METADATA" == 1 ]]; then
+    [[ "$(stat -c '%u' -- "$1")" == "$REQUIRED_OWNER_UID" ]] \
+      || die "required immutable marker has the wrong owner: $1"
+    [[ "$(stat -c '%a' -- "$1")" == 444 ]] \
+      || die "required immutable marker is not mode 0444: $1"
+  fi
+}
+
+for required in "$INTENT" "$INSTALL_IDENTITY" "$DEVICE_ROOT" "$SRK_PUBLIC"; do
+  secure_file "$required"
+done
+for required in "$ACCESS_POLICY" "$HARDWARE_TARGET_PATH" "$TRUST_POLICY_PATH"; do
+  immutable_marker "$required"
+done
 
 install -d -m 0700 "$RUN_ROOT"
 exec 9>"$RUN_ROOT/lifecycle.lock"
