@@ -7,6 +7,12 @@ image/driver-modules/
 image/driver-modules-unsigned/
 image/nvidia-userspace/
 image/signed-boot/
+# Measured hardware identity + the release-authorization public key: STAGED
+# build inputs, produced by measuring the reference appliance and by the release
+# key ceremony. Committing a fingerprint nobody measured would be exactly the
+# invented vendor string image/hardware-identity/README.md exists to avoid.
+image/hardware-identity/*.fingerprints
+image/keys/
 image/generation.env
 image/manifest.sha256
 image/labkey/
@@ -15,6 +21,13 @@ build/output/
 *.iso
 *.img
 *.img.xz
+*.img.zst
+# Media-build side files: the sealed-core facts the base build hands to the
+# PRELOADED final gate, and the receipt that gate publishes.
+*.img.sealed-core.json
+*.img.final-media.json
+*.img.final-media.json.sha256
+*.img.zst.sha256
 *.raw
 *.run
 
@@ -33,6 +46,7 @@ ignition/*.ign
 *.token
 
 # Misc
+__pycache__/
 *.log
 .DS_Store
 

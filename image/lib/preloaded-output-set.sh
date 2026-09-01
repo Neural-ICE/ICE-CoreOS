@@ -27,6 +27,7 @@ preloaded_require_fresh_output_set() {
     "${artifact}.sha256"
     "${raw}.final-media.json"
     "${raw}.final-media.json.sha256"
+    "${raw}.sealed-core.json"
   )
   if [[ "$artifact" != "$raw" ]]; then
     outputs+=("$artifact")

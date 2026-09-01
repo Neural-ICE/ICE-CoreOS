@@ -15,10 +15,12 @@ on:
       - main
     paths:
       - 'tools/ni-ota-verify/**'
+      - 'ci/test-open-core-boundary.sh'
       - '.github/workflows/test-ni-ota-verify.yml'
   pull_request:
     paths:
       - 'tools/ni-ota-verify/**'
+      - 'ci/test-open-core-boundary.sh'
       - '.github/workflows/test-ni-ota-verify.yml'
   workflow_dispatch:
 
@@ -50,6 +52,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+
+      - name: Enforce the open-core boundary
+        run: ./ci/test-open-core-boundary.sh
 
       - name: Verify, lint and test in the pinned Rust toolchain
         env:

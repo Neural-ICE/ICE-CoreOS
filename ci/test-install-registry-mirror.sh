@@ -32,14 +32,18 @@ check "the drop-in lands in the LIVE environment only"      -F '/etc/containers/
 check "the target is checked for a leaked mirror drop-in"   -F '"$dep"/etc/containers/registries.conf.d/*neural-ice-install-mirror*'
 check "a leaked drop-in is removed, not merely reported"    -E 'rm -f -- "\$\{_leaked\[@\]\}"'
 
-# The property that makes the whole design work: the image reference is NOT
-# rewritten. A `location =` that points anywhere other than the real registry
-# would mean the medium installs something whose identity differs from what the
-# signed lock names -- exactly what digest-pinning is supposed to prevent.
-if grep -E '^\s*location = "registry\.neural-ice\.ch/' "$S" >/dev/null; then
-  printf '  ok    the registry scope keeps its real name (no reference rewriting)\n'
+# The original authority comes only from the required digest-pinned image ref.
+# There is deliberately no built-in product endpoint or fallback authority.
+check "registry authority is parsed from explicit osimage"  -F 'INSTALL_REGISTRY_AUTHORITY="${_image_ref_lines[1]}"'
+check "mirror keeps the configured original authority"       -F 'location = "$INSTALL_REGISTRY_AUTHORITY/$_scope"'
+check "mirror without registry source fails closed"           -F 'neuralice.mirror requires neuralice.source=registry'
+check "short-name fallback is explicitly refused"             -F 'no short-name/default fallback is available'
+check "raw and signed authorities must be identical"          -F 'raw registry authority'
+check "resolved and configured authorities must be identical" -F 'container tooling resolved authority'
+if grep -qF 'INSTALL_REGISTRY_AUTHORITY="${' "$S" && ! grep -qF 'INSTALL_REGISTRY_AUTHORITY="${_image_ref_lines[1]}"' "$S"; then
+  printf '  FAIL  registry authority has an implicit default or fallback\n'; fail=1
 else
-  printf '  FAIL  the registry scope must stay registry.neural-ice.ch\n'; fail=1
+  printf '  ok    registry authority has no implicit default or fallback\n'
 fi
 
 # A trailing `[[ ]] && cmd` as the LAST statement of the script would make the
@@ -58,10 +62,79 @@ fi
 # the LAN served".
 check "the install source is an explicit kernel argument"    -F 'neuralice.source='
 check "the appliance image is an explicit kernel argument"   -F 'neuralice.osimage='
-check "the appliance image must be digest-pinned"            -F '@sha256:[0-9a-f]{64}$'
+check "the appliance image must be digest-pinned"            -F 'sha256:[0-9a-f]{64}'
 check "a registry install requires a signed docker scope"    -F 'refusing a registry install that nothing would verify'
-check "the pulled digest is re-checked after the pull"       -F 'is not the requested one'
+# The pulled bytes are re-checked, and BOTH digests are. For an OCI index,
+# `.Digest` is the PLATFORM CHILD manifest while `.RepoDigests` keeps the INDEX
+# digest that was asked for. Checking one of the two would let a hostile mirror
+# answer an index request with a child, or swap the child under a correct index —
+# and a mirror is only safe because the DIGEST, not the server, is the authority.
+check "the pulled index digest is OBSERVED, not restated from the karg" \
+  -F 'does not carry exactly one repo digest for'
+check "the observed index digest is compared to the requested one" \
+  -F 'is not the requested one (${OS_IMAGE##*@})'
+# The child-manifest comparison lives in the library, next to the index one, so
+# the two can never drift apart. Assert it where it is, not where it is called.
+if grep -qF 'is not the authorised one ($auth_manifest)' image/lib/release-authorization.sh; then
+  printf '  ok    the pulled child manifest digest is re-checked too\n'
+else
+  printf '  FAIL  the pulled child manifest digest must be re-checked against the authorization\n'; fail=1
+fi
+check "the installer reads the platform child manifest digest it compares" \
+  -F 'got_manifest="$(podman image inspect'
+# ...and the mirror's safety argument now rests on more than a digest: the
+# digest itself must have been AUTHORISED for this medium before the pull
+# (DESIGN-NOTE-0001 Finding 2, ADR-0015). Without this, a mirror that holds a
+# perfectly image-ci-signed `debug` image is enough to open a customer appliance.
+check "the requested digest must be authorised before it is pulled" \
+  -F 'release_auth_gate_request "$RELEASE_AUTH"'
+check "the pulled object is inspected against its authorization" \
+  -F 'release_auth_gate_pulled "$RELEASE_AUTH"'
+check "the authorization is signature-verified with the sealed key" \
+  -F 'release_auth_verify_signature'
+check "the signed UKI pins the exact v2 authorization reader" \
+  -F '[[ "$SEALED_RELAUTH_SCHEMA" == "$NEURAL_ICE_RELEASE_AUTH_SCHEMA" ]]'
+if grep -qF 'NEURAL_ICE_RELEASE_AUTH_SCHEMA="neural-ice-installer-release-authorization-v2"' \
+    image/lib/release-authorization.sh \
+    && ! grep -qF 'NEURAL_ICE_RELEASE_AUTH_SCHEMA="neural-ice-installer-release-authorization-v1"' \
+      image/lib/release-authorization.sh; then
+  printf '  ok    installer release authorization is strict v2 (no v1 reader)\n'
+else
+  printf '  FAIL  installer release authorization must be strict v2 and reject v1\n'; fail=1
+fi
+check "Fabric's signed issuance sequence is preserved exactly" \
+  -F 'the release-authorization gate changed Fabric'\''s allocated issuance sequence'
 check "bootc consumes the resolved source, not a literal"    -F -e '--source-imgref "$source_imgref"'
+check "the install source cannot change after it was authorised" \
+  -F '"$source_imgref" == "$RELEASE_AUTH_VERIFIED_REF"'
+
+# THE ORDERING PROPERTY. The pull used to happen in phase 4, AFTER
+# wipefs/sfdisk/luksFormat/mkfs: by the time anything about the image was known,
+# the target disk was already destroyed, so "refuse" could not mean "leave the
+# machine as it was". A comment cannot hold this; a line-number comparison can.
+pull_line="$(grep -n 'events-backend=file pull "\$OS_IMAGE"' "$S" | head -1 | cut -d: -f1)"
+destructive_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luksFormat)' "$S" \
+  | head -1 | cut -d: -f1)"
+if [ -n "$pull_line" ] && [ -n "$destructive_line" ] && [ "$pull_line" -lt "$destructive_line" ]; then
+  printf '  ok    the registry pull happens BEFORE the first disk write (line %s < %s)\n' \
+    "$pull_line" "$destructive_line"
+else
+  printf '  FAIL  the registry pull must precede the first disk write (pull=%s, first write=%s)\n' \
+    "${pull_line:-none}" "${destructive_line:-none}"; fail=1
+fi
+
+# Fabric allocates issuance_seq, but the TPM high-water must not move until the
+# installed filesystem exists. The intent publication is the handoff to the
+# mandatory firstboot ceremony and must sit after bootc's commit boundary.
+bootc_commit_line="$(grep -nF '|| die "bootc install to-filesystem failed"' "$S" | head -1 | cut -d: -f1)"
+intent_line="$(grep -nF '_initial_issuance_seq="${RELEASE_AUTH_ISSUANCE_SEQ:-0}"' "$S" | head -1 | cut -d: -f1)"
+if [ -n "$bootc_commit_line" ] && [ -n "$intent_line" ] && [ "$intent_line" -gt "$bootc_commit_line" ]; then
+  printf '  ok    issuance_seq handoff follows install commit (line %s > %s)\n' \
+    "$intent_line" "$bootc_commit_line"
+else
+  printf '  FAIL  issuance_seq handoff must follow install commit (intent=%s, commit=%s)\n' \
+    "${intent_line:-none}" "${bootc_commit_line:-none}"; fail=1
+fi
 
 # The default MUST remain the medium. This is the single property that keeps the
 # USB path -- the one that installs appliances today -- untouched by all of the

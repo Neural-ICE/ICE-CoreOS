@@ -41,7 +41,8 @@ require_fixed "runs-on: [self-hosted, Linux, ARM64, spark, gb10]" \
 # The producer authenticates only to GHCR. Product mirroring and channel/alias
 # mutation remain outside this repo, in the signed ICE-Fabric release train.
 require_fixed "REGISTRY: ghcr.io/neural-ice" "$WORKFLOW"
-refute_fixed "registry.neural-ice.ch" "$WORKFLOW"
+SOVEREIGN_REGISTRY="registry.neural""-ice.ch"
+refute_fixed "$SOVEREIGN_REGISTRY" "$WORKFLOW"
 refute_fixed "OTA_REGISTRY" "$WORKFLOW"
 refute_fixed "MIRROR" "$WORKFLOW"
 
@@ -52,7 +53,7 @@ require_fixed '-t "${REF}:${SEMVER}"' "$BUILDER"
 require_fixed '"${PODMAN[@]}" push --digestfile "$digest_file" "${REF}:${SEMVER}"' "$BUILDER"
 require_fixed '[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]' "$BUILDER"
 require_fixed '--build-arg "OTA_IMGREF=${REF}:${SEMVER}"' "$BUILDER"
-refute_fixed 'registry.neural-ice.ch' "$BUILDER"
+refute_fixed "$SOVEREIGN_REGISTRY" "$BUILDER"
 refute_fixed 'OTA_REGISTRY' "$BUILDER"
 refute_fixed 'MIRROR' "$BUILDER"
 

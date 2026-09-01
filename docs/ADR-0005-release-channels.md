@@ -38,7 +38,7 @@
 
 > **Historical amendment (2026-07-10, ICE-Fabric)**: the alpha/beta/prod channel *model*
 > below is unchanged, but for the **appliance fleet** the channel tags now also live on
-> **`registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>`** (the sovereign OTA
+> **`registry.example.test/neural-ice/neural-ice-coreos:<channel>`** (the sovereign OTA
 > target), and `promote.yml` moves the channel pointer on **both** GHCR and the sovereign
 > registry by the same digest. This mechanism was retired by the 2026-07-15
 > supersession above; the tags remain only for rollback/forensics and do not move.

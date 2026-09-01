@@ -1,0 +1,6 @@
+[Unit]
+Description=Neural ICE fail-closed single-purpose installer boot
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+Requires=basic.target neural-ice-autoinstall.service
+After=basic.target neural-ice-autoinstall.service
+AllowIsolate=yes

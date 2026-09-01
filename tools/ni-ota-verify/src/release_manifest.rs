@@ -1,10 +1,9 @@
 //! Canonical Neural ICE release-manifest v1 reader and delta planner.
 //!
-//! This is the CoreOS side of ONE contract. The authority is
-//! `ICE-Fabric release-manifest/{contract.py,classifier.py,
-//! release-manifest-v1.schema.json}` at `e08446d6fc899f670b962f1e013bbf46e7e91497`;
-//! `tests/fixtures/release-manifest-v1/golden.json` holds that implementation's
-//! own output, so any drift here is a test failure rather than a field surprise.
+//! This is the CoreOS side of ONE contract. The exact Fabric producer inputs,
+//! schema, consumer pack, and generated vectors are copied and hash-pinned under
+//! `tests/fixtures/release-manifest-v1/producer/`; any drift is a test failure
+//! rather than a field surprise.
 //!
 //! What this module does: bounded strict JSON in, one normalized value out,
 //! canonical bytes and a digest that depend on the MEANING of the manifest and
@@ -29,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::net::Ipv4Addr;
 
 use sha2::{Digest, Sha256};
 
@@ -520,22 +520,179 @@ fn is_repository_segment(segment: &str) -> bool {
     !previous_separator
 }
 
-/// `^registry\.neural-ice\.ch/(neural-ice|vendor)/<path>$`.
+fn is_dns_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    alnum(bytes[0])
+        && alnum(bytes[bytes.len() - 1])
+        && bytes.iter().all(|&byte| alnum(byte) || byte == b'-')
+}
+
+fn is_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && !port.starts_with('0')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|value| value <= 65_535)
+}
+
+fn ipv6_hextet(text: &str) -> Option<u16> {
+    if text.is_empty()
+        || text.len() > 4
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u16::from_str_radix(text, 16).ok()
+}
+
+/// Validate Fabric's published lowercase RFC 5952 hextet language directly.
 ///
-/// `vendor/` is a first-class Fabric namespace, not an exception: a reader that
-/// rejects it silently un-ships every third-party component.
-fn is_repository(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("registry.neural-ice.ch/") else {
+/// In particular, this deliberately does not compare against `Ipv6Addr`'s
+/// display output: Rust renders IPv4-mapped addresses with dotted quads, while
+/// the signed contract admits only compressed hexadecimal hextets.
+fn is_canonical_ipv6_text(text: &str) -> bool {
+    let (left, right, compressed) = if let Some((left, right)) = text.split_once("::") {
+        if left.contains("::") || right.contains("::") {
+            return false;
+        }
+        (left, right, true)
+    } else {
+        (text, "", false)
+    };
+
+    let parse_side = |side: &str| -> Option<Vec<u16>> {
+        if side.is_empty() {
+            return Some(Vec::new());
+        }
+        side.split(':').map(ipv6_hextet).collect()
+    };
+    let Some(left_groups) = parse_side(left) else {
         return false;
     };
-    let rest = match rest.strip_prefix("neural-ice/") {
-        Some(rest) => rest,
-        None => match rest.strip_prefix("vendor/") {
-            Some(rest) => rest,
-            None => return false,
-        },
+    let Some(right_groups) = parse_side(right) else {
+        return false;
     };
-    !rest.is_empty() && rest.split('/').all(is_repository_segment)
+    let explicit = left_groups.len() + right_groups.len();
+    let compressed_length = if compressed {
+        let Some(length) = 8_usize.checked_sub(explicit) else {
+            return false;
+        };
+        if length < 2 {
+            return false;
+        }
+        length
+    } else {
+        if explicit != 8 {
+            return false;
+        }
+        0
+    };
+
+    let mut groups = left_groups.clone();
+    groups.extend(std::iter::repeat_n(0, compressed_length));
+    groups.extend(right_groups);
+
+    let mut best_start = 0;
+    let mut best_length = 0;
+    let mut index = 0;
+    while index < groups.len() {
+        if groups[index] != 0 {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < groups.len() && groups[index] == 0 {
+            index += 1;
+        }
+        let length = index - start;
+        if length > best_length {
+            best_start = start;
+            best_length = length;
+        }
+    }
+
+    if best_length < 2 {
+        !compressed
+    } else {
+        compressed && left_groups.len() == best_start && compressed_length == best_length
+    }
+}
+
+/// Validate one canonical generic OCI registry authority.
+///
+/// The accepted forms match Fabric exactly: lowercase DNS, canonical IPv4, or
+/// bracketed canonical IPv6, each optionally followed by a canonical port.
+fn is_registry_authority(value: &str) -> bool {
+    if value.bytes().any(|byte| b"/@?#".contains(&byte)) {
+        return false;
+    }
+
+    if let Some(bracketed) = value.strip_prefix('[') {
+        let Some((literal, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        let canonical = is_canonical_ipv6_text(literal);
+        return canonical && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(is_port));
+    }
+
+    if value.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = value
+        .rsplit_once(':')
+        .map_or((value, None), |(host, port)| (host, Some(port)));
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    let valid_host = if host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        host.parse::<Ipv4Addr>()
+            .is_ok_and(|address| address.to_string() == host)
+    } else {
+        (host == "localhost" || host.contains('.')) && host.split('.').all(is_dns_label)
+    };
+    valid_host && port.is_none_or(is_port)
+}
+
+fn registry_authority(value: Option<&str>, context: &str) -> Result<String, Refusal> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return refuse(format!("{context} is required"));
+    };
+    if !is_registry_authority(value) {
+        return refuse(format!("{context} is malformed"));
+    }
+    Ok(value.to_owned())
+}
+
+fn repository(value: &Json, context: &str) -> Result<String, Refusal> {
+    let Json::Str(repository) = value else {
+        return refuse(format!("{context} has an invalid value"));
+    };
+    let Some((authority, path)) = repository.split_once('/') else {
+        return refuse(format!("{context} has an invalid value"));
+    };
+    let Some(rest) = path
+        .strip_prefix("neural-ice/")
+        .or_else(|| path.strip_prefix("vendor/"))
+    else {
+        return refuse(format!("{context} has an invalid value"));
+    };
+    if rest.is_empty() || !rest.split('/').all(is_repository_segment) {
+        return refuse(format!("{context} has an invalid value"));
+    }
+    if !is_registry_authority(authority) {
+        return refuse(format!("{context} has an invalid value"));
+    }
+    Ok(repository.clone())
 }
 
 /// `^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$`
@@ -704,9 +861,8 @@ impl Payload {
 fn payload_common(object: &BTreeMap<String, Json>, context: &str) -> Result<Payload, Refusal> {
     // Order matters: with several faults in one payload, the reported one must
     // be the same on both sides of the contract.
-    let repository = string(
+    let repository = repository(
         field(object, "repository"),
-        is_repository,
         &format!("{context}.repository"),
     )?;
     let digest = string(
@@ -903,7 +1059,10 @@ fn evidence(value: &Json) -> Result<Vec<Evidence>, Refusal> {
     Ok(normalized)
 }
 
-fn normalize(value: &Json) -> Result<Manifest, Refusal> {
+fn normalize(
+    value: &Json,
+    configured_registry_authority: Option<&str>,
+) -> Result<Manifest, Refusal> {
     let object = strict_object(value, TOP_KEYS, "release manifest")?;
     match field(object, "schema") {
         Json::Str(schema) if schema == SCHEMA => {}
@@ -956,6 +1115,34 @@ fn normalize(value: &Json) -> Result<Manifest, Refusal> {
             "payload contracts are absent from compatibility.required_contracts: {}",
             undeclared.join(", ")
         ));
+    }
+    let authority = registry_authority(
+        configured_registry_authority,
+        "configured registry authority",
+    )?;
+    let repositories = std::iter::once(("host.repository".to_owned(), &manifest.host.repository))
+        .chain(manifest.components.iter().enumerate().map(|(index, item)| {
+            (
+                format!("components[{index}].repository"),
+                &item.payload.repository,
+            )
+        }))
+        .chain(manifest.content.iter().enumerate().map(|(index, item)| {
+            (
+                format!("content[{index}].repository"),
+                &item.payload.repository,
+            )
+        }));
+    for (context, repository) in repositories {
+        let actual = repository
+            .split_once('/')
+            .expect("repository validation guarantees an authority")
+            .0;
+        if actual != authority {
+            return refuse(format!(
+                "{context} authority '{actual}' does not match configured registry authority '{authority}'"
+            ));
+        }
     }
     Ok(manifest)
 }
@@ -1098,11 +1285,14 @@ fn canonical_bytes(manifest: &Manifest) -> Vec<u8> {
 /// The digest covers the CANONICAL bytes including the trailing LF — never the
 /// input bytes. Hashing the input would make re-serialization a rollback and
 /// re-indentation a new release.
-pub(crate) fn parse(data: &[u8]) -> Result<ParsedManifest, Refusal> {
+pub(crate) fn parse(
+    data: &[u8],
+    configured_registry_authority: Option<&str>,
+) -> Result<ParsedManifest, Refusal> {
     if data.len() > MAX_MANIFEST_BYTES {
         return refuse("release manifest exceeds the byte limit");
     }
-    let manifest = normalize(&parse_json(data)?)?;
+    let manifest = normalize(&parse_json(data)?, configured_registry_authority)?;
     let encoded = canonical_bytes(&manifest);
     if encoded.len() > MAX_MANIFEST_BYTES {
         return refuse("canonical release manifest exceeds the byte limit");
@@ -1357,14 +1547,15 @@ pub(crate) fn classify(
     current_bytes: &[u8],
     candidate_bytes: &[u8],
     device: &DeviceCompatibility,
+    configured_registry_authority: Option<&str>,
 ) -> Plan {
-    let current = match parse(current_bytes) {
+    let current = match parse(current_bytes, configured_registry_authority) {
         Ok(parsed) => parsed,
         Err(refusal) => {
             return Plan::refusal(format!("current manifest refused: {refusal}"), None, None)
         }
     };
-    let candidate = match parse(candidate_bytes) {
+    let candidate = match parse(candidate_bytes, configured_registry_authority) {
         Ok(parsed) => parsed,
         Err(refusal) => {
             return Plan::refusal(

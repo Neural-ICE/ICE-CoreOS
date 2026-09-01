@@ -35,6 +35,17 @@ expensive work happens **once on the build host, never on the target device**:
    and only then publishes it without overwriting an existing path. A
    `*.img.final-media.json` receipt binds both the accepted raw and the final archive digest, size,
    compression, seed manifest and `PARTUUID`; there is no pathname-only gate-to-artifact interval.
+   🔴 **The sealed core is re-inspected here, on the finished raw** (review 2026-09-01, P1 #4).
+   Steps 2–4 above grow this file, relocate the GPT backup header, rewrite the partition table and
+   copy ~20 GB of seed into a new `ni-seed` partition — all after the base media build inspected
+   the LIGHT raw. So the gate runs the full `image/inspect-installer-media.py` through its own
+   locked descriptor before it publishes anything: `EFI/BOOT/BOOTAA64.EFI` and its sealed
+   `.cmdline`, the ESP allowlist, every payload region hash, both recomputed dm-verity root hashes
+   and "every other partition is entirely zero". Its expectations come from
+   `<name>.img.sealed-core.json`, written by the build that sealed them, and they are REQUIRED
+   arguments: a final gate that can be invoked without inspecting what the medium boots is not a
+   gate. The receipt (now `neural-ice-preloaded-final-media-receipt-v2`) records the result under
+   `sealed_core`.
 5. **`ota/neural-ice-autoinstall.sh`** (seed step, only when `/dev/disk/by-partlabel/ni-seed`
    exists): after `bootc install`, it copies the ready store onto the encrypted data volume as
    `/var/lib/neural-ice/data/seed-store` (SELinux-labelled `container_ro_file_t`) and the models
@@ -63,7 +74,7 @@ The raw→archive compression is the build bottleneck (a ~110 GiB raw).
 ```sh
 SEED_IMAGES=$HOME/ice-seed/images \
 SEED_MODELS=$HOME/ice-seed/models \
-BASE_IMAGE=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<train-digest> \
+BASE_IMAGE=registry.example.test/neural-ice/neural-ice-appliance@sha256:<train-digest> \
 SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
 SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
 LAB_BASELINE_BOM_FILE=/release/train.bom.json \
@@ -76,7 +87,9 @@ COMPRESS=zstd-fast ./image/build-preloaded.sh
 Produces `ice-coreos-installer-preloaded-<version>.img.zst` (+ `.sha256`). Flash:
 `zstd -dc <img.zst> | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress`.
 
-The build also emits `<name>.img.final-media.json` and its `.sha256`. Release automation must
+The build also emits `<name>.img.sealed-core.json` — what the signed UKI on this raw seals, handed
+from the base media build to the final gate — plus `<name>.img.final-media.json` and its `.sha256`.
+Release automation must
 verify both checksums, retain the receipt, expand exactly the archive digest recorded in it, and
 flash/read back exactly the raw digest and size recorded in the same receipt. Existing artifact,
 checksum or receipt paths are never overwritten; retry with a fresh output name after diagnosing a
@@ -87,13 +100,26 @@ product payload. The sum receives 10% proportional headroom plus 4 GiB fixed hea
 up to 1 MiB. This keeps large (~70 GiB) payloads from exhausting the partition. First-boot payload
 application is bounded to two hours instead of systemd's default 90 seconds.
 
-For debug media, the optional SSH public-key file is validated, hash-bound and written to
-`EFI:/ice-coreos/authorized_keys` before final-media acceptance. Injection is refused unless the
-base image self-identifies as debug and the installed target is that same digest-pinned debug
-reference. The input must be one plain OpenSSH public-key record (never a private key or an
-`authorized_keys` record with options) and at most 512 bytes so its base64 form fits the supported
-ARM64 kernel command line with headroom. The delivered USB therefore remains byte-for-byte covered
-by the raw and artifact digests in the final receipt; do not modify its ESP after acceptance.
+For LAB-MANAGED media, the optional SSH public-key file is validated, hash-bound and written to
+`EFI:/ice-coreos/authorized_keys` before final-media acceptance. Staging is refused unless the base
+image is lab-anchored, its immutable `/usr/lib/neural-ice/access-policy` permits installer SSH
+provisioning, and the installed target is that same digest-pinned reference. The input must be one
+plain OpenSSH public-key record (never a private key or an `authorized_keys` record with options)
+and at most 512 bytes so its base64 form fits the supported ARM64 kernel command line with
+headroom.
+
+The final-media gate then closes the loop: pass `--esp-authorized-keys-sha256 <approved>` to
+`image/verify-preloaded-media.py` and it refuses a medium whose ESP key is absent, drifted,
+oversized or — with the flag omitted — present at all. The delivered USB therefore remains
+byte-for-byte covered by the raw and artifact digests in the final receipt (which now carries an
+`esp_authorized_keys` entry, `null` when no key was approved); do not modify its ESP after
+acceptance.
+
+🔴 **The medium is a convenience, not the authority.** Whether a provisioned key is ever honoured
+is decided twice on the appliance itself, against the immutable access policy in the signed image:
+once by the autoinstaller before any disk write, once by the first-boot service. A `customer-locked`
+image refuses a crafted ESP entry or a forged `neuralice.sshkey=` karg outright — see
+[ADR-0014](ADR-0014-access-policy-lab-vs-customer.md).
 
 Notes:
 - `OUT` names the output archive here but is the bib output DIR in
@@ -159,8 +185,8 @@ before install completion. The target SELinux policy labels the directory in the
 the rest of runtime `/var`. The Fabric baseline service is the sole consumer responsible for
 signature verification and the trust decision after boot.
 
-This handoff is independent of `/ice-coreos/authorized_keys`; its existing debug-key behavior is
-unchanged.
+This handoff is independent of `/ice-coreos/authorized_keys`; the installer SSH key behavior
+described above is unchanged by it.
 
 ### Failure recovery and one-version rollback
 

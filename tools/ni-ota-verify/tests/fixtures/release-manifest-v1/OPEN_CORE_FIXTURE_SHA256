@@ -1,0 +1,7 @@
+# Only exact historical producer fixture bytes may carry a sovereign endpoint.
+# The boundary gate structurally rejects entries outside this pinned subtree.
+a2c7a55b52c106a6d5230c3186b8f0685ca4545822b8a96ba9198856f6ef01a0  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/consumer-pack/release-manifest-v1.json
+cfc1b6240783f4dafec825582eb36ac910f87ef312b13515dfeb1bc15c5f327c  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/generate_vectors.py
+ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/vectors/canonical/valid-production-host.json
+ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/vectors/parser/valid-production-host.json
+ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc  tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/vectors/planner/production-host.json

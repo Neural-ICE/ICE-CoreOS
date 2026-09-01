@@ -1,7 +1,8 @@
 [Unit]
 Description=Provision and attest the dedicated TPM device root
 Documentation=https://github.com/Neural-ICE/ICE-CoreOS/blob/main/docs/ADR-0013-device-root-tpm-v1.md
-After=local-fs.target systemd-tmpfiles-setup.service
+Requires=neural-ice-firstboot-tpm-ceremony.service
+After=local-fs.target systemd-tmpfiles-setup.service neural-ice-firstboot-tpm-ceremony.service
 Before=network-online.target
 ConditionPathExistsGlob=/dev/tpm*
 RequiresMountsFor=/var/lib/neural-ice/ota

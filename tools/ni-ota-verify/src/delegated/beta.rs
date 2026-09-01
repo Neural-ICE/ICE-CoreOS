@@ -12,6 +12,7 @@ use super::{
     freeze_authority, freeze_root, refusal, validate_candidate, verify_root_binding,
     verify_signature,
 };
+use crate::access_profile_anchor;
 use crate::config::{
     immutable_appliance_variant, immutable_hardware_target, immutable_minimum_delegation_seq,
     Config,
@@ -29,6 +30,28 @@ const RECEIPT_DOMAIN: &[u8] = b"neural-ice:ota:beta-publication-receipt:v1\0";
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReleaseAuthorization {
+    /// The access posture the release is FOR (DESIGN-NOTE-0001, Finding 3).
+    ///
+    /// A REQUIRED field, and `deny_unknown_fields` above means a producer that
+    /// omits it is refused rather than defaulted. That is deliberate and it is
+    /// fail-closed: until ICE-Fabric emits this field, no delegated release
+    /// verifies. The alternative -- an `Option` that falls back to the variant
+    /// mapping -- would reinstate the exact premise this field exists to
+    /// replace, and would do it silently.
+    pub(crate) access_profile: String,
+    /// SHA-256 of the CANDIDATE deployment's own
+    /// `/usr/lib/neural-ice/access-policy` file.
+    ///
+    /// `access_profile` above is a WORD in this document; this is a hash of the
+    /// bytes the appliance will actually boot with. Without it a same-variant
+    /// candidate could ship a widened marker while the signed release JSON kept
+    /// the old profile, satisfy every comparison, and change the appliance's
+    /// posture on the next boot. Required, and `deny_unknown_fields` means an
+    /// omission is a refusal rather than a default — the same fail-closed shape
+    /// `access_profile` itself was introduced with. Spelled as ICE-Fabric's
+    /// `neural-ice-ota-release-authorization-v1` schema spells it, so one fact
+    /// does not acquire two names.
+    pub(crate) access_policy_sha256: String,
     pub(crate) attestation_set_sha256: String,
     pub(crate) beta_publication_receipt_sha256: Option<String>,
     pub(crate) bom_sha256: String,
@@ -97,6 +120,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "accepted-snapshot",
             "accepted-delegation-seq",
             "accepted-delegation-sha256",
+            "candidate-root",
             "config",
         ],
     )?;
@@ -191,6 +215,34 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "release variant '{}' does not match immutable host variant '{variant}'",
             release.variant
         ));
+    }
+    // The variant check above binds what the appliance IS BUILT FROM. This one
+    // binds what it WAS INSTALLED AS -- a value enrolled at install time,
+    // outside the candidate deployment, and signed by the device root. Without
+    // it, a correctly signed SAME-VARIANT release could rewrite the
+    // variant->profile mapping and widen the appliance's access posture with no
+    // signature ever having stated the old one (DESIGN-NOTE-0001, Finding 3).
+    let enrolled = match access_profile_anchor::enrolled_access_profile(&state_dir, &scratch)? {
+        Ok(profile) => profile,
+        Err(reason) => return refusal(reason),
+    };
+    if let Err(reason) =
+        access_profile_anchor::gate_release_profile(&enrolled, &release.access_profile)
+    {
+        return refusal(reason);
+    }
+    // …and the CANDIDATE's own marker, not only the release document's word for
+    // it. `--candidate-root` is required rather than optional: an optional
+    // security argument is one every caller forgets, and this one is what stops
+    // a same-variant candidate shipping a widened access policy under an
+    // unchanged signed profile.
+    let candidate_root = Path::new(required("candidate-root")?);
+    if let Err(reason) = access_profile_anchor::assert_candidate_access_profile(
+        candidate_root,
+        &enrolled,
+        &release.access_policy_sha256,
+    ) {
+        return refusal(reason);
     }
     if let Err(reason) = device_compatibility(&release, config.device_compat) {
         if config.enforce {
@@ -336,6 +388,18 @@ pub(crate) fn validate_release_for_time_challenge<'a>(
     )
 }
 
+/// The one mapping, restated here so the verifier does not have to trust the
+/// appliance's own copy of `image/lib/access-policy.sh` -- which a same-variant
+/// release could rewrite, which is the whole reason Finding 3 exists.
+pub(crate) fn access_profile_for_variant(variant: &str) -> Option<&'static str> {
+    match variant {
+        "prod" => Some("customer-locked"),
+        "sealed-lab" => Some("lab-managed"),
+        "debug" => Some("developer-diagnostic"),
+        _ => None,
+    }
+}
+
 fn validate_release_contract(
     value: &ReleaseAuthorization,
     snapshot: &Snapshot,
@@ -355,6 +419,12 @@ fn validate_release_contract(
         || !safe_uint(value.compat_max)
         || value.compat_min > value.compat_max
         || !matches!(value.variant.as_str(), "debug" | "prod" | "sealed-lab")
+        // The variant -> profile mapping is the same total function the image
+        // build derives its marker from (image/lib/access-policy.sh). A release
+        // whose two fields disagree is an internally inconsistent signed
+        // statement, and the honest response is to refuse it rather than to
+        // prefer one half over the other.
+        || access_profile_for_variant(&value.variant) != Some(value.access_profile.as_str())
         || !target(&value.hardware_target)
         || value.hardware_target != immutable_target
         || !ident(&value.issuance_id)
@@ -511,9 +581,18 @@ mod tests {
         let mut release: ReleaseAuthorization = parse_canonical(RELEASE, "release").unwrap();
         let mut receipt: BetaReceipt = parse_canonical(RECEIPT, "receipt").unwrap();
         let snapshot_hash = canonical_hash(SNAPSHOT).unwrap();
+        // This golden vector moved twice on 2026-08-31, both times because the
+        // release authorization gained a required field: first `access_profile`
+        // (DESIGN-NOTE-0001, Finding 3), then `access_policy_sha256` — the hash
+        // of the CANDIDATE's own immutable marker, without which `access_profile`
+        // is a word about a deployment rather than a property of it. The receipt
+        // binds the release by hash, so a new field on the release necessarily
+        // restates the receipt. That is the binding working, not drifting — and
+        // pinning the receipt's own hash here is what forces anyone changing
+        // either document to say so.
         assert_eq!(
             canonical_hash(RECEIPT).unwrap(),
-            "ddc2000c61895c5094691e51cd953f2aec43123987460d7a2e5316b09beb6df5"
+            "af572ee9055bfde6255bfef4438cef8f9f40d6855fa917af06419d261bfaf93b"
         );
         validate_release(
             &release,

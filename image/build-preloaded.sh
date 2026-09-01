@@ -16,6 +16,8 @@
 #   SEED_IMAGES=$HOME/ice-seed/images \
 #   SEED_MODELS=$HOME/ice-seed/models \
 #   BASE_IMAGE=<registry>/<org>/<appliance-image>@sha256:<digest> \
+#   # LAB-MANAGED media only: the base image's immutable access policy must permit
+#   # installer SSH provisioning, and the appliance re-checks it twice anyway.
 #   SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
 #   SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
 #   LAB_BASELINE_BOM_FILE=/path/to/<train>.bom.json \
@@ -44,6 +46,20 @@ OUT="${OUT:-ice-coreos-installer-preloaded-$(tr -d '[:space:]' < VERSION)}"
 COMPRESS="${COMPRESS:-zstd-fast}"
 LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
 LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
+# Forwarded to build-installer-usb.sh through the environment; declared here so
+# the final-media gate can be told which key — if any — was approved for this
+# medium. Without that, the gate would accept whatever key happened to be staged.
+SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
+# The sealed boot path (docs/ADR-0015). These are mandatory in
+# build-installer-usb.sh and have no defaults there on purpose -- a default
+# would be a silent decision about what a medium may install -- so they are
+# forwarded verbatim rather than reinvented here.
+VARIANT="${VARIANT:-}"
+HARDWARE_TARGET="${HARDWARE_TARGET:-}"
+HARDWARE_IDENTITY_FILE="${HARDWARE_IDENTITY_FILE:-}"
+UKI_SIGNING_KEY="${UKI_SIGNING_KEY:-}"
+UKI_SIGNING_CERT="${UKI_SIGNING_CERT:-}"
+ALLOW_UNSIGNED_MEDIA="${ALLOW_UNSIGNED_MEDIA:-0}"
 
 # Refuse a reused OUT before bootc-image-builder replaces the raw or any large seed work starts.
 # Failed builds remain evidence; retries use a fresh output name after diagnosis.
@@ -73,9 +89,56 @@ echo "==> 1. build the base installer raw FROM ${BASE_IMAGE}  (uncompressed)"
 # nothing about any appliance, so building it must not require one.
 env -u OUT BASE_IMAGE="$BASE_IMAGE" TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}" \
   TARGET_PROOF_REF="${TARGET_PROOF_REF:-${TARGET_IMGREF:-$BASE_IMAGE}}" \
+  VARIANT="$VARIANT" HARDWARE_TARGET="$HARDWARE_TARGET" \
+  HARDWARE_IDENTITY_FILE="$HARDWARE_IDENTITY_FILE" \
+  UKI_SIGNING_KEY="$UKI_SIGNING_KEY" UKI_SIGNING_CERT="$UKI_SIGNING_CERT" \
+  ALLOW_UNSIGNED_MEDIA="$ALLOW_UNSIGNED_MEDIA" \
   OUT_NAME="$OUT" ./image/build-installer-usb.sh
 RAW="${REPO_ROOT}/${OUT}.img"
 [ -f "$RAW" ] || { echo "base raw not produced ($RAW)" >&2; exit 1; }
+# WHAT THE SIGNED UKI ON THIS RAW SEALS (review 2026-09-01, P1 #4). Everything
+# below keeps WRITING to $RAW -- it grows the file, rewrites the GPT and appends
+# a ~20 GB ni-seed partition -- so the final gate has to inspect the sealed core
+# again on the FINISHED raw. These are the values it checks against, produced by
+# the build that sealed them; they are read here and forwarded, never recomputed.
+SEALED_CORE_FACTS="${RAW}.sealed-core.json"
+[ -f "$SEALED_CORE_FACTS" ] && [ ! -L "$SEALED_CORE_FACTS" ] \
+  || { echo "the base media build declared no sealed-core facts at $SEALED_CORE_FACTS; refusing to finalize a medium whose boot path nothing would re-inspect" >&2; exit 1; }
+# A command substitution, not a process substitution: `mapfile` always succeeds,
+# so a python failure behind `< <(...)` would be silently read as an empty array.
+SEALED_CORE_ARG_TEXT="$(python3 - "$SEALED_CORE_FACTS" <<'PY'
+import json
+import re
+import sys
+
+document = json.load(open(sys.argv[1], encoding="ascii"))
+if document.get("schema") != "neural-ice-sealed-core-facts-v1":
+    raise SystemExit("the sealed-core facts are not neural-ice-sealed-core-facts-v1")
+for key in ("verity_root_hash", "payload_digest"):
+    if not re.fullmatch(r"[0-9a-f]{64}", str(document.get(key, ""))):
+        raise SystemExit(f"the sealed-core facts carry no usable {key}")
+if document.get("media_mode") not in ("install", "live"):
+    raise SystemExit("the sealed-core facts carry no usable media mode")
+for flag, key in (
+    ("--expect-verity-root-hash", "verity_root_hash"),
+    ("--expect-payload-digest", "payload_digest"),
+    ("--expect-mode", "media_mode"),
+    ("--expect-access-profile", "access_profile"),
+    ("--expect-hardware-target", "hardware_target"),
+    ("--expect-trust-policy-id", "trust_policy_id"),
+):
+    value = str(document.get(key, ""))
+    if not value:
+        raise SystemExit(f"the sealed-core facts carry no {key}")
+    print(flag)
+    print(value)
+if document.get("allow_unsigned") is True:
+    print("--allow-unsigned")
+PY
+)" || { echo "the sealed-core facts alongside $RAW are unusable" >&2; exit 1; }
+mapfile -t SEALED_CORE_ARGS <<<"$SEALED_CORE_ARG_TEXT"
+[ "${#SEALED_CORE_ARGS[@]}" -ge 12 ] \
+  || { echo "the sealed-core facts alongside $RAW are incomplete" >&2; exit 1; }
 
 echo "==> 2. build the READY overlay image store (ONCE, here) + size the seed"
 # The untar + sha256 of the images happens once here on the build host — never on the client.
@@ -239,6 +302,16 @@ if [[ -n "$LAB_BASELINE_BOM_SHA256" || -n "$LAB_BASELINE_SIGNATURE_SHA256" ]]; t
     --lab-baseline-signature-sha256 "$LAB_BASELINE_SIGNATURE_SHA256"
   )
 fi
+final_media_ssh_key_args=()
+if [[ -n "$SSH_AUTHORIZED_KEYS_SHA256" ]]; then
+  final_media_ssh_key_args=(--esp-authorized-keys-sha256 "$SSH_AUTHORIZED_KEYS_SHA256")
+fi
+# THE FULL SEALED-CORE INSPECTION HAPPENS INSIDE THIS GATE, under the exclusive
+# lock it holds on the finished raw and before it publishes anything: the
+# artifact, its checksum, the receipt and the receipt's checksum all come after
+# it. That ordering is the whole of P1 #4 -- the sealed core used to be inspected
+# only on the LIGHT raw, i.e. before steps 2-4 above grew the file, rewrote the
+# GPT and appended ni-seed.
 sudo python3 image/verify-preloaded-media.py \
   --raw "$RAW" \
   --expected-manifest "$EXPECTED_SEED_MANIFEST" \
@@ -247,7 +320,8 @@ sudo python3 image/verify-preloaded-media.py \
   --compression "$COMPRESS" \
   --receipt "$FINAL_MEDIA_RECEIPT" \
   --receipt-checksum "$FINAL_MEDIA_RECEIPT_CHECKSUM" \
-  "${final_media_baseline_args[@]}"
+  "${SEALED_CORE_ARGS[@]}" \
+  "${final_media_baseline_args[@]}" "${final_media_ssh_key_args[@]}"
 storecleanup; trap - EXIT
 
 echo "==> PRELOADED installer ready: ${ART}"

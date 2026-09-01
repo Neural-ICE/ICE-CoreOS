@@ -208,7 +208,7 @@ delegated trust model and its local verifier only; they authorize no channel
 movement.
 
 The closed snapshot contract also reserves a distinct `trusted-time` role for
-canonical assertions issued by `licensing.neural-ice.ch`. It cannot sign images,
+canonical assertions issued by `licensing.example.test`. It cannot sign images,
 releases, receipts or channels. On first bootstrap, the immutable root may
 authenticate the physically delivered candidate snapshot before trusted time is
 available; the snapshot is accepted only in the later atomic transaction after
@@ -298,9 +298,135 @@ does not move a channel or persist state.
 The device must explicitly carry `device_channel=beta`; an absent or different
 channel is an authority refusal in every mode. The signed release variant must
 also equal immutable `/usr/lib/neural-ice/appliance-variant`, written from the
-validated `debug|prod` build argument. This prevents a signed debug release
-from entering a sealed production host. A missing or malformed immutable marker
-is broken image tooling (exit `2`), never a shadow-mode bypass.
+validated `debug|sealed-lab|prod` build argument. This prevents a signed debug
+release from entering a sealed production host. A missing or malformed immutable
+marker is broken image tooling (exit `2`), never a shadow-mode bypass.
+
+The variant equality above is NOT, by itself, what preserves the ACCESS POLICY
+across an OTA. It was believed to be (`docs/ADR-0014-access-policy-lab-vs-customer.md`),
+on the premise that the variant → policy mapping is a total function, so equal
+variants imply an equal policy. That premise is a property of the SOURCE TREE
+(`image/lib/access-policy.sh`), not of anything signed: a later, correctly
+signed, SAME-VARIANT release can rewrite the mapping — or the marker — and the
+host's access posture changes with no signature ever having stated the old one.
+
+`docs/ADR-0015-installer-trust-anchor-uki-verity.md` closes it, and it needs
+**two new fields from ICE-Fabric** plus **one new argument from the caller**:
+
+> **`access_profile`** on the release authorization — REQUIRED, one of
+> `lab-managed` | `customer-locked` | `developer-diagnostic`, and it must be the
+> value the release's own `variant` derives (`prod` → `customer-locked`,
+> `sealed-lab` → `lab-managed`, `debug` → `developer-diagnostic`). A release
+> whose two fields disagree is refused as an internally inconsistent signed
+> statement.
+>
+> **`access_policy_sha256`** on the release authorization — REQUIRED, the
+> SHA-256 of the CANDIDATE deployment's own
+> `/usr/lib/neural-ice/access-policy` file. Spelled as ICE-Fabric's
+> `neural-ice-ota-release-authorization-v1` schema spells it, so one fact does
+> not acquire two names.
+>
+> **`--candidate-root <path>`** on `verify-delegated-beta`,
+> `verify-delegated-usb`, `guard-state-v2` and `commit-state-v2` — REQUIRED, the
+> root of the staged deployment being judged.
+
+Both fields are required rather than optional, and the document keeps
+`deny_unknown_fields`, so a producer that omits either is refused rather than
+defaulted. That is deliberate: an optional field falling back to the variant
+mapping would reinstate the exact premise it replaces, silently. **Until
+ICE-Fabric emits them, no delegated release verifies.** Nothing is in production.
+
+This OTA-v1 authorization is distinct from the installer contract sealed into
+the signed UKI. Installation accepts only the closed, exactly 14-field
+`neural-ice-installer-release-authorization-v2`: it declares either
+`single-manifest` or `index`, preserves Fabric's signed `issuance_seq` unchanged,
+and advances the TPM absolute high-water only from mandatory first boot after
+the install commit. See
+`docs/ADR-0015-installer-trust-anchor-uki-verity.md`; neither contract aliases or
+silently upgrades the other.
+
+Every delegated path — *and* the two state-v2 commands, which previously skipped
+this entirely — then compares that value against the profile ENROLLED AT INSTALL
+TIME: written into the stateroot, outside the candidate deployment, and signed by
+the TPM device root at `0x81010005`
+(`ota/neural-ice-access-profile-anchor.sh`, `src/access_profile_anchor.rs`).
+
+**Why `access_policy_sha256` as well.** `access_profile` is a word in a signed
+JSON; the appliance boots with a FILE. A same-variant candidate could ship a
+widened `/usr/lib/neural-ice/access-policy` while its signed release kept the old
+profile, pass every comparison, and change the appliance's posture on the next
+boot. The verifier therefore reads the marker out of `--candidate-root`, requires
+its hash to be the authorised one, and requires its CONTENT to be the enrolled
+profile.
+
+**Why the TPM is interrogated live.** The anchor, its signature, its SPKI and the
+device-root identity all live in `/var`, so a coherent bundle copied from another
+appliance satisfied every file comparison. The verifier makes the device root at
+`0x81010005` **sign a fresh nonce** — a private key that never leaves a TPM
+cannot do that on a second machine — and requires `anchor_seq` to equal the
+machine's monotonic install counter in TPM NV `0x01500003`
+(`ota/neural-ice-tpm-state.sh`). No TPM, no counter, a foreign key or a key
+that will not sign are all refusals; there is no branch where absent evidence
+means "carry on".
+
+**Why the device-root signature is not the profile's AUTHORITY** (review
+2026-09-01). That key has `userwithauth` and an **empty authorization policy**,
+so anything running as root on the appliance can make it sign — including a
+replacement anchor carrying a different `access_profile` at the current counter
+value. The liveness challenge does not help: it proves the key is usable on this
+machine, which is exactly what such an attacker also enjoys.
+
+The profile is therefore bound to a **write-once, policy-protected TPM NV
+record** at `0x01500005`, written and locked only by the mandatory first-boot
+ceremony after the installer has persisted the device root and intended SRK:
+
+| field | bytes | meaning |
+| --- | --- | --- |
+| magic | `0..8` | `NI-TPM02` |
+| profile binding | `8..40` | `sha256("neural-ice:tpm:access-profile-binding:v1" ‖ 0x00 ‖ profile ‖ 0x00 ‖ hardware_target ‖ 0x00 ‖ signed_boot_trust_policy_id)` |
+| reserved | `40..64` | zero |
+
+Index contract, asserted before the content is read:
+
+* attributes `policywrite|writedefine|ownerread|authread` (`0x62008`, with the
+  TPM's own `WRITELOCKED`/`READLOCKED`/`WRITTEN` bits masked out) — **no
+  `ownerwrite`, no `authwrite`**;
+* authorization policy `PolicyOR(PolicyCommandCode(NV_Write),
+  PolicyCommandCode(NV_WriteLock))` =
+  `f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230`;
+* written once and immediately `NV_WriteLock`ed; `writedefine` makes that lock
+  permanent for the life of the index, across TPM restarts.
+
+`enrolled_access_profile()` requires the anchor's `(access_profile,
+hardware_target, signed_boot_trust_policy_id)` triple to hash to that record. An
+index that is absent, redefined with weaker attributes, or under a different
+policy is a refusal — reading content without checking shape would hand an
+attacker exactly the authority the record exists to remove.
+
+Before the ceremony, any existing or partial fixed state is a refusal rather
+than an idempotent success. The ceremony replaces owner authorization with 32
+random bytes and retains no copy; after it completes, runtime root cannot
+undefine/redefine the indices or evict/recreate the persistent objects. The
+freshness high-water is the absolute value of `0x01500004`, and runtime never
+creates missing state. Legitimately changing what an appliance is requires a
+**TPM clear with physical presence** followed by a reinstall from signed media —
+`docs/ADR-0015-installer-trust-anchor-uki-verity.md` §"Amendment, 2026-09-01" §D
+documents the operator procedure.
+
+A mismatch, an absent anchor, a non-canonical one, one signed by another
+machine's device root, one whose sequence is not this machine's current install,
+or a candidate whose own marker disagrees is refused with **"reinstall
+required"** — deliberately not "re-enrol": a profile change is a change of what
+the appliance *is*, and the only honest path back is signed physical media.
+`tests/cli.rs` proves all of it against REAL ECDSA P-256 and a mocked TPM that
+signs with the same real key — including a perfectly signed, live, current anchor
+whose profile the TPM record does not back, an absent record, a record redefined
+with weaker attributes, and one under a different policy.
+`ci/test-swtpm-monotonic-state.sh` proves the index contract itself against a
+real TPM 2.0.
+
+The beta publication receipt needs no new field: it binds the release by
+SHA-256, so it binds both fields transitively.
 
 The device compatibility range is compared with the signed release range.
 Unknown or disjoint compatibility refuses when `enforce=1`; during an explicit
@@ -437,7 +563,7 @@ ni-ota-verify bootstrap \
   --bom /run/neural-ice/bootstrap/0.44.18.bom.json \
   --bom-sig /run/neural-ice/bootstrap/0.44.18.bom.sig \
   --expected-train 0.44.18 \
-  --current-os-ref registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:<64hex> \
+  --current-os-ref registry.example.test/neural-ice/neural-ice-appliance@sha256:<64hex> \
   --current-seed-ref <40hex> \
   --device-compat 5,5
 ```
@@ -498,18 +624,25 @@ authenticated by the caller.
 
 ### One contract, not two
 
-The authority is ICE-Fabric `release-manifest/{contract.py,classifier.py,
-release-manifest-v1.schema.json}` at
-`e08446d6fc899f670b962f1e013bbf46e7e91497`. CoreOS implements that contract; it
-does not define a dialect of it. Concretely:
+The authority is the Owner-approved ICE-Fabric consumer pack copied exactly
+under `tests/fixtures/release-manifest-v1/producer/`. `PIN.json` binds the
+producer base, schema, parser, classifier, generator, and consumer-pack hashes.
+The pack hash consumed by this revision is
+`sha256:a2c7a55b52c106a6d5230c3186b8f0685ca4545822b8a96ba9198856f6ef01a0`.
+CoreOS does not define a dialect of it. Concretely:
 
 - the sequence field is `bundle_seq`. There is no `release_seq`, and no alias
   for one — an alias would be a second manifest grammar under one signature;
 - classification is exactly `no-op`, `component-content`, `host`, `refusal`.
   Components and content share **one** class, so a bundle touching both still
   has an engine;
-- `registry.neural-ice.ch/vendor/...` is a first-class namespace alongside
-  `neural-ice/`;
+- the configured registry authority is required and strict generic OCI host
+  syntax; both `(neural-ice|vendor)/...` namespaces remain first-class;
+- DNS hosts are bounded at exactly 253 ASCII characters (the optional port is
+  outside that bound), and a trailing dot is not canonical;
+- IPv4-mapped IPv6 is admitted only in the producer's lowercase compressed
+  hexadecimal form, such as `[::ffff:c000:201]`; dotted mapped forms are
+  refused rather than normalized;
 - identity is the SHA-256 of the **canonical** bytes (sorted keys, compact
   separators, normalized set-like arrays, one trailing LF), never of the input
   bytes. Re-indenting a manifest must not mint a new release. That hash is
@@ -522,7 +655,10 @@ does not define a dialect of it. Concretely:
 
 ### Semantics
 
-Both manifests are checked against the device (`hardware_target`,
+Every host, component, and content repository in both manifests is validated
+against the required configured registry authority before compatibility,
+sequence, or transition classification. Missing, malformed, foreign, or mixed
+authorities refuse. Both manifests are then checked against the device (`hardware_target`,
 `minimum_reader` vs the reader version, `required_contracts` vs what the device
 supports) before any transition is considered. `bundle_seq` is anti-rollback:
 strictly lower refuses, and equality is admitted **only** for the byte-identical
@@ -542,51 +678,39 @@ that must be started. `reboot_required` is the OR over the same set.
 
 ```
 ni-ota-verify release-plan --current <path> --candidate <path> \
+    --registry-host registry.example.test \
     --hardware-target nvidia-gb10-arm64 --reader-version 1 \
     --supported-contracts host-bootc-v1,component-oci-v1,content-oci-v1
 ```
 
-Device capability is passed explicitly and never sniffed from the environment,
-so an operator can reproduce a device's plan off-device from the same two files.
+Registry authority and device capability are passed explicitly and never
+defaulted or sniffed from the environment, so an operator can reproduce a
+device's plan off-device from the same two files.
 The canonical plan document goes to stdout in every case — on a refusal the
 reason is the useful part. Exit codes follow the binary's contract: `0` a
 transition was classified, `1` the contract refused it, `2` tooling failure.
 
-### Cross-contract golden vectors
+### Exact producer consumer pack
 
-`tests/fixtures/release-manifest-v1/golden.json` is **Fabric's own output**, not
-this implementation's: `generate-golden.py` runs the pinned Python contract over
-the committed manifest vectors and records the canonical bytes, digests, refusal
-texts and plans. The Rust tests then assert byte-for-byte equality, so a
-divergence between CoreOS and Fabric is a red test rather than a field incident.
+The `producer/consumer-pack/release-manifest-v1.json` handoff and every referenced
+schema/input/canonical/planner vector are exact Fabric bytes. Rust source tests
+verify every declared hash, canonical parser result, strict refusal text, and
+configured-host plan. `tests/registry_host_cli.rs` repeats the planner cases
+through the real binary and proves that an environment variable cannot replace
+the required `--registry-host` argument.
 
-The generator is **not** run by CI (the pinned Rust image has no Python); it is
-the documented, re-runnable procedure behind the committed vectors:
+The copied producer procedure is standard-library Python and regenerates the
+CoreOS-owned copy in place. Run it twice; both runs must leave no diff:
 
 ```bash
-# Requires Bash: `pipefail` is not POSIX. Without it `gh api … | base64 -d`
-# reports only base64's status, so an API failure (auth, rate limit, a moved
-# ref) silently leaves a truncated or empty source file and the vectors get
-# regenerated from nothing. Run from the CoreOS repository root; the procedure
-# never changes directory, so the generator's relative path stays resolvable.
-(
-  set -euo pipefail
-  ICE_FABRIC_SHA=e08446d6fc899f670b962f1e013bbf46e7e91497
-  FABRIC_DIR="$(mktemp -d)"
-  trap 'rm -rf -- "$FABRIC_DIR"' EXIT
-  for f in contract.py classifier.py release-manifest-v1.schema.json; do
-    gh api "repos/Neural-ICE/ICE-Fabric/contents/release-manifest/$f?ref=$ICE_FABRIC_SHA" \
-      --jq .content | base64 -d > "$FABRIC_DIR/$f"
-  done
-  PYTHONPATH="$FABRIC_DIR" python3 \
-    tools/ni-ota-verify/tests/fixtures/release-manifest-v1/generate-golden.py
-  git diff --stat tools/ni-ota-verify/tests/fixtures/release-manifest-v1/
-)
+python3 tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/generate_vectors.py
+git diff --exit-code -- tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer
+python3 tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/generate_vectors.py
+git diff --exit-code -- tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer
 ```
 
-Regenerating is a no-op unless the Fabric contract itself moved. A dirty
-`git diff` there means the two repositories disagree and the pin has to be
-re-decided — not refreshed silently.
+Regeneration does not refresh `PIN.json`: moving any producer input or pack hash
+is a contract update requiring an explicit repin, not a silent fixture refresh.
 
 ## Caller integration (the OTA path, ICE-Fabric side)
 

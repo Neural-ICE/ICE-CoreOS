@@ -1,0 +1,641 @@
+{
+  "configured_host_cases": [
+    {
+      "candidate": "vectors/planner/candidate-no-op.json",
+      "candidate_sha256": "sha256:1e68e05955b4f5ba6d5930ea0951858f013d415e74c99120fe129ffa80e3c16c",
+      "configured_registry_authority": "registry.example.test",
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": 42,
+        "candidate_manifest_digest": "sha256:e5385dc2c836edc2c409e92c99e6253972ca762ed3296b3613446cba011e0b08",
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "no-op",
+        "current_manifest_digest": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+        "reboot_required": false,
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "example-no-op"
+    },
+    {
+      "candidate": "vectors/planner/candidate-component.json",
+      "candidate_sha256": "sha256:8c0aff12384f9b2ae54c0e6f6871ef85b471f57ad4051b772b45523af923bda8",
+      "configured_registry_authority": "registry.example.test",
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": 42,
+        "candidate_manifest_digest": "sha256:d0e454e98a5a6e670bb260d994e0c484b2007ac770b1c7c954eb0157a863d630",
+        "changed_components": [
+          "ice-ac1"
+        ],
+        "changed_content": [],
+        "classification": "component-content",
+        "current_manifest_digest": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+        "reboot_required": false,
+        "restart_scope": [
+          "icecore-api.service"
+        ],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "example-component"
+    },
+    {
+      "candidate": "vectors/planner/candidate-host.json",
+      "candidate_sha256": "sha256:9bfc6e86755b6f61ddc185b3a8099bb0e12a785c0340903505c7f60604fad112",
+      "configured_registry_authority": "registry.example.test",
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": 42,
+        "candidate_manifest_digest": "sha256:aca5605d2e7fbafff78517e0f6c027b6489bd367fdd1cd20a882f51243279926",
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "host",
+        "current_manifest_digest": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+        "reboot_required": false,
+        "restart_scope": [
+          "bootc-fetch-apply-updates.service"
+        ],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "example-host"
+    },
+    {
+      "candidate": "vectors/planner/candidate-no-op.json",
+      "candidate_sha256": "sha256:1e68e05955b4f5ba6d5930ea0951858f013d415e74c99120fe129ffa80e3c16c",
+      "configured_registry_authority": null,
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": null,
+        "candidate_manifest_digest": null,
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "refusal",
+        "current_manifest_digest": null,
+        "reboot_required": false,
+        "refusal_reason": "current manifest refused: configured registry authority is required",
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "missing-config"
+    },
+    {
+      "candidate": "vectors/planner/candidate-no-op.json",
+      "candidate_sha256": "sha256:1e68e05955b4f5ba6d5930ea0951858f013d415e74c99120fe129ffa80e3c16c",
+      "configured_registry_authority": "https://registry.example.test",
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": null,
+        "candidate_manifest_digest": null,
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "refusal",
+        "current_manifest_digest": null,
+        "reboot_required": false,
+        "refusal_reason": "current manifest refused: configured registry authority is malformed",
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "malformed-config"
+    },
+    {
+      "candidate": "vectors/planner/candidate-no-op.json",
+      "candidate_sha256": "sha256:1e68e05955b4f5ba6d5930ea0951858f013d415e74c99120fe129ffa80e3c16c",
+      "configured_registry_authority": "foreign.example.test",
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": null,
+        "candidate_manifest_digest": null,
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "refusal",
+        "current_manifest_digest": null,
+        "reboot_required": false,
+        "refusal_reason": "current manifest refused: host.repository authority 'registry.example.test' does not match configured registry authority 'foreign.example.test'",
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "mismatched-config"
+    },
+    {
+      "candidate": "vectors/planner/candidate-mixed-host.json",
+      "candidate_sha256": "sha256:4c547c07d8e18821eb24a1956c5efe8b0b81014629a293db5d6707d84be3e479",
+      "configured_registry_authority": "registry.example.test",
+      "current": "vectors/planner/current-example.json",
+      "current_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "expected_plan": {
+        "bundle_seq": null,
+        "candidate_manifest_digest": null,
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "refusal",
+        "current_manifest_digest": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+        "reboot_required": false,
+        "refusal_reason": "candidate manifest refused: components[0].repository authority 'foreign.example.test' does not match configured registry authority 'registry.example.test'",
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "candidate-mixed-host"
+    },
+    {
+      "candidate": "vectors/planner/candidate-no-op.json",
+      "candidate_sha256": "sha256:1e68e05955b4f5ba6d5930ea0951858f013d415e74c99120fe129ffa80e3c16c",
+      "configured_registry_authority": "registry.example.test",
+      "current": "vectors/planner/current-mixed-host.json",
+      "current_sha256": "sha256:ba387c3c28fc1064a6bc9441e57e6493a3780e9238a4a9cb6de6f8fd2c873255",
+      "expected_plan": {
+        "bundle_seq": null,
+        "candidate_manifest_digest": null,
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "refusal",
+        "current_manifest_digest": null,
+        "reboot_required": false,
+        "refusal_reason": "current manifest refused: content[0].repository authority 'foreign.example.test' does not match configured registry authority 'registry.example.test'",
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "current-mixed-host"
+    },
+    {
+      "candidate": "vectors/planner/production-host.json",
+      "candidate_sha256": "sha256:ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc",
+      "configured_registry_authority": "registry.neural-ice.ch",
+      "current": "vectors/planner/production-host.json",
+      "current_sha256": "sha256:ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc",
+      "expected_plan": {
+        "bundle_seq": 41,
+        "candidate_manifest_digest": "sha256:ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc",
+        "changed_components": [],
+        "changed_content": [],
+        "classification": "no-op",
+        "current_manifest_digest": "sha256:ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc",
+        "reboot_required": false,
+        "restart_scope": [],
+        "schema": "neural-ice-release-plan-v1"
+      },
+      "id": "production-host-compatibility"
+    }
+  ],
+  "format": "neural-ice-release-manifest-v1-consumer-pack",
+  "format_version": 1,
+  "parser_vectors": [
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-example-canonical.json",
+      "canonical_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "configured_registry_authority": "registry.example.test",
+      "id": "valid-example-canonical",
+      "input": "vectors/parser/valid-example-canonical.json",
+      "input_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-example-noncanonical.json",
+      "canonical_sha256": "sha256:28bbaa33024d3588fa5d7e941b4f41ca36f76cce70675ac429235849bccbcf9c",
+      "configured_registry_authority": "registry.example.test",
+      "id": "valid-example-noncanonical",
+      "input": "vectors/parser/valid-example-noncanonical.json",
+      "input_sha256": "sha256:901a2d8c88c387ced4b6ac931cf898757bfd0a27db75080f77ff07ad6074eac6"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-production-host.json",
+      "canonical_sha256": "sha256:ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc",
+      "configured_registry_authority": "registry.neural-ice.ch",
+      "id": "valid-production-host",
+      "input": "vectors/parser/valid-production-host.json",
+      "input_sha256": "sha256:ddd81b940caa17a70f89de5580a25ad6c0d4f7520aaaf32f5bd16af7f46f2bfc"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-registry-port.json",
+      "canonical_sha256": "sha256:0e79ee5e0a9e006b538bdef05eb66bb4d289e8b5760dc5c956bdc14e250dbe8a",
+      "configured_registry_authority": "registry.example.test:5443",
+      "id": "valid-registry-port",
+      "input": "vectors/parser/valid-registry-port.json",
+      "input_sha256": "sha256:a98b63d3d28ebf7c546c5041fdbab898a7e1a0feeccd0c7817c0f4dba7086446"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-bracketed-ipv6.json",
+      "canonical_sha256": "sha256:25bba49c907462438bef655e98606dce152c98ee24bb39eb85520d111d24fed2",
+      "configured_registry_authority": "[2001:db8::1]:5443",
+      "id": "valid-bracketed-ipv6",
+      "input": "vectors/parser/valid-bracketed-ipv6.json",
+      "input_sha256": "sha256:c5050cdc3f341eae4cce95107997ed100510c66b65df53b883192a3ee29daadf"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-dns-host-253.json",
+      "canonical_sha256": "sha256:ca891b690bfedf19ebc2e3068b8085880d395ef6a52ce0d79531f4c803481031",
+      "configured_registry_authority": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "id": "valid-dns-host-253",
+      "input": "vectors/parser/valid-dns-host-253.json",
+      "input_sha256": "sha256:5215a44966ad7cdd7bff443204f6c396b149dbb26f681843b808dcac7c6e690e"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-dns-host-253-port.json",
+      "canonical_sha256": "sha256:6f8d265f97330e307b6969c9d3cc0bca6aa29f230d89afb6f8cfec01ff8130cb",
+      "configured_registry_authority": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:65535",
+      "id": "valid-dns-host-253-port",
+      "input": "vectors/parser/valid-dns-host-253-port.json",
+      "input_sha256": "sha256:04e249ff2f2606b68f78018d2ba02f818ddecb233fc2eb2cec6fd6abcf01bdf8"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-ipv4-mapped-ipv6-c000.json",
+      "canonical_sha256": "sha256:fd606d272c8da0b48ab2605b492a213cb9a278fc6aabdef4e6676c4852aa1a01",
+      "configured_registry_authority": "[::ffff:c000:201]",
+      "id": "valid-ipv4-mapped-ipv6-c000",
+      "input": "vectors/parser/valid-ipv4-mapped-ipv6-c000.json",
+      "input_sha256": "sha256:0096cbca77997c2bbd003931bf6a145f86ee79230b426a006b8ec20a0f8afff3"
+    },
+    {
+      "accepted": true,
+      "canonical": "vectors/canonical/valid-ipv4-mapped-ipv6-7f00.json",
+      "canonical_sha256": "sha256:55e8b972d8a39c8aa2d9fae6c3fe151a9a44ffc117de4603f5c1ead3485a6dfa",
+      "configured_registry_authority": "[::ffff:7f00:1]",
+      "id": "valid-ipv4-mapped-ipv6-7f00",
+      "input": "vectors/parser/valid-ipv4-mapped-ipv6-7f00.json",
+      "input_sha256": "sha256:3950640e7c1e22999fbb9429833bf52cac77da8ba3e2bbe3658b46dfa09c4a45"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test",
+      "id": "invalid-duplicate-key",
+      "input": "vectors/parser/invalid-duplicate-key.json",
+      "input_sha256": "sha256:4e40d0e7abc2b3c4f14dd9c80ce85f59bb99d8f553811400adfe96d4bbdf972e",
+      "refusal_reason": "duplicate JSON object key: schema"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test",
+      "id": "invalid-malformed-authority",
+      "input": "vectors/parser/invalid-malformed-authority.json",
+      "input_sha256": "sha256:10e505837d3bf0bcdce55b22f8b5e4c9a8f26d4facb2e18b1b6175efb5a025a6",
+      "refusal_reason": "host.repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test",
+      "id": "invalid-repository-namespace",
+      "input": "vectors/parser/invalid-repository-namespace.json",
+      "input_sha256": "sha256:6d329685fd7c538ef90633cfa3d1237c1fb50b1a1e7847b2d3c0d83f4cafc774",
+      "refusal_reason": "host.repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test",
+      "id": "invalid-tagged-repository",
+      "input": "vectors/parser/invalid-tagged-repository.json",
+      "input_sha256": "sha256:b3901e266022877e32bc0d3c2d9a9003971a82825431a91c23ce54837c26f03b",
+      "refusal_reason": "host.repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "Registry.example.test",
+      "id": "invalid-uppercase-authority",
+      "input": "vectors/parser/invalid-uppercase-authority.json",
+      "input_sha256": "sha256:6118f8c232272db19a338fb30e9b50cb5746dabd599b3cc66e8105fad1b5681b",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test:0",
+      "id": "invalid-zero-port",
+      "input": "vectors/parser/invalid-zero-port.json",
+      "input_sha256": "sha256:8fda9b6ddd45e9397a3db1c0510dab840618f7aa04cc17e914e269e9e9391a81",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test:65536",
+      "id": "invalid-overflow-port",
+      "input": "vectors/parser/invalid-overflow-port.json",
+      "input_sha256": "sha256:d1b35bf704f3241532918c98c3d32f732e9ab3f54cd6aef8603ac357eda7e424",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "[2001:0db8::1]",
+      "id": "invalid-noncanonical-ipv6",
+      "input": "vectors/parser/invalid-noncanonical-ipv6.json",
+      "input_sha256": "sha256:3765ca6c91b2692df18ff2d24708b921c726482f1bb4213e7824a4fcbb322387",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "[fe80::1%eth0]",
+      "id": "invalid-ipv6-zone-id",
+      "input": "vectors/parser/invalid-ipv6-zone-id.json",
+      "input_sha256": "sha256:30c2b9f5efbb1bae9946462831e30902f1d93074d1622d077552084327c56907",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "[fe80::1%\u00e9]",
+      "id": "invalid-ipv6-unicode-zone-id",
+      "input": "vectors/parser/invalid-ipv6-unicode-zone-id.json",
+      "input_sha256": "sha256:f8a0988898f7d7e87689117ee32f2a12f64e414984e5450ddc4295131254e801",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "[2001:DB8::1]",
+      "id": "invalid-uppercase-ipv6",
+      "input": "vectors/parser/invalid-uppercase-ipv6.json",
+      "input_sha256": "sha256:874601db5d803fb27589ca337097643cc5cc5820aa2a2da44d519c0f62b1cc6d",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "[2001:db8:0:0:0:0:0:1]",
+      "id": "invalid-expanded-ipv6-zero-run",
+      "input": "vectors/parser/invalid-expanded-ipv6-zero-run.json",
+      "input_sha256": "sha256:dda3ecdcd99c7922c421cbe8faf8e059bd27a05ad6c21506f2d4c23626176103",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "192.0.002.10",
+      "id": "invalid-noncanonical-ipv4",
+      "input": "vectors/parser/invalid-noncanonical-ipv4.json",
+      "input_sha256": "sha256:f956432f624343660f48c934b45b81ca75487805702e0f629795eb9e11e4df05",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "r\u00e9gistry.example.test",
+      "id": "invalid-nonascii-dns",
+      "input": "vectors/parser/invalid-nonascii-dns.json",
+      "input_sha256": "sha256:b9086e6187a8ad1967efce781a60882d3ff40aad403f865b5592c5833d94b7dd",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "id": "invalid-dns-host-254",
+      "input": "vectors/parser/invalid-dns-host-254.json",
+      "input_sha256": "sha256:fc16cea757e20c5521e526a5ceb9a5beff20005ed2aff1e4f1567b5078363cce",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "registry.example.test.",
+      "id": "invalid-dns-trailing-dot",
+      "input": "vectors/parser/invalid-dns-trailing-dot.json",
+      "input_sha256": "sha256:ff0631ad102917f636abf1ab892608a08a5b845522fe2d3abc58ed0cf39bd1a2",
+      "refusal_reason": "components[0].repository has an invalid value"
+    },
+    {
+      "accepted": false,
+      "configured_registry_authority": "[::ffff:192.0.2.1]",
+      "id": "invalid-ipv4-mapped-ipv6-dotted",
+      "input": "vectors/parser/invalid-ipv4-mapped-ipv6-dotted.json",
+      "input_sha256": "sha256:2a388d0f85a204bf26c66426813711b6d63d5e773e90114a4467311b9135a989",
+      "refusal_reason": "components[0].repository has an invalid value"
+    }
+  ],
+  "path_base": "..",
+  "repository_grammar": {
+    "dns_host_max_ascii_characters": 253,
+    "equivalence_vectors": [
+      {
+        "accepted": true,
+        "configured_registry_authority": "registry.example.test",
+        "id": "dns",
+        "repository": "registry.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "localhost",
+        "id": "single-label-dns",
+        "repository": "localhost/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "registry.example.test:1",
+        "id": "dns-port-min",
+        "repository": "registry.example.test:1/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "registry.example.test:65535",
+        "id": "dns-port-max",
+        "repository": "registry.example.test:65535/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "id": "dns-host-253",
+        "repository": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:65535",
+        "id": "dns-host-253-port",
+        "repository": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:65535/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "id": "dns-host-254",
+        "repository": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "registry.example.test.",
+        "id": "dns-trailing-dot",
+        "repository": "registry.example.test./neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "192.0.2.10",
+        "id": "ipv4",
+        "repository": "192.0.2.10/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "192.0.2.10:5443",
+        "id": "ipv4-port",
+        "repository": "192.0.2.10:5443/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "[2001:db8::1]",
+        "id": "ipv6-compressed",
+        "repository": "[2001:db8::1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "[::]",
+        "id": "ipv6-all-zero",
+        "repository": "[::]/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "[1:2:3:4:5:6:7:8]",
+        "id": "ipv6-no-zero",
+        "repository": "[1:2:3:4:5:6:7:8]/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "[2001:db8::1]:5443",
+        "id": "ipv6-port",
+        "repository": "[2001:db8::1]:5443/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "[::ffff:c000:201]",
+        "id": "ipv4-mapped-ipv6-c000",
+        "repository": "[::ffff:c000:201]/neural-ice/equivalence"
+      },
+      {
+        "accepted": true,
+        "configured_registry_authority": "[::ffff:7f00:1]",
+        "id": "ipv4-mapped-ipv6-7f00",
+        "repository": "[::ffff:7f00:1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[::ffff:192.0.2.1]",
+        "id": "ipv4-mapped-ipv6-dotted",
+        "repository": "[::ffff:192.0.2.1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "",
+        "id": "empty",
+        "repository": "/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "https://registry.example.test",
+        "id": "scheme",
+        "repository": "https://registry.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "user@registry.example.test",
+        "id": "userinfo",
+        "repository": "user@registry.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "Registry.example.test",
+        "id": "uppercase-dns",
+        "repository": "Registry.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "r\u00e9gistry.example.test",
+        "id": "nonascii-dns",
+        "repository": "r\u00e9gistry.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "-registry.example.test",
+        "id": "leading-hyphen",
+        "repository": "-registry.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "registry-.example.test",
+        "id": "trailing-hyphen",
+        "repository": "registry-.example.test/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "registry.example.test:0",
+        "id": "port-zero",
+        "repository": "registry.example.test:0/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "registry.example.test:0001",
+        "id": "port-leading-zero",
+        "repository": "registry.example.test:0001/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "registry.example.test:65536",
+        "id": "port-overflow",
+        "repository": "registry.example.test:65536/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "192.0.002.10",
+        "id": "ipv4-leading-zero",
+        "repository": "192.0.002.10/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "192.0.2.999",
+        "id": "ipv4-overflow",
+        "repository": "192.0.2.999/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "2001:db8::1",
+        "id": "ipv6-unbracketed",
+        "repository": "2001:db8::1/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[fe80::1%eth0]",
+        "id": "ipv6-zone",
+        "repository": "[fe80::1%eth0]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[fe80::1%\u00e9]",
+        "id": "ipv6-unicode-zone",
+        "repository": "[fe80::1%\u00e9]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[2001:DB8::1]",
+        "id": "ipv6-uppercase",
+        "repository": "[2001:DB8::1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[2001:0db8::1]",
+        "id": "ipv6-leading-zero",
+        "repository": "[2001:0db8::1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[2001:db8:0:0:0:0:0:1]",
+        "id": "ipv6-expanded-zero-run",
+        "repository": "[2001:db8:0:0:0:0:0:1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[2001::1:0:0:0:1]",
+        "id": "ipv6-compress-shorter-run",
+        "repository": "[2001::1:0:0:0:1]/neural-ice/equivalence"
+      },
+      {
+        "accepted": false,
+        "configured_registry_authority": "[2001:0:0:1::2:3]",
+        "id": "ipv6-compress-later-tie",
+        "repository": "[2001:0:0:1::2:3]/neural-ice/equivalence"
+      }
+    ],
+    "ipv4_mapped_ipv6_text": "lowercase-compressed-hexadecimal-hextets",
+    "parser_symbol": "contract.REPOSITORY_PATTERN",
+    "pattern_sha256": "sha256:d1a7ddece75847b59094c22483e2ba8e56680c20fb682bba79f072daf0450db6",
+    "schema_pointer": "#/$defs/repository/pattern"
+  },
+  "schema": "release-manifest-v1.schema.json",
+  "schema_sha256": "sha256:f687aef0003dec4e8524fa3d94ec3cdd2f8b3da1e2f45a72f0713f129205892a"
+}

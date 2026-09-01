@@ -71,6 +71,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "accepted-snapshot",
             "accepted-delegation-seq",
             "accepted-delegation-sha256",
+            "candidate-root",
             "config",
         ],
     )?;
@@ -188,6 +189,27 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             release.variant
         ));
     }
+    // EVERY delegated path owes the appliance this comparison, not just the
+    // ordinary beta one. A path that skipped it would be the way around it.
+    let enrolled = match crate::access_profile_anchor::enrolled_access_profile(state_dir, &scratch)?
+    {
+        Ok(profile) => profile,
+        Err(reason) => return refusal(reason),
+    };
+    refuse_try!(crate::access_profile_anchor::gate_release_profile(
+        &enrolled,
+        &release.access_profile
+    ));
+    // The candidate's own immutable marker, for the same reason the ordinary
+    // beta path checks it: a signed word about a deployment is not a property of
+    // that deployment until its bytes agree.
+    refuse_try!(
+        crate::access_profile_anchor::assert_candidate_access_profile(
+            Path::new(required("candidate-root")?),
+            &enrolled,
+            &release.access_policy_sha256,
+        )
+    );
     refuse_try!(device_compatibility(&release, config.device_compat));
     let release_key = refuse_try!(authorized_key(
         &snapshot,

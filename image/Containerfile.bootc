@@ -69,14 +69,37 @@ ARG NVIDIA_DRIVER_VERSION=580.159.03
 # channel (that's the image tag). Default = prod (secure, sealed).
 #   prod       : sshd MASKED (sealed appliance, ADR-0003), kargs=["quiet"], SELinux enforcing.
 #   sealed-lab : IDENTICAL posture to prod — the branch below seals everything that is
-#                not `debug`. It differs ONLY in the Secure Boot anchor it will accept
+#                not `debug`. It differs in the Secure Boot anchor it will accept
 #                (lab, i.e. a key enrolled by hand), which is why it says so in its name
 #                instead of borrowing `prod`. Confined to the beta-debug OTA channel by
 #                ICE-Fabric, so it cannot reach a customer.
 #   debug      : sshd enabled (core key), serial console (ttyS0) + tty1, verbose boot,
 #                SELinux permissive (enforcing=0) — for lab/field troubleshooting only.
+#                NOT a release posture: it must never enter a channel.
 # Build both: --build-arg VARIANT=prod  ->  :prod ; --build-arg VARIANT=debug -> :debug
 ARG VARIANT=prod
+
+# WHICH SECURE BOOT TRUST POLICY signed the boot chain this image is paired with.
+# Today: neural-ice-secureboot-lab-v1 (the DIRECT UEFI key path — the Neural ICE
+# CA in db, no MS-signed shim). `neural-ice-secureboot-prod-v1` does not exist
+# yet; until its key ceremony completes, no production-chain evidence can be
+# produced. That is a gap in EVIDENCE, not a hole in the lab trust proof: on lab
+# media the cmdline is authenticated by the same signature as the kernel.
+ARG SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1
+
+# ACCESS POLICY (ADR-0014). The variant above also decides, MECHANICALLY, whether
+# an installation medium may provision an operator SSH key on this image:
+#
+#   prod       -> customer-locked       never, under any input
+#   sealed-lab -> lab-managed           yes, one validated key, sealed otherwise
+#   debug      -> developer-diagnostic  yes (it already ships sshd enabled)
+#
+# The derived value is written to /usr/lib/neural-ice/access-policy, i.e. into the
+# read-only ostree /usr that the image signature covers. That file — not a label,
+# not /etc, not a kernel argument, not a file on a mutable ESP — is the trust
+# anchor the autoinstaller and the first-boot service both interrogate. Before it
+# existed, editing `ice-coreos/authorized_keys` on an otherwise correctly signed
+# installer USB opened SSH on a `prod` image.
 
 # --------------------------------------------------------------------------- #
 # 1) Swap the stock el10 kernel -> GB10 `nvidia-gb10` kernel, STANDARD 4k flavor
@@ -167,6 +190,19 @@ RUN curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-co
 
 COPY image/bootc-overlay/            /
 COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
+# The install-time access-profile anchor (DESIGN-NOTE-0001, Finding 3). It signs
+# with the device root provisioned by the helper above, so it ships beside it and
+# is chmod-ed in the same RUN.
+COPY ota/neural-ice-access-profile-anchor.sh /usr/libexec/neural-ice-access-profile-anchor
+# The TPM-backed monotonic state both the installer and the OTA path lean on: an
+# NV counter that numbers access-profile anchors, and an NV high-water that stops
+# a consumed release authorization being replayed. It ships in the IMAGE rather
+# than only on the medium because the OTA gate reads the same counter on every
+# upgrade — the installer's `anchor_seq` means nothing if nothing later compares
+# against it.
+COPY ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state
+COPY ota/neural-ice-firstboot-tpm-ceremony.sh /usr/libexec/neural-ice-firstboot-tpm-ceremony
+COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luks-token-evidence
 # Container-image signature policy: the MECHANISM, never the identity.
 # The overlay ships /etc/containers/policy.json with a default of `reject`, so
 # this OS pulls NOTHING until a composer declares which repository it trusts and
@@ -182,8 +218,13 @@ COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
 COPY image/policy/render-container-policy.sh /usr/libexec/neural-ice-render-container-policy
 RUN test "$(cat /usr/lib/neural-ice/hardware-target)" = nvidia-gb10-arm64
 
+
 RUN set -euxo pipefail; \
     chmod 0755 /usr/libexec/neural-ice-device-root; \
+    chmod 0755 /usr/libexec/neural-ice-access-profile-anchor; \
+    chmod 0755 /usr/libexec/neural-ice-tpm-state; \
+    chmod 0755 /usr/libexec/neural-ice-firstboot-tpm-ceremony; \
+    chmod 0755 /usr/libexec/neural-ice-luks-token-evidence; \
     chmod 0755 /usr/libexec/neural-ice-render-container-policy; \
     systemctl enable neural-ice-device-root.service; \
     chmod 0600 /etc/NetworkManager/system-connections/*.nmconnection; \
@@ -315,7 +356,88 @@ COPY image/signed-boot/ /
 # First-boot SSH-key provisioning: lets a VANILLA install receive an operator
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
-COPY image/firstboot/neural-ice-firstboot-sshkey.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
+# TWO units, one script. Provisioning is ordered Before=sshd.service and writes
+# the key without ever starting or polling sshd (it cannot: the manager holds
+# the sshd job until the oneshot exits). Activation is ordered after both the
+# provisioning unit and sshd, starts sshd, VERIFIES it, and only then records
+# success -- rolling the key and the sshd mask back if it never came up.
+COPY image/firstboot/neural-ice-firstboot-sshkey.service          /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
+COPY image/firstboot/neural-ice-firstboot-sshkey-activate.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey-activate.service
+COPY image/firstboot/neural-ice-firstboot-tpm-ceremony.service /usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/sshd.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/getty@.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/serial-getty@.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/autovt@.service.d/50-neural-ice-tpm-ceremony.conf
+# A Before= edge cannot propagate failure. Every listener, login/session path,
+# network readiness path, OTA executor and root-capable extension therefore has
+# a hard Requires= edge to the successful oneshot gate as well.
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/sshd.socket.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/network-pre.target.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/network.target.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/network-online.target.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/NetworkManager.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/NetworkManager-wait-online.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/avahi-daemon.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/avahi-daemon.socket.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/systemd-user-sessions.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/user@.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/neural-ice-payload-apply.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/neural-ice-hostname-init.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/neural-ice-dhcp-retry.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/nvidia-device-nodes.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/nvidia-cdi-generate.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/neural-ice-device-root.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/bootc-fetch-apply-updates.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/bootc-fetch-apply-updates.timer.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/systemd-sysext.service.d/50-neural-ice-tpm-ceremony.conf
+COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/systemd-confext.service.d/50-neural-ice-tpm-ceremony.conf
+# The access-policy decision and the SSH-key validator live in ONE place, inside
+# the immutable /usr, so the image build (which writes the marker), the
+# autoinstaller (installer image = FROM this one) and the first-boot service
+# cannot drift apart. A second copy of this logic is a second thing to forget.
+COPY image/lib/access-policy.sh     /usr/lib/neural-ice/lib/access-policy.sh
+COPY image/lib/installer-ssh-key.sh /usr/lib/neural-ice/lib/installer-ssh-key.sh
+# The SEALED trust anchor and the release-authorization verifier. These two are
+# what make the marker above defensible ON A REMOVABLE MEDIUM: the first proves
+# the root the marker lives in is the dm-verity target the signed UKI names, the
+# second proves an image digest is authorised for this medium's profile before
+# anything on the target disk is touched (DESIGN-NOTE-0001, Findings 1 and 2).
+COPY image/lib/installer-payload.sh      /usr/lib/neural-ice/lib/installer-payload.sh
+COPY image/lib/installer-trust.sh        /usr/lib/neural-ice/lib/installer-trust.sh
+COPY image/lib/release-authorization.sh  /usr/lib/neural-ice/lib/release-authorization.sh
+# The MEASURED hardware identity. `neuralice.hardware_target=` used to be a word
+# compared only with another copy of itself, so a medium built for a GB10 booted
+# on any other arm64 box satisfied every check and then wiped it. This library
+# asks the machine what it is; the fingerprint list beside it says which answers
+# the target admits. Both live in the read-only /usr, so the image signature and
+# — on the installer — the dm-verity hash cover them.
+COPY image/lib/hardware-identity.sh /usr/lib/neural-ice/lib/hardware-identity.sh
+# STAGED build inputs (image/hardware-identity/README.md): the accepted machine
+# fingerprints, produced by measuring the reference appliance, and the public key
+# that authorises an installable release. Neither is invented in this tree.
+COPY image/hardware-identity/ /usr/lib/neural-ice/hardware-identity/
+COPY image/keys/              /usr/lib/neural-ice/keys/
+# --------------------------------------------------------------------------- #
+# FAIL-CLOSED on the two staged inputs the installer trust construction cannot
+# work without. Both were absent when the construction was written, which is why
+# the runtime gate refused every medium it was ever handed: it required a
+# release-authorization key at a path nothing had ever populated.
+#
+# The key's IDENTITY is its SHA-256, and that hash is what the UKI seals. There
+# is therefore nothing to configure here beyond "a real, parseable public key is
+# present" -- the binding is established at media build, not by this line.
+# --------------------------------------------------------------------------- #
+RUN set -euxo pipefail; \
+    target="$(cat /usr/lib/neural-ice/hardware-target)"; \
+    key=/usr/lib/neural-ice/keys/release-authorization.pub; \
+    test -f "$key"; \
+    openssl pkey -pubin -in "$key" -noout \
+      || openssl pkey -pubin -inform DER -in "$key" -noout; \
+    identity="/usr/lib/neural-ice/hardware-identity/${target}.fingerprints"; \
+    test -f "$identity"; \
+    bash /usr/lib/neural-ice/lib/hardware-identity.sh read-fingerprints / "$target" \
+      | grep -Eq '^[0-9a-f]{64}$'; \
+    chmod 0444 "$key" "$identity" /usr/lib/neural-ice/lib/hardware-identity.sh
 # Generic installer-payload apply (one-shot): the PRELOADED installer may stage a
 # payload/ dir on the data volume; this runs its apply.sh once on first boot. The
 # payload CONTENT is product-side — the OS ships only the mechanism.
@@ -393,7 +515,9 @@ RUN set -euxo pipefail; \
                /usr/local/bin/neural-ice-payload-apply.sh; \
     systemctl mask bootc-fetch-apply-updates.timer; \
     systemctl enable nvidia-device-nodes.service nvidia-cdi-generate.service \
+                     neural-ice-firstboot-tpm-ceremony.service \
                      neural-ice-firstboot-sshkey.service \
+                     neural-ice-firstboot-sshkey-activate.service \
                      neural-ice-hostname-init.service \
                      neural-ice-payload-apply.service \
                      avahi-daemon.service; \
@@ -538,6 +662,38 @@ RUN set -euxo pipefail; \
     install -d -m 0755 /usr/lib/bootc/kargs.d; \
     case "${VARIANT}" in debug|sealed-lab|prod) ;; *) echo "invalid VARIANT" >&2; exit 2 ;; esac; \
     printf '%s\n' "${VARIANT}" > /usr/lib/neural-ice/appliance-variant; \
+    # The access policy is DERIVED, never passed in: a build arg would be one
+    # more thing an operator can get wrong, and the whole point of this marker
+    # is that nobody outside the image gets a vote on it.
+    bash /usr/lib/neural-ice/lib/access-policy.sh for-variant "${VARIANT}" \
+        > /usr/lib/neural-ice/access-policy; \
+    # The Secure Boot trust policy this image is built against, as a FILE in the
+    # read-only /usr rather than only as an OCI label. The label is metadata,
+    # trivially settable by whoever builds an image and read on a build host; the
+    # file is what the installer cross-checks against the value sealed in the
+    # signed UKI cmdline. Both exist, and they must agree.
+    printf '%s\n' "${SIGNED_BOOT_TRUST_POLICY_ID}" > /usr/lib/neural-ice/signed-boot-trust-policy-id; \
+    case "${SIGNED_BOOT_TRUST_POLICY_ID}" in \
+      neural-ice-secureboot-*) ;; \
+      *) echo "SIGNED_BOOT_TRUST_POLICY_ID must name a neural-ice-secureboot-* trust policy" >&2; exit 2 ;; \
+    esac; \
+    chmod 0444 /usr/lib/neural-ice/access-policy \
+               /usr/lib/neural-ice/signed-boot-trust-policy-id \
+               /usr/lib/neural-ice/lib/hardware-identity.sh \
+               /usr/lib/neural-ice/lib/access-policy.sh \
+               /usr/lib/neural-ice/lib/installer-payload.sh \
+               /usr/lib/neural-ice/lib/installer-trust.sh \
+               /usr/lib/neural-ice/lib/release-authorization.sh \
+               /usr/lib/neural-ice/lib/installer-ssh-key.sh; \
+    # Read the marker BACK and restate the mapping independently. This is not
+    # redundancy for its own sake: the library above is the single source of
+    # truth precisely so it can be changed in one place, and a mapping that can
+    # be changed in one place must break the BUILD if it ever stops agreeing
+    # with what this file says the variants mean.
+    case "${VARIANT}:$(cat /usr/lib/neural-ice/access-policy)" in \
+      debug:developer-diagnostic|sealed-lab:lab-managed|prod:customer-locked) ;; \
+      *) echo "derived access policy does not match VARIANT ${VARIANT}" >&2; exit 2 ;; \
+    esac; \
     install -d -m 0755 /usr/lib/sysctl.d; \
     printf 'kernel.printk = 3 4 1 7\n' > /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf; \
     if [ "${VARIANT}" = "debug" ]; then \
@@ -555,6 +711,34 @@ RUN set -euxo pipefail; \
         # getty@/autovt@ templates too so no login prompt can autospawn on any secondary VT
         # (Ctrl+Alt+F2..F6). Debug keeps its VT gettys + serial + ssh; prod does not.
         systemctl mask getty@.service autovt@.service; \
+        # FAIL-CLOSED READBACK of the sealed posture, asserted on the built bytes
+        # rather than assumed from the commands above. `sealed-lab` is the NVIDIA
+        # .67 candidate's posture and it must be provably identical to `prod`:
+        # SELinux enforcing, no serial root autologin, no VT shell, sshd masked
+        # AND keyless. A base image that ever reinstates one of these must break
+        # the BUILD, not surface on an appliance.
+        test "$(readlink -f /etc/systemd/system/sshd.service)" = /dev/null; \
+        test "$(readlink -f /etc/systemd/system/getty@.service)" = /dev/null; \
+        test "$(readlink -f /etc/systemd/system/autovt@.service)" = /dev/null; \
+        test ! -e /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf; \
+        ! grep -q 'enforcing=0' /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
+        ! grep -q 'console=ttyS0' /usr/lib/bootc/kargs.d/10-neural-ice.toml; \
+        # Keyless: a sealed image must ship NO baked authorized key. The
+        # privilege travels on the installation medium and is authorised by the
+        # access policy — never soldered into the bytes everyone receives.
+        #
+        # TWO independent requirements, because either one alone is bypassable.
+        # The build arg must be EXACTLY EMPTY: that is the only input that can
+        # put a key here, and checking it directly needs no opinion about what a
+        # key looks like. And the produced file must hold no non-whitespace byte
+        # at all. The previous check rejected only lines STARTING with a key
+        # algorithm, so `restrict ssh-ed25519 AAAA…` — a perfectly valid
+        # authorized_keys record, accepted by sshd, options-prefixed — passed a
+        # build that claims to ship keyless. Whitespace is all `printf '%s\n' ""`
+        # leaves behind, so "no non-whitespace bytes" is the honest predicate;
+        # it lives in the library so the suite can exercise the real one.
+        test -z "${SSH_AUTHORIZED_KEY}"; \
+        bash /usr/lib/neural-ice/lib/installer-ssh-key.sh assert-keyless /usr/ssh/core.keys; \
     fi
 
 # --------------------------------------------------------------------------- #
@@ -640,4 +824,6 @@ LABEL org.opencontainers.image.title="ICE-CoreOS" \
       org.opencontainers.image.source="https://github.com/Neural-ICE/ICE-CoreOS" \
       org.opencontainers.image.licenses="Apache-2.0" \
       neural-ice.nvidia.driver="r${NVIDIA_DRIVER_VERSION}" \
-      neural-ice.base="centos-bootc:stream10"
+      neural-ice.base="centos-bootc:stream10" \
+      ch.neural-ice.signed-boot-trust-policy-id="${SIGNED_BOOT_TRUST_POLICY_ID}" \
+      ch.neural-ice.access-profile="${VARIANT}"

@@ -22,6 +22,7 @@
 //!   2  internal error (missing cosign, unreadable config, …) — ALWAYS,
 //!      regardless of mode: broken tooling never passes (fail-closed).
 
+mod access_profile_anchor;
 mod atomic_state;
 mod bootstrap;
 mod commit;
@@ -59,10 +60,12 @@ const USAGE: &str = "usage:
   ni-ota-verify commit-state-v2 --bom <path> --release <path> --release-sig <path>
                        --snapshot <path> --snapshot-sig <path>
                        --trusted-time <path> --trusted-time-sig <path>
+                       --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify guard-state-v2 --bom <path> --release <path> --release-sig <path>
                        --snapshot <path> --snapshot-sig <path>
                        --trusted-time <path> --trusted-time-sig <path>
+                       --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify prepare-trusted-time-v2 --snapshot <path> --snapshot-sig <path>
                        --release <path> --release-sig <path>
@@ -77,15 +80,17 @@ const USAGE: &str = "usage:
                        --receipt <path> --receipt-sig <path> --trusted-now <UTC-seconds>
                        --accepted-snapshot <path>
                        --accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>
+                       --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify verify-delegated-usb --snapshot <path> --snapshot-sig <path>
                        --release <path> --release-sig <path> --bom <path>
                        --record <path> --attestation <path> --attestation-sig <path>
                        --bundle-digest <sha256:...>
                        --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
-                       --trusted-now <UTC-seconds>
+                       --trusted-now <UTC-seconds> --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify release-plan --current <path> --candidate <path>
+                       --registry-host <canonical OCI authority>
                        --hardware-target <id> --reader-version <n>
                        --supported-contracts <id[,id...]>
   ni-ota-verify capabilities
@@ -153,9 +158,9 @@ fn run() -> u8 {
 /// `release-plan` — the only I/O the release-manifest reader gets: read two
 /// local files, hand the bytes to the pure planner, print the canonical plan.
 ///
-/// Device capabilities are explicit arguments, never sniffed from the
-/// environment, so an operator can reproduce a device's plan off-device from
-/// the same two manifests.
+/// Registry authority and device capabilities are explicit arguments, never
+/// sniffed from the environment, so an operator can reproduce a device's plan
+/// off-device from the same two manifests.
 ///
 /// No download, staging, activation, `bootc` or reboot happens here or
 /// downstream of here: a plan is a statement about two documents.
@@ -168,6 +173,7 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
         &[
             "current",
             "candidate",
+            "registry-host",
             "hardware-target",
             "reader-version",
             "supported-contracts",
@@ -181,6 +187,7 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
 
     let current_path = required("current")?;
     let candidate_path = required("candidate")?;
+    let registry_host = required("registry-host")?;
     let hardware_target = required("hardware-target")?.clone();
     let reader_version: u64 = required("reader-version")?.parse().map_err(|_| {
         InternalError("--reader-version must be a non-negative integer".to_string())
@@ -225,6 +232,7 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
             reader_version,
             supported_contracts,
         },
+        Some(registry_host),
     );
     // stdout carries the plan even on a refusal: the reason is the useful part.
     print!("{}", String::from_utf8_lossy(&plan.to_canonical_json()));

@@ -1,6 +1,9 @@
-# ICE-CoreOS — dual-mode INSTALLER image (DGX Spark)
+# ICE-CoreOS — SINGLE-PURPOSE INSTALLER image (DGX Spark)
 # = Secure Boot SIGNED (validated) base image + auto-install service.
-# At boot the media (raw GPT) offers, via GRUB: "Live" and "Auto install".
+# A produced medium boots ONE signed UKI from \EFI\BOOT\BOOTAA64.EFI and carries
+# no boot manager, no second EFI binary and no kernel of its own: Live or Install
+# is decided when the medium is cut (MEDIA_MODE) and stated by a signature, not
+# by a menu (ADR-0015; review 2026-09-01, P0 #2).
 #
 # The base image is a build-arg so the installer can be built for any channel:
 #   sudo podman build --platform linux/arm64 -f image/Containerfile.installer \
@@ -18,12 +21,22 @@ FROM ${BASE_IMAGE}
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
 COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-baseline-handoff
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
+COPY image/installer/neural-ice-installer.target \
+     /usr/lib/systemd/system/neural-ice-installer.target
+COPY image/installer/neural-ice-installer-runtime-generator.sh \
+     /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator
 # Install boots must never start getty@tty1 (its start job would resolve the
 # autoinstall Conflicts= by stopping the install mid-flight). Live boots keep it.
 RUN install -d -m 0755 /etc/systemd/system/getty@tty1.service.d
 COPY ota/neural-ice-getty-tty1-installer-skip.conf \
      /etc/systemd/system/getty@tty1.service.d/10-installer-skip.conf
 COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
+# The installer reads the monotonic install counter at preflight, binds this
+# appliance's access profile to a write-once TPM NV record once the install
+# commits, and advances the release-authorization issuance high-water. The base
+# image ships this helper too; copying it here keeps the medium's copy the same
+# bytes as the appliance's, so the two readers of one record cannot drift.
+COPY ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state
 COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service \
      /usr/lib/systemd/system/neural-ice-device-root.service
 RUN install -d -m 0755 /etc/systemd/system/neural-ice-device-root.service.d
@@ -32,7 +45,9 @@ COPY ota/neural-ice-device-root-installer-only.conf \
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
       /usr/local/libexec/neural-ice-lab-baseline-handoff \
-      /usr/libexec/neural-ice-device-root; \
+      /usr/libexec/neural-ice-device-root \
+      /usr/libexec/neural-ice-tpm-state \
+      /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator; \
     # The installer-only drop-in gates this enabled unit to the explicit
     # autoinstall entry.  Autoinstall removes that drop-in from the target
     # deployment before reboot, leaving the installed appliance enabled for
@@ -76,7 +91,7 @@ RUN rm -rf /usr/lib/bootc/bound-images.d
 # falls to `default: reject`, and every step that reads a local image dies:
 #
 #   bootc-image-builder, writing this medium : containers-storage:…  rejected
-#   the autoinstaller, copy-to-storage       : oci:/proc/self/fd/3   rejected
+#   the autoinstaller, reading its own store : containers-storage:…  rejected
 #
 # Enumerating transports is whack-a-mole -- the next bootc release picks another.
 # The medium instead runs permissive and the STRICT policy travels beside it, to
@@ -96,10 +111,11 @@ json.dump(d, open(p,'w'), indent=4, sort_keys=True)"
 # Assert both halves rather than trusting the edit: the medium is permissive,
 # the strict original is preserved verbatim for the autoinstaller to restore,
 # and the signed docker scopes survive in both.
-RUN python3 -c "import json; live=json.load(open('/etc/containers/policy.json')); strict=json.load(open('/usr/lib/neural-ice-policy-strict.json')); \
+RUN python3 -c "import json; live=json.load(open('/etc/containers/policy.json')); strict=json.load(open('/usr/lib/neural-ice-policy-strict.json')); docker=live.get('transports',{}).get('docker'); \
 assert live['default']==[{'type':'insecureAcceptAnything'}]; \
 assert strict['default']==[{'type':'reject'}]; \
-assert 'registry.neural-ice.ch/neural-ice' in live['transports']['docker']; \
+assert isinstance(docker,dict) and docker, 'installer policy carries no explicitly configured signed docker scope'; \
+assert all(isinstance(scope,str) and scope and '/' in scope for scope in docker), 'installer policy carries a malformed docker scope'; \
 assert strict['transports']==live['transports']; \
 print('installer policy: medium permissive, strict original preserved for the target')"
 

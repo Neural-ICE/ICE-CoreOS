@@ -2,12 +2,19 @@
 Description=Neural ICE - provision operator SSH key on first boot
 Documentation=https://github.com/Neural-ICE/ICE-CoreOS
 ConditionPathExists=!/var/lib/neural-ice/.sshkey-provisioned
-After=local-fs.target
+Requires=neural-ice-firstboot-tpm-ceremony.service
+After=local-fs.target neural-ice-firstboot-tpm-ceremony.service
+# The key must be on disk before anything could serve it, so this unit is
+# ordered BEFORE sshd -- which is exactly why it must never start or poll sshd:
+# systemd holds the sshd start job until this oneshot exits, so a poll here can
+# only ever time out. Starting and VERIFYING sshd belongs to
+# neural-ice-firstboot-sshkey-activate.service, which is ordered where that is
+# possible.
 Before=sshd.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/neural-ice-firstboot-sshkey.sh
+ExecStart=/usr/local/bin/neural-ice-firstboot-sshkey.sh provision
 RemainAfterExit=yes
 
 [Install]

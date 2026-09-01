@@ -16,9 +16,45 @@ on:
       # that exists — the media build is the real test, but it costs 20 minutes
       # and a build host, so it cannot be the FIRST thing that notices.
       - "image/Containerfile.installer"
+      - "image/installer/**"
+      - "image/test-installer-systemd-lifecycle.sh"
       - "image/build-installer-usb.sh"
-      - "image/lib/debug-ssh-key.sh"
+      - "image/lib/installer-ssh-key.sh"
+      - "image/lib/access-policy.sh"
+      # The P0 installer trust architecture (docs/ADR-0015): the sealed UKI
+      # anchor, the release authorization and the install-time access-profile
+      # anchor. These three decide whether an appliance installs the image it
+      # was authorised to install, so they get the same cheap pull-request gate
+      # as the installer files above -- the media build is the real test, but it
+      # costs 20 minutes and a build host and cannot be the FIRST thing to notice.
+      - "image/lib/installer-trust.sh"
+      - "image/lib/release-authorization.sh"
+      - "image/lib/hardware-identity.sh"
+      - "image/lib/signing-trust.sh"
+      - "image/build-installer-uki.sh"
+      - "image/build-installer-root.sh"
+      - "image/build-installer-payload.sh"
+      - "image/lib/installer-payload.sh"
+      - "image/inspect-installer-media.py"
+      - "image/initramfs/**"
+      - "image/hardware-identity/**"
+      - "image/test-access-policy.sh"
+      - "image/test-installer-trust.sh"
+      - "image/test-installer-uki.sh"
+      - "image/test-installer-media.sh"
+      - "image/test-lib/**"
+      - "image/test-build-installer-root.sh"
+      - "image/test-installer-payload.sh"
+      - "image/test-hardware-identity.sh"
+      - "image/test-signing-trust.sh"
+      - "image/test-release-authorization.sh"
+      - "ota/neural-ice-access-profile-anchor.sh"
+      - "ota/test-neural-ice-access-profile-anchor.sh"
+      - "ota/neural-ice-tpm-state.sh"
+      - "ota/test-neural-ice-tpm-state.sh"
       - "ota/neural-ice-autoinstall.sh"
+      - "ota/neural-ice-autoinstall.service"
+      - "ota/test-autoinstall-kargs.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-oci-signature-policy.sh"
@@ -34,6 +70,7 @@ on:
       - "build/build-kernel.sh"
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
+      - "ci/test-swtpm-monotonic-state.sh"
       - "ci/test-gb10-console-boot.sh"
       # Le script qui nomme la machine rend AUSSI son profil réseau de secours :
       # sans lui, une appliance sur un lien sans DHCP n'a aucune adresse et
@@ -53,6 +90,44 @@ on:
   push:
     branches: [main]
     paths:
+      - "image/lib/installer-ssh-key.sh"
+      - "image/lib/access-policy.sh"
+      # The P0 installer trust architecture (docs/ADR-0015): the sealed UKI
+      # anchor, the release authorization and the install-time access-profile
+      # anchor. These three decide whether an appliance installs the image it
+      # was authorised to install, so they get the same cheap pull-request gate
+      # as the installer files above -- the media build is the real test, but it
+      # costs 20 minutes and a build host and cannot be the FIRST thing to notice.
+      - "image/lib/installer-trust.sh"
+      - "image/lib/release-authorization.sh"
+      - "image/lib/hardware-identity.sh"
+      - "image/lib/signing-trust.sh"
+      - "image/build-installer-uki.sh"
+      - "image/build-installer-root.sh"
+      - "image/build-installer-payload.sh"
+      - "image/lib/installer-payload.sh"
+      - "image/inspect-installer-media.py"
+      - "image/initramfs/**"
+      - "image/hardware-identity/**"
+      - "image/test-access-policy.sh"
+      - "image/test-installer-trust.sh"
+      - "image/test-installer-uki.sh"
+      - "image/test-installer-media.sh"
+      - "image/installer/**"
+      - "image/test-installer-systemd-lifecycle.sh"
+      - "image/test-lib/**"
+      - "image/test-build-installer-root.sh"
+      - "image/test-installer-payload.sh"
+      - "image/test-hardware-identity.sh"
+      - "image/test-signing-trust.sh"
+      - "image/test-release-authorization.sh"
+      - "ota/neural-ice-access-profile-anchor.sh"
+      - "ota/test-neural-ice-access-profile-anchor.sh"
+      - "ota/neural-ice-tpm-state.sh"
+      - "ota/test-neural-ice-tpm-state.sh"
+      - "ota/neural-ice-autoinstall.sh"
+      - "ota/neural-ice-autoinstall.service"
+      - "ota/test-autoinstall-kargs.sh"
       - "ci/artifact-generation.sh"
       - "ci/canonicalize-vmlinuz.sh"
       - "ci/stage-artifacts.sh"
@@ -75,6 +150,7 @@ on:
       - "build/build-kernel.sh"
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
+      - "ci/test-swtpm-monotonic-state.sh"
       - "ci/test-gb10-console-boot.sh"
       # Le script qui nomme la machine rend AUSSI son profil réseau de secours :
       # sans lui, une appliance sur un lien sans DHCP n'a aucune adresse et
@@ -114,12 +190,38 @@ jobs:
             ci/test-build-image-dispatch-contract.sh ci/test-open-core-boundary.sh \
             ci/test-oci-signature-policy.sh image/policy/render-container-policy.sh \
             ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
+            ci/test-swtpm-monotonic-state.sh \
             build/build-kernel.sh \
-            image/build-installer-usb.sh image/lib/debug-ssh-key.sh \
-            ota/neural-ice-autoinstall.sh \
+            image/build-installer-usb.sh image/lib/installer-ssh-key.sh \
+            image/lib/access-policy.sh \
+            image/lib/installer-trust.sh image/lib/release-authorization.sh \
+            image/lib/hardware-identity.sh image/lib/signing-trust.sh \
+            image/build-installer-uki.sh image/build-installer-root.sh \
+            image/build-installer-payload.sh image/lib/installer-payload.sh \
+            image/initramfs/90neural-ice-installer-verity/module-setup.sh \
+            image/test-access-policy.sh image/test-installer-trust.sh \
+            image/test-installer-uki.sh image/test-release-authorization.sh \
+            image/test-installer-media.sh image/test-build-installer-root.sh \
+            image/installer/neural-ice-installer-runtime-generator.sh \
+            image/test-installer-systemd-lifecycle.sh \
+            image/test-lib/sealed-medium-fixture.sh \
+            image/test-installer-payload.sh \
+            image/test-hardware-identity.sh image/test-signing-trust.sh \
+            ota/neural-ice-access-profile-anchor.sh \
+            ota/test-neural-ice-access-profile-anchor.sh \
+            ota/neural-ice-tpm-state.sh \
+            ota/test-neural-ice-tpm-state.sh \
+            ota/neural-ice-autoinstall.sh ota/test-autoinstall-kargs.sh \
             ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh \
             image/mdns/neural-ice-hostname-init.sh image/mdns/neural-ice-dhcp-retry.sh \
             ci/test-linklocal-fallback.sh
+          # The initramfs hooks and the payload library are POSIX sh, on purpose:
+          # they run in the initramfs /bin/sh AND are sourced by bash on the build
+          # host and by the installer. Checking them as `sh` is what catches a
+          # bashism that would only fail inside a signed UKI, on the appliance.
+          shellcheck -s sh image/lib/installer-payload.sh \
+            image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity.sh \
+            image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity-cmdline.sh
       - name: Validate the installer image recipe
         run: |
           # A Containerfile has no linter here, so assert the properties that
@@ -136,17 +238,55 @@ jobs:
             || { echo "::error::the autoinstaller must restore the strict policy: the deployment is written from the medium's own image, so the permissive one would otherwise reach the appliance"; exit 1; }
           echo "installer recipe: every property that broke on 2026-08-19 is asserted"
 
-      # skopeo is the containers/image policy engine itself: the signature-policy
-      # test does not simulate a verdict, it asks the same code the appliance
-      # runs. Installed explicitly rather than assumed present on the runner
-      # image — a test that silently skips when its tool is missing is a gate
-      # that reports green while guarding nothing.
-      - name: Install the container tooling the signature-policy test needs
+      # 🔴 THE PRODUCTION TOOLCHAIN, INSTALLED RATHER THAN ASSUMED.
+      #
+      # This job used to run the UKI suite -- which mocks veritysetup, objcopy,
+      # sbsign and an `sbverify` that always exits 0 -- without installing any of
+      # them, and the release-authorization suite fell back to its openssl shim
+      # because cosign was absent. So the whole signed-root architecture could be
+      # broken and every check stayed green: a test that silently substitutes its
+      # own tool is a gate that reports on a simulation.
+      #
+      # Every binary below is one a real medium build uses. `--version` on each
+      # is deliberate: a package that installed but does not run is the same
+      # green-while-guarding-nothing failure one step later.
+      - name: Install the real signing, verity and media toolchain
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends skopeo
+          sudo apt-get install -y --no-install-recommends \
+            skopeo cryptsetup-bin sbsigntool binutils mtools dosfstools gdisk \
+            squashfs-tools tpm2-tools swtpm swtpm-tools openssl
           skopeo --version
+          veritysetup --version
+          sbsign --version
+          sbverify --version
+          objcopy --version | head -1
+          mkfs.vfat --help 2>&1 | head -1
+          mcopy -V 2>&1 | head -1
+          sgdisk --version
+          mksquashfs -version | head -1
+          tpm2_getcap --version
+          swtpm --version
+          openssl version
+
+      # cosign is the ONE signature stack this tree uses, and the appliance bakes
+      # a pinned build of it (Containerfile.bootc §2b). Installing it here is what
+      # stops the release-authorization suite quietly running against its openssl
+      # shim -- which verifies the same ECDSA but proves nothing about cosign's
+      # own argument handling, i.e. about the invocation the appliance performs.
+      - name: Install the pinned cosign the appliance uses
+        env:
+          COSIGN_VERSION: 2.6.3
+          COSIGN_SHA256_AMD64: 7c78a7f2efc00088bd788a758db6e0928e79f3e0eb83eb5d3c499ed98da4c4f4
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/cosign \
+            "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256_AMD64}  /tmp/cosign" | sha256sum -c -
+          sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+          cosign version
+
       - name: Test artifact generation and kernel packaging contract
         run: |
           ./ci/test-artifact-generation.sh
@@ -159,3 +299,52 @@ jobs:
           ./ci/test-gb10-console-boot.sh
           ./ci/test-install-registry-mirror.sh
           ./ci/test-linklocal-fallback.sh
+          # The P0 installer trust architecture, in dependency order: the sealed
+          # anchor first (nothing below means anything without an authenticated
+          # root), then what it authorises, then how the build produces it, then
+          # what the appliance carries forward.
+          ./image/test-access-policy.sh
+          ./image/test-hardware-identity.sh
+          ./image/test-signing-trust.sh
+          ./image/test-installer-trust.sh
+          ./image/test-release-authorization.sh
+          ./image/test-build-installer-root.sh
+          ./image/test-installer-payload.sh
+          ./image/test-installer-uki.sh
+          # The one suite that uses the REAL toolchain end to end: real objcopy
+          # assembles a real PE, real sbsign signs it, real sbverify verifies it,
+          # and a real GPT medium with a real FAT ESP is read back WITHOUT root.
+          ./image/test-installer-media.sh
+          ./image/test-installer-systemd-lifecycle.sh
+          ./ota/test-autoinstall-kargs.sh
+          ./ota/test-neural-ice-tpm-state.sh
+          ./ota/test-neural-ice-access-profile-anchor.sh
+
+      # 🔴 THE SUITES MUST NOT HAVE SUBSTITUTED THEIR OWN CRYPTO. Every suite
+      # above reports which stack it used, and a run that fell back to a shim is
+      # a run whose green means something weaker than it looks. Assert the
+      # production stack was the one exercised.
+      - name: Prove the suites ran against the production crypto, not a shim
+        run: |
+          set -euo pipefail
+          out="$(./image/test-release-authorization.sh)"
+          printf '%s\n' "$out"
+          case "$out" in
+            *"cosign=real"*) ;;
+            *) echo "::error::the release-authorization suite fell back to its openssl shim; cosign is the appliance's only signature stack and CI must exercise it"; exit 1 ;;
+          esac
+          out="$(./image/test-installer-media.sh 2>&1)"
+          printf '%s\n' "$out"
+          case "$out" in
+            *"using the host's real veritysetup"*) ;;
+            *) echo "::error::the media suite ran without a real veritysetup"; exit 1 ;;
+          esac
+
+      # swtpm is a REAL TPM 2.0 implementation, not a mock of one: the anchor and
+      # high-water helpers below talk to it through the same tpm2-tools the
+      # appliance uses. What it cannot prove is that a GB10's discrete TPM behaves
+      # identically, or that the UKI boots — those need the hardware job named in
+      # docs/ADR-0015, and this step says so out loud rather than implying
+      # coverage it does not have.
+      - name: Exercise the TPM helpers against a real software TPM
+        run: ./ci/test-swtpm-monotonic-state.sh

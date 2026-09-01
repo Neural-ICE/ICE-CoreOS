@@ -1,10 +1,27 @@
 # bootc-image-builder config for the Neural ICE installer USB (--type raw).
 #
-# Size the LIVE root filesystem. The auto-install runs `bootc image copy-to-storage`
-# (duplicates the OS image, ~10 GiB) on the live USB before deploying it to the internal
-# disk. bib's default (~8 GiB) is too small → runs out. 16 GiB fits the copy + headroom,
-# while shedding ~24 GiB of zeros vs the old 40 GiB → the raw (and thus the USB write) is
-# that much smaller. The PRELOADED seed lives in a SEPARATE ni-seed partition, not here.
+# 🔴 WHAT bib STILL PROVIDES, AND WHAT IT NO LONGER DECIDES (review 2026-09-01,
+# P0 #1 and #2). bib gives this build a valid GPT, an ESP and a data partition of
+# a known size. Every byte of BOOTABLE content it writes is then replaced by
+# image/build-installer-usb.sh: the ESP is remade from scratch around a single
+# signed UKI, the boot partition is overwritten with zeros, and this filesystem's
+# extent is overwritten by the sealed payload. So the size below is not "room for
+# an ostree deployment plus a copy"; it is the size of the SEALED PAYLOAD, and
+# the build refuses when the payload does not fit.
+#
+# The extent that becomes the `ni-installer-payload` partition. It has to hold,
+# as one raw self-describing object:
+#   header        4 KiB, whose SHA-256 the signed UKI seals
+#   root-image    the dm-verity-protected installer root (a squashfs of the
+#                 installer image, ~10 GiB)
+#   root-hash     its dm-verity hash tree
+#   store-image   a squashfs of the containers-storage the install reads FROM,
+#                 registered read-only and installed from in place (~10 GiB)
+#   store-hash    its dm-verity hash tree
+#
+# It ALSO has to be big enough, while bib runs, for the ostree deployment bib
+# writes here and this build then overwrites. 24 GiB covers both. The PRELOADED
+# seed lives in a SEPARATE ni-seed partition, not here.
 [[customizations.filesystem]]
 mountpoint = "/"
-minsize = "16 GiB"
+minsize = "24 GiB"

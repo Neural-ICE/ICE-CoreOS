@@ -1,0 +1,14 @@
+{
+  "consumer_pack_sha256": "sha256:a2c7a55b52c106a6d5230c3186b8f0685ca4545822b8a96ba9198856f6ef01a0",
+  "fabric_base_commit": "e1dc63424a17d83d7119bb8d26745a3097c531c8",
+  "format": "neural-ice-release-manifest-v1-coreos-consumer-pin",
+  "format_version": 1,
+  "producer_inputs": {
+    "classifier.py": "sha256:ee742bb453b0080cc958e8f64942d2091c46ec373f39081730541f29789c3c80",
+    "contract.py": "sha256:c08d85d56920d42fe6c174a8ddc74f32e92e2bd737dc7f83fe7b19b0b9b00ce8",
+    "generate_vectors.py": "sha256:cfc1b6240783f4dafec825582eb36ac910f87ef312b13515dfeb1bc15c5f327c",
+    "release-manifest-v1.schema.json": "sha256:f687aef0003dec4e8524fa3d94ec3cdd2f8b3da1e2f45a72f0713f129205892a"
+  },
+  "repository_pattern_sha256": "sha256:d1a7ddece75847b59094c22483e2ba8e56680c20fb682bba79f072daf0450db6",
+  "producer_worktree": "/data/github/@Neural-ICE_Dev/ICE-Fabric/.letta/worktrees/fabric-registry-host-contract"
+}
