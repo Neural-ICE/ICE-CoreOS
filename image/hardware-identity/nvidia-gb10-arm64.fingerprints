@@ -1,0 +1,19 @@
+# Accepted machine identities for hardware target nvidia-gb10-arm64.
+#
+# Each line is the SHA-256 of the canonical measurement image/lib/hardware-identity.sh
+# prints for the machine (`bash image/lib/hardware-identity.sh measure`), with no
+# trailing newline in the hashed bytes. Produced by MEASURING the machine named in
+# the comment above it; never written from a datasheet.
+#
+# Both machines are GB10 (Blackwell) appliances. They are different products from
+# different vendors, so they report different SMBIOS triples and are therefore two
+# entries, not one: a revision that changes what it reports is a different machine
+# until somebody measures it and says otherwise.
+
+# NVIDIA DGX Spark — reference build appliance, measured 2026-09-02
+#   dmi:NVIDIA|NVIDIA_DGX_Spark|P4242
+290dbcf49f80cb1d2fed2546e86dca79c0c8535b8e7008d2aa937fcc7c5a7759
+
+# ASUS GX10 — qualification appliance, measured 2026-09-02
+#   dmi:ASUSTeK COMPUTER INC.|GX10|GX10
+c676f79a0ec333a619a49d66676750c40c0a843578f6e2a391b0b204c289acb2
