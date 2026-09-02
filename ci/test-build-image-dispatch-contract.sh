@@ -12,6 +12,16 @@ require_fixed() {
   local needle="$1" file="$2"
   grep -Fq -- "$needle" "$file" || fail "missing contract '$needle' in ${file#"$REPO_ROOT"/}"
 }
+require_exact_line() {
+  local needle="$1" file="$2"
+  grep -Fx -- "$needle" "$file" >/dev/null \
+    || fail "missing exact line '$needle' in ${file#"$REPO_ROOT"/}"
+}
+refute_exact_line() {
+  local needle="$1" file="$2"
+  ! grep -Fx -- "$needle" "$file" >/dev/null \
+    || fail "forbidden exact line '$needle' in ${file#"$REPO_ROOT"/}"
+}
 refute_fixed() {
   local needle="$1" file="$2"
   ! grep -Fq -- "$needle" "$file" || fail "forbidden contract '$needle' in ${file#"$REPO_ROOT"/}"
@@ -28,15 +38,21 @@ require_fixed "runs-on: [self-hosted, Linux, X64]" "$WORKFLOW"
 require_fixed "permissions: {}" "$WORKFLOW"
 require_fixed 'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUEST_REF" != refs/heads/main ]; then' "$WORKFLOW"
 require_fixed "needs: validate-request" "$WORKFLOW"
-# `gb10` is part of the contract, not decoration: seven runners answer `spark`
-# and only spark-63 holds the immutable artifact store this job materialises
-# from. Asserting the label here is what keeps the pin from being dropped as
-# noise -- it was previously a comment in the workflow and a lottery in fact.
-require_fixed "runs-on: [self-hosted, Linux, ARM64, spark, gb10]" "$WORKFLOW"
+# The artifact store lives only on spark-827a (.63). `gb10` used to be that pin,
+# but spark-77 now advertises it too (run 33676173732 lost the lottery). The
+# unique label today is `usb-media`. Exact-line matching is required: a prefix
+# grep of the old `spark, gb10` vector would still match after usb-media is
+# appended, and that is exactly how the lottery came back.
+require_exact_line "    runs-on: [self-hosted, Linux, ARM64, spark, gb10, usb-media]" "$WORKFLOW"
+refute_exact_line "    runs-on: [self-hosted, Linux, ARM64, spark, gb10]" "$WORKFLOW"
 # build-kernel shares that store (same concurrency group) and so shares the pin.
 # Asserting only one of the pair is how the other drifts back.
-require_fixed "runs-on: [self-hosted, Linux, ARM64, spark, gb10]" \
+require_exact_line "    runs-on: [self-hosted, Linux, ARM64, spark, gb10, usb-media]" \
   "$REPO_ROOT/.github/workflows/build-kernel.yml"
+refute_exact_line "    runs-on: [self-hosted, Linux, ARM64, spark, gb10]" \
+  "$REPO_ROOT/.github/workflows/build-kernel.yml"
+require_fixed '[ "$host" = spark-827a ]' "$WORKFLOW"
+require_fixed '[ "$host" = spark-827a ]' "$REPO_ROOT/.github/workflows/build-kernel.yml"
 
 # The producer authenticates only to GHCR. Product mirroring and channel/alias
 # mutation remain outside this repo, in the signed ICE-Fabric release train.
