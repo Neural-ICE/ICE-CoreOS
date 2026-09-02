@@ -76,13 +76,25 @@ jobs:
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --all-targets --all-features --locked -- -D warnings
-              cargo test --locked --features test-path-overrides
-              # The build the OS image ships: no seam is compiled in, and the
-              # unit tests that only exist there prove the environment is ignored.
-              cargo test --locked
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
               ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
+              # 🔴 THE SUITES RUN UNPRIVILEGED. The cosign test seam refuses a
+              # root process (review 2026-09-02, P1), exactly as it must on an
+              # appliance, so the container root that installed the toolchain
+              # hands the tests to a plain user. Every crate was fetched by the
+              # build above; the test user only reads that cache.
+              useradd --create-home ci
+              chown -R ci /tmp/target /tmp/cargo-home
+              run_tests() {
+                runuser -u ci -- env HOME=/home/ci PATH="$PATH" RUSTUP_HOME="$RUSTUP_HOME" \
+                  CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \
+                  NI_TRUSTED_TIME_ISSUER="$NI_TRUSTED_TIME_ISSUER" "$@"
+              }
+              run_tests cargo test --locked --features test-path-overrides
+              # The build the OS image ships: no seam is compiled in, and the
+              # unit tests that only exist there prove the environment is ignored.
+              run_tests cargo test --locked
             '
 
   linux-x86_64:
@@ -104,22 +116,31 @@ jobs:
           podman run --rm \
             -v "$PWD:/src:Z" \
             -w /src/tools/ni-ota-verify \
-            -e CARGO_HOME=/src/.cargo-ci \
+            -e CARGO_HOME=/tmp/cargo-home \
+            -e CARGO_TARGET_DIR=/tmp/target \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --all-targets --all-features --locked -- -D warnings
-              # Valeur NEUTRE et volontairement fausse : la suite doit prouver le
-              # contrat, pas l identite du deploiement. L autorite reelle vient de
-              # la configuration du depot au moment de builder l image.
-              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
-              cargo test --locked --features test-path-overrides
-              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
-              cargo test --locked
               cargo build --release --locked
-              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
-              ! grep -a -q NI_OTA_COSIGN target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
+              # 🔴 THE SUITES RUN UNPRIVILEGED: the cosign test seam refuses a
+              # root process (review 2026-09-02, P1). Build directories live
+              # inside the container, so nothing the test user writes reaches
+              # the bind mount. Valeur NEUTRE et volontairement fausse pour
+              # l emetteur de temps : la suite doit prouver le contrat, pas
+              # l identite du deploiement.
+              useradd --create-home ci
+              chown -R ci /tmp/target /tmp/cargo-home
+              run_tests() {
+                runuser -u ci -- env HOME=/home/ci PATH="$PATH" RUSTUP_HOME="$RUSTUP_HOME" \
+                  CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \
+                  NI_TRUSTED_TIME_ISSUER=trusted-time.example.test "$@"
+              }
+              run_tests cargo test --locked --features test-path-overrides
+              run_tests cargo test --locked
             '
 
       - name: Cleanup build tree
@@ -143,22 +164,31 @@ jobs:
           podman run --rm \
             -v "$PWD:/src:Z" \
             -w /src/tools/ni-ota-verify \
-            -e CARGO_HOME=/src/.cargo-ci \
+            -e CARGO_HOME=/tmp/cargo-home \
+            -e CARGO_TARGET_DIR=/tmp/target \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --all-targets --all-features --locked -- -D warnings
-              # Valeur NEUTRE et volontairement fausse : la suite doit prouver le
-              # contrat, pas l identite du deploiement. L autorite reelle vient de
-              # la configuration du depot au moment de builder l image.
-              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
-              cargo test --locked --features test-path-overrides
-              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
-              cargo test --locked
               cargo build --release --locked
-              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
-              ! grep -a -q NI_OTA_COSIGN target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
+              # 🔴 THE SUITES RUN UNPRIVILEGED: the cosign test seam refuses a
+              # root process (review 2026-09-02, P1). Build directories live
+              # inside the container, so nothing the test user writes reaches
+              # the bind mount. Valeur NEUTRE et volontairement fausse pour
+              # l emetteur de temps : la suite doit prouver le contrat, pas
+              # l identite du deploiement.
+              useradd --create-home ci
+              chown -R ci /tmp/target /tmp/cargo-home
+              run_tests() {
+                runuser -u ci -- env HOME=/home/ci PATH="$PATH" RUSTUP_HOME="$RUSTUP_HOME" \
+                  CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \
+                  NI_TRUSTED_TIME_ISSUER=trusted-time.example.test "$@"
+              }
+              run_tests cargo test --locked --features test-path-overrides
+              run_tests cargo test --locked
             '
 
       - name: Cleanup build tree
