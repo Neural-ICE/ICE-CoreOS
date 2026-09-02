@@ -611,15 +611,22 @@ RUN set -euxo pipefail; \
       || { echo "FATAL: a debuginfod endpoint is still configured under /etc" >&2; exit 1; }
 
 # Masked, not disabled: masking survives a base-image update that re-enables a
-# unit by preset. Each is asserted PRESENT before masking and MASKED after —
-# `systemctl mask` happily creates a symlink for a name that does not exist, so
-# masking a unit upstream has renamed would pass while the real channel stayed
-# open. A loud failure here means the base changed and this list needs
-# re-reading, which is the correct outcome rather than a nuisance.
+# unit by preset. Each is asserted PRESENT on disk before masking and MASKED
+# after — `systemctl mask` happily creates a symlink for a name that does not
+# exist, so masking a unit upstream has renamed would pass while the real
+# channel stayed open. A loud failure here means the base changed and this
+# list needs re-reading, which is the correct outcome rather than a nuisance.
+#
+# Assert the UNIT FILE, not `systemctl list-unit-files | grep -q`. Under
+# `set -o pipefail`, grep -q exits on the first match and the writer dies
+# SIGPIPE (141). Run 33692883287 reported that as "fwupd-refresh.timer is
+# not in the base image" while `/usr/lib/systemd/system/fwupd-refresh.timer`
+# was on disk in the parent layer and `fwupdmgr` was present. The daemon
+# stays (capsule-on-disk); only the LVFS metadata refresh is stopped.
 RUN set -euxo pipefail; \
     for u in rpm-ostree-countme.timer rpm-ostree-countme.service \
              fwupd-refresh.timer fwupd-refresh.service; do \
-      systemctl list-unit-files "$u" | grep -qE "^${u}[[:space:]]" \
+      test -f "/usr/lib/systemd/system/$u" \
         || { echo "FATAL: $u is not in the base image — upstream renamed or dropped it; re-read the egress list" >&2; exit 1; }; \
       systemctl mask "$u"; \
       test "$(systemctl is-enabled "$u")" = masked \

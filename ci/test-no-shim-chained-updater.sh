@@ -63,6 +63,22 @@ done
 grep -Fq 'test -x /usr/bin/fwupdmgr' "$CONTAINERFILE" \
   || fail "nothing asserts that fwupd itself survived the purge of fwupd-efi"
 
+# LVFS metadata refresh is egress, not the firmware-update contract. The
+# daemon stays; the refresh timer/service must still be masked. Presence is
+# the unit FILE — `list-unit-files | grep -q` under pipefail is exit 141
+# (run 33692883287) and reports a missing unit that is on disk.
+for refresh_unit in fwupd-refresh.timer fwupd-refresh.service; do
+  grep -Fq "test -f \"/usr/lib/systemd/system/\$u\"" "$CONTAINERFILE" \
+    || fail "the egress mask no longer asserts the unit file on disk before masking"
+  grep -Fq "$refresh_unit" "$CONTAINERFILE" \
+    || fail "the egress mask dropped $refresh_unit; LVFS refresh would go unmasked"
+done
+if grep -n 'fwupd-refresh' "$CONTAINERFILE" | grep -F 'list-unit-files' >/dev/null; then
+  fail "the fwupd-refresh mask still uses list-unit-files; that pipeline is exit 141 under pipefail"
+fi
+grep -E 'systemctl (enable|start) fwupd-refresh' "$CONTAINERFILE" >/dev/null \
+  && fail "fwupd-refresh must stay masked; enabling it is LVFS egress, not capsule-on-disk"
+
 [ -f "$REVIEW_ANSWERS" ] || fail "$REVIEW_ANSWERS is missing"
 grep -Fq 'no fwupd EFI binary is shipped' "$REVIEW_ANSWERS" \
   || fail "the shim-review claim about fwupd is gone.
