@@ -78,6 +78,25 @@ tag_count="$(grep -Fc -- '-t "${REF}:${SEMVER}"' "$BUILDER")"
 push_count="$(grep -Fc -- '"${PODMAN[@]}" push ' "$BUILDER")"
 [[ "$push_count" == 1 ]] || fail "expected exactly one registry push, found $push_count"
 
+# The installer seals the SHA-256 of this public-key FILE (not its SPKI DER).
+# Fabric release-lab-v1 is the only lab key that can later sign installer
+# authorizations; a generated stand-in would make the UKI unverifiable.
+RELAUTH_PUB="$REPO_ROOT/image/keys/release-authorization.pub"
+[[ -f "$RELAUTH_PUB" && ! -L "$RELAUTH_PUB" && -s "$RELAUTH_PUB" ]] \
+  || fail "image/keys/release-authorization.pub is missing"
+require_fixed "-----BEGIN PUBLIC KEY-----" "$RELAUTH_PUB"
+refute_fixed "PRIVATE" "$RELAUTH_PUB"
+relauth_file_sha256="$(sha256sum "$RELAUTH_PUB" | awk '{print $1}')"
+[[ "$relauth_file_sha256" == "4a26e698326d697841d8f27d1451af7dcc6343cc2cb64156f089b7a1a315fed7" ]] \
+  || fail "release-authorization.pub file digest is '$relauth_file_sha256', not the canonical release-lab-v1 PEM"
+relauth_spki_sha256="$(openssl pkey -pubin -in "$RELAUTH_PUB" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+[[ "$relauth_spki_sha256" == "1683fb2c19c506257626c42ea46dfdb5d58c0ee2430f3e1270758e207f33db34" ]] \
+  || fail "release-authorization.pub SPKI digest is '$relauth_spki_sha256', not Fabric release-lab-v1"
+# `image/keys/` as a directory ignore makes the un-ignore unreachable. Contents
+# must be ignored (`image/keys/*`) so this exact name can be tracked.
+git -C "$REPO_ROOT" check-ignore -q -- image/keys/release-authorization.pub \
+  && fail "image/keys/release-authorization.pub is gitignored; the producer checkout would lose it"
+
 echo "build-image dispatch contract tests: PASS"
 
 # --------------------------------------------------------------------------- #
