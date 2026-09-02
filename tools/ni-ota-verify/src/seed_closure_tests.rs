@@ -593,7 +593,7 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         (manifest_digest, payload_digest, record)
     }
 
-    let repository = "registry.neural-ice.ch/neural-ice/neural-ice-appliance";
+    let repository = "registry.example.test/neural-ice/neural-ice-appliance";
     let media_manifest = "application/vnd.oci.image.manifest.v1+json";
     let media_config = "application/vnd.oci.image.config.v1+json";
     let media_layer = "application/vnd.oci.image.layer.v1.tar";
@@ -872,7 +872,7 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
     }
 
     let expectation = SeedExpectation {
-        registry_host: "registry.neural-ice.ch".into(),
+        registry_host: "registry.example.test".into(),
         hardware_target,
         access_profile: "customer-locked".into(),
         device_channel: "beta".into(),

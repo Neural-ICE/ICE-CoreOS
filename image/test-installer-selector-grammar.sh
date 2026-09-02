@@ -135,7 +135,7 @@ gate_call_line="$(grep -nx 'require_signed_install_cmdline' "$AUTOINSTALL" | hea
   || fail "the installer defines its revalidation but never calls it; a direct invocation walks straight past"
 first_karg_line="$(grep -n '^_[a-z_]*_karg="\$(karg_once' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 first_write_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luksFormat|install -d|cat >|bootc install)' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
-[ -n "$first_karg_line" ] && [ -n "$first_write_line" ] \
+{ [ -n "$first_karg_line" ] && [ -n "$first_write_line" ]; } \
   || fail "cannot locate the installer's first argument read or first mutation; the ordering assertion below would be vacuous"
 [ "$gate_call_line" -lt "$first_karg_line" ] \
   || fail "the installer reads a security-relevant argument (line $first_karg_line) before revalidating its own authorisation (line $gate_call_line)"
@@ -155,9 +155,9 @@ installer_gate() { # $1=cmdline -> 0 when the installer would proceed
     set -uo pipefail
     # The installer's own `die`/`log`, and the two inputs its gate reads. All
     # four are consumed by the extracted function below, not by this file.
-    # shellcheck disable=SC2329,SC2034
+    # shellcheck disable=SC2329,SC2317,SC2034
     die() { echo "die: $*" >&2; exit 1; }
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2329,SC2317
     log() { :; }
     # shellcheck disable=SC2034
     NEURALICE_CMDLINE_FILE="$TMP/installer-cmdline"
@@ -399,9 +399,9 @@ printf '%s\n' "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.
   > "$TMP/installer-cmdline"
 if (
   set -uo pipefail
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2329,SC2317
   die() { echo "die: $*" >&2; exit 1; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2329,SC2317
   log() { :; }
   # shellcheck disable=SC2034
   NEURALICE_CMDLINE_FILE="$TMP/installer-cmdline"

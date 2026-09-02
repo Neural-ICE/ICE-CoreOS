@@ -217,7 +217,7 @@ grep -Fq 'would poweroff after 60 seconds' "$TMP/nopolicy" \
 grep -qx 'action=poweroff' "$POLICY" \
   || fail "the shipped failure policy no longer powers the machine off"
 shipped_delay="$(sed -n 's/^delay_seconds=//p' "$POLICY")"
-[[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 300 ] \
+{ [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 300 ]; } \
   || fail "the shipped failure delay ($shipped_delay) is outside the bounds its own reader enforces"
 
 # --------------------------------------------------------------------------- #
@@ -472,7 +472,7 @@ for id in 1 2 3 4 5 6 7 8; do
   evidence="$TMP/phase-$id"
   (
     set -uo pipefail
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2329,SC2317
     log() { :; }
     PHASE_TOTAL=8; PHASE_ID=0; PHASE_LABEL=startup; PHASE_T0=0; SECONDS=0
     FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
@@ -507,7 +507,7 @@ done
 # field correlates nothing.
 (
   set -uo pipefail
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2329,SC2317
   log() { :; }
   PHASE_TOTAL=8; PHASE_ID=4; PHASE_LABEL=x; PHASE_SLUG=write-deployment
   PHASE_CODE=install-failed-write-deployment
@@ -524,7 +524,7 @@ done
 # inheriting the previous phase's identity.
 (
   set -uo pipefail
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2329,SC2317
   log() { :; }
   PHASE_TOTAL=8; PHASE_ID=0; PHASE_LABEL=startup; PHASE_T0=0; SECONDS=0
   FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1

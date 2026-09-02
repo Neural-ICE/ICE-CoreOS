@@ -771,7 +771,7 @@ fi
   || { echo "a non-directory handoff still reached the key mutation" >&2; exit 1; }
 [ ! -s "$badhandoff/systemctl.log" ] \
   || { echo "a non-directory handoff still touched sshd" >&2; exit 1; }
-[ -f "$badhandoff$act_condition" ] && [ ! -d "$badhandoff$act_condition" ] \
+{ [ -f "$badhandoff$act_condition" ] && [ ! -d "$badhandoff$act_condition" ]; } \
   || { echo "the refusal replaced the handoff path it could not interpret" >&2; exit 1; }
 [ "$(receipt_field "$badhandoff" decision)" = '"invalid-handoff-path"' ] \
   || { echo "the refusal did not record an invalid handoff path" >&2; exit 1; }
@@ -929,7 +929,7 @@ commit_body="$(awk '/^commit_rollback\(\) \{/,/^}$/' "$FIRSTBOOT")"
 target_sync_line="$(grep -n 'fsync_path "\$authorized_dir"' <<<"$commit_body" | head -1 | cut -d: -f1)"
 journal_removal_line="$(grep -n 'rm -rf -- "\$pending"' <<<"$commit_body" | head -1 | cut -d: -f1)"
 state_sync_line="$(grep -n 'fsync_path "\$STATE_DIR"' <<<"$commit_body" | head -1 | cut -d: -f1)"
-[ -n "$target_sync_line" ] && [ -n "$journal_removal_line" ] && [ -n "$state_sync_line" ] \
+{ [ -n "$target_sync_line" ] && [ -n "$journal_removal_line" ] && [ -n "$state_sync_line" ]; } \
   || { echo "commit_rollback no longer fsyncs the target, removes the journal and fsyncs the state directory" >&2; exit 1; }
 [ "$target_sync_line" -lt "$journal_removal_line" ] \
   || { echo "the journal is removed before the undo is durable on the TARGET filesystem (line $journal_removal_line <= $target_sync_line)" >&2; exit 1; }

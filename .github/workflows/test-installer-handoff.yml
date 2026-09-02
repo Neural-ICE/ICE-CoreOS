@@ -39,7 +39,18 @@ jobs:
             ota/test-neural-ice-lab-baseline-handoff.sh \
             ota/neural-ice-device-root-tpm.sh \
             ota/test-neural-ice-device-root-tpm.sh
+          # The libraries the autoinstaller sources are given to the same
+          # invocation: shellcheck can only follow a `source` whose target it was
+          # also handed, and an unfollowed source is an SC1091 finding that fails
+          # this step (test-artifact-generation.yml documents the same rule).
           shellcheck ota/neural-ice-autoinstall.sh \
+            image/installer/neural-ice-sealed-cmdline-grammar.sh \
+            image/lib/access-policy.sh \
+            image/lib/hardware-identity.sh \
+            image/lib/installer-payload.sh \
+            image/lib/installer-ssh-key.sh \
+            image/lib/installer-trust.sh \
+            image/lib/release-authorization.sh \
             ota/neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-lab-baseline-handoff.sh \
             ota/neural-ice-device-root-tpm.sh \

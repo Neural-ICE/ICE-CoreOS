@@ -16,11 +16,11 @@ ni_root=
 ni_tools=/usr/bin
 ni_cmdline=/proc/cmdline
 if [ -n "${NEURALICE_INITRAMFS_TEST_ROOT:-}${NEURALICE_INITRAMFS_TEST_TOOLS:-}${NEURALICE_INITRAMFS_TEST_CMDLINE:-}" ]; then
-  [ "${NEURALICE_INITRAMFS_TESTING:-}" = 1 ] \
+  { [ "${NEURALICE_INITRAMFS_TESTING:-}" = 1 ] \
     && [ "$(id -u)" -ne 0 ] \
     && [ ! -e "$ni_release_marker" ] \
     && [ -n "${NEURALICE_INITRAMFS_TEST_ROOT:-}" ] \
-    && [ ! -e "${NEURALICE_INITRAMFS_TEST_ROOT%/}$ni_release_marker" ] \
+    && [ ! -e "${NEURALICE_INITRAMFS_TEST_ROOT%/}$ni_release_marker" ]; } \
     || ni_die "test seams require non-root and an unmarked test root"
   ni_root=${NEURALICE_INITRAMFS_TEST_ROOT%/}
   ni_tools=${NEURALICE_INITRAMFS_TEST_TOOLS:?test tool directory is required}

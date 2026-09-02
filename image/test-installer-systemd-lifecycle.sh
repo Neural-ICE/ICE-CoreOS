@@ -187,7 +187,7 @@ done
 # pattern: a pattern only refuses what someone thought of.
 FAILURE_TARGET="$ROOT/image/installer/neural-ice-installer-failure.target"
 FAILURE_UNIT="$ROOT/image/installer/neural-ice-installer-failure.service"
-[ -f "$FAILURE_TARGET" ] && [ -f "$FAILURE_UNIT" ] \
+{ [ -f "$FAILURE_TARGET" ] && [ -f "$FAILURE_UNIT" ]; } \
   || fail "the installer failure sink units are missing"
 failure_dependencies="$(grep -E '^(Requires|Wants|Requisite|BindsTo|PartOf)=' "$FAILURE_TARGET" | sort)"
 [[ "$failure_dependencies" == 'Requires=neural-ice-installer-failure.service' ]] \

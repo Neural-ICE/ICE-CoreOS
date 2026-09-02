@@ -121,6 +121,7 @@ jobs:
             image/lib/installer-payload.sh \
             image/lib/installer-trust.sh \
             image/lib/release-authorization.sh \
+            image/installer/neural-ice-sealed-cmdline-grammar.sh \
             image/firstboot/neural-ice-firstboot-sshkey.sh \
             ota/neural-ice-autoinstall.sh \
             image/lib/preloaded-sizing.sh \
@@ -166,6 +167,7 @@ jobs:
             image/lib/installer-payload.sh \
             image/lib/installer-trust.sh \
             image/lib/release-authorization.sh \
+            image/installer/neural-ice-sealed-cmdline-grammar.sh \
             image/firstboot/neural-ice-firstboot-sshkey.sh \
             ota/neural-ice-autoinstall.sh \
             image/lib/preloaded-sizing.sh \
