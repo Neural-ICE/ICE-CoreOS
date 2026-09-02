@@ -186,6 +186,19 @@ bash "$LIB" assert-target "$SHIPPED_IMG" nvidia-gb10-arm64 "$GX10" >/dev/null \
 [ "$(bash "$LIB" read-fingerprints "$SHIPPED_IMG" nvidia-gb10-arm64 | wc -l)" = 2 ] \
   || fail "the committed list does not carry exactly the two measured machines"
 
+# The bootc fail-closed RUN used `grep -Eq` under `set -o pipefail`.
+# read-fingerprints prints two lines for this target; grep -q exits after the
+# first; the writer dies SIGPIPE; the pipeline is 141. Run 33692480833 died
+# there after the key and the list were already present.
+if grep -n 'read-fingerprints' "$ROOT/image/Containerfile.bootc" | grep -F 'grep -Eq' >/dev/null; then
+  fail "Containerfile.bootc still pipes read-fingerprints into grep -Eq; that is exit 141 on a two-entry list"
+fi
+(
+  set -o pipefail
+  fps="$(bash "$LIB" read-fingerprints "$SHIPPED_IMG" nvidia-gb10-arm64)"
+  printf '%s\n' "$fps" | grep -E '^[0-9a-f]{64}$' >/dev/null
+) || fail "the bootc fingerprint presence check fails under pipefail on the shipped two-entry list"
+
 # NEGATIVE: a GB10-adjacent machine nobody measured is still refused, and so is
 # the same vendor with a different board — the list is a set of measurements,
 # not a family.

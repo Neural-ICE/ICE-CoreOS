@@ -446,8 +446,8 @@ RUN set -euxo pipefail; \
       || openssl pkey -pubin -inform DER -in "$key" -noout; \
     identity="/usr/lib/neural-ice/hardware-identity/${target}.fingerprints"; \
     test -f "$identity"; \
-    bash /usr/lib/neural-ice/lib/hardware-identity.sh read-fingerprints / "$target" \
-      | grep -Eq '^[0-9a-f]{64}$'; \
+    fps="$(bash /usr/lib/neural-ice/lib/hardware-identity.sh read-fingerprints / "$target")"; \
+    printf '%s\n' "$fps" | grep -E '^[0-9a-f]{64}$' >/dev/null; \
     chmod 0444 "$key" "$identity" /usr/lib/neural-ice/lib/hardware-identity.sh
 # Generic installer-payload apply (one-shot): the PRELOADED installer may stage a
 # payload/ dir on the data volume; this runs its apply.sh once on first boot. The
