@@ -15,8 +15,13 @@ image/signed-boot/
 # and a staged-only file made every build depend on someone remembering to copy it.
 image/hardware-identity/*.fingerprints
 !image/hardware-identity/nvidia-gb10-arm64.fingerprints
-# The release-authorization public key stays a staged build input (key ceremony).
-image/keys/
+# The release-authorization public key stays ignored by default: a key nobody
+# generated is worse than none. The lab key that actually exists
+# (Fabric release-lab-v1, provisioned 2026-09-02) is un-ignored by exact name
+# once its public half is the canonical SPKI PEM. The installer seals this
+# file's SHA-256; the private half never enters this repository.
+image/keys/*
+!image/keys/release-authorization.pub
 image/generation.env
 image/manifest.sha256
 image/labkey/
