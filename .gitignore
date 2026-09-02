@@ -7,11 +7,15 @@ image/driver-modules/
 image/driver-modules-unsigned/
 image/nvidia-userspace/
 image/signed-boot/
-# Measured hardware identity + the release-authorization public key: STAGED
-# build inputs, produced by measuring the reference appliance and by the release
-# key ceremony. Committing a fingerprint nobody measured would be exactly the
-# invented vendor string image/hardware-identity/README.md exists to avoid.
+# Measured hardware identity. A fingerprint nobody measured is exactly the
+# invented vendor string image/hardware-identity/README.md exists to avoid, so
+# every list stays ignored by default. The list for a target this tree actually
+# SHIPS is un-ignored by exact name once its machines have been measured and the
+# provenance comments name them: the media build needs it (HARDWARE_IDENTITY_FILE)
+# and a staged-only file made every build depend on someone remembering to copy it.
 image/hardware-identity/*.fingerprints
+!image/hardware-identity/nvidia-gb10-arm64.fingerprints
+# The release-authorization public key stays a staged build input (key ceremony).
 image/keys/
 image/generation.env
 image/manifest.sha256

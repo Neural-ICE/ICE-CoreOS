@@ -146,8 +146,63 @@ grep -Fq 'HARDWARE_IDENTITY_FILE' "$ROOT/image/build-installer-uki.sh" \
   || fail "the UKI build does not require a measured-identity list"
 grep -Fq 'HARDWARE_IDENTITY_FILE' "$ROOT/image/build-installer-usb.sh" \
   || fail "the media build does not require a measured-identity list"
-# The list must be staged, not invented in this open-core tree.
+# A list must be measured, not invented in this open-core tree: every list stays
+# ignored by default, and exactly one — the target this tree ships — is
+# un-ignored by exact name. A second negation would put a target back in the
+# tree without this test noticing.
 grep -Fq 'image/hardware-identity/*.fingerprints' "$ROOT/.gitignore" \
   || fail "a fingerprint list could be committed without anyone having measured it"
+[ "$(grep -c '^!image/hardware-identity/.*\.fingerprints$' "$ROOT/.gitignore")" = 1 ] \
+  || fail "the set of committed fingerprint lists changed without this test"
+grep -Fqx '!image/hardware-identity/nvidia-gb10-arm64.fingerprints' "$ROOT/.gitignore" \
+  || fail "the shipped target's measured list is not the one that is committed"
+
+# --------------------------------------------------------------------------- #
+# 4) THE COMMITTED LIST. The digests in the tree must be the digests of the
+#    machines the comments name. A datasheet cannot produce them: each one is
+#    reproduced here from the canonical SMBIOS triple of a real appliance, so an
+#    edited, truncated or invented entry fails this suite rather than a boot.
+# --------------------------------------------------------------------------- #
+SHIPPED="$ROOT/image/hardware-identity/nvidia-gb10-arm64.fingerprints"
+[ -f "$SHIPPED" ] || fail "the shipped target has no committed fingerprint list"
+SHIPPED_IMG="$work/shipped"
+mkdir -p "$SHIPPED_IMG/usr/lib/neural-ice/hardware-identity"
+cp "$SHIPPED" "$SHIPPED_IMG/usr/lib/neural-ice/hardware-identity/nvidia-gb10-arm64.fingerprints"
+
+# POSITIVE: both measured appliances are admitted by the committed list.
+SPARK="$work/spark"; machine_dmi "$SPARK" 'NVIDIA' 'NVIDIA_DGX_Spark' 'P4242'
+[ "$(bash "$LIB" measure "$SPARK")" = 'dmi:NVIDIA|NVIDIA_DGX_Spark|P4242' ] \
+  || fail "the DGX Spark triple is not the identity the committed comment names"
+bash "$LIB" assert-target "$SHIPPED_IMG" nvidia-gb10-arm64 "$SPARK" >/dev/null \
+  || fail "the committed list refuses the reference build appliance"
+
+GX10="$work/gx10"; machine_dmi "$GX10" 'ASUSTeK COMPUTER INC.' 'GX10' 'GX10'
+[ "$(bash "$LIB" measure "$GX10")" = 'dmi:ASUSTeK COMPUTER INC.|GX10|GX10' ] \
+  || fail "the ASUS GX10 triple is not the identity the committed comment names"
+bash "$LIB" assert-target "$SHIPPED_IMG" nvidia-gb10-arm64 "$GX10" >/dev/null \
+  || fail "the committed list refuses the qualification appliance"
+
+# ...and the file says exactly those two machines, in the reader's own grammar.
+[ "$(bash "$LIB" read-fingerprints "$SHIPPED_IMG" nvidia-gb10-arm64 | wc -l)" = 2 ] \
+  || fail "the committed list does not carry exactly the two measured machines"
+
+# NEGATIVE: a GB10-adjacent machine nobody measured is still refused, and so is
+# the same vendor with a different board — the list is a set of measurements,
+# not a family.
+OTHER="$work/other-gb10"; machine_dmi "$OTHER" 'NVIDIA' 'NVIDIA_DGX_Spark' 'P9999'
+bash "$LIB" assert-target "$SHIPPED_IMG" nvidia-gb10-arm64 "$OTHER" >/dev/null 2>&1 \
+  && fail "an unmeasured board revision was admitted by the committed list"
+LOOKALIKE="$work/lookalike"; machine_dmi "$LOOKALIKE" 'ASUSTeK COMPUTER INC.' 'GX11' 'GX10'
+bash "$LIB" assert-target "$SHIPPED_IMG" nvidia-gb10-arm64 "$LOOKALIKE" >/dev/null 2>&1 \
+  && fail "an unmeasured product was admitted by the committed list"
+
+# NEGATIVE: one flipped hex character is a different machine, so a tampered or
+# mistyped entry admits nobody rather than admitting somebody else.
+TAMPERED="$work/tampered"
+mkdir -p "$TAMPERED/usr/lib/neural-ice/hardware-identity"
+sed 's/^290dbcf4/290dbcf5/' "$SHIPPED" \
+  > "$TAMPERED/usr/lib/neural-ice/hardware-identity/nvidia-gb10-arm64.fingerprints"
+bash "$LIB" assert-target "$TAMPERED" nvidia-gb10-arm64 "$SPARK" >/dev/null 2>&1 \
+  && fail "a tampered fingerprint still admitted the machine it was derived from"
 
 echo "HARDWARE_IDENTITY_TEST_OK"

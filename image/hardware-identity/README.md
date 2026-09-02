@@ -36,6 +36,22 @@ different machine until somebody measures it and says otherwise.
 * A machine that exposes neither device-tree nor SMBIOS → the install-time gate
   refuses. "I cannot tell what this is" is not a licence to repartition it.
 
-These files are **staged build inputs**, like `image/signed-boot/` and
-`image/rpms/`: they are git-ignored, because a fingerprint committed here without
-a measurement behind it is exactly the invented vendor string this design avoids.
+## What is committed, and what is staged
+
+`*.fingerprints` is **git-ignored by default**, because a fingerprint committed
+without a measurement behind it is exactly the invented vendor string this design
+avoids. The list for a target this tree actually ships is un-ignored **by exact
+name** in `.gitignore` once its machines have been measured:
+
+* `nvidia-gb10-arm64.fingerprints` — committed. Its two entries were measured on
+  the reference build appliance (NVIDIA DGX Spark) and on the qualification
+  appliance (ASUS GX10) on 2026-09-02, and each carries the machine and the date
+  above it. `image/test-hardware-identity.sh` reproduces both measurements from
+  their canonical SMBIOS triples and fails if the committed digests drift.
+* Every other target — staged, like `image/signed-boot/` and `image/rpms/`.
+
+A staged-only list made every media build depend on somebody remembering to copy
+a file that `build-installer-uki.sh` and `build-installer-usb.sh` refuse to
+proceed without; committing the measured list for the shipped target removes that
+step without weakening anything. Adding a machine is still a measurement, a
+comment naming it, and a reviewed commit.
