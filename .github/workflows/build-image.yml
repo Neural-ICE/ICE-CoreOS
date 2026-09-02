@@ -44,13 +44,12 @@ jobs:
     concurrency:
       group: coreos-gb10-artifacts-nvidia-gb10-arm64
       cancel-in-progress: false
-    # `gb10` is what pins this to the ONE host holding the immutable artifact
-    # store the step above materialises from. Seven runners answer `spark`;
-    # only spark-63 answers `gb10`. Without it the job is a lottery that fails
-    # with "current is not an atomic generation pointer" on any other machine --
-    # the runner-local dependency was stated in the comment above and enforced
-    # nowhere.
-    runs-on: [self-hosted, Linux, ARM64, spark, gb10]
+    # The immutable artifact store lives only on spark-827a (.63). `gb10` used
+    # to be that pin, but spark-77 now advertises the same label, so a job that
+    # matches only `spark, gb10` is a lottery (run 33676173732). `usb-media` is
+    # currently unique to .63. The hostname step below still fail-closes if a
+    # future runner copies that label.
+    runs-on: [self-hosted, Linux, ARM64, spark, gb10, usb-media]
     timeout-minutes: 120
     permissions:
       contents: read
@@ -63,6 +62,18 @@ jobs:
       SOURCE_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Require the GB10 artifact host
+        env:
+          ARTIFACTS_DIR: ${{ vars.ARTIFACTS_DIR }}
+        run: |
+          set -euo pipefail
+          host="$(hostname -s)"
+          [ "$host" = spark-827a ] \
+            || { echo "::error::GB10 artifact store lives only on spark-827a (.63); this runner is $host ($RUNNER_NAME)"; exit 1; }
+          artifacts_root="${ARTIFACTS_DIR:-$HOME/neural-ice/artifacts}"
+          [[ -L "$artifacts_root/current" ]] \
+            || { echo "::error::$host: $artifacts_root/current is not an atomic generation pointer"; exit 1; }
 
       - name: Materialize verified GB10 artifact generation
         env:
