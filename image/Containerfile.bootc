@@ -825,8 +825,17 @@ RUN set -euxo pipefail; \
     dracut --force --no-hostonly --kver "${KVER}" \
         "/usr/lib/modules/${KVER}/initramfs.img"; \
     listing="$(lsinitrd "/usr/lib/modules/${KVER}/initramfs.img")"; \
+    # 91neural-ice-tpm-policy is the dracut *module directory* on the OS image
+    # (`/usr/lib/dracut/modules.d/`). dracut does not copy that directory name
+    # into the generated initramfs: it installs the hook as
+    # `var/lib/dracut/hooks/pre-trigger/01-neural-ice-tpm-policy.sh` and the
+    # parser as `lib/neural-ice-tpm2-nv-public.sh`. Run 33694091901 died here
+    # with "91neural-ice-tpm-policy missing" after #120 while those two files
+    # were already in the listing. Assert the installed names, not the source
+    # directory. Community rebuilds (REGISTRY/OTA_IMGREF as build-args) hit the
+    # same oracle; do not require a Neural ICE product registry.
     for required in gsp_ga10x.bin 90-neural-ice-nvidia-drm.conf vconsole.conf default8x16 \
-        91neural-ice-tpm-policy neural-ice-tpm-policy.sh neural-ice-tpm2-nv-public.sh \
+        01-neural-ice-tpm-policy.sh neural-ice-tpm2-nv-public.sh \
         tpm2_nvreadpublic tpm2_nvread; do \
         case "$listing" in \
           *"$required"*) ;; \

@@ -20,7 +20,7 @@ grep -Fq 'COPY image/lib/tpm2-nv-public.sh /usr/lib/dracut/modules.d/91neural-ic
   "$ROOT_DIR/image/Containerfile.bootc"
 grep -Fq 'COPY image/lib/tpm2-nv-public.sh         /usr/lib/neural-ice/lib/tpm2-nv-public.sh' \
   "$ROOT_DIR/image/Containerfile.bootc"
-grep -Fq '91neural-ice-tpm-policy neural-ice-tpm-policy.sh neural-ice-tpm2-nv-public.sh' \
+grep -Fq '01-neural-ice-tpm-policy.sh neural-ice-tpm2-nv-public.sh' \
   "$ROOT_DIR/image/Containerfile.bootc"
 # shellcheck disable=SC2016 # literal source text is what is being matched
 grep -Fq 'source "$NV_PUBLIC_PARSER"' "$ROOT_DIR/ota/neural-ice-tpm-state.sh"
