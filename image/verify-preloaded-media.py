@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -295,6 +296,51 @@ def verify_lab_baseline(
     }
 
 
+def expected_esp_authorized_keys(arguments: argparse.Namespace) -> str | None:
+    value = arguments.esp_authorized_keys_sha256
+    if value is None:
+        return None
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise GateError("the approved installer SSH key requires one exact lowercase SHA-256")
+    return value
+
+
+def verify_esp_authorized_keys(
+    mountpoint: Path, expected: str | None
+) -> dict[str, Any] | None:
+    """An operator SSH key may only ship on media that explicitly approved it.
+
+    The installed system refuses an unauthorised key twice over (the immutable
+    access policy is checked by the autoinstaller and again at first boot), but
+    a key nobody approved has no business leaving the build host at all: it is
+    either a staging mistake or a modified ESP, and both are things a release
+    gate exists to catch. Absence when one was approved is equally a refusal --
+    silently shipping unreachable lab media wastes a hardware trip.
+    """
+    path = mountpoint / "ice-coreos" / "authorized_keys"
+    present = path.exists() or path.is_symlink()
+    if not present:
+        if expected is not None:
+            raise GateError("the approved installer SSH key is absent from the installer ESP")
+        return None
+    if expected is None:
+        raise GateError("installer ESP carries an unapproved SSH authorized_keys file")
+    # read_regular opens with O_NOFOLLOW and bounds the size, so a symlinked or
+    # padded authorized_keys is refused before its content is considered. The
+    # bound matches INSTALLER_SSH_PUBLIC_KEY_MAX_BYTES in image/lib/installer-ssh-key.sh.
+    content = read_regular(path, 512)
+    if not content:
+        raise GateError("installer ESP SSH authorized_keys file must be non-empty")
+    sha256 = hashlib.sha256(content).hexdigest()
+    if sha256 != expected:
+        raise GateError("installer ESP SSH key differs from the approved hash")
+    return {
+        "path": "ice-coreos/authorized_keys",
+        "sha256": sha256,
+        "size": len(content),
+    }
+
+
 def validate_filename(filename: str) -> None:
     if filename in ("", ".", "..") or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
@@ -518,6 +564,71 @@ def build_artifact(
         os.close(directory)
 
 
+SEALED_CORE_HEX = ("expect_verity_root_hash", "expect_payload_digest")
+
+
+def inspect_sealed_core(descriptor: int, arguments: argparse.Namespace) -> dict[str, Any]:
+    """Prove the SEALED CORE of the finalized raw, under this gate's own lock.
+
+    Why this runs here and not where it used to
+    -------------------------------------------
+    ``build-installer-usb.sh`` inspects the raw it produces -- but PRELOADED then
+    keeps writing to that raw: it grows the file, rewrites the GPT backup header
+    and the partition table, attaches it WRITABLE and copies ~20 GB of seed into
+    a new ``ni-seed`` partition (review 2026-09-01, P1 #4). The final acceptance
+    gate re-checked the seed and the ESP handoffs and nothing else, so the
+    receipt and the checksum could bless a raw whose ``BOOTAA64.EFI``, sealed
+    payload or supposedly-zeroed partitions had changed after their only
+    inspection.
+
+    The inspector therefore runs HERE: after the last writable phase, before the
+    receipt, the checksum and the release artifact, and through
+    ``/proc/self/fd/N`` -- i.e. through the very descriptor this gate holds an
+    exclusive ``flock`` on and whose identity and digest it brackets. It reads
+    the same bytes that are about to be published, not a path that could be
+    replaced between the two.
+
+    It is the FULL inspector, not a subset: the ESP allowlist, the signed UKI's
+    ``.cmdline``, every payload region hash, both recomputed dm-verity root
+    hashes and the "every other partition is entirely zero" check. ``ni-seed`` is
+    the one partition it deliberately permits.
+    """
+    inspector = Path(__file__).with_name("inspect-installer-media.py")
+    if not inspector.is_file():
+        raise GateError("the sealed-core inspector is missing; refusing to publish an uninspected medium")
+    command = [
+        sys.executable,
+        str(inspector),
+        "--raw",
+        f"/proc/self/fd/{descriptor}",
+        "--expect-verity-root-hash",
+        arguments.expect_verity_root_hash,
+        "--expect-payload-digest",
+        arguments.expect_payload_digest,
+        "--expect-mode",
+        arguments.expect_mode,
+        "--expect-access-profile",
+        arguments.expect_access_profile,
+        "--expect-hardware-target",
+        arguments.expect_hardware_target,
+        "--expect-trust-policy-id",
+        arguments.expect_trust_policy_id,
+    ]
+    if arguments.allow_unsigned:
+        command.append("--allow-unsigned")
+    run(*command, capture=False, pass_fds=(descriptor,))
+    return {
+        "access_profile": arguments.expect_access_profile,
+        "hardware_target": arguments.expect_hardware_target,
+        "inspected": "after-final-write",
+        "media_mode": arguments.expect_mode,
+        "payload_digest": arguments.expect_payload_digest,
+        "signed": not arguments.allow_unsigned,
+        "trust_policy_id": arguments.expect_trust_policy_id,
+        "verity_root_hash": arguments.expect_verity_root_hash,
+    }
+
+
 def detach_own_loop(loop: str, raw_descriptor: int) -> None:
     matches = existing_loop_for(raw_descriptor)
     if not any(mapping.get("name") == loop for mapping in matches):
@@ -546,7 +657,12 @@ def verify(arguments: argparse.Namespace) -> None:
         or expected_document.get("schema") != "neural-ice-offline-seed-tree-v1"
     ):
         raise GateError("expected seed manifest schema is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", arguments.release_closure_sha256):
+        raise GateError("expected release closure is not 64 lowercase hex")
+    if not re.fullmatch(r"[0-9a-f]{64}", arguments.release_manifest_sha256):
+        raise GateError("expected release manifest is not 64 lowercase hex")
     expected_baseline = expected_lab_baseline(arguments)
+    expected_esp_key = expected_esp_authorized_keys(arguments)
 
     descriptor = os.open(raw, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     loop = ""
@@ -639,6 +755,7 @@ def verify(arguments: argparse.Namespace) -> None:
         mounted = True
         verify_mount(esp_partition, "vfat", mountpoint_path)
         lab_baseline = verify_lab_baseline(mountpoint_path, expected_baseline)
+        esp_authorized_keys = verify_esp_authorized_keys(mountpoint_path, expected_esp_key)
         if lab_baseline is not None:
             lab_baseline["esp"] = {
                 "fstype": "vfat",
@@ -655,6 +772,15 @@ def verify(arguments: argparse.Namespace) -> None:
         after_digest = hash_fd(descriptor)
         if after_identity != before_identity or after_digest != before_digest:
             raise GateError("raw image changed during final-media verification")
+
+        # THE SEALED CORE, AFTER THE LAST WRITABLE PHASE (review 2026-09-01,
+        # P1 #4). Nothing below this line writes to the raw, and everything below
+        # it publishes: the artifact, its checksum, the receipt and the receipt's
+        # checksum. So this is the last moment at which "what is about to be
+        # blessed" and "what was inspected" are the same bytes.
+        sealed_core = inspect_sealed_core(descriptor, arguments)
+        if fd_identity(descriptor) != before_identity or hash_fd(descriptor) != before_digest:
+            raise GateError("raw image changed while its sealed core was inspected")
 
         artifact = build_artifact(
             descriptor,
@@ -680,10 +806,14 @@ def verify(arguments: argparse.Namespace) -> None:
                 "manifest_sha256": expected_sha,
                 "mount_options": ["nodev", "noexec", "nosuid", "ro"],
                 "partuuid": partuuid,
+                "release_closure_sha256": arguments.release_closure_sha256,
+                "release_manifest_sha256": arguments.release_manifest_sha256,
             },
+            "esp_authorized_keys": esp_authorized_keys,
             "lab_baseline": lab_baseline,
             "raw": {"sha256": before_digest, "size": metadata.st_size},
-            "schema": "neural-ice-preloaded-final-media-receipt-v1",
+            "schema": "neural-ice-preloaded-final-media-receipt-v2",
+            "sealed_core": sealed_core,
         }
         receipt_bytes = (
             json.dumps(receipt_document, sort_keys=True, separators=(",", ":")) + "\n"
@@ -725,6 +855,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw", required=True, type=Path)
     parser.add_argument("--expected-manifest", required=True, type=Path)
+    parser.add_argument("--release-closure-sha256", required=True)
+    parser.add_argument("--release-manifest-sha256", required=True)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--artifact-checksum", required=True, type=Path)
     parser.add_argument(
@@ -734,9 +866,25 @@ def main() -> int:
     )
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--receipt-checksum", required=True, type=Path)
+    parser.add_argument("--esp-authorized-keys-sha256")
     parser.add_argument("--lab-baseline-bom-sha256")
     parser.add_argument("--lab-baseline-signature-sha256")
+    # THE SEALED CORE. Required, not optional: a final gate that can be invoked
+    # without inspecting what the medium boots and installs is the finding.
+    parser.add_argument("--expect-verity-root-hash", required=True)
+    parser.add_argument("--expect-payload-digest", required=True)
+    parser.add_argument("--expect-mode", required=True, choices=("install", "live"))
+    parser.add_argument("--expect-access-profile", required=True)
+    parser.add_argument("--expect-hardware-target", required=True)
+    parser.add_argument("--expect-trust-policy-id", required=True)
+    parser.add_argument("--allow-unsigned", action="store_true")
     arguments = parser.parse_args()
+    for name in SEALED_CORE_HEX:
+        value = getattr(arguments, name)
+        if not re.fullmatch(r"[0-9a-f]{64}", value or ""):
+            flag = "--" + name.replace("_", "-")
+            print(f"ERROR: {flag} must be 64 lowercase hex", file=sys.stderr)
+            return 2
     try:
         verify(arguments)
     except (GateError, OSError) as error:

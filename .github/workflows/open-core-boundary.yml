@@ -1,0 +1,23 @@
+name: open-core-boundary
+
+# This security boundary is intentionally unconditional. A path filter would
+# let the first new production path evade the scanner that is meant to find it.
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Prove the workflow cannot be path-filtered
+        run: bash ci/test-open-core-workflow.sh
+      - name: Scan every Git-visible input as raw bytes
+        run: bash ci/test-open-core-boundary.sh

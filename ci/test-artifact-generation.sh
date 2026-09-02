@@ -161,9 +161,41 @@ cp "$FAKE_TRUST_POLICY" \
 # podman for an unavailable production policy.
 cp -a "$DEST" "$TEST_REPO/image"
 cp "$REPO_ROOT/VERSION" "$TEST_REPO/VERSION"
+# The two STAGED trust inputs the build now demands (docs/ADR-0015). They are
+# git-ignored in the real tree on purpose -- a fingerprint nobody measured and a
+# key nobody generated look like checks while being none -- so the harness stages
+# throwaway ones, and asserts below that their ABSENCE is a refusal.
+stage_trust_inputs() {
+  install -d "$TEST_REPO/image/keys" "$TEST_REPO/image/hardware-identity" \
+    "$TEST_REPO/image/bootc-overlay/usr/lib/neural-ice"
+  printf -- '-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----\n' \
+    > "$TEST_REPO/image/keys/release-authorization.pub"
+  printf 'nvidia-gb10-arm64\n' \
+    > "$TEST_REPO/image/bootc-overlay/usr/lib/neural-ice/hardware-target"
+  printf '%s\n' "$(printf 'devicetree:nvidia,gb10' | sha256sum | awk '{print $1}')" \
+    > "$TEST_REPO/image/hardware-identity/nvidia-gb10-arm64.fingerprints"
+}
+stage_trust_inputs
 install -d "$TMP/fake-bin"
+# The fake podman logs the BUILD invocation and answers the marker READBACK.
+#
+# 🔴 WHY THE READBACK EXISTS. `SIGNED_BOOT_TRUST_POLICY_ID` is verified by the
+# trust policy that approved the staged signed-boot tree, and it used to travel
+# only as an OCI LABEL -- metadata anyone can set -- while the FILE the
+# installer actually cross-checks kept the Containerfile's `lab-v1` default. An
+# image whose label and whose immutable marker name different policies is an
+# image whose two halves disagree about which chain signed it, and the medium
+# seals the marker. `NI_TEST_BUILT_POLICY_ID` is how this suite makes the two
+# disagree on purpose.
 # shellcheck disable=SC2016 # literal script body expands its own environment
-printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$PODMAN_LOG"' > "$TMP/fake-bin/podman"
+cat > "$TMP/fake-bin/podman" <<'FAKEPODMAN'
+#!/usr/bin/env bash
+if [[ "$1" == run ]]; then
+  printf '%s\n' "${NI_TEST_BUILT_POLICY_ID-neural-ice-secureboot-lab-v1}"
+  exit 0
+fi
+printf "%s\n" "$@" > "$PODMAN_LOG"
+FAKEPODMAN
 chmod +x "$TMP/fake-bin/podman"
 rm -f "$TMP/podman-mutating.out"
 touch "$TEST_REPO/secureboot/trust-policies/.mutate-policy"
@@ -173,6 +205,7 @@ rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy"
 [[ ! -e "$TMP/podman-mutating.out" ]] || fail "mutating policy reached podman"
 rm -rf "$TEST_REPO/image"
 cp -a "$DEST" "$TEST_REPO/image"
+stage_trust_inputs
 rm -f "$TMP/podman-rehashed.out"
 touch "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
 expect_failure env PODMAN_LOG="$TMP/podman-rehashed.out" \
@@ -181,6 +214,7 @@ rm -f "$TEST_REPO/secureboot/trust-policies/.mutate-policy-rehash"
 [[ ! -e "$TMP/podman-rehashed.out" ]] || fail "self-rehashing policy reached podman"
 rm -rf "$TEST_REPO/image"
 cp -a "$DEST" "$TEST_REPO/image"
+stage_trust_inputs
 env PODMAN_LOG="$TMP/podman-debug.out" PATH="$EVIL_BIN:$TMP/fake-bin:$PATH" \
   BASH_ENV="$BASH_ENV_FILE" ENV="$ENV_FILE" POLICY_ENV_POISON=direct VARIANT=debug \
   "$TEST_REPO/ci/build-image.sh" > "$TMP/build-debug.out"
@@ -192,6 +226,42 @@ grep -Fx -- "ch.neural-ice.signed-boot-trust-policy-sha256=$FAKE_TRUST_POLICY_SH
   "$TMP/podman-debug.out" >/dev/null
 grep -Fx -- "NVIDIA_DRIVER_VERSION=595.58.03" "$TMP/podman-debug.out" >/dev/null \
   || fail "build did not derive the NVIDIA version from the verified generation"
+# 🔴 PASSED AS A BUILD ARG, not merely labelled. Without this the immutable
+# marker inside the image silently keeps the Containerfile's default.
+grep -Fx -- "SIGNED_BOOT_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1" \
+  "$TMP/podman-debug.out" >/dev/null \
+  || fail "the verified trust policy id is not passed as a build argument"
+grep -Fq 'immutable signed-boot trust policy marker: neural-ice-secureboot-lab-v1' \
+  "$TMP/build-debug.out" \
+  || fail "the build does not read the immutable trust-policy marker back off the built image"
+
+# 🔴 ABSENCE IS A REFUSAL, WITH A NAME. The installer seals the
+# release-authorization key's SHA-256 and measures the machine against the
+# fingerprint list. A build that produced an image carrying neither would fail
+# much later, on an appliance, as "the verified installer root carries no
+# release-authorization public key" -- so it fails here, saying which input and
+# why. The MESSAGE is asserted: a refusal for an unrelated reason would pass a
+# bare expect_failure and prove nothing.
+for absent in image/keys/release-authorization.pub \
+  image/hardware-identity/nvidia-gb10-arm64.fingerprints; do
+  rm -f "$TEST_REPO/$absent"
+  if env PATH="$TMP/fake-bin:$PATH" VARIANT=debug "$TEST_REPO/ci/build-image.sh" \
+    >"$TMP/absent.out" 2>&1; then
+    cat "$TMP/absent.out" >&2
+    fail "a build with no $absent produced an image"
+  fi
+  grep -Fq "$absent" "$TMP/absent.out" \
+    || { cat "$TMP/absent.out" >&2; fail "the refusal for a missing $absent does not name it"; }
+  stage_trust_inputs
+done
+
+# ...and an image whose marker disagrees with the verified staged artifacts must
+# not be published, however correct its labels are.
+rm -rf "$TEST_REPO/image"; cp -a "$DEST" "$TEST_REPO/image"; stage_trust_inputs
+expect_failure env PODMAN_LOG="$TMP/podman-drift.out" PATH="$TMP/fake-bin:$PATH" \
+  NI_TEST_BUILT_POLICY_ID=neural-ice-secureboot-prod-v1 VARIANT=debug \
+  "$TEST_REPO/ci/build-image.sh"
+rm -rf "$TEST_REPO/image"; cp -a "$DEST" "$TEST_REPO/image"; stage_trust_inputs
 rm -f "$TMP/podman-prod.out"
 expect_failure env PODMAN_LOG="$TMP/podman-prod.out" PATH="$EVIL_BIN:$PATH" VARIANT=prod \
   "$TEST_REPO/ci/build-image.sh"

@@ -1,4 +1,14 @@
 //! Verify and atomically commit one complete OTA state generation.
+//!
+//! # The access profile is gated here too
+//!
+//! `guard-state-v2` and `commit-state-v2` are public commands that stage and
+//! commit an OTA generation, and they used to bind the release to the BOM, the
+//! hardware target, the variant and the ring — but not to the appliance's
+//! enrolled access profile. Only the two delegated paths consulted the anchor,
+//! so an appliance driven through the state-v2 commands skipped the one control
+//! that makes `customer-locked` un-walkable by OTA. A gate two of three entry
+//! points enforce is the third entry point.
 
 use std::path::{Path, PathBuf};
 
@@ -27,20 +37,26 @@ pub(crate) fn guard(args: &[String]) -> Result<u8, InternalError> {
     execute(args, false)
 }
 
+/// The complete argument surface of `guard-state-v2` / `commit-state-v2`.
+///
+/// A named constant rather than a literal, so the suite can assert that
+/// `candidate-root` is still in it. The access-profile gate on this path was
+/// absent entirely until 2026-08-31; a list nothing checks is a list something
+/// can be quietly dropped from.
+pub(crate) const STATE_V2_FLAGS: &[&str] = &[
+    "bom",
+    "candidate-root",
+    "config",
+    "release",
+    "release-sig",
+    "snapshot",
+    "snapshot-sig",
+    "trusted-time",
+    "trusted-time-sig",
+];
+
 fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
-    let flags = parse_flags(
-        args,
-        &[
-            "bom",
-            "config",
-            "release",
-            "release-sig",
-            "snapshot",
-            "snapshot-sig",
-            "trusted-time",
-            "trusted-time-sig",
-        ],
-    )?;
+    let flags = parse_flags(args, STATE_V2_FLAGS)?;
     let required = |name: &str| -> Result<PathBuf, InternalError> {
         flags
             .get(name)
@@ -271,6 +287,30 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     ) {
         return refusal(reason);
     }
+    // THE ACCESS PROFILE, on this path too. The variant binding above says what
+    // the appliance is BUILT FROM; this says what it was INSTALLED AS — a value
+    // enrolled outside the candidate deployment and signed by the device root,
+    // now additionally proved live against this machine's TPM. Without it, an
+    // appliance driven through state-v2 rather than through verify-delegated-*
+    // could be walked from customer-locked to lab-managed by a correctly signed
+    // same-variant release.
+    let enrolled = match crate::access_profile_anchor::enrolled_access_profile(state_dir, &scratch)?
+    {
+        Ok(profile) => profile,
+        Err(reason) => return refusal(reason),
+    };
+    if let Err(reason) =
+        crate::access_profile_anchor::gate_release_profile(&enrolled, &release.access_profile)
+    {
+        return refusal(reason);
+    }
+    if let Err(reason) = crate::access_profile_anchor::assert_candidate_access_profile(
+        Path::new(&required("candidate-root")?),
+        &enrolled,
+        &release.access_policy_sha256,
+    ) {
+        return refusal(reason);
+    }
     let trusted_state = TrustedTimeState {
         assertion_seq: trusted.assertion_seq,
         assertion_sha256: trusted.assertion_sha256.clone(),
@@ -315,6 +355,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     }
     let candidate = Candidate {
         applied: AppliedStateV1 {
+            active_ring: None,
             bom_sha256: bom_hash,
             bundle_seq: bom.bundle_seq,
             schema: "neural-ice-ota-applied-state-v1".into(),
@@ -391,6 +432,30 @@ fn validate_bom_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state-v2 commands are PUBLIC and they stage and commit an OTA
+    /// generation. Until 2026-08-31 they bound the release to the BOM, the
+    /// hardware target, the variant and the ring — and not to the appliance's
+    /// enrolled access profile, which only the two delegated paths consulted. A
+    /// gate two of three entry points enforce is the third entry point, so both
+    /// halves of the fix are asserted here: the argument exists, and the code
+    /// that uses it is reachable from this module.
+    #[test]
+    fn state_v2_requires_the_candidate_deployment() {
+        assert!(
+            STATE_V2_FLAGS.contains(&"candidate-root"),
+            "the state-v2 commands no longer accept the candidate deployment, so the \
+             access-profile gate on this path cannot run"
+        );
+        // Missing entirely: an absent required flag is an internal error, never
+        // a pass, because a verdict reached without the gate is not a verdict.
+        let args: Vec<String> = ["--bom", "/nonexistent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let flags = crate::parse_flags(&args, STATE_V2_FLAGS).unwrap();
+        assert!(!flags.contains_key("candidate-root"));
+    }
 
     fn bom() -> BomCore {
         BomCore {

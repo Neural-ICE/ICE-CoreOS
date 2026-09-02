@@ -1,0 +1,22 @@
+[Unit]
+Description=Neural ICE mandatory TPM owner ceremony and runtime trust gate
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS/blob/main/docs/ADR-0015-installer-trust-anchor-uki-verity.md
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=network-pre.target network.target network-online.target systemd-user-sessions.service sshd.service
+OnFailure=emergency.target
+OnFailureJobMode=isolate
+RequiresMountsFor=/var/lib/neural-ice/ota
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/neural-ice-firstboot-tpm-ceremony
+RemainAfterExit=yes
+UMask=0077
+RuntimeDirectory=neural-ice-owner-ceremony
+RuntimeDirectoryMode=0700
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/neural-ice/ota /run/neural-ice-owner-ceremony
+
+[Install]
+RequiredBy=multi-user.target

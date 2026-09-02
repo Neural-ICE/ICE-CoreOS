@@ -33,8 +33,12 @@ install it on a DGX Spark and inject their own SSH key.
   `ghcr.io/neural-ice/neural-ice-coreos`; Fabric mirrors approved digests and
   signed product trains drive atomic OTA + rollback. See
   [ADR-0003](docs/ADR-0003-base-and-update-model.md).
-- **Flashable USB installer** — dual-mode (Live / Install), light or preloaded
-  edition (see [docs/PRELOADED-EDITION.md](docs/PRELOADED-EDITION.md)).
+- **Flashable USB installer** — single-purpose (`MEDIA_MODE=install` or `live`),
+  light or preloaded edition (see
+  [docs/PRELOADED-EDITION.md](docs/PRELOADED-EDITION.md)). The medium carries one
+  signed UKI at `\EFI\BOOT\BOOTAA64.EFI` and no boot manager: what it does is a
+  property of a signature, not of a menu
+  ([ADR-0015](docs/ADR-0015-installer-trust-anchor-uki-verity.md)).
 
 ---
 
@@ -45,7 +49,7 @@ build publishes one run-unique immutable GHCR tag and reports its digest. It nev
 logs in to the sovereign registry and never moves `beta`, `stable`, `latest`, or
 any other alias.
 
-ICE-Fabric centrally mirrors an approved digest to `registry.neural-ice.ch`, binds
+ICE-Fabric centrally mirrors an approved digest to `registry.example.test`, binds
 it into a signed BOM, and moves only the signed product-train `beta`/`stable`
 pointers. Appliances install the BOM's digest with `bootc switch --retain`; the
 current `.72` validation uses `beta`, while `stable` remains untouched.
@@ -58,8 +62,94 @@ The vanilla OS source image is public on GHCR. Resolve an immutable tag to a dig
 and pass that exact reference when building a local installer:
 
 ```sh
-BASE_IMAGE='ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest>' ./image/build-installer-usb.sh
+BASE_IMAGE='ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest>' \
+MEDIA_MODE=install \
+VARIANT=sealed-lab \
+HARDWARE_TARGET=nvidia-gb10-arm64 \
+HARDWARE_IDENTITY_FILE=image/hardware-identity/nvidia-gb10-arm64.fingerprints \
+UKI_SIGNING_KEY=<path> UKI_SIGNING_CERT=<path> \
+  ./image/build-installer-usb.sh
 ```
+
+`MEDIA_MODE` decides what the medium IS — `install` (the default) wipes the
+internal disk, `live` does not — and it cannot be changed afterwards: the mode is
+sealed into the one UKI the medium carries, and there is no second bootable
+object to choose instead. An operator who needs both cuts two media.
+
+Each mode is an **affirmative** sealed selector, not the absence of the other:
+`install` seals `neuralice.autoinstall=1` with `systemd.unit=neural-ice-installer.target`,
+and `live` seals `neuralice.live=1` with `systemd.unit=neural-ice-live.target`.
+
+Those two pairs are not the whole check. The signed command line is validated as
+a **closed grammar** — every word must be one
+`image/installer/neural-ice-sealed-cmdline-grammar.sh` names, so `systemd.debug_shell`,
+`init=`, `rd.break`, `systemd.mask=`, `systemd.wants=`, `emergency`, `rescue`,
+`single`, `selinux=0`, a second `systemd.unit=` and any argument invented after
+that file was written are all refused. A blocklist would be whack-a-mole; one
+missed word is one unauthenticated root shell on a medium whose entire safety
+argument is that it has none. The grammar is enforced in four places: the
+producer refuses to cut such a medium, `image/inspect-installer-media.py` refuses
+to accept one off-device, the early runtime generator refuses to boot one, and
+`ota/neural-ice-autoinstall.sh` revalidates it itself before its first mutation —
+because a service precondition guards a unit, not an executable a shell can run
+by hand.
+
+A boot the generator does not recognise reaches **nothing**: it masks every
+general boot target, the installer, every login surface and every debug/emergency
+/rescue shell *before* it classifies, and takes back only what a recognised
+grammar allows.
+
+**`live` is a non-destructive read-only diagnostics mode.** On tty1 it prints one
+bounded summary — the sealed trust anchor, the mode, Secure Boot state, the
+dm-verity mapping, the hardware, the storage it *enumerated* (nothing mounted,
+unlocked or read), network link state, and how to end the boot — and then stops.
+It has no shell, no login, no SSH, no installer and no operator input of any
+kind; it takes no arguments, opens no listener, is denied IP traffic outright
+(`IPAddressDeny=any`) and runs `ProtectSystem=strict` with no writable path. It
+is safe to boot on a machine holding customer data, and it no longer looks like a
+hung one.
+
+### Registry-backed installs
+
+`install` media default to installing the medium's own image. A **light** medium
+can instead pull a digest-pinned appliance image over the network
+(FAB-0040 deployment bench):
+
+```sh
+INSTALL_SOURCE=registry \
+OS_IMAGE='ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest>' \
+INSTALL_MIRROR='bench.example.test:5000' \
+  ./image/build-installer-usb.sh   # plus the same inputs as above
+```
+
+All three are **sealed into the signed UKI**, so a registry install is a property
+of a signature, not of a keystroke. `OS_IMAGE` must be digest-pinned with a
+canonical registry authority — a mutable tag is refused, because the digest is
+what makes consulting `INSTALL_MIRROR` safe (the mirror is `digest-only` and the
+signature policy is still evaluated against the original scope). The build also
+refuses to cut a registry medium whose own container signature policy carries no
+explicitly configured signed `docker` scope for that image: a pull nothing would
+verify is not an install.
+
+A media boot obtains networking without running the installed appliance's
+first-boot TPM ceremony: the runtime generator shadows the appliance's
+`50-neural-ice-tpm-ceremony.conf` drop-in on the five network units, under `/run`
+only. The installed appliance's ordering is untouched — with no media selector on
+the command line the generator emits nothing at all.
+
+None of the others has a default, and that is deliberate (docs/ADR-0015): the
+medium's access profile, the hardware it may install onto and the key that signs
+its boot chain are decisions, and a default would make them silently. Two of them
+need material this repository does not and must not carry:
+
+- `HARDWARE_IDENTITY_FILE` lists the SHA-256 of the **measured** identity of every
+  machine the target admits. Produce it by running
+  `bash image/lib/hardware-identity.sh fingerprint` **on the reference appliance**
+  (see `image/hardware-identity/README.md`). Without it the build refuses — a
+  hardware target no machine can be measured against is a word, not a binding.
+- `UKI_SIGNING_CERT` must be a certificate the image's own Secure Boot trust
+  policy pins, or be issued by one. Set `ALLOW_UNSIGNED_MEDIA=1` to build an
+  unsigned medium deliberately; it will not boot with Secure Boot on.
 
 The local build writes `${OUT:-/var/tmp/ice-coreos-bib}/image/disk.raw`. Then:
 
@@ -70,14 +160,43 @@ The local build writes `${OUT:-/var/tmp/ice-coreos-bib}/image/disk.raw`. Then:
    ```
 3. **Inject your SSH key** (the vanilla image has none) — either:
    - drop your public key onto the USB's EFI partition at `ice-coreos/authorized_keys`
-     after flashing and byte-verifying the raw image; debug CI images keep sshd
-     enabled but are keyless by default, so this per-USB injection is the normal path
-     (the EFI partition is FAT and mounts on any OS), **or**
+     after flashing and byte-verifying the raw image; `debug` and `sealed-lab` images are
+     keyless by default, so this per-USB injection is the normal path (the EFI partition
+     is FAT and mounts on any OS), **or**
    - pass `neuralice.sshkey=<base64-of-your-pubkey>` as a kernel argument.
-4. Boot the USB on the DGX Spark (GPT raw disk; the firmware only boots GPT, not El-Torito
-   ISO), choose **“Neural ICE - Install”**. It wipes the internal disk, sets up the
-   encrypted volumes (TPM2), shows the **data recovery key** (also saved on the USB), then
-   prompts to remove the USB and reboot.
+
+   Either input is honoured **only** if the access profile permits it
+   (`lab-managed` or `developer-diagnostic`). A `customer-locked` (`prod`) image
+   refuses both, before any disk write and again at first boot — see
+   [ADR-0014](docs/ADR-0014-access-policy-lab-vs-customer.md). The profile the
+   installer acts on comes from the **signed UKI command line**, and the marker in
+   `/usr/lib/neural-ice/access-policy` must agree with it
+   ([ADR-0015](docs/ADR-0015-installer-trust-anchor-uki-verity.md)).
+4. Boot the USB on the DGX Spark (GPT raw disk; the firmware only boots GPT, not
+   El-Torito ISO). There is no menu: the firmware loads
+   `\EFI\BOOT\BOOTAA64.EFI`, which is the signed UKI this medium was cut as. An
+   `install` medium wipes the internal disk, sets up the encrypted volumes (TPM2),
+   shows the **data recovery key** (also saved on the USB), then prompts to remove
+   the USB and reboot.
+
+> Installer trust: the medium boots a **signed UKI** whose command line seals the
+> dm-verity root hash of the installer root, the SHA-256 of the sealed payload
+> header (which names and hashes every extent on the medium, including the
+> container store the install writes from), the access profile, the hardware
+> target, the Secure Boot trust-policy id and the identity of the key that may
+> authorise a release. dm-verity is enforced **before** any policy is read — the
+> installer runs from a bounded tmpfs overlay over that read-only verified root —
+> and a registry install additionally requires a signed release authorization that
+> names the exact image, verified, pulled and inspected before the target disk is
+> touched. Design and rationale:
+> [ADR-0015](docs/ADR-0015-installer-trust-anchor-uki-verity.md); the problem it
+> solves: [DESIGN-NOTE-0001](docs/DESIGN-NOTE-0001-sealed-access-trust-anchor.md).
+>
+> ⚠️ **Evidence status.** The chain above is proven by the automated suites and by
+> the lab-v1 **direct UEFI key path** (the Neural ICE CA enrolled in `db`).
+> `neural-ice-secureboot-prod-v1` does not exist yet, so **no production-chain
+> evidence exists**, and the four physical tamper tests under real Secure Boot on
+> GB10 have not been run. Those are gaps in evidence, not in the lab trust proof.
 
 > Secure Boot: until the Microsoft-signed shim lands (see
 > [ADR-0002](docs/ADR-0002-secure-boot-zero-touch.md) and [secureboot/](secureboot/)),
@@ -224,7 +343,7 @@ is supported. Keep the `neural-ice-coreos` package **public** for free community
 
 ```
 image/          bootc OS image + installer (Containerfiles, overlay, branding, bib config)
-ota/            auto-install service + script (dual-mode installer logic)
+ota/            auto-install service + script, TPM state and access-profile anchor
 ignition/       Butane/Ignition for first-boot provisioning (SSH key, etc.)
 build/          GB10 kernel (4k) + driver build (heavy, rare)
 ci/             build/stage/version helper scripts used by CI and locally

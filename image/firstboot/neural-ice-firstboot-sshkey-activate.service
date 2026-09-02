@@ -1,0 +1,23 @@
+[Unit]
+Description=Neural ICE - start and verify sshd for the provisioned operator key
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+# Only on a boot where provisioning actually staged a key. The handoff directory
+# is created by the provisioning unit at run time, and this condition is
+# evaluated after it has run because of the ordering below -- so a refusal, a
+# keyless appliance and an already-provisioned host all skip this unit cleanly.
+ConditionPathExists=/var/lib/neural-ice/sshkey-activation-pending
+Requires=neural-ice-firstboot-tpm-ceremony.service neural-ice-firstboot-sshkey.service
+After=neural-ice-firstboot-tpm-ceremony.service neural-ice-firstboot-sshkey.service
+# ...and AFTER sshd itself. This is the ordering that makes verification
+# possible at all: nothing orders sshd after this unit, so the manager is free
+# to run the sshd job while this one watches for the effect. The provisioning
+# unit (Before=sshd.service) structurally cannot observe that.
+After=sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neural-ice-firstboot-sshkey.sh activate
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

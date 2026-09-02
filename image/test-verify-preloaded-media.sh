@@ -60,6 +60,15 @@ baseline_args=(
   --lab-baseline-signature-sha256 "$signature_sha256"
 )
 
+# A LAB-MANAGED medium may carry exactly one approved operator public key. The
+# gate must accept precisely that key and refuse every other state: a key nobody
+# approved, a key that drifted, and an approved key that never made it onto the
+# medium.
+ssh-keygen -q -t ed25519 -N '' -f "$work/operator" </dev/null
+operator_key="$work/operator.pub"
+operator_sha256="$(sha256sum "$operator_key" | cut -d' ' -f1)"
+esp_key_args=(--esp-authorized-keys-sha256 "$operator_sha256")
+
 expect_baseline_refusal() {
   local name="$1"
   shift
@@ -70,7 +79,8 @@ expect_baseline_refusal() {
     --artifact-checksum "$work/$name.img.sha256" \
     --compression none \
     --receipt "$work/$name.json" \
-    --receipt-checksum "$work/$name.json.sha256" "$@"; then
+    --receipt-checksum "$work/$name.json.sha256" \
+    "${sealed_core_args[@]}" "${esp_key_args[@]}" "$@"; then
     echo "gate accepted forbidden LAB baseline state: $name" >&2
     exit 1
   fi
@@ -78,28 +88,60 @@ expect_baseline_refusal() {
   test ! -e "$work/$name.json"
 }
 
+# --------------------------------------------------------------------------- #
+# THE FIXTURE IS A REAL SEALED MEDIUM, FINISHED THE WAY PRELOADED FINISHES ONE
+# (review 2026-09-01, P1 #4).
+#
+# 🔴 WHY IT IS NO LONGER THREE EMPTY PARTITIONS. The gate now runs the FULL
+# sealed-core inspector on the finished raw, under the exclusive lock it holds,
+# before it publishes the artifact, the checksum or the receipt. A fixture with
+# no signed UKI and no sealed payload could only ever exercise the seed and ESP
+# halves of this gate -- which is precisely the coverage that let the sealed core
+# go uninspected after the seed phase.
+#
+# So the fixture is built by the same library image/test-installer-media.sh uses
+# (one definition of "a sealed medium"), and then FINISHED here exactly as
+# image/build-preloaded.sh finishes one: grow the file, relocate the GPT backup
+# header, append `ni-seed`, mkfs it and copy the seed tree in.
+# --------------------------------------------------------------------------- #
+TMP="$work/fixture"; mkdir -p "$TMP"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+# shellcheck source=image/test-lib/sealed-medium-fixture.sh
+source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
+sealed_core_args=(
+  --expect-verity-root-hash "$ROOT_HASH"
+  --expect-payload-digest "$PAYLOAD_DIGEST"
+  --expect-mode install
+  --expect-access-profile lab-managed
+  --expect-hardware-target nvidia-gb10-arm64
+  --expect-trust-policy-id "$POLICY_ID"
+)
+
 raw="$work/preloaded.img"
-truncate -s 512M "$raw"
-sgdisk --clear "$raw" >/dev/null
-sgdisk --new 1:2048:+64M --change-name 1:EFI-SYSTEM --typecode 1:EF00 "$raw" >/dev/null
-sgdisk --new 2:0:+320M --change-name 2:ni-seed --typecode 2:8300 "$raw" >/dev/null
-sgdisk --new 3:0:+96M --change-name 3:spare --typecode 3:8300 "$raw" >/dev/null
+cp "$RAW" "$raw"
+truncate -s "+384M" "$raw"
+sgdisk -e "$raw" >/dev/null
+sgdisk -n 0:0:0 -c 0:ni-seed -t 0:8300 "$raw" >/dev/null
+seed_number="$(sgdisk -p "$raw" | awk '/ni-seed/{n=$1} END{print n}')"
+[ -n "$seed_number" ] || { echo "ni-seed partition not created" >&2; exit 1; }
 loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
-mkfs.vfat -n EFI-SYSTEM "${loop}p1" >/dev/null
 mount "${loop}p1" "$mountpoint"
 "$ROOT/ota/neural-ice-lab-baseline-handoff.sh" stage-media \
   "$work/ota-lab-baseline.json" "$bom_sha256" \
   "$work/ota-lab-baseline.sig" "$signature_sha256" "$mountpoint"
+"$ROOT/image/lib/installer-ssh-key.sh" install \
+  "$operator_key" "$operator_sha256" "$mountpoint"
 sync
 umount "$mountpoint"
-mkfs.xfs -q -L ni-seed "${loop}p2"
-mount "${loop}p2" "$mountpoint"
+mkfs.xfs -q -L ni-seed "${loop}p${seed_number}"
+mount "${loop}p${seed_number}" "$mountpoint"
 cp -a "$work/source/." "$mountpoint/"
 sync
 umount "$mountpoint"
 losetup --detach "$loop"
 loop=''
+raw_bytes="$(stat -c '%s' "$raw")"
 
 ulimit -n 64
 artifact="$work/preloaded.img.zst"
@@ -114,22 +156,47 @@ python3 "$ROOT/image/verify-preloaded-media.py" \
   --compression zstd-fast \
   --receipt "$receipt" \
   --receipt-checksum "$receipt_checksum" \
-  "${baseline_args[@]}"
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"
 (
   cd "$work"
   sha256sum -c "$(basename "$artifact_checksum")"
   sha256sum -c "$(basename "$receipt_checksum")"
 )
-python3 - "$receipt" "$artifact" "$raw" "$bom_sha256" "$signature_sha256" <<'PY'
+python3 - "$receipt" "$artifact" "$raw" "$bom_sha256" "$signature_sha256" "$operator_sha256" \
+  "$raw_bytes" "$ROOT_HASH" "$PAYLOAD_DIGEST" "$POLICY_ID" <<'PY'
 import hashlib
 import json
 import sys
 
-receipt_path, artifact_path, raw_path, bom_sha256, signature_sha256 = sys.argv[1:]
+(
+    receipt_path,
+    artifact_path,
+    raw_path,
+    bom_sha256,
+    signature_sha256,
+    operator_sha256,
+    raw_bytes,
+    root_hash,
+    payload_digest,
+    policy_id,
+) = sys.argv[1:]
 with open(receipt_path, encoding="ascii") as stream:
     receipt = json.load(stream)
-assert receipt["schema"] == "neural-ice-preloaded-final-media-receipt-v1"
-assert receipt["raw"]["size"] == 512 * 1024 * 1024
+assert receipt["schema"] == "neural-ice-preloaded-final-media-receipt-v2"
+assert receipt["raw"]["size"] == int(raw_bytes)
+# The receipt now RECORDS what the sealed-core inspection established, so a
+# medium blessed without one is visible in the receipt rather than only in the
+# gate's exit status.
+assert receipt["sealed_core"] == {
+    "access_profile": "lab-managed",
+    "hardware_target": "nvidia-gb10-arm64",
+    "inspected": "after-final-write",
+    "media_mode": "install",
+    "payload_digest": payload_digest,
+    "signed": True,
+    "trust_policy_id": policy_id,
+    "verity_root_hash": root_hash,
+}
 assert receipt["ni_seed"]["fstype"] == "xfs"
 assert receipt["artifact"]["compression"] == "zstd-fast"
 assert receipt["artifact"]["filename"] == artifact_path.rsplit("/", 1)[-1]
@@ -143,6 +210,8 @@ assert receipt["lab_baseline"]["signature"] == {
     "sha256": signature_sha256,
     "size": 29,
 }
+assert receipt["esp_authorized_keys"]["path"] == "ice-coreos/authorized_keys"
+assert receipt["esp_authorized_keys"]["sha256"] == operator_sha256
 assert receipt["lab_baseline"]["esp"]["fstype"] == "vfat"
 assert receipt["lab_baseline"]["esp"]["partuuid"]
 for path, expected in ((artifact_path, receipt["artifact"]), (raw_path, receipt["raw"])):
@@ -198,6 +267,83 @@ umount "$mountpoint"
 losetup --detach "$loop"
 loop=''
 
+# --- the installer SSH key on the ESP -------------------------------------- #
+# An approved key that is present must still be REFUSED when the caller approved
+# nothing: media that carries a key nobody signed off on must not be published.
+expect_media_refusal() { # <name> <message> [extra args...]
+  local name="$1" message="$2"
+  shift 2
+  if python3 "$ROOT/image/verify-preloaded-media.py" \
+    --raw "$raw" \
+    --expected-manifest "$work/expected.json" \
+    --artifact "$raw" \
+    --artifact-checksum "$work/$name.img.sha256" \
+    --compression none \
+    --receipt "$work/$name.json" \
+    --receipt-checksum "$work/$name.json.sha256" "${sealed_core_args[@]}" "$@"; then
+    echo "$message" >&2
+    exit 1
+  fi
+  test ! -e "$work/$name.img.sha256"
+  test ! -e "$work/$name.json"
+}
+
+expect_media_refusal esp-key-unapproved \
+  "gate published a medium carrying an unapproved installer SSH key" \
+  "${baseline_args[@]}"
+
+wrong_sha256="$(printf 'not-the-operator-key' | sha256sum | cut -d' ' -f1)"
+expect_media_refusal esp-key-drift \
+  "gate accepted an installer SSH key that differs from the approved hash" \
+  "${baseline_args[@]}" --esp-authorized-keys-sha256 "$wrong_sha256"
+
+expect_media_refusal esp-key-malformed-hash \
+  "gate accepted a malformed approved-key hash" \
+  "${baseline_args[@]}" --esp-authorized-keys-sha256 deadbeef
+
+# A key that was approved but never staged: the medium is unreachable in the lab
+# and the operator would only find out on hardware.
+loop="$(losetup --find --show --partscan "$raw")"
+udevadm settle
+mount "${loop}p1" "$mountpoint"
+mv "$mountpoint/ice-coreos/authorized_keys" "$work/removed-key"
+sync
+umount "$mountpoint"
+losetup --detach "$loop"
+loop=''
+expect_media_refusal esp-key-absent \
+  "gate accepted a medium missing its approved installer SSH key" \
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"
+
+# A MODIFIED ESP. vfat cannot hold a symlink, so the modification an attacker
+# actually has on this filesystem is a padded/appended payload -- and the gate
+# bounds the read at the same 512 bytes the key validator does.
+loop="$(losetup --find --show --partscan "$raw")"
+udevadm settle
+mount "${loop}p1" "$mountpoint"
+{ cat "$work/removed-key"; head -c 4096 /dev/zero | tr '\0' 'A'; } \
+  > "$mountpoint/ice-coreos/authorized_keys"
+sync
+umount "$mountpoint"
+losetup --detach "$loop"
+loop=''
+expect_media_refusal esp-key-oversized \
+  "gate accepted an oversized installer SSH key on the ESP" \
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"
+
+# Restore the approved key so every refusal below stays attributable to the
+# state it is actually testing rather than to a leftover modified ESP.
+loop="$(losetup --find --show --partscan "$raw")"
+udevadm settle
+mount "${loop}p1" "$mountpoint"
+rm -f "$mountpoint/ice-coreos/authorized_keys"
+"$ROOT/image/lib/installer-ssh-key.sh" install \
+  "$operator_key" "$operator_sha256" "$mountpoint"
+sync
+umount "$mountpoint"
+losetup --detach "$loop"
+loop=''
+
 printf 'owner-data\n' > "$work/owned-receipt.json"
 if python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
@@ -207,7 +353,7 @@ if python3 "$ROOT/image/verify-preloaded-media.py" \
   --compression none \
   --receipt "$work/owned-receipt.json" \
   --receipt-checksum "$work/owned-receipt.json.sha256" \
-  "${baseline_args[@]}"; then
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"; then
   echo "gate overwrote an existing receipt" >&2
   exit 1
 fi
@@ -226,7 +372,7 @@ if python3 "$ROOT/image/verify-preloaded-media.py" \
   --compression zstd-fast \
   --receipt "$work/root-injection.json" \
   --receipt-checksum "$work/root-injection.json.sha256" \
-  "${baseline_args[@]}"; then
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"; then
   echo "gate accepted an unapproved payload root" >&2
   exit 1
 fi
@@ -240,7 +386,7 @@ if python3 "$ROOT/image/verify-preloaded-media.py" \
   --compression zstd-fast \
   --receipt "$work/should-not-exist.json" \
   --receipt-checksum "$work/should-not-exist.json.sha256" \
-  "${baseline_args[@]}"; then
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"; then
   echo "gate accepted a raw with an existing writable loop" >&2
   exit 1
 fi
@@ -262,7 +408,7 @@ if env PATH="$work/fake-bin:$PATH" python3 "$ROOT/image/verify-preloaded-media.p
   --compression zstd-fast \
   --receipt "$work/bad-mount.json" \
   --receipt-checksum "$work/bad-mount.json.sha256" \
-  "${baseline_args[@]}"; then
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"; then
   echo "gate accepted ambiguous post-mount verification" >&2
   exit 1
 fi
@@ -270,9 +416,92 @@ after_mount_dirs="$(find /run -maxdepth 1 -type d -name 'neural-ice-ni-seed.*' -
 test "$after_mount_dirs" = "$before_mount_dirs"
 test -z "$(losetup --associated "$raw" --noheadings --output NAME)"
 
+# --------------------------------------------------------------------------- #
+# THE SEALED CORE, MUTATED AFTER THE SEED PHASE (review 2026-09-01, P1 #4).
+#
+# This is the window the finding is about: build-preloaded.sh holds the raw open
+# for writing long after the only inspection that used to happen, and the receipt
+# and checksum were published without looking at the boot path again. Each
+# mutation below is applied to the FINISHED raw and must stop finalization dead --
+# no artifact, no checksum, no receipt.
+# --------------------------------------------------------------------------- #
+sealed_core_mutation() { # <name> <python mutation> <message>
+  local name="$1" mutation="$2" message="$3"
+  python3 - "$raw" "$work/$name.restore" "$mutation" <<'PY'
+import struct
+import sys
+
+raw, restore, mutation = sys.argv[1:]
+with open(raw, "rb") as handle:
+    handle.seek(512)
+    header = handle.read(512)
+if header[:8] != b"EFI PART":
+    raise SystemExit("the fixture has no GPT at LBA 1")
+entries_lba, = struct.unpack_from("<Q", header, 72)
+count, size = struct.unpack_from("<II", header, 80)
+partitions = {}
+with open(raw, "rb") as handle:
+    handle.seek(entries_lba * 512)
+    for _ in range(count):
+        entry = handle.read(size)
+        name = entry[56:128].decode("utf-16-le").rstrip("\x00")
+        if name:
+            first, = struct.unpack_from("<Q", entry, 32)
+            partitions[name] = first * 512
+if mutation == "payload":
+    # The first byte of the first REGION, past the 4096-byte header: its recorded
+    # sha256 and its recomputed dm-verity root hash must both stop matching.
+    offset = partitions["ni-installer-payload"] + 4096
+elif mutation == "void":
+    # The emptied remains of what bootc-image-builder wrote. It is OVERWRITTEN,
+    # not deleted, and anything written back into it is a boot authority nothing
+    # signed.
+    offset = partitions["ni-installer-void"]
+else:
+    raise SystemExit(f"unknown mutation {mutation}")
+with open(raw, "r+b") as handle:
+    handle.seek(offset)
+    original = handle.read(16)
+    with open(restore, "wb") as saved:
+        saved.write(struct.pack("<Q", offset) + original)
+    handle.seek(offset)
+    handle.write(bytes(byte ^ 0xFF for byte in original))
+PY
+  expect_media_refusal "$name" "$message" "${baseline_args[@]}" "${esp_key_args[@]}"
+  python3 - "$raw" "$work/$name.restore" <<'PY'
+import struct
+import sys
+
+raw, restore = sys.argv[1:]
+blob = open(restore, "rb").read()
+offset, = struct.unpack_from("<Q", blob, 0)
+with open(raw, "r+b") as handle:
+    handle.seek(offset)
+    handle.write(blob[8:])
+PY
+}
+
+sealed_core_mutation payload-mutated payload \
+  "gate published a medium whose sealed payload changed after the seed phase"
+sealed_core_mutation void-repopulated void \
+  "gate published a medium whose emptied boot partition was written to after the seed phase"
+
+# ...and the restored medium is still accepted, so both refusals are about the
+# mutation and not about the fixture having drifted.
+python3 "$ROOT/image/verify-preloaded-media.py" \
+  --raw "$raw" \
+  --expected-manifest "$work/expected.json" \
+  --artifact "$work/restored.img" \
+  --artifact-checksum "$work/restored.img.sha256" \
+  --compression none \
+  --receipt "$work/restored.json" \
+  --receipt-checksum "$work/restored.json.sha256" \
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"
+test -s "$work/restored.json"
+
 loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
-sgdisk --change-name 3:ni-seed "$loop" >/dev/null
+sgdisk --change-name 2:ni-seed "$loop" >/dev/null
 losetup --detach "$loop"
 loop=''
 if python3 "$ROOT/image/verify-preloaded-media.py" \
@@ -283,7 +512,7 @@ if python3 "$ROOT/image/verify-preloaded-media.py" \
   --compression zstd-fast \
   --receipt "$work/ambiguous.json" \
   --receipt-checksum "$work/ambiguous.json.sha256" \
-  "${baseline_args[@]}"; then
+  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"; then
   echo "gate accepted two ni-seed partitions" >&2
   exit 1
 fi

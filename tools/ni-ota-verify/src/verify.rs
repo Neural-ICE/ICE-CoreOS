@@ -616,6 +616,7 @@ mod tests {
             bundle_seq: seq,
             bom_sha256: sha.to_string(),
             bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
+            active_ring: None,
         })))
     }
 

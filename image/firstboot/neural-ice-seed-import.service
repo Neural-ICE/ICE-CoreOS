@@ -1,0 +1,22 @@
+[Unit]
+Description=Verify and publish the Neural ICE offline release generation
+RequiresMountsFor=/var/lib/neural-ice/data
+After=var-lib-neural\x2dice-data.mount
+Before=network-pre.target neural-ice-payload-apply.service
+Wants=network-pre.target
+ConditionPathExists=/var/lib/neural-ice/data/release/CLOSURE
+ConditionPathExists=!/var/lib/neural-ice/data/OFFLINE-READY
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neural-ice-seed-import.sh
+RemainAfterExit=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice
+
+[Install]
+WantedBy=multi-user.target

@@ -4,7 +4,7 @@
   "bundle_seq": 41,
   "hardware_target": "nvidia-gb10-arm64",
   "host": {
-    "repository": "registry.neural-ice.ch/neural-ice/neural-ice-appliance",
+    "repository": "registry.example.test/neural-ice/neural-ice-appliance",
     "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
     "contract": "host-bootc-v1",
     "restart_scope": [],
@@ -14,7 +14,7 @@
   "components": [
     {
       "component_id": "icecore-api",
-      "repository": "registry.neural-ice.ch/neural-ice/icecore-api",
+      "repository": "registry.example.test/neural-ice/icecore-api",
       "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "contract": "component-oci-v1",
       "restart_scope": [
@@ -25,7 +25,7 @@
     },
     {
       "component_id": "agentic-core",
-      "repository": "registry.neural-ice.ch/vendor/agentic-core",
+      "repository": "registry.example.test/vendor/agentic-core",
       "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "contract": "component-oci-v1",
       "restart_scope": [
@@ -40,7 +40,7 @@
     {
       "content_id": "model-gemma",
       "media_type": "application/vnd.oci.image.manifest.v1+json",
-      "repository": "registry.neural-ice.ch/vendor/models/gemma",
+      "repository": "registry.example.test/vendor/models/gemma",
       "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
       "contract": "content-oci-v1",
       "restart_scope": [

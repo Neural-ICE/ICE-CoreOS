@@ -1,0 +1,25 @@
+# THE INSTALLER'S FAILURE SINK. Isolating here is what a failed install reaches
+# instead of emergency.target (independent review 2026-09-02, P0 #1).
+#
+# 🔴 IT IS A SINK, NOT A RECOVERY MODE. It pulls exactly one output-only service
+# and nothing else: no getty, no login, no shell, no network, no OTA path and no
+# second attempt at the install. Every one of those units is masked by
+# image/installer/neural-ice-installer-runtime-generator on every medium boot,
+# Install included, so this target cannot acquire one by inheritance either.
+#
+# AllowIsolate=yes because neural-ice-autoinstall.service isolates onto it: an
+# isolation is what stops every other job on the machine, which is the property
+# `OnFailure=emergency.target` used to provide and is the only part of it worth
+# keeping.
+#
+# Any Requires=/Wants= added here is a new surface on a boot whose whole safety
+# argument is that it has none; image/test-installer-systemd-lifecycle.sh
+# enumerates this dependency set exactly and refuses any addition to it.
+[Unit]
+Description=Neural ICE installer failure sink (bounded evidence, then power off)
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+DefaultDependencies=no
+Requires=neural-ice-installer-failure.service
+After=neural-ice-installer-failure.service
+Conflicts=neural-ice-installer.target neural-ice-autoinstall.service neural-ice-live.target
+AllowIsolate=yes

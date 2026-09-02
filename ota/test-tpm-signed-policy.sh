@@ -25,8 +25,8 @@ LOOP=""
 PCR=7
 
 cleanup() {
-  [[ -e /dev/mapper/nitest ]] && cryptsetup close nitest 2>/dev/null || true
-  [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null || true
+  if [[ -e /dev/mapper/nitest ]]; then cryptsetup close nitest 2>/dev/null || true; fi
+  if [[ -n "$LOOP" ]]; then losetup -d "$LOOP" 2>/dev/null || true; fi
   rm -rf "$W"
   rm -f /run/systemd/tpm2-pcr-signature.json
 }

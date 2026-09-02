@@ -1,0 +1,241 @@
+# THE SEALED MEDIA COMMAND-LINE CORPUS — one file, four readers.
+#
+# image/test-installer-selector-grammar.sh drives every vector below through the
+# THREE implementations of the grammar that ship, plus the runtime generator's
+# actual mask/unmask output, and fails on any disagreement:
+#
+#   bash       image/installer/neural-ice-sealed-cmdline-grammar.sh  (producer,
+#              early runtime generator, and the installer's own revalidation)
+#   python     image/inspect-installer-media.py --classify-cmdline   (the
+#              off-device reader of a FINISHED medium, deliberately a second
+#              implementation in another language)
+#   installer  the revalidation function extracted verbatim out of
+#              ota/neural-ice-autoinstall.sh
+#
+# WHY THE CORPUS IS A FILE AND NOT A LIST IN ONE SUITE. Three readers agreeing is
+# only evidence if they are asked the same questions. A list living inside one
+# suite is a list only that suite can be wrong about.
+#
+# FORMAT, tab-separated:
+#   <expected>  <anchor>  <label>  <words>
+#
+#   expected  install | live | refuse:<stable-reason-token>
+#   anchor    yes       = prepend the eight sealed trust fields (lab-managed)
+#             customer  = the same eight, with access_profile=customer-locked
+#             no        = <words> is the whole command line, which is how the
+#                         missing-anchor cases are stated
+#   label     what the vector is about
+#   words     the rest of the sealed command line
+#
+# The refusal token is part of the contract: asserting the exact token is what
+# stops a future edit collapsing a specific refusal into a generic one and still
+# looking green.
+
+# --------------------------------------------------------------------------- #
+# THE TWO GRAMMARS A PRODUCER MAY CUT.
+# --------------------------------------------------------------------------- #
+install	yes	install: the exact produced Install line	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos@sha256:1111111111111111111111111111111111111111111111111111111111111111
+install	yes	install: without the optional OTA origin	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
+refuse:invalid-argument:neuralice.imgref	yes	origin: a MUTABLE TAG as the OTA origin every later upgrade follows	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos:stable
+live	yes	live: the exact produced Live line	quiet systemd.unit=neural-ice-live.target neuralice.live=1
+
+# --------------------------------------------------------------------------- #
+# THE REGISTRY-BACKED INSTALL. Supported, and only in exactly this shape.
+# --------------------------------------------------------------------------- #
+install	yes	registry: digest-pinned appliance image at the canonical authority	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+install	yes	registry: every argument the producer seals at once	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd neuralice.mirror_manifest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.mirror_generation=7
+install	yes	registry: with a lab-managed LAN mirror	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd neuralice.mirror_manifest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.mirror_generation=7
+install	yes	registry: mirror on an IPv4 literal with a port	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:3333333333333333333333333333333333333333333333333333333333333333 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=10.0.0.7:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd neuralice.mirror_manifest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.mirror_generation=7
+install	yes	registry: an explicit medium source is still a grammar	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.source=medium
+refuse:registry-source-without-osimage	yes	registry: source with no image to pull	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry
+refuse:osimage-without-registry-source	yes	registry: an image nothing will pull	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.osimage=release.example.test/neural-ice/x@sha256:4444444444444444444444444444444444444444444444444444444444444444
+refuse:mirror-without-registry-source	yes	registry: a mirror with no registry install	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.mirror=bench.example.test
+refuse:mirror-without-registry-source	yes	registry: a mirror on an explicit medium source	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=medium neuralice.mirror=bench.example.test
+refuse:invalid-argument:neuralice.osimage	yes	registry: MUTABLE TAG instead of a digest	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.osimage	yes	registry: a URL, not an image reference	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=https://release.example.test/neural-ice/x@sha256:5555555555555555555555555555555555555555555555555555555555555555 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.osimage	yes	registry: a short name with no authority	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=neural-ice-coreos@sha256:5555555555555555555555555555555555555555555555555555555555555555 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.osimage	yes	registry: single-label host is not an authority	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=registry/neural-ice/x@sha256:5555555555555555555555555555555555555555555555555555555555555555 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.osimage	yes	registry: a truncated digest	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:5555 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.osimage	yes	registry: a dotted quad with a bad octet is not an authority at all	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=10.0.0.300/neural-ice/x@sha256:6666666666666666666666666666666666666666666666666666666666666666 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.mirror	yes	registry: a mirror with a scheme	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:7777777777777777777777777777777777777777777777777777777777777777 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=http:__bench neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+refuse:invalid-argument:neuralice.mirror	yes	registry: a mirror port out of range	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:7777777777777777777777777777777777777777777777777777777777777777 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:70000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+refuse:duplicate-argument:neuralice.osimage	yes	registry: two appliance images	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:8888888888888888888888888888888888888888888888888888888888888888 neuralice.osimage=release.example.test/neural-ice/y@sha256:9999999999999999999999999999999999999999999999999999999999999999 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE ESCAPE THE INDEPENDENT REVIEW FOUND, AND ITS WHOLE FAMILY.
+#
+# Each of these was a validly signed medium under the previous three-word check.
+# `systemd.debug_shell` is the one that was demonstrated: systemd-debug-generator
+# starts an unauthenticated root shell on tty9, and the destructive installer is
+# then one command away.
+# --------------------------------------------------------------------------- #
+refuse:word-not-in-grammar:systemd.debug_shell	yes	ESCAPE: a root debug shell on a signed Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.debug_shell
+refuse:word-not-in-grammar:systemd.debug_shell	yes	ESCAPE: a root debug shell on a signed Install medium	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 systemd.debug_shell
+refuse:word-not-in-grammar:systemd.default_debug_tty	yes	ESCAPE: choosing the debug shell's tty	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.default_debug_tty=/dev/tty9
+refuse:word-not-in-grammar:init	yes	ESCAPE: init= replaces PID 1 outright	quiet systemd.unit=neural-ice-live.target neuralice.live=1 init=/bin/sh
+refuse:word-not-in-grammar:rd.break	yes	ESCAPE: rd.break drops to an initramfs shell	quiet systemd.unit=neural-ice-live.target neuralice.live=1 rd.break
+refuse:word-not-in-grammar:rd.break	yes	ESCAPE: rd.break at a named stage	quiet systemd.unit=neural-ice-live.target neuralice.live=1 rd.break=pre-pivot
+refuse:word-not-in-grammar:rd.shell	yes	ESCAPE: rd.shell on initramfs failure	quiet systemd.unit=neural-ice-live.target neuralice.live=1 rd.shell
+refuse:word-not-in-grammar:rd.systemd.unit	yes	ESCAPE: a second unit selection, in the initrd	quiet systemd.unit=neural-ice-live.target neuralice.live=1 rd.systemd.unit=emergency.target
+refuse:word-not-in-grammar:emergency	yes	ESCAPE: emergency	quiet systemd.unit=neural-ice-live.target neuralice.live=1 emergency
+refuse:word-not-in-grammar:rescue	yes	ESCAPE: rescue	quiet systemd.unit=neural-ice-live.target neuralice.live=1 rescue
+refuse:word-not-in-grammar:single	yes	ESCAPE: single	quiet systemd.unit=neural-ice-live.target neuralice.live=1 single
+refuse:word-not-in-grammar:S	yes	ESCAPE: the one-letter runlevel	quiet systemd.unit=neural-ice-live.target neuralice.live=1 S
+refuse:word-not-in-grammar:1	yes	ESCAPE: the SysV single-user runlevel	quiet systemd.unit=neural-ice-live.target neuralice.live=1 1
+refuse:word-not-in-grammar:systemd.mask	yes	ESCAPE: masking the diagnostics or a control unit	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.mask=neural-ice-live-diagnostics.service
+refuse:word-not-in-grammar:systemd.wants	yes	ESCAPE: pulling in an arbitrary unit	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.wants=debug-shell.service
+refuse:word-not-in-grammar:systemd.wants	yes	ESCAPE: pulling in a getty	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.wants=getty@tty2.service
+refuse:word-not-in-grammar:systemd.setenv	yes	ESCAPE: seeding the manager's environment	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.setenv=NEURALICE_SEALED_GRAMMAR=/tmp/x
+refuse:word-not-in-grammar:systemd.set_credential	yes	ESCAPE: seeding a manager credential	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.set_credential=x:y
+refuse:word-not-in-grammar:systemd.firstboot	yes	ESCAPE: forcing first-boot provisioning	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.firstboot=1
+refuse:word-not-in-grammar:systemd.condition_first_boot	yes	ESCAPE: forcing the first-boot condition	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.condition_first_boot=1
+refuse:word-not-in-grammar:systemd.confirm_spawn	yes	ESCAPE: an interactive spawn confirmation prompt	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.confirm_spawn=1
+refuse:word-not-in-grammar:selinux	yes	ESCAPE: SELinux disabled outright on Live	quiet systemd.unit=neural-ice-live.target neuralice.live=1 selinux=0
+refuse:word-not-in-grammar:selinux	yes	ESCAPE: SELinux disabled outright on Install	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 selinux=0
+refuse:word-not-permitted-in-mode	yes	ESCAPE: SELinux permissive on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 enforcing=0
+refuse:word-not-in-grammar:audit	yes	ESCAPE: auditing off	quiet systemd.unit=neural-ice-live.target neuralice.live=1 audit=0
+refuse:word-not-in-grammar:module_blacklist	yes	ESCAPE: blacklisting a module the sealed root needs	quiet systemd.unit=neural-ice-live.target neuralice.live=1 module_blacklist=dm_verity
+refuse:word-not-in-grammar:root	yes	ESCAPE: naming another root filesystem	quiet systemd.unit=neural-ice-live.target neuralice.live=1 root=/dev/sda2
+refuse:word-not-in-grammar:console	yes	ESCAPE: redirecting the console	quiet systemd.unit=neural-ice-live.target neuralice.live=1 console=ttyS0,115200
+refuse:word-not-in-grammar:systemd.log_level	yes	an argument that is merely not ours	quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.log_level=debug
+refuse:word-not-in-grammar:neuralice.tomorrow	yes	an argument invented after this grammar was written	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.tomorrow=1
+
+# --------------------------------------------------------------------------- #
+# MODE AMBIGUITY. A medium is ONE of the two grammars; a line that is both, half
+# of one, or neither is refused rather than resolved.
+# --------------------------------------------------------------------------- #
+refuse:mixed-mode-selector	yes	MIXED: a well-formed Install target that also claims Live	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.live=1
+refuse:mixed-mode-selector	yes	MIXED: a well-formed Live target that also claims Install	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.autoinstall=1
+refuse:ambiguous-boot-target	yes	MIXED: both signed targets on one line	quiet systemd.unit=neural-ice-installer.target systemd.unit=neural-ice-live.target neuralice.autoinstall=1 neuralice.live=1
+refuse:ambiguous-boot-target	yes	a second systemd.unit= the manager would resolve by itself	quiet systemd.unit=neural-ice-installer.target systemd.unit=multi-user.target neuralice.autoinstall=1
+refuse:ambiguous-boot-target	yes	no boot target at all	quiet neuralice.live=1
+refuse:ambiguous-boot-target	yes	no boot target on an Install claim	quiet neuralice.autoinstall=1
+refuse:unknown-boot-target	yes	a target that is neither signed grammar	quiet systemd.unit=multi-user.target neuralice.autoinstall=1
+refuse:unknown-boot-target	yes	the general default target	quiet systemd.unit=default.target neuralice.live=1
+refuse:missing-mode-selector	yes	the Live target with no affirmative Live selector	quiet systemd.unit=neural-ice-live.target
+refuse:missing-mode-selector	yes	the Install target with no affirmative selector	quiet systemd.unit=neural-ice-installer.target enforcing=0
+refuse:duplicate-mode-selector	yes	a duplicated Live selector	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.live=1
+refuse:duplicate-mode-selector	yes	a duplicated Install selector	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.autoinstall=1
+refuse:missing-mode-selector	yes	a Live selector that is not =1	quiet systemd.unit=neural-ice-live.target neuralice.live=0
+refuse:missing-mode-selector	yes	an Install selector that is not =1	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=0
+refuse:duplicate-word	yes	a duplicated quiet	quiet quiet systemd.unit=neural-ice-live.target neuralice.live=1
+
+# --------------------------------------------------------------------------- #
+# THE TRUST ANCHOR. Eight fields, each exactly once, in both modes.
+# --------------------------------------------------------------------------- #
+refuse:missing-sealed-field:neuralice.trust	no	no anchor at all	quiet systemd.unit=neural-ice-live.target neuralice.live=1
+refuse:duplicate-sealed-field:neuralice.rootverity	yes	a duplicated verity root hash	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.rootverity=1111111111111111111111111111111111111111111111111111111111111111
+refuse:duplicate-sealed-field:neuralice.access_profile	yes	a duplicated access profile	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.access_profile=lab-managed
+
+# --------------------------------------------------------------------------- #
+# SHAPE. What cannot have come out of installer_trust_render_cmdline.
+# --------------------------------------------------------------------------- #
+refuse:empty-cmdline	no	an empty command line
+refuse:unrepresentable-word	yes	a word outside the renderer's character class	quiet systemd.unit=neural-ice-live.target neuralice.live=1 x!y
+refuse:unrepresentable-word	yes	a word that is only an equals sign	quiet systemd.unit=neural-ice-live.target neuralice.live=1 =value
+refuse:invalid-argument:neuralice.target	yes	a wipe target that escapes /dev	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.target=/dev/../etc/x
+refuse:invalid-argument:neuralice.systemsize	yes	a system size below the floor	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=8
+refuse:word-not-permitted-in-mode	yes	an Install-only argument on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.target=/dev/nvme0n1
+refuse:word-not-permitted-in-mode	yes	an operator SSH key on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.sshkey=QUFB
+refuse:word-not-permitted-in-mode	yes	an OTA origin on a Live medium	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.imgref=release.example.test/neural-ice/x@sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE FAIL-CLOSED MEDIA MARKER (independent review 2026-09-02, P1 #6).
+#
+# Every vector below carries the SEALED TRUST ANCHOR and a selector that is
+# absent, misspelled or aimed at the wrong target. The grammar refuses all of
+# them -- it always did. What it could not do is stop the early runtime
+# generator from treating them as an INSTALLED APPLIANCE boot and emitting no
+# masks at all, because the generator's media marker recognised only the selector
+# words that these lines are missing.
+#
+# The marker is now the trust anchor itself, which only signed media can carry,
+# so the suite's `has_media_hint` says "this claims to be media" for every one of
+# these and then requires the FULL mask set: no default/multi-user/graphical
+# fallback, no installer, no root shell, no getty, no sshd.
+# --------------------------------------------------------------------------- #
+refuse:ambiguous-boot-target	yes	MARKER: the sealed anchor alone, with no selector or target at all	quiet
+refuse:missing-mode-selector	yes	MARKER: a misspelled Install selector	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstal=1
+refuse:unknown-boot-target	yes	MARKER: a misspelled Install target word	quiet systemd.unit=neural-ice-instaler.target neuralice.autoinstall=1
+refuse:unknown-boot-target	yes	MARKER: a misspelled Live target word	quiet systemd.unit=neural-ice-live-target neuralice.live=1
+refuse:missing-mode-selector	yes	MARKER: a misspelled Live selector	quiet systemd.unit=neural-ice-live.target neuralice.liv=1
+refuse:ambiguous-boot-target	yes	MARKER: the anchor plus an Install-only argument and nothing else	quiet neuralice.systemsize=100
+refuse:ambiguous-boot-target	yes	MARKER: the anchor plus an operator SSH key and no selector	quiet neuralice.sshkey=QUFB
+refuse:ambiguous-boot-target	yes	MARKER: the anchor plus enforcing=0 and no selector	quiet enforcing=0
+
+# --------------------------------------------------------------------------- #
+# 🔴 ONE CANONICAL ORIGIN, AND A MIRROR THAT IS ONLY TRANSPORT (independent
+# review 2026-09-02, P0 #3).
+#
+# The OS/source reference a medium may seal is exactly
+# `release.example.test/<repo>@sha256:<digest>`. A mutable tag, GHCR, an
+# example registry and a LAN host are all refused -- as ORIGINS. The mirror
+# names a lab-managed host that may SERVE those bytes, and it must additionally
+# seal the CA it is trusted with and the exact release-closure hash it declares
+# READY, so being reachable never makes it an authority.
+# --------------------------------------------------------------------------- #
+refuse:origin-not-the-release-authority:neuralice.osimage	yes	origin: GHCR is not the sealed release authority	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=ghcr.io/neural-ice/neural-ice-coreos@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:origin-not-the-release-authority:neuralice.osimage	yes	origin: an arbitrary private registry is not the sealed release authority	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=registry.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:origin-not-the-release-authority:neuralice.osimage	yes	origin: a look-alike authority is not the sealed one	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test.evil.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:origin-not-the-release-authority:neuralice.imgref	yes	origin: GHCR as the recorded OTA origin	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=ghcr.io/neural-ice/neural-ice-coreos@sha256:1111111111111111111111111111111111111111111111111111111111111111
+refuse:invalid-argument:neuralice.imgref	yes	origin: a bare repository name as the recorded OTA origin	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=neural-ice-coreos:stable
+refuse:registry-source-without-release-authorization	yes	registry: no release-authorization document is pinned	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222
+refuse:registry-source-without-release-authorization-signature	yes	registry: the document is pinned but its detached signature is not	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+refuse:release-authorization-hashes-identical	yes	registry: one hash pinned twice pins neither object	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+refuse:release-authorization-without-registry-source	yes	registry: an authorization pinned on a medium-source install	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:invalid-argument:neuralice.relauth_sha256	yes	registry: a truncated authorization hash	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=abcd neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:mirror-without-pinned-ca	yes	mirror: a mirror with no pinned CA	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:5000 neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+refuse:mirror-without-ready-closure-hash	yes	mirror: a mirror that declares no exact READY closure	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+refuse:mirror-pin-without-mirror	yes	mirror: a pinned CA with no mirror to pin it to	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+refuse:mirror-pin-without-mirror	yes	mirror: a READY closure hash with no mirror	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+refuse:mirror-is-the-release-authority	yes	mirror: the release authority is the origin, never a mirror of itself	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=release.example.test neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+
+# --------------------------------------------------------------------------- #
+# 🔴 A CUSTOMER APPLIANCE NEVER DEPENDS ON THE LAB. The mirror is the one
+# argument whose admissibility is a property of the sealed ACCESS PROFILE rather
+# than of its own value: the same well-formed host is transport on a lab-managed
+# medium and a lab host in a customer's boot path on a customer-locked one.
+# --------------------------------------------------------------------------- #
+install	customer	customer-locked: a registry install with no mirror is still fine	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:mirror-not-permitted-outside-lab-managed	customer	customer-locked: a LAN mirror on customer media	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+refuse:mirror-not-permitted-outside-lab-managed	customer	customer-locked: a fully pinned LAN mirror is still a LAN mirror	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=10.0.0.63:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE OFFLINE SEED'S RELEASE CLOSURE (independent review 2026-09-02, P0 #2).
+#
+# A medium install that carries a seed seals the closure hash the seed root is
+# NAMED by, so the installer can refuse a seed that is not the one this medium
+# was cut with. A registry install pulls its bytes and may not also carry one:
+# two unreconciled sources of the same objects is how "which bytes did we
+# install" stops having an answer.
+# --------------------------------------------------------------------------- #
+install	yes	seed: a medium install sealing its offline closure	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.seed_manifest=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff neuralice.seed_trusted_now=2026-09-02T07:00:00Z
+install	yes	seed: with an explicit medium source	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=medium neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.seed_manifest=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff neuralice.seed_trusted_now=2026-09-02T07:00:00Z
+refuse:seed-closure-without-trusted-time	yes	seed: closure without sealed verification time	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.seed_manifest=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+refuse:invalid-argument:neuralice.seed_closure	yes	seed: a truncated closure hash	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.seed_closure=eeee
+refuse:invalid-argument:neuralice.seed_closure	yes	seed: an uppercase closure hash	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.seed_closure=EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+refuse:duplicate-argument:neuralice.seed_closure	yes	seed: two closures on one medium	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.seed_closure=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+refuse:seed-closure-with-registry-source	yes	seed: an offline seed beside a registry pull	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+refuse:word-not-permitted-in-mode	yes	seed: an offline closure on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE RELEASE AUTHORITY IS SEALED, AND EVERY ORIGIN IS HELD TO IT.
+#
+# ICE-CoreOS is open core: ci/test-open-core-boundary.sh refuses the sovereign
+# endpoint's bytes in every Git-visible file, so the authority cannot be a
+# literal in this tree. It arrives on the SIGNED command line instead, and these
+# vectors are the contract that makes that equivalent to hardcoding it -- and
+# stronger, because it is one value the signature covers rather than a constant
+# a fork can edit.
+# --------------------------------------------------------------------------- #
+refuse:origin-without-release-authority:neuralice.osimage	yes	authority: an appliance image with no sealed authority to check it against	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+refuse:origin-without-release-authority:neuralice.imgref	yes	authority: an OTA origin with no sealed authority to check it against	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/x@sha256:1111111111111111111111111111111111111111111111111111111111111111
+refuse:seed-closure-without-release-authority	yes	authority: an offline seed with no sealed authority to verify it against	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.seed_closure=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+refuse:invalid-argument:neuralice.release_authority	yes	authority: an IPv4 literal is not a name a signature scope is written against	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=10.0.0.63
+refuse:invalid-argument:neuralice.release_authority	yes	authority: localhost is not a release authority	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=localhost
+refuse:invalid-argument:neuralice.release_authority	yes	authority: a single-label host is not a release authority	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=registry
+refuse:invalid-argument:neuralice.release_authority	yes	authority: a scheme is not a host	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=https:__release.example.test
+refuse:duplicate-argument:neuralice.release_authority	yes	authority: two release authorities on one line	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=release.example.test neuralice.release_authority=other.example.test
+refuse:origin-not-the-release-authority:neuralice.imgref	yes	authority: the OTA origin and the installed image disagree about the registry	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.release_authority=release.example.test neuralice.imgref=other.example.test/neural-ice/x@sha256:1111111111111111111111111111111111111111111111111111111111111111
+refuse:word-not-permitted-in-mode	yes	authority: a release authority on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.release_authority=release.example.test
+install	yes	authority: a lab mirror beside the sealed authority it is not	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/x@sha256:2222222222222222222222222222222222222222222222222222222222222222 neuralice.relauth_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa neuralice.relauth_sig_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb neuralice.mirror=bench.example.test:5000 neuralice.mirror_ca_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc neuralice.mirror_ready=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd neuralice.mirror_manifest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee neuralice.mirror_generation=7

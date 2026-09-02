@@ -69,7 +69,7 @@ OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 
 def host(digest: str = HOST_A) -> dict:
     return {
-        "repository": "registry.neural-ice.ch/neural-ice/neural-ice-appliance",
+        "repository": "registry.example.test/neural-ice/neural-ice-appliance",
         "digest": digest,
         "contract": "host-bootc-v1",
         "restart_scope": [],
@@ -81,7 +81,7 @@ def host(digest: str = HOST_A) -> dict:
 def api(digest: str = API_A, contract: str = "component-oci-v1") -> dict:
     return {
         "component_id": "icecore-api",
-        "repository": "registry.neural-ice.ch/neural-ice/icecore-api",
+        "repository": "registry.example.test/neural-ice/icecore-api",
         "digest": digest,
         "contract": contract,
         "restart_scope": ["icecore-api.service"],
@@ -95,7 +95,7 @@ def api(digest: str = API_A, contract: str = "component-oci-v1") -> dict:
 def agentic(digest: str = AGENT_A, scope: list[str] | None = None) -> dict:
     return {
         "component_id": "agentic-core",
-        "repository": "registry.neural-ice.ch/vendor/agentic-core",
+        "repository": "registry.example.test/vendor/agentic-core",
         "digest": digest,
         "contract": "component-oci-v1",
         "restart_scope": (
@@ -112,7 +112,7 @@ def gemma(scope: list[str] | None = None) -> dict:
     return {
         "content_id": "model-gemma",
         "media_type": OCI_MANIFEST,
-        "repository": "registry.neural-ice.ch/vendor/models/gemma",
+        "repository": "registry.example.test/vendor/models/gemma",
         "digest": GEMMA_A,
         "contract": "content-oci-v1",
         "restart_scope": ["sglang-inference.service"] if scope is None else scope,
@@ -125,7 +125,7 @@ def docs() -> dict:
     return {
         "content_id": "kb-corpus",
         "media_type": OCI_MANIFEST,
-        "repository": "registry.neural-ice.ch/neural-ice/kb/corpus",
+        "repository": "registry.example.test/neural-ice/kb/corpus",
         "digest": DOCS_A,
         "contract": "content-oci-v1",
         "restart_scope": [],

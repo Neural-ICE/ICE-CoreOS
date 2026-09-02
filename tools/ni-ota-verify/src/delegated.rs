@@ -25,6 +25,8 @@ use contract::{
 };
 
 pub(crate) const SNAPSHOT_DOMAIN: &[u8] = b"neural-ice:ota:delegation-snapshot:v1\0";
+pub(crate) const RELEASE_AUTHORIZATION_V2_DOMAIN: &[u8] =
+    b"neural-ice:ota:release-authorization:v2\0";
 const MAX_ARTIFACT: usize = 128 * 1024;
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0x800;
@@ -394,17 +396,32 @@ pub(crate) fn verify_signature(
     if let Err(reason) = validate_der_signature(der) {
         return Ok(Err(reason));
     }
-    let mut message = domain.to_vec();
-    let Some(payload) = payload.strip_suffix(b"\n") else {
-        return Ok(Err("canonical payload lacks LF".into()));
+    let message = match signing_bytes(domain, payload) {
+        Ok(message) => message,
+        Err(reason) => return Ok(Err(reason)),
     };
-    message.extend_from_slice(payload);
     let key = store.secure_temp_bytes("delegated-key", public_key)?;
     let message = store.secure_temp_bytes("delegated-message", &message)?;
     let encoded = encode_base64(der);
     let signature = store.secure_temp_bytes("delegated-signature-b64", encoded.as_bytes())?;
     let cosign = runner::cosign_path()?;
     runner::verify_blob(&cosign, key.path(), signature.path(), message.path())
+}
+
+/// Construct the one Fabric delegated-signature message. Canonical documents
+/// are stored with exactly one terminal LF, but that transport terminator is
+/// deliberately outside the domain-separated signature.
+pub(crate) fn signing_bytes(domain: &[u8], canonical_payload: &[u8]) -> Result<Vec<u8>, String> {
+    let Some(payload) = canonical_payload.strip_suffix(b"\n") else {
+        return Err("canonical payload lacks LF".into());
+    };
+    if payload.ends_with(b"\n") {
+        return Err("canonical payload has more than one terminal LF".into());
+    }
+    let mut message = Vec::with_capacity(domain.len() + payload.len());
+    message.extend_from_slice(domain);
+    message.extend_from_slice(payload);
+    Ok(message)
 }
 
 fn refusal(reason: String) -> Result<u8, InternalError> {

@@ -27,6 +27,18 @@ if preloaded_require_fresh_output_set "$work" candidate zstd-fast >/dev/null 2>&
   echo "stale final-media receipt was accepted" >&2
   exit 1
 fi
+rm -f "$work/candidate.img.final-media.json"
+
+# The sealed-core facts are an OUTPUT of the base media build (review 2026-09-01,
+# P1 #4): the finished raw's inspection reads them, so a stale one left by an
+# earlier build would hand the final gate another medium's expectations.
+touch "$work/candidate.img.sealed-core.json"
+if preloaded_require_fresh_output_set "$work" candidate zstd-fast >/dev/null 2>&1; then
+  echo "stale sealed-core facts were accepted" >&2
+  exit 1
+fi
+rm -f "$work/candidate.img.sealed-core.json"
+preloaded_require_fresh_output_set "$work" candidate zstd-fast
 
 if preloaded_require_fresh_output_set "$work" candidate invalid >/dev/null 2>&1; then
   echo "invalid compression was accepted" >&2

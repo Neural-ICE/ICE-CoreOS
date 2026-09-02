@@ -11,19 +11,19 @@
 > The "64k tested/QA" rationale below is superseded on the page-size point only.
 
 > **Amendment (2026-07-10, ICE-Fabric — uniform packaging & OTA)**: for the
-> **appliance fleet**, `bootc upgrade` now follows **`registry.neural-ice.ch`** (the
+> **appliance fleet**, `bootc upgrade` now follows **`registry.example.test`** (the
 > sovereign R2-backed registry), not GHCR directly. The OS image is still built and
 > published to `ghcr.io/neural-ice/neural-ice-coreos` (upstream + **public community
 > pull** — `bootc` from GHCR still works for open-core users), but it is **mirrored to
 > the sovereign registry** and the appliance's baked OTA imgref points there. Where this
-> ADR says "OTA from GHCR", read "GHCR for community; `registry.neural-ice.ch` for the
+> ADR says "OTA from GHCR", read "GHCR for community; `registry.example.test` for the
 > fleet" (ADR-0006/0007 sovereign egress).
 >
 > **Two migration caveats (Codex on the OTA PR — the baked imgref is set at INSTALL, day-2
 > `bootc upgrade` just follows it):**
 > 1. **Existing installs stay on GHCR** until migrated — the sovereign imgref is only baked into
 >    *new* installs. Migrate an already-installed appliance with a one-shot
->    `sudo bootc switch registry.neural-ice.ch/neural-ice/neural-ice-coreos:<channel>` (can be
+>    `sudo bootc switch registry.example.test/neural-ice/neural-ice-coreos:<channel>` (can be
 >    OTA-delivered). Until then it keeps polling GHCR (which still works — no regression).
 > 2. **Promoted channels carry the build channel's baked imgref** — `promote.yml` re-tags a
 >    validated digest across channels by *copy* (ADR-0005: no rebuild), so a promoted `:stable`

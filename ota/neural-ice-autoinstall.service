@@ -1,20 +1,46 @@
 [Unit]
-Description=Neural ICE - automatic install to internal disk (GRUB "Install" entry)
+Description=Neural ICE - automatic install to internal disk (signed installer target)
 Documentation=https://github.com/Neural-ICE/ICE-CoreOS
-# Runs ONLY when the GRUB "Install" entry was selected.
-ConditionKernelCommandLine=neuralice.autoinstall
 # basic.target, NOT multi-user.target: the live env's dbus stack is broken
 # (dbus-broker crash-loop) and wedges multi-user.target forever — the install
-# must not depend on it. Nothing in the install path needs dbus or network
-# (TPM via /dev/tpmrm0, podman runs systemd-decoupled, air-gapped by design).
+# must not depend on it. The medium path is air-gapped; registry mode may start
+# networking explicitly as an autoinstall dependency, never as appliance
+# readiness. TPM access remains direct via /dev/tpmrm0.
 # getty@tty1 is condition-skipped on install boots (see the getty drop-in),
 # so it can never race us for the console mid-install.
 After=basic.target
+Before=neural-ice-installer.target
 Conflicts=getty@tty1.service
+# 🔴 THE FAILURE SINK IS OUTPUT-ONLY (independent review 2026-09-02, P0 #1).
+# This was `OnFailure=emergency.target`, and the early runtime generator unmasked
+# emergency/rescue/debug-shell on every Install boot so that sink would resolve.
+# So every preflight, authorisation, pull, storage, TPM and deployment failure
+# ended on a root shell on tty1. Authorisation to wipe ONE disk is not
+# authorisation to receive a root shell over the whole machine.
+#
+# neural-ice-installer-failure.target pulls exactly one service: it prints a
+# bounded, fixed-vocabulary failure code with no operator input, no shell and no
+# customer data, and powers the machine off after the delay the signed read-only
+# /usr states. The isolate is kept -- stopping every other job is the one part of
+# the previous behaviour that was worth having.
+OnFailure=neural-ice-installer-failure.target
+OnFailureJobMode=isolate
 
 [Service]
 Type=oneshot
 RemainAfterExit=true
+# The failure evidence the sink reads. systemd creates it root-only BEFORE
+# ExecStart, so the installer's `die` only ever writes a file into a directory
+# that already exists with the right mode -- there is no directory creation on
+# the failure path. RuntimeDirectoryPreserve=yes is what lets the sink read it
+# after this unit has failed and been stopped.
+RuntimeDirectory=neural-ice-installer-failure
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# Conditions are intentionally not used here: a skipped required service is not
+# a failure.  This executable preflight makes an absent, duplicated or partial
+# signed selector fail the required installer target and isolate recovery.
+ExecStartPre=/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check
 # The TPM char device is udev-driven; make sure it exists before preflight.
 # Accept either node — the installer's own TPM preflight takes tpmrm0 OR tpm0.
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do { [ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ]; } && exit 0; sleep 1; done; echo "no /dev/tpmrm0 or /dev/tpm0" >&2; exit 1'
@@ -29,4 +55,4 @@ TTYVHangup=yes
 TimeoutStartSec=0
 
 [Install]
-WantedBy=basic.target
+RequiredBy=neural-ice-installer.target

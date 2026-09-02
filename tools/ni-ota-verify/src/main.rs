@@ -22,14 +22,17 @@
 //!   2  internal error (missing cosign, unreadable config, …) — ALWAYS,
 //!      regardless of mode: broken tooling never passes (fail-closed).
 
+mod access_profile_anchor;
 mod atomic_state;
 mod bootstrap;
 mod commit;
 mod config;
 mod delegated;
+mod device_policy;
 mod record;
 mod release_manifest;
 mod runner;
+mod seed_closure;
 mod state;
 mod state_v1;
 mod time_challenge;
@@ -55,14 +58,18 @@ const USAGE: &str = "usage:
                           --current-seed-ref <40-hex-commit>
                           [--config /etc/neural-ice/ota.conf]
                           [--device-compat <min,max>] [--applied-state <path>]
-  ni-ota-verify commit --bom <path> [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
+  ni-ota-verify commit --bom <path> [--active-ring <lab|beta|stable>
+                       --previous-ring <lab|beta|stable>]
+                       [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
   ni-ota-verify commit-state-v2 --bom <path> --release <path> --release-sig <path>
                        --snapshot <path> --snapshot-sig <path>
                        --trusted-time <path> --trusted-time-sig <path>
+                       --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify guard-state-v2 --bom <path> --release <path> --release-sig <path>
                        --snapshot <path> --snapshot-sig <path>
                        --trusted-time <path> --trusted-time-sig <path>
+                       --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify prepare-trusted-time-v2 --snapshot <path> --snapshot-sig <path>
                        --release <path> --release-sig <path>
@@ -77,18 +84,32 @@ const USAGE: &str = "usage:
                        --receipt <path> --receipt-sig <path> --trusted-now <UTC-seconds>
                        --accepted-snapshot <path>
                        --accepted-delegation-seq <n> --accepted-delegation-sha256 <64hex>
+                       --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify verify-delegated-usb --snapshot <path> --snapshot-sig <path>
                        --release <path> --release-sig <path> --bom <path>
                        --record <path> --attestation <path> --attestation-sig <path>
                        --bundle-digest <sha256:...>
                        --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
-                       --trusted-now <UTC-seconds>
+                       --trusted-now <UTC-seconds> --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
   ni-ota-verify release-plan --current <path> --candidate <path>
+                       --registry-host <canonical OCI authority>
                        --hardware-target <id> --reader-version <n>
                        --supported-contracts <id[,id...]>
+  ni-ota-verify verify-seed-closure --seed-root <dir named by the closure hex>
+                       --pubkey <release public key PEM>
+                       --registry-host <canonical OCI authority>
+                       --hardware-target <id> --access-profile <p>
+                       --device-channel <lab|beta|stable>
+                       --trust-policy-id <id>
+                       --expect-manifest <sha256:64-lowercase-hex>
+                       --trusted-now <YYYY-MM-DDTHH:MM:SSZ>
+                       --pcr-policy-digest <64hex> --pcr-policy-public-key-sha256 <64hex>
+                       --pcr-policy-signature-sha256 <64hex> --pcr-policy-seq <n>
+                       --expect-closure <sha256:64-lowercase-hex>
   ni-ota-verify capabilities
+  ni-ota-verify device-policy [--config /etc/neural-ice/ota.conf]
   ni-ota-verify --version";
 
 /// Environment/tooling failure — never a verification verdict. Always mapped
@@ -114,21 +135,20 @@ fn run() -> u8 {
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
         Some("release-plan") => release_plan(&args[1..]),
+        Some("verify-seed-closure") => seed_closure::run(&args[1..]),
+        Some("device-policy") => device_policy::run(&args[1..]),
         Some("capabilities") if args.len() == 1 => {
+            // Capability discovery is side-effect free and must work before
+            // device configuration exists. Atomic state remains conditional;
+            // the two ring contracts are implemented by this binary itself.
             let capability_ready =
-                match state_v1::capability_ready(std::path::Path::new(DEFAULT_CONFIG)) {
-                    Ok(ready) => ready,
-                    Err(InternalError(message)) => {
-                        eprintln!("ni-ota-verify: internal error: {message}");
-                        return EXIT_INTERNAL;
-                    }
-                };
+                state_v1::capability_ready(std::path::Path::new(DEFAULT_CONFIG)).unwrap_or(false);
             if capability_ready {
                 println!(
-                    "{{\"schema\":1,\"features\":[\"atomic-state-v1\",\"bundle-digest-v1\"]}}"
+                    "{{\"features\":[\"atomic-state-v1\",\"bundle-digest-v1\",\"delegated-rings-v1\",\"transactional-ring-state-v1\"],\"schema\":1}}"
                 );
             } else {
-                println!("{{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}}");
+                println!("{{\"features\":[\"bundle-digest-v1\",\"delegated-rings-v1\",\"transactional-ring-state-v1\"],\"schema\":1}}");
             }
             return EXIT_PASS;
         }
@@ -153,9 +173,9 @@ fn run() -> u8 {
 /// `release-plan` — the only I/O the release-manifest reader gets: read two
 /// local files, hand the bytes to the pure planner, print the canonical plan.
 ///
-/// Device capabilities are explicit arguments, never sniffed from the
-/// environment, so an operator can reproduce a device's plan off-device from
-/// the same two manifests.
+/// Registry authority and device capabilities are explicit arguments, never
+/// sniffed from the environment, so an operator can reproduce a device's plan
+/// off-device from the same two manifests.
 ///
 /// No download, staging, activation, `bootc` or reboot happens here or
 /// downstream of here: a plan is a statement about two documents.
@@ -168,6 +188,7 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
         &[
             "current",
             "candidate",
+            "registry-host",
             "hardware-target",
             "reader-version",
             "supported-contracts",
@@ -181,6 +202,7 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
 
     let current_path = required("current")?;
     let candidate_path = required("candidate")?;
+    let registry_host = required("registry-host")?;
     let hardware_target = required("hardware-target")?.clone();
     let reader_version: u64 = required("reader-version")?.parse().map_err(|_| {
         InternalError("--reader-version must be a non-negative integer".to_string())
@@ -225,6 +247,7 @@ fn release_plan(args: &[String]) -> Result<u8, InternalError> {
             reader_version,
             supported_contracts,
         },
+        Some(registry_host),
     );
     // stdout carries the plan even on a refusal: the reason is the useful part.
     print!("{}", String::from_utf8_lossy(&plan.to_canonical_json()));

@@ -99,6 +99,25 @@ for d in image/rpms image/nvidia-userspace image/signed-boot; do
   fi
 done
 
+# The two staged inputs the installer TRUST construction cannot work without
+# (docs/ADR-0015). They are git-ignored on purpose: a fingerprint nobody measured
+# and a key nobody generated are worse than none, because they look like checks.
+# `COPY` would fail on them anyway; failing HERE says which one and why.
+if [ ! -s image/keys/release-authorization.pub ]; then
+  echo "ERROR: no release-authorization public key staged at image/keys/release-authorization.pub." >&2
+  echo "       The installer seals its SHA-256 in the signed UKI and refuses a registry" >&2
+  echo "       install without it. Stage the public half of the release-authorization key." >&2
+  exit 3
+fi
+_hw_target="$(tr -d '[:space:]' < image/bootc-overlay/usr/lib/neural-ice/hardware-target)"
+if [ ! -s "image/hardware-identity/${_hw_target}.fingerprints" ]; then
+  echo "ERROR: no measured-identity list at image/hardware-identity/${_hw_target}.fingerprints." >&2
+  echo "       A hardware target no machine can be measured against is a word, not a binding." >&2
+  echo "       Produce it with 'bash image/lib/hardware-identity.sh fingerprint' ON the" >&2
+  echo "       reference appliance — see image/hardware-identity/README.md." >&2
+  exit 3
+fi
+
 # Directory presence is not provenance. Require the finalized generation
 # metadata, re-hash every byte and re-check the signed vmlinuz binding before
 # podman receives the build context.
@@ -176,6 +195,15 @@ BUILD_ARGS=(
   --build-arg "NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}"
   --build-arg "OTA_IMGREF=${REF}:${SEMVER}"
   --build-arg "OS_VERSION=${SEMVER}"
+  # 🔴 PASSED, not merely labelled. This value is VERIFIED above by the trust
+  # policy that approved the staged signed-boot tree, and it was then used only
+  # as an OCI label — metadata anyone can set — while the FILE the installer
+  # actually cross-checks
+  # (/usr/lib/neural-ice/signed-boot-trust-policy-id) silently kept the
+  # Containerfile's `lab-v1` default. An image whose label and whose immutable
+  # marker name different policies is an image whose two halves disagree about
+  # which chain signed it, and the medium seals the marker.
+  --build-arg "SIGNED_BOOT_TRUST_POLICY_ID=${SIGNED_BOOT_TRUST_POLICY_ID}"
   # Ancre de confiance de l heure fiable : elle vient de la CONFIGURATION du
   # depot, jamais du source — c est ce qui garde l open-core neutre.
   # `:-` deliberement : ce script tourne en `set -u`, et le harnais de contrat
@@ -197,6 +225,19 @@ fi
   -f image/Containerfile.bootc \
   -t "${REF}:${SEMVER}" \
   .
+
+# READ THE MARKER BACK off the built image. The build argument above and the
+# label are two statements about the same thing; this asserts the third — the
+# file in the read-only /usr that the installer's sealed anchor is compared
+# against — actually says the same word. The whole defect this replaces was a
+# silent disagreement between exactly these three.
+built_policy_id="$("${PODMAN[@]}" run --rm --entrypoint '' --net=none "${REF}:${SEMVER}" \
+  cat /usr/lib/neural-ice/signed-boot-trust-policy-id 2>/dev/null | tr -d '[:space:]')"
+if [ "$built_policy_id" != "$SIGNED_BOOT_TRUST_POLICY_ID" ]; then
+  echo "ERROR: the built image states trust policy '${built_policy_id:-none}' but the verified staged artifacts report '${SIGNED_BOOT_TRUST_POLICY_ID}'." >&2
+  exit 3
+fi
+echo "==> immutable signed-boot trust policy marker: ${built_policy_id}"
 
 echo "SEMVER=${SEMVER}"
 echo "REF=${REF}"
@@ -227,6 +268,17 @@ if [ "$PUSH" = "1" ]; then
   [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || { echo "ERROR: push returned invalid digest '$DIGEST'" >&2; exit 4; }
   echo "DIGEST=${DIGEST}"
+  # 🔴 THE PUBLICATION SHAPE, SAID OUT LOUD (review 2026-09-01, P1 #5). `podman
+  # push` of a single-platform build publishes ONE arm64 manifest, so the
+  # repository digest printed above and the platform manifest digest are the SAME
+  # object. An installer release authorization describing this artefact must
+  # therefore declare `image_publication_shape: "single-manifest"` and repeat that
+  # digest in BOTH `image_index_digest` and `image_manifest_digest`
+  # (image/lib/release-authorization.sh). Declaring `index` here, or splitting the
+  # digests, is refused by the parser -- as is declaring `single-manifest` for a
+  # real multi-arch index, which still needs a distinct, recursively signed index
+  # and child.
+  echo "PUBLICATION_SHAPE=single-manifest"
   cleanup_digest_file
   trap - EXIT
 fi
