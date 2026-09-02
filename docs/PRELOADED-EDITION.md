@@ -5,29 +5,30 @@ Two installer editions from the **same** codebase and the **same** OS image:
 | Edition | Size | Contents | For |
 |---|---|---|---|
 | **light** (`./image/build-installer-usb.sh`) | ~1.4 GB | OS only → workload images + models pulled post-install (registry / HF) | good bandwidth |
-| **preloaded** (`./image/build-preloaded.sh`) | ~48 GB (zstd) | light installer **+ a `ni-seed` GPT partition**: a READY podman overlay image store + base models | poor bandwidth / air-gap / fast dev iteration |
+| **preloaded** (`./image/build-preloaded.sh`) | release-dependent | light installer **+ a `ni-seed` GPT partition** carrying one signed Fabric release pack and its digest-addressed closure | poor bandwidth / air-gap |
 
-## Key design decision — seed partition on the INSTALLER, zero first-boot import
+## Seed v2 lifecycle
 
-The OS image stays **LIGHT in both editions**, so **OTA updates stay small** (bootc never ships the
-seed). The preload is a one-shot install-time seed carried by the *installer media only*, and the
-expensive work happens **once on the build host, never on the target device**:
+The OS image stays light in both editions. The preload is a transport, never an authority and never
+an already-trusted containers-storage graphroot:
 
-1. **Container images** — `image/build-preloaded.sh` runs `podman --root <tmp> load` on the build
-   host for each workload image archive (`SEED_IMAGES=…/*.tar`), producing a **ready overlay
-   store** (untar + sha256 done here). Refs are preserved so Quadlets resolve them offline.
-2. **Base models** — copied from `SEED_MODELS` (a local Hugging Face hub staging directory) into
-   the seed. Only openly redistributable model files belong in the seed; anything gated or
-   restricted must be pulled post-install through its own channel. `SEED_MODELS` may be a stable
-   symlink; the builder resolves it once before sizing and copying so partition capacity is based
-   on the real model tree, not on the symlink inode.
-3. The script grows the light raw, appends a **`ni-seed` GPT partition** (xfs, sized from the
-   EXTRACTED store + models + headroom) and copies both payloads in.
-4. After the writable build loop is detached, a Linux-only final-media gate locks and retains a
+1. Fabric produces a canonical release manifest, recursive OCI release closure, root-signed
+   delegation snapshot, delegated release authorization and detached signatures. The authorization
+   binds the exact manifest and closure plus the signed PCR-policy generation. The sealed device
+   channel defaults to `lab` for the initial `.67` installer and must equal the authorization's
+   signed `ring`; only the Fabric-defined `lab|beta|stable` values are accepted.
+2. `image/build-seed-v2.sh` copies the exact closed object set to
+   `seed/<release-closure-sha256>/objects/sha256/<digest>`, calls `ni-ota-verify` before publication,
+   and writes the non-authoritative `READY` crash marker last. No registry `index.json`, tag or loose
+   model path is an authority input.
+3. `image/build-preloaded.sh` adds that tree as the sole contents of the **`ni-seed`** partition.
+   Its deterministic tree manifest records every object size/hash. The final-media receipt binds
+   that manifest, the seed partition identity, both release hashes, and the raw/archive identities.
+4. After the writable build loop is detached, the Linux-only final-media gate locks and retains a
    descriptor for the exact raw, creates its own private mount namespace, then reopens that inode
    with a read-only loop. It selects the `ni-seed` child partition from that loop (never from a
-   global label link), mounts XFS `ro,nosuid,nodev,noexec`, closes the root namespace to exactly
-   `models`, `store` and the optional approved `payload`, and recreates the complete tree manifest.
+   global label link), mounts XFS `ro,nosuid,nodev,noexec`, enforces the seed-v2 root shape and
+   recreates the complete tree manifest.
    The build refuses unless every file digest, directory, symlink, hard-link relation, OCI overlay
    whiteout (`c 0:0` only), owner, mode and xattr matches the approved source manifest and the raw
    SHA-256 is unchanged before/after. Other device nodes, FIFOs and sockets are rejected.
@@ -46,20 +47,33 @@ expensive work happens **once on the build host, never on the target device**:
    arguments: a final gate that can be invoked without inspecting what the medium boots is not a
    gate. The receipt (now `neural-ice-preloaded-final-media-receipt-v2`) records the result under
    `sealed_core`.
-5. **`ota/neural-ice-autoinstall.sh`** (seed step, only when `/dev/disk/by-partlabel/ni-seed`
-   exists): after `bootc install`, it copies the ready store onto the encrypted data volume as
-   `/var/lib/neural-ice/data/seed-store` (SELinux-labelled `container_ro_file_t`) and the models
-   into `data/huggingface`. The image's `storage.conf.d` drop-in registers `seed-store` as a
-   **READ-ONLY `additionalimagestores`** — the device sees the images INSTANTLY at first boot:
-   no `podman load`, no import, no pull.
+5. Before destructive installation, the autoinstaller verifies the complete pack from the mounted
+   seed. It copies the still-non-authoritative bytes to encrypted persistent storage and re-verifies
+   them there. The previous installed generation is not touched.
+6. On first boot, `neural-ice-seed-import.service` re-verifies again with networking denied, builds
+   a candidate containers-storage generation with `skopeo --preserve-digests`, reads every imported
+   root digest back, constructs content/model CAS generations from signed manifest references,
+   relabels the store, fsyncs receipts and directories, then atomically switches all `current`
+   pointers. `OFFLINE-READY` is written last. A crash or refusal before that point leaves the prior
+   generation selected; an exact retry reuses a complete generation.
 
 **Invariant (learned in the field):** the `additionalimagestores` path MUST exist on every edition —
 containers-storage hard-fails on a missing path. It is guaranteed three ways: baked into the image,
 tmpfiles.d recreation, and an unconditional `mkdir` in the autoinstall (LIGHT gets an empty store).
 
-Result: first boot starts with **no downloads**. Later updates flow normally (bootc OTA + regular
-registry/model pulls). Contrast with bootc *Logically Bound Images*, which bind images to the OS
-image and would bloat every OTA — rejected for that reason.
+Result: no network is permitted during admission or import. Workloads become offline-ready only
+after complete verification, import, relabel, readback and atomic publication.
+The P0 seed is self-sufficient: its signed closure supplies the OS pack, every P0 image, payload,
+required content and vLLM model objects. SGLang is outside P0. A Zot mirror such as `.63` can be an
+optional digest-pinned cache, but is never a first-boot dependency or alternate authority.
+
+Each validated model card uses the closed JSON schema
+`neural-ice-hf-cache-model-card-v1`, with exactly `cache_directory`, `card_id`, `files`, `model`,
+`revision`, and `schema`. Every sorted `files` entry has exactly `path`, `sha256`, and `size`.
+It is carried without extending Fabric's closure schema: a standard `oci-artifact` root manifest
+has artifact type `application/vnd.neural-ice.hf-cache-model-card.v1`, the card JSON is its typed
+config, and the model bytes are typed layers. Thus the existing signed root and recursive OCI
+edges authenticate every byte and the importer never trusts an unbound loose file path.
 
 ## Compression — `COMPRESS` (speed vs size lever)
 The raw→archive compression is the build bottleneck (a ~110 GiB raw).
@@ -72,8 +86,17 @@ The raw→archive compression is the build bottleneck (a ~110 GiB raw).
 ## Build (on a self-hosted ARM64 runner with the seed staged locally)
 
 ```sh
-SEED_IMAGES=$HOME/ice-seed/images \
-SEED_MODELS=$HOME/ice-seed/models \
+SEED_RELEASE_MANIFEST=/release/release-manifest.json \
+SEED_RELEASE_CLOSURE=/release/release-closure.json \
+SEED_RELEASE_AUTHORIZATION=/release/release-authorization.json \
+SEED_RELEASE_AUTHORIZATION_SIGNATURE=/release/release-authorization.json.sig \
+SEED_DELEGATION_SNAPSHOT=/release/delegation-snapshot.json \
+SEED_DELEGATION_SIGNATURE=/release/delegation-snapshot.json.sig \
+SEED_OBJECTS=/release/objects/sha256 \
+SEED_HF_CACHE=/cache/huggingface/hub \
+SEED_MODEL_PROFILES=/fabric/config/inference/model-profiles.json \
+SEED_MODEL_CATALOGUE=/fabric/config/inference/model-catalogue.json \
+DEVICE_CHANNEL=lab \
 BASE_IMAGE=registry.example.test/neural-ice/neural-ice-appliance@sha256:<train-digest> \
 SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
 SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \

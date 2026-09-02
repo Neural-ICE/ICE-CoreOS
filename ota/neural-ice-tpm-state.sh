@@ -23,6 +23,9 @@
 #   0x01500005  THE SEALED RECORD (64 bytes, WRITE-ONCE). Magic and the digest
 #               that binds this machine's access profile, hardware target and
 #               Secure Boot trust policy. The remaining bytes are fixed zeroes.
+#   0x01500007  PCR POLICY COUNTER (`nt=counter`). Its absolute value is the
+#               high-water of signed PolicyAuthorize generations activated for
+#               LUKS. It advances only after both enrolled tokens read back.
 #
 # Neither index overlaps the OTA state indices (0x01500001 legacy floor,
 # 0x01500002 atomic state-v1) or the device-root/PKI persistent handles.
@@ -103,6 +106,7 @@ readonly COUNTER_INDEX="0x01500003"
 readonly FRESHNESS_INDEX="0x01500004"
 readonly RECORD_INDEX="0x01500005"
 readonly COMPLETION_INDEX="0x01500006"
+readonly PCR_POLICY_INDEX="0x01500007"
 readonly RECORD_BYTES=64
 readonly RECORD_MAGIC="NI-TPM02"
 readonly COMPLETION_MAGIC="NI-DONE1"
@@ -159,6 +163,8 @@ die() { printf 'neural-ice-tpm-state: refused: %s\n' "$*" >&2; exit 1; }
 if [[ -n "${NI_TPM_STATE_TEST_TOOLS:-}" ]]; then
   [[ "${NI_TPM_STATE_TESTING:-}" == 1 && "$EUID" -ne 0 ]] \
     || die "test tool override is forbidden in a privileged process"
+  [[ ! -e /usr/lib/neural-ice/release-image ]] \
+    || die "test tool override is forbidden in a release image"
   readonly TOOL_DIR="$NI_TPM_STATE_TEST_TOOLS"
   readonly RUN_DIR="${NI_TPM_STATE_TEST_RUN_DIR:?test run directory is required}"
 else
@@ -166,6 +172,30 @@ else
   readonly TOOL_DIR="/usr/bin"
   readonly RUN_DIR="/run/neural-ice-tpm-state"
 fi
+
+# The tpm2_nvreadpublic parser is shared with the initramfs high-water hook
+# (image/lib/tpm2-nv-public.sh): one grammar, one answer, both inside the signed
+# image. The test seam resolves it beside this file in the source tree.
+if [[ -n "${NI_TPM_STATE_TEST_TOOLS:-}" ]]; then
+  NV_PUBLIC_PARSER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../image/lib/tpm2-nv-public.sh"
+else
+  NV_PUBLIC_PARSER="/usr/lib/neural-ice/lib/tpm2-nv-public.sh"
+fi
+readonly NV_PUBLIC_PARSER
+[[ -r "$NV_PUBLIC_PARSER" ]] || die "the tpm2_nvreadpublic parser is unavailable: $NV_PUBLIC_PARSER"
+# shellcheck source=image/lib/tpm2-nv-public.sh
+source "$NV_PUBLIC_PARSER"
+
+# $1=index -> "attributes size policy name" exactly as the shared parser emits
+# them, or a refusal: an index the TPM will not describe, or a public area that
+# is not the tpm2-tools contract, is not state this appliance may reason about.
+nv_public_contract() {
+  local public
+  public="$("$(tool tpm2_nvreadpublic)" "$1" 2>/dev/null)" \
+    || die "the TPM will not describe $1"
+  ni_tpm2_nv_public_parse "$1" <<<"$public" \
+    || die "$1 does not present the tpm2_nvreadpublic public-area contract"
+}
 
 tool() {
   local path="$TOOL_DIR/$1"
@@ -276,11 +306,10 @@ index_present() { # $1=index
 # shape assertion because the DYNAMIC bits are read for two different questions:
 # "is this the index this appliance defined" and "has it been finished".
 index_raw_attributes() { # $1=index -> decimal
-  local public attributes
-  public="$("$(tool tpm2_nvreadpublic)" "$1" 2>/dev/null)" \
-    || die "the TPM will not describe $1"
-  attributes="$(awk '/value: 0x/{v=$2} END{print v}' <<<"$public")"
-  [[ "$attributes" =~ ^0x[0-9a-fA-F]+$ ]] || die "$1 reports no usable attributes"
+  local contract attributes _size _policy _name
+  contract="$(nv_public_contract "$1")" || exit 1
+  read -r attributes _size _policy _name <<<"$contract"
+  [[ "$attributes" =~ ^0x[0-9a-f]+$ ]] || die "$1 reports no usable attributes"
   printf '%s\n' "$(( 16#${attributes#0x} ))"
 }
 
@@ -291,18 +320,15 @@ index_raw_attributes() { # $1=index -> decimal
 # is right and whose HISTORY is wrong -- written but never locked -- is not a
 # record this appliance may act on.
 assert_index_shape() {
-  local public attributes policy size raw required=${5:-0}
-  public="$("$(tool tpm2_nvreadpublic)" "$1" 2>/dev/null)" \
-    || die "the TPM will not describe $1"
-  attributes="$(awk '/value: 0x/{v=$2} END{print v}' <<<"$public")"
-  [[ "$attributes" =~ ^0x[0-9a-fA-F]+$ ]] || die "$1 reports no usable attributes"
+  local contract attributes policy size _name raw required=${5:-0}
+  contract="$(nv_public_contract "$1")" || exit 1
+  read -r attributes size policy _name <<<"$contract"
+  [[ "$attributes" =~ ^0x[0-9a-f]+$ ]] || die "$1 reports no usable attributes"
   raw=$(( 16#${attributes#0x} ))
   (( ( raw & ~ATTRIBUTE_DYNAMIC_MASK ) == 16#${2#0x} )) \
     || die "$1 carries attributes $attributes, not the $2 this appliance defines; an index redefined with different authorization is not this machine's state"
-  policy="$(awk '/authorization policy:/{print tolower($3)}' <<<"$public")"
   [[ "$policy" == "$3" ]] \
     || die "$1 carries authorization policy '${policy:-none}', not the one this appliance defines"
-  size="$(awk '/^  size:/{print $2}' <<<"$public")"
   [[ "$size" == "$4" ]] || die "$1 is ${size:-unknown} bytes, not $4"
   if (( required != 0 )); then
     (( ( raw & required ) == required )) \
@@ -535,6 +561,76 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
 }
 
 # --------------------------------------------------------------------------- #
+# pcr-policy-check / pcr-policy-activate — signed PCR policy anti-replay.
+# Check is read-only and runs before LUKS enrollment. Activate is the only
+# writer and is called only after both signed-policy tokens were enrolled and
+# read back successfully by systemd-cryptenroll.
+# --------------------------------------------------------------------------- #
+validate_pcr_policy_seq() {
+  if ! [[ "$1" =~ ^[1-9][0-9]{0,15}$ ]] || (( 10#$1 > MAX_SAFE_INTEGER )); then
+    die "'$1' is not a valid signed PCR policy sequence"
+  fi
+}
+
+pcr_policy_current() {
+  index_present "$PCR_POLICY_INDEX" \
+    || die "the PCR policy high-water is absent; signed physical recovery is required"
+  assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
+  counter_value "$PCR_POLICY_INDEX"
+}
+
+pcr_policy_check() { # $1=signed candidate sequence
+  (( $# == 1 )) || die "pcr-policy-check requires exactly one signed policy sequence"
+  validate_pcr_policy_seq "$1"
+  local requested=$((10#$1)) current index
+  with_workspace; compute_policies
+  if index_present "$PCR_POLICY_INDEX"; then
+    current="$(pcr_policy_current)"
+  else
+    [[ "$(owner_auth_set)" == 0 ]] \
+      || die "the PCR policy high-water is absent after owner authorization was sealed"
+    for index in "$COUNTER_INDEX" "$FRESHNESS_INDEX" "$RECORD_INDEX" "$COMPLETION_INDEX"; do
+      ! index_present "$index" \
+        || die "PCR policy state is absent while another appliance state index exists"
+    done
+    current=0
+  fi
+  (( requested > current )) \
+    || die "refusing signed PCR policy sequence $requested at or below high-water $current"
+  (( requested - current <= MAX_FRESHNESS_GAP )) \
+    || die "signed PCR policy sequence $requested is more than $MAX_FRESHNESS_GAP ahead of high-water $current"
+  printf '%s\n' "$current"
+}
+
+pcr_policy_activate() { # $1=signed sequence whose two LUKS tokens succeeded
+  (( $# == 1 )) || die "pcr-policy-activate requires exactly one signed policy sequence"
+  validate_pcr_policy_seq "$1"
+  local requested=$((10#$1)) current step newly_defined=0
+  with_workspace; compute_policies
+  if index_present "$PCR_POLICY_INDEX"; then
+    current="$(pcr_policy_current)"
+  else
+    [[ "$(owner_auth_set)" == 0 ]] \
+      || die "cannot provision PCR policy high-water after owner authorization was sealed"
+    provision_counter "$PCR_POLICY_INDEX"
+    increment_counter "$PCR_POLICY_INDEX"
+    current="$(pcr_policy_current)"
+    newly_defined=1
+  fi
+  (( requested > current || (newly_defined == 1 && requested == current) )) \
+    || die "refusing to activate signed PCR policy sequence $requested at or below high-water $current"
+  (( requested >= current && requested - current <= MAX_FRESHNESS_GAP )) \
+    || die "signed PCR policy sequence $requested cannot advance the TPM high-water $current"
+  for (( step = current; step < requested; step++ )); do
+    increment_counter "$PCR_POLICY_INDEX"
+  done
+  current="$(pcr_policy_current)"
+  (( current == requested )) \
+    || die "PCR policy high-water read back as $current, not activated sequence $requested"
+  printf '%s\n' "$current"
+}
+
+# --------------------------------------------------------------------------- #
 # profile-read / profile-bind / profile-digest — the access-profile authority.
 # --------------------------------------------------------------------------- #
 profile_read() {
@@ -698,6 +794,7 @@ assert_fixed_state() { # $1=expected profile binding
   done
   assert_index_shape "$COUNTER_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
   assert_index_shape "$FRESHNESS_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
+  assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
   [[ "$(record_state)" == sealed ]] \
     || die "the access-profile record is not written and write-locked; signed physical recovery is required"
   [[ "$(record_read)" == "$1" ]] \
@@ -709,10 +806,12 @@ assert_fixed_state() { # $1=expected profile binding
 }
 
 public_contract_digest() { # $1=index -> digest of its exact TPM-computed Name
-  local name="$WORK/${1#0x}.name" public name_hex
+  local name="$WORK/${1#0x}.name" public contract name_hex
   public="$("$(tool tpm2_nvreadpublic)" "$1" 2>"$WORK/nv-public.err")" \
     || die "the TPM will not emit the exact public Name for $1: $(tr '\n' ' ' < "$WORK/nv-public.err")"
-  name_hex="$(awk '/^  name:/{print tolower($2)}' <<<"$public")"
+  contract="$(ni_tpm2_nv_public_parse "$1" <<<"$public")" \
+    || die "$1 does not present the tpm2_nvreadpublic public-area contract"
+  read -r _ _ _ name_hex <<<"$contract"
   [[ "$name_hex" =~ ^000b[0-9a-f]{64}$ ]] \
     || die "the TPM emitted no canonical SHA-256 public Name for $1"
   "$(tool python3)" -c 'import sys; open(sys.argv[2],"wb").write(bytes.fromhex(sys.argv[1]))' \
@@ -784,7 +883,12 @@ provisioning_status() {
     ! index_present "$index" \
       || die "TPM state already exists at $index; encrypted-volume reset is not a fresh install — TPM clear with physical presence and signed reinstall are required"
   done
-  printf 'virgin\n'
+  if index_present "$PCR_POLICY_INDEX"; then
+    pcr_policy_current >/dev/null
+    printf 'pcr-policy-activated\n'
+  else
+    printf 'virgin\n'
+  fi
 }
 
 ceremony_prepare() { # profile target policy initial consumed absolute issuance seq
@@ -802,13 +906,15 @@ ceremony_prepare() { # profile target policy initial consumed absolute issuance 
   [[ "$(owner_auth_set)" == 0 ]] \
     || die "ownerAuthSet=1 before the trusted ceremony; refusing to accept arbitrary owner authorization — TPM clear with physical presence and signed reinstall are required"
 
-  # Virgin means all four fixed indices are absent. Once provisioning begins,
+  # The four ceremony indices must be absent. The PCR policy counter is already
+  # present because LUKS policy activation necessarily precedes first boot.
   # deleting the record alone or record+freshness still leaves the install
   # counter, so this command can never reinterpret partial state as virgin.
   for index in "$COUNTER_INDEX" "$FRESHNESS_INDEX" "$RECORD_INDEX" "$COMPLETION_INDEX"; do
     ! index_present "$index" \
       || die "TPM provisioning already began ($index exists); ceremony is one-time and partial state requires signed physical recovery"
   done
+  pcr_policy_current >/dev/null
 
   # EVERYTHING THE OWNER HIERARCHY IS STILL NEEDED FOR MUST ALREADY BE DONE.
   # These are refusals: sealing first and discovering the consequence at the next
@@ -910,6 +1016,8 @@ usage:
   neural-ice-tpm-state counter-next
   neural-ice-tpm-state freshness-read
   neural-ice-tpm-state freshness-consume ISSUANCE_SEQ
+  neural-ice-tpm-state pcr-policy-check POLICY_SEQ
+  neural-ice-tpm-state pcr-policy-activate POLICY_SEQ
   neural-ice-tpm-state profile-read
   neural-ice-tpm-state profile-bind PROFILE HARDWARE_TARGET TRUST_POLICY_ID
   neural-ice-tpm-state profile-digest PROFILE HARDWARE_TARGET TRUST_POLICY_ID
@@ -930,6 +1038,8 @@ case "$command_name" in
   counter-next) counter_next "$@" ;;
   freshness-read) freshness_read "$@" ;;
   freshness-consume) freshness_consume "$@" ;;
+  pcr-policy-check) pcr_policy_check "$@" ;;
+  pcr-policy-activate) pcr_policy_activate "$@" ;;
   profile-read) profile_read "$@" ;;
   profile-bind) profile_bind "$@" ;;
   profile-digest) profile_digest_command "$@" ;;

@@ -191,6 +191,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         bundle_seq: bom.bundle_seq,
         bom_sha256,
         bom_format: Some(crate::state::BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
+        active_ring: cfg.device_channel.clone(),
     };
     match store.read() {
         Ok(StateRead::Applied(applied)) => {

@@ -4,8 +4,9 @@ name: test-ni-ota-verify
 # ICE-Fabric OTA signing plan P2): fmt + clippy + tests on the
 # organization-owned x86_64 and ARM64 pools. The toolchain runs inside the same
 # digest-pinned Rust image used by the bootc build, so runners stay toolchain-free.
-# The tests stub cosign via NI_OTA_COSIGN, so no signing infrastructure is needed
-# here. Persistent self-hosted runners never execute pull_request-controlled
+# The test-path-overrides build stubs cosign via NI_OTA_COSIGN, so no signing
+# infrastructure is needed here; the default build is tested too, and its release
+# binary must not even contain that name. Persistent self-hosted runners never execute pull_request-controlled
 # workflow definitions. Only the protected main ref may schedule these jobs;
 # workflow_dispatch is guarded at the job boundary as defense in depth.
 
@@ -76,8 +77,12 @@ jobs:
               cargo fmt --check
               cargo clippy --all-targets --all-features --locked -- -D warnings
               cargo test --locked --features test-path-overrides
+              # The build the OS image ships: no seam is compiled in, and the
+              # unit tests that only exist there prove the environment is ignored.
+              cargo test --locked
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
             '
 
   linux-x86_64:
@@ -110,8 +115,11 @@ jobs:
               # la configuration du depot au moment de builder l image.
               NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
               cargo test --locked --features test-path-overrides
+              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
+              cargo test --locked
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_COSIGN target/release/ni-ota-verify
             '
 
       - name: Cleanup build tree
@@ -146,8 +154,11 @@ jobs:
               # la configuration du depot au moment de builder l image.
               NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
               cargo test --locked --features test-path-overrides
+              NI_TRUSTED_TIME_ISSUER=trusted-time.example.test \
+              cargo test --locked
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_COSIGN target/release/ni-ota-verify
             '
 
       - name: Cleanup build tree

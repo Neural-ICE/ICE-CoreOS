@@ -39,6 +39,10 @@ pub(crate) struct AppliedState {
     /// after a rollback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bom_format: Option<String>,
+    /// Ring committed by the same post-health transaction. Older records omit
+    /// it and may migrate only through the explicitly bounded beta/stable path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ring: Option<String>,
 }
 
 impl AppliedState {
@@ -1041,7 +1045,7 @@ fn flock(file: &File, operation: i32) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
@@ -1089,6 +1093,7 @@ mod tests {
             bundle_seq: 8,
             bom_sha256: "bb".repeat(32),
             bom_format: Some(BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
+            active_ring: Some("beta".into()),
         };
         let encoded = serde_json::to_string(&marked).unwrap();
         assert!(encoded.contains(r#""bom_format":"media-independent-v1""#));
@@ -1109,6 +1114,7 @@ mod tests {
             bundle_seq: 7,
             bom_sha256: "ab".repeat(32),
             bom_format: Some(BOM_FORMAT_MEDIA_INDEPENDENT_V1.to_string()),
+            active_ring: None,
         };
         s.write(&state).unwrap();
         match s.read().unwrap() {

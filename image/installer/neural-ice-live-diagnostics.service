@@ -1,0 +1,122 @@
+# The ONLY thing a signed Live medium does.
+#
+# Live is a non-destructive READ-ONLY DIAGNOSTICS mode. Before this unit existed
+# `neural-ice-live.target` reached basic.target and stopped: safe, and
+# operationally indistinguishable from a hung machine (review 2026-09-02).
+#
+# 🔴 EVERY DIRECTIVE BELOW IS A BOUNDARY, NOT A PREFERENCE.
+#   - no ExecStart argument, no StandardInput: this unit takes no operator input
+#     and the script parses none, so there is no command surface to reach;
+#   - the console is tty1 OUTPUT ONLY. getty@, serial-getty@, autovt@,
+#     console-getty, container-getty@, getty.target, systemd-user-sessions, user@,
+#     debug-shell, emergency and rescue are all masked on a Live boot by
+#     image/installer/neural-ice-installer-runtime-generator, so tty1 carries this
+#     summary and nothing that could take a keystroke;
+#   - IPAddressDeny=any makes "no network is touched" a kernel-enforced property
+#     rather than a claim about what the script happens to run;
+#   - the write boundary is KERNEL-ENFORCED OVER EVERY HOST FILESYSTEM
+#     (independent review 2026-09-02, P1 #7). `ProtectSystem=strict` mounts the
+#     whole hierarchy read-only, but the previous revision then added
+#     `PrivateTmp=yes`, which mounts a WRITABLE tmpfs back over /tmp and
+#     /var/tmp -- so the claim "it cannot write ANYWHERE" was false in the two
+#     places it was easiest to be false. PrivateTmp is gone, so /tmp and /var/tmp
+#     stay under the strict read-only mount like /var and /run; /dev is a private,
+#     minimal, device-free tmpfs via PrivateDevices=, and /proc and /sys are
+#     covered by ProtectProc=, ProtectKernelTunables= and ProtectControlGroups=;
+#   - it runs as `nobody` with an EMPTY capability bounding set, so even a defect
+#     that reached a writable inode could not own, relabel or chmod it;
+#   - and the script PROVES the boundary on the machine before it prints
+#     anything: it attempts a fixed write in every writable-by-default location
+#     and refuses to produce a summary if any of them succeeds. A directive that
+#     is silently dropped by a future systemd is then a Live boot that says so,
+#     not a Live boot that quietly writes;
+#   - the memory, task and time bounds hold even if the script is wrong.
+[Unit]
+Description=Neural ICE live medium read-only diagnostics summary
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+After=basic.target
+# No Requires=/Wants= on basic.target: neural-ice-live.target already requires it
+# and orders this unit after it, and an extra edge from a service back onto an
+# early-boot target is how ordering cycles are manufactured.
+# The destructive installer must never be reachable from this unit, in any
+# direction. Conflicts= states it as a manager-enforced fact rather than as an
+# absence of a dependency.
+Conflicts=neural-ice-autoinstall.service neural-ice-installer.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/neural-ice-live-diagnostics
+# Minimal identity. Every probe reads a world-readable file in /proc, /sys or the
+# block layer's metadata, so root buys this unit nothing and costs it the one
+# property that matters on a medium booted next to customer data.
+User=nobody
+Group=nobody
+UMask=0777
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TimeoutStartSec=60
+
+# Bounds that survive a wrong script.
+MemoryMax=64M
+TasksMax=32
+LimitNOFILE=256
+LimitCORE=0
+
+# Read-only, privilege-free, network-free.
+#
+# 🔴 NO PrivateTmp=. It is the directive that broke the boundary: it mounts a
+# WRITABLE tmpfs over /tmp and /var/tmp after ProtectSystem=strict has made them
+# read-only. Without it both stay read-only with the rest of the hierarchy, and
+# this unit has no writable path at all -- which is what the script's own
+# boundary self-proof then verifies on the machine.
+IPAddressDeny=any
+# No IP and no packet socket can be created at all, so "no network is touched" is
+# a property of the kernel's socket layer and not only of the firewall. AF_UNIX
+# is kept because the manager hands this unit a journald socket for stderr;
+# AF_NETLINK because libudev opens one to enumerate block devices.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# `invisible`, NOT `ProcSubset=pid`: this summary reads /proc/cpuinfo and
+# /proc/meminfo, which ProcSubset=pid would hide. Hiding other processes is the
+# part that is free.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# @system-service with EPERM rather than SIGSYS on refusal: a call this set does
+# not cover degrades one probe instead of killing the summary, and a Live boot
+# with no summary is the hang this unit exists to remove.
+#
+# MemoryDenyWriteExecute is deliberately ABSENT. It is the one directive here
+# with a history of breaking dynamic loaders, it cannot be validated off-device,
+# and the cost of getting it wrong is exactly the failure this unit fixes. The
+# whole sandbox below is nonetheless unproven until a real signed Live boot on
+# GB10 -- recorded as such, not asserted.
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @swap @reboot @module @raw-io @debug
+SystemCallErrorNumber=EPERM
+# It reads /proc, /sys and the block layer's metadata; it needs no capability at
+# all beyond opening files it is already allowed to open.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=neural-ice-live.target

@@ -629,7 +629,7 @@ fn is_canonical_ipv6_text(text: &str) -> bool {
 ///
 /// The accepted forms match Fabric exactly: lowercase DNS, canonical IPv4, or
 /// bracketed canonical IPv6, each optionally followed by a canonical port.
-fn is_registry_authority(value: &str) -> bool {
+pub(crate) fn is_registry_authority(value: &str) -> bool {
     if value.bytes().any(|byte| b"/@?#".contains(&byte)) {
         return false;
     }

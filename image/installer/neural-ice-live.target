@@ -1,0 +1,34 @@
+# The signed non-installing boot of the installer medium.
+#
+# Live is an AFFIRMATIVE mode, not "Install minus the autoinstall word": the UKI
+# seals `neuralice.live=1` AND `systemd.unit=neural-ice-live.target`, and the
+# early runtime generator accepts only that exact pair inside a closed sealed
+# grammar. Before this target existed, MEDIA_MODE=live sealed no selector at all,
+# so the medium fell through to the inherited installed-appliance default --
+# which hard-requires the first-boot TPM ceremony (RequiredBy=multi-user.target)
+# and drove a pristine Live boot into emergency.
+#
+# 🔴 THIS TARGET PULLS THE BASE SYSTEM AND ONE READ-ONLY DIAGNOSTIC SUMMARY.
+# multi-user.target is exactly the edge that carries the installed ceremony, and
+# neural-ice-installer.target is the destructive one. Requiring basic.target and
+# nothing else is what keeps Live free of both.
+#
+# neural-ice-live-diagnostics.service is the mode's only product surface, and it
+# is deliberately a Wants=, not a Requires=: a summary that fails must not take
+# the boot with it, because on a medium with no login there is nothing to fall
+# back to. That service takes no input, opens no listener, writes nothing and is
+# forbidden IP traffic outright; see its unit file for why each bound is there.
+#
+# Any OTHER Requires=/Wants= added here -- an installed-appliance unit, a
+# login/session surface, or the installer -- is a new access path on a medium
+# whose whole safety argument is that it has none.
+# image/test-installer-systemd-lifecycle.sh enumerates this dependency set
+# exactly and refuses any addition to it.
+[Unit]
+Description=Neural ICE signed non-installing live boot (read-only diagnostics)
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+Requires=basic.target
+Wants=neural-ice-live-diagnostics.service
+After=basic.target neural-ice-live-diagnostics.service
+Conflicts=neural-ice-installer.target neural-ice-autoinstall.service
+AllowIsolate=yes

@@ -27,7 +27,8 @@ What it proves
 * ``BOOTAA64.EFI`` is a PE binary whose ``.cmdline`` section parses as a
   ``neural-ice-installer-trust-v1`` anchor sealing the expected verity root
   hash, payload digest, access profile, hardware target and trust policy id;
-* an Install medium seals ``neuralice.autoinstall=1`` and a Live medium does not
+* an Install medium seals its exact autoinstall selector and a Live medium seals
+  its distinct exact ``neuralice.live=1`` selector
   -- so the destructive mode is a property of a signature, not of a keystroke;
 * the UKI carries a signature directory (i.e. it was actually signed), unless
   ``--allow-unsigned`` says an unsigned medium was built on purpose;
@@ -59,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import re
 import struct
 import sys
@@ -94,7 +96,20 @@ ESP_OPTIONAL = frozenset(
         "ice-coreos/ota-lab-baseline.sig",
         "ice-coreos/release-authorization.json",
         "ice-coreos/release-authorization.sig",
+        # The bench-specific CA a LAN mirror's TLS is pinned to. Like the
+        # release authorization, it lives on the mutable ESP and its digest is
+        # sealed in the UKI command line, which is what makes the ESP a carrier
+        # rather than a chooser.
+        "ice-coreos/mirror-ca.crt",
     }
+)
+# Every ESP artefact whose digest the sealed command line pins, and the karg that
+# pins it. `check_esp` recomputes each from the medium and refuses a mismatch --
+# a signature that names a document is worth nothing if nobody compares them.
+ESP_HASH_BOUND = (
+    ("ice-coreos/release-authorization.json", "neuralice.relauth_sha256"),
+    ("ice-coreos/release-authorization.sig", "neuralice.relauth_sig_sha256"),
+    ("ice-coreos/mirror-ca.crt", "neuralice.mirror_ca_sha256"),
 )
 ESP_MANIFEST_RE = re.compile(r"^EFI/neural-ice/installer-(install|live)\.efi\.manifest$")
 
@@ -404,6 +419,412 @@ def sealed_fields(cmdline: str) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# THE SEALED MEDIA COMMAND-LINE GRAMMAR, re-implemented.
+#
+# image/installer/neural-ice-sealed-cmdline-grammar.sh is the definition the
+# PRODUCER, the early runtime generator and the installer all share. This is a
+# deliberate SECOND implementation, in another language, for the same reason the
+# payload header contract is re-implemented below: an inspector that re-used the
+# producer's own code would confirm the producer is self-consistent, which is not
+# the question. image/test-installer-selector-grammar.sh drives both over one
+# shared corpus and fails on any disagreement, in either direction.
+#
+# It is a CLOSED WORLD. A blocklist of `systemd.debug_shell`, `init=`,
+# `rd.break`, `systemd.mask=`, `emergency`, `rescue`, `single`, `selinux=0` ...
+# would be whack-a-mole -- the kernel and systemd add arguments faster than any
+# list is maintained, and one missed word is one unauthenticated root shell on a
+# medium whose entire safety argument is that it has no shell. Every word must
+# instead be one this grammar names, so an argument invented tomorrow is refused
+# today.
+# --------------------------------------------------------------------------- #
+SEALED_INSTALL_TARGET = "systemd.unit=neural-ice-installer.target"
+SEALED_INSTALL_SELECTOR = "neuralice.autoinstall=1"
+SEALED_LIVE_TARGET = "systemd.unit=neural-ice-live.target"
+SEALED_LIVE_SELECTOR = "neuralice.live=1"
+SEALED_CMDLINE_MAX_BYTES = 4096
+SEALED_CMDLINE_MAX_WORDS = 64
+# Install only. `bootc install` relabels the target and the enforcing live policy
+# denies it; a Live boot relabels nothing, so a Live medium sealing this is a
+# medium asking for a relaxation it cannot use.
+SEALED_INSTALL_ONLY_WORDS = ("enforcing=0",)
+SEALED_INSTALL_OPTIONAL_KEYS = (
+    "neuralice.release_authority",
+    "neuralice.device_channel",
+    "neuralice.imgref",
+    "neuralice.source",
+    "neuralice.osimage",
+    "neuralice.mirror",
+    "neuralice.systemsize",
+    "neuralice.target",
+    "neuralice.sshkey",
+    "neuralice.relauth_sha256",
+    "neuralice.relauth_sig_sha256",
+    "neuralice.mirror_ca_sha256",
+    "neuralice.mirror_ready",
+    "neuralice.mirror_manifest",
+    "neuralice.mirror_generation",
+    "neuralice.seed_closure",
+    "neuralice.seed_manifest",
+    "neuralice.seed_trusted_now",
+    "neuralice.pcr_policy",
+    "neuralice.pcr_policy_key",
+    "neuralice.pcr_policy_signature",
+    "neuralice.pcr_policy_seq",
+)
+# 🔴 ONE CANONICAL ORIGIN, SEALED RATHER THAN COMPILED IN (independent review
+# 2026-09-02, P0 #3). Every OS/source reference a medium may seal carries the
+# authority `neuralice.release_authority` names on the same signed line: not a
+# mutable tag, not a second registry, not a LAN host. The mirror names a lab host
+# that may SERVE those bytes and is never an origin.
+#
+# The authority is an ARGUMENT and not a literal in this tree on purpose:
+# ci/test-open-core-boundary.sh refuses the sovereign endpoint's bytes in every
+# Git-visible file, and an open repository that names the production registry has
+# published it.
+_WORD_CHARACTERS = re.compile(r"[A-Za-z0-9._:=,/@+-]+")
+_REGISTRY_PATH_SEGMENT = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+
+
+class SelectorRefusal(InspectionError):
+    """A sealed command line that is not one this repository could have cut.
+
+    ``reason`` is a stable machine-readable token; the corpus test asserts the
+    exact token, so a future edit cannot collapse a specific refusal into a
+    generic one and still look green.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"the sealed command line is refused: {reason}")
+        self.reason = reason
+
+
+def _authority_is_valid(authority: str) -> bool:
+    """A registry authority: bracketed IPv6 literal, dotted quad, ``localhost``
+    or a DNS name of at least two labels, with an optional 1-65535 port."""
+    port = ""
+    if authority.startswith("["):
+        close = authority.find("]")
+        if close < 0:
+            return False
+        host, suffix = authority[1:close], authority[close + 1 :]
+        # Canonical compressed IPv6 only: a non-canonical spelling is refused
+        # rather than normalised, so two readers of one medium cannot disagree
+        # about which host it names.
+        try:
+            address = ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        if address.compressed != host:
+            return False
+        if suffix:
+            if not suffix.startswith(":"):
+                return False
+            port = suffix[1:]
+    else:
+        host = authority
+        if ":" in authority:
+            if authority.count(":") != 1:
+                return False
+            host, port = authority.rsplit(":", 1)
+            if not port:
+                return False
+        if all(character in "0123456789." for character in host):
+            try:
+                if str(ipaddress.IPv4Address(host)) != host:
+                    return False
+            except ValueError:
+                return False
+        elif host != "localhost":
+            labels = host.split(".")
+            if len(labels) < 2 or len(host) > 253:
+                return False
+            if any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            ):
+                return False
+    if port:
+        if not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+            return False
+    return True
+
+
+def _release_authority_is_valid(value: str) -> bool:
+    """The ONE release authority a medium's origin references must carry.
+
+    A DNS name with at least two labels: an origin is a name a certificate can be
+    issued for and a signature scope can be written against, which an IP literal
+    and ``localhost`` are not.
+    """
+    host = value.split(":", 1)[0]
+    if value.startswith("[") or host == "localhost":
+        return False
+    if re.fullmatch(r"[0-9.]+", host) or "." not in host:
+        return False
+    return _authority_is_valid(value)
+
+
+def _reference_authority(value: str) -> str:
+    """The authority of a digest-pinned reference this grammar already accepted."""
+    return value.split("@sha256:", 1)[0].split("/", 1)[0]
+
+
+def _osimage_is_valid(value: str) -> bool:
+    """A digest-pinned appliance image.
+
+    A MUTABLE TAG IS REFUSED: the digest is what makes a LAN mirror safe to
+    consult, so accepting a tag would quietly undo the property the mirror
+    depends on. WHOSE registry it is, is a question about the LINE rather than
+    about this value, and is answered against ``neuralice.release_authority``.
+    """
+    match = re.fullmatch(r"(.+)@sha256:[0-9a-f]{64}", value)
+    if not match:
+        return False
+    repository = match.group(1)
+    if "/" not in repository:
+        return False
+    authority, path = repository.split("/", 1)
+    if not re.fullmatch(
+        rf"{_REGISTRY_PATH_SEGMENT}(?:/{_REGISTRY_PATH_SEGMENT})*", path
+    ):
+        return False
+    return _authority_is_valid(authority)
+
+
+def _sealed_value_is_valid(key: str, value: str) -> bool:
+    if key == "neuralice.imgref":
+        # The OTA ORIGIN recorded on the appliance and followed by every later
+        # `bootc upgrade`, held to exactly the rule the installed image is:
+        # canonical authority, digest-pinned, no tag. A mutable tag here is an
+        # appliance whose future is decided by whoever can move that tag.
+        return _osimage_is_valid(value)
+    if key == "neuralice.source":
+        return value in ("medium", "registry")
+    if key == "neuralice.device_channel":
+        return value in ("lab", "beta", "stable")
+    if key == "neuralice.osimage":
+        return _osimage_is_valid(value)
+    if key == "neuralice.mirror":
+        # Whether it is the release authority -- which a mirror may never be, a
+        # "mirror" of the origin being the origin -- is a question about the
+        # LINE, and is answered below.
+        return bool(
+            re.fullmatch(r"[A-Za-z0-9._-]+(:[0-9]{1,5})?", value)
+        ) and _authority_is_valid(value)
+    if key == "neuralice.release_authority":
+        return _release_authority_is_valid(value)
+    if key in (
+        "neuralice.relauth_sha256",
+        "neuralice.relauth_sig_sha256",
+        "neuralice.mirror_ca_sha256",
+        "neuralice.mirror_ready",
+        "neuralice.mirror_manifest",
+        # The offline seed's release closure. The seed root is a directory NAMED
+        # by this hash and the installer refuses unless the canonical release
+        # manifest inside it canonicalises to exactly this value.
+        "neuralice.seed_closure",
+        "neuralice.seed_manifest",
+        "neuralice.pcr_policy",
+        "neuralice.pcr_policy_key",
+        "neuralice.pcr_policy_signature",
+    ):
+        return bool(re.fullmatch(r"[0-9a-f]{64}", value))
+    if key == "neuralice.systemsize":
+        return bool(re.fullmatch(r"[0-9]{1,5}", value)) and 16 <= int(value) <= 65536
+    if key in ("neuralice.mirror_generation", "neuralice.pcr_policy_seq"):
+        return bool(re.fullmatch(r"[1-9][0-9]{0,18}", value))
+    if key == "neuralice.seed_trusted_now":
+        return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value))
+    if key == "neuralice.target":
+        # This value selects the disk that is about to be destroyed.
+        return bool(re.fullmatch(r"/dev/[a-zA-Z0-9][a-zA-Z0-9_-]*", value))
+    if key == "neuralice.sshkey":
+        return bool(re.fullmatch(r"[A-Za-z0-9+/=]{1,1024}", value))
+    return False
+
+
+def classify_sealed_cmdline(cmdline: str) -> str:
+    """Return ``"install"`` or ``"live"``; raise :class:`SelectorRefusal` for
+    anything else, including a line that is merely *almost* one of them."""
+    if len(cmdline) > SEALED_CMDLINE_MAX_BYTES:
+        raise SelectorRefusal("cmdline-too-long")
+    words = cmdline.split()
+    if not words:
+        raise SelectorRefusal("empty-cmdline")
+    if len(words) > SEALED_CMDLINE_MAX_WORDS:
+        raise SelectorRefusal("too-many-words")
+
+    counts: dict[str, int] = {}
+    for word in words:
+        # The renderer's own character class. A word outside it cannot have come
+        # from installer_trust_render_cmdline, so it did not come from a build.
+        if not _WORD_CHARACTERS.fullmatch(word):
+            raise SelectorRefusal("unrepresentable-word")
+        key = word.split("=", 1)[0]
+        if not key:
+            raise SelectorRefusal("unrepresentable-word")
+        counts[key] = counts.get(key, 0) + 1
+
+    for key in SEALED_KEYS:
+        seen = counts.get(key, 0)
+        if seen == 0:
+            raise SelectorRefusal(f"missing-sealed-field:{key}")
+        if seen > 1:
+            raise SelectorRefusal(f"duplicate-sealed-field:{key}")
+
+    if counts.get("systemd.unit", 0) != 1:
+        raise SelectorRefusal("ambiguous-boot-target")
+    if counts.get("neuralice.autoinstall", 0) > 1:
+        raise SelectorRefusal("duplicate-mode-selector")
+    if counts.get("neuralice.live", 0) > 1:
+        raise SelectorRefusal("duplicate-mode-selector")
+
+    if SEALED_INSTALL_TARGET in words:
+        mode = "install"
+    elif SEALED_LIVE_TARGET in words:
+        mode = "live"
+    else:
+        raise SelectorRefusal("unknown-boot-target")
+
+    if mode == "install":
+        if SEALED_INSTALL_SELECTOR not in words:
+            raise SelectorRefusal("missing-mode-selector")
+        if counts.get("neuralice.live", 0):
+            raise SelectorRefusal("mixed-mode-selector")
+    else:
+        if SEALED_LIVE_SELECTOR not in words:
+            raise SelectorRefusal("missing-mode-selector")
+        if counts.get("neuralice.autoinstall", 0):
+            raise SelectorRefusal("mixed-mode-selector")
+
+    optional: dict[str, str] = {}
+    for word in words:
+        key, _, value = word.partition("=")
+        if key in SEALED_KEYS:
+            continue
+        if word == "quiet":
+            if counts.get("quiet", 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
+        if word in (SEALED_INSTALL_TARGET, SEALED_LIVE_TARGET):
+            continue
+        if word == SEALED_INSTALL_SELECTOR:
+            if mode != "install":
+                raise SelectorRefusal("mixed-mode-selector")
+            continue
+        if word == SEALED_LIVE_SELECTOR:
+            if mode != "live":
+                raise SelectorRefusal("mixed-mode-selector")
+            continue
+        if word in SEALED_INSTALL_ONLY_WORDS:
+            if mode != "install":
+                raise SelectorRefusal("word-not-permitted-in-mode")
+            if counts.get(key, 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
+        if "=" in word and key in SEALED_INSTALL_OPTIONAL_KEYS:
+            if mode != "install":
+                raise SelectorRefusal("word-not-permitted-in-mode")
+            if counts.get(key, 0) != 1 or key in optional:
+                raise SelectorRefusal(f"duplicate-argument:{key}")
+            optional[key] = value
+            if not _sealed_value_is_valid(key, value):
+                raise SelectorRefusal(f"invalid-argument:{key}")
+            continue
+        raise SelectorRefusal(f"word-not-in-grammar:{key}")
+
+    # ----------------------------------------------------------------------- #
+    # THE REGISTRY-INSTALL CONTRACT, stated once so the producer, the generator
+    # and the installer cannot disagree about which combinations are meaningful.
+    #
+    # 🔴 EVERY RULE HERE IS A COMBINATION, NOT A VALUE (independent review
+    # 2026-09-02, P0 #3). A well-shaped value in the wrong company is how a
+    # registry medium was cut that deterministically refused at runtime: the
+    # installer required a signed release authorization on the ESP and the
+    # producer had no reason to stage one.
+    # ----------------------------------------------------------------------- #
+    # 🔴 ONE ORIGIN, NAMED ON THE LINE. Every reference that decides WHICH BYTES
+    # an appliance runs must carry the authority `neuralice.release_authority`
+    # names, and a line that carries such a reference must name one.
+    release_authority = optional.get("neuralice.release_authority")
+    for origin_key in ("neuralice.imgref", "neuralice.osimage"):
+        if origin_key not in optional:
+            continue
+        if release_authority is None:
+            raise SelectorRefusal(f"origin-without-release-authority:{origin_key}")
+        if _reference_authority(optional[origin_key]) != release_authority:
+            raise SelectorRefusal(f"origin-not-the-release-authority:{origin_key}")
+
+    source = optional.get("neuralice.source")
+    if source == "registry":
+        if "neuralice.osimage" not in optional:
+            raise SelectorRefusal("registry-source-without-osimage")
+        # The ESP is mutable, so the two SHA-256 values that pin the release
+        # authorization document and its detached signature are sealed in the
+        # line the UKI signature covers.
+        if "neuralice.relauth_sha256" not in optional:
+            raise SelectorRefusal("registry-source-without-release-authorization")
+        if "neuralice.relauth_sig_sha256" not in optional:
+            raise SelectorRefusal(
+                "registry-source-without-release-authorization-signature"
+            )
+        if optional["neuralice.relauth_sha256"] == optional["neuralice.relauth_sig_sha256"]:
+            raise SelectorRefusal("release-authorization-hashes-identical")
+    else:
+        if "neuralice.osimage" in optional:
+            raise SelectorRefusal("osimage-without-registry-source")
+        for key in ("neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"):
+            if key in optional:
+                raise SelectorRefusal("release-authorization-without-registry-source")
+
+    # THE MIRROR IS LAB TRANSPORT AND NOTHING ELSE. A mirror on a CUSTOMER
+    # appliance puts a lab host in the boot path of a machine that must never
+    # depend on one, and no digest argument makes that acceptable.
+    if "neuralice.mirror" in optional:
+        if source != "registry":
+            raise SelectorRefusal("mirror-without-registry-source")
+        # A "mirror" of the origin IS the origin, and the digest-only/insecure
+        # transport rules the installer writes for a mirror must never be applied
+        # to the authority its signature scope is written against.
+        if release_authority is not None and optional["neuralice.mirror"].split(":", 1)[0] == (
+            release_authority.split(":", 1)[0]
+        ):
+            raise SelectorRefusal("mirror-is-the-release-authority")
+        if sealed_fields(cmdline)["neuralice.access_profile"] != "lab-managed":
+            raise SelectorRefusal("mirror-not-permitted-outside-lab-managed")
+        if "neuralice.mirror_ca_sha256" not in optional:
+            raise SelectorRefusal("mirror-without-pinned-ca")
+        if "neuralice.mirror_ready" not in optional:
+            raise SelectorRefusal("mirror-without-ready-closure-hash")
+        if "neuralice.mirror_manifest" not in optional:
+            raise SelectorRefusal("mirror-without-ready-manifest-hash")
+        if "neuralice.mirror_generation" not in optional:
+            raise SelectorRefusal("mirror-without-cache-generation")
+    else:
+        for key in ("neuralice.mirror_ca_sha256", "neuralice.mirror_ready", "neuralice.mirror_manifest", "neuralice.mirror_generation"):
+            if key in optional:
+                raise SelectorRefusal("mirror-pin-without-mirror")
+
+    # A medium either carries an offline seed and seals its closure hash, or
+    # carries neither. A registry install pulls its bytes; a seed staged beside
+    # it would be a second, unreconciled source of the same objects.
+    if "neuralice.seed_closure" in optional:
+        if source == "registry":
+            raise SelectorRefusal("seed-closure-with-registry-source")
+        # The seed's release manifest names repositories under the release
+        # authority, and the verifier is handed that authority explicitly.
+        if release_authority is None:
+            raise SelectorRefusal("seed-closure-without-release-authority")
+        if "neuralice.seed_manifest" not in optional:
+            raise SelectorRefusal("seed-closure-without-manifest-hash")
+        if "neuralice.seed_trusted_now" not in optional:
+            raise SelectorRefusal("seed-closure-without-trusted-time")
+    elif "neuralice.seed_manifest" in optional or "neuralice.seed_trusted_now" in optional:
+        raise SelectorRefusal("seed-manifest-without-closure")
+    return mode
+
+
+# --------------------------------------------------------------------------- #
 # The sealed payload: an independent reader of the header contract, and a
 # from-scratch recomputation of both dm-verity root hashes.
 # --------------------------------------------------------------------------- #
@@ -601,6 +1022,48 @@ def assert_zero(raw: Path, partition: Partition) -> None:
 # --------------------------------------------------------------------------- #
 # The ESP: exactly one EFI authority, and an allowlisted tree around it.
 # --------------------------------------------------------------------------- #
+def check_esp_hash_bound(paths: set[str], read_file, cmdline: str) -> None:
+    """Every ESP artefact the sealed command line pins must be present and hash
+    to the pinned value; every one that is present must be pinned.
+
+    🔴 WHY THIS IS A COMPARISON AND NOT A PRESENCE TEST (independent review
+    2026-09-02, P0 #3). A registry medium carries `release-authorization.json`
+    and its detached signature, and a lab-managed bench medium also carries the
+    mirror CA. All three live on a MUTABLE vfat partition an attacker holding the
+    medium can rewrite, while the UKI that seals their digests is signed. The
+    installer verifies the authorization's SIGNATURE, which makes the verifier
+    non-editable and left the DOCUMENT selectable: any other correctly signed
+    authorization -- for a different digest, a different profile, an older
+    issuance -- would have been accepted. The digests close that.
+
+    Both directions are refusals. An artefact the signature does not pin is one
+    anybody can replace; a pin with no artefact is a medium that would refuse
+    itself on a bench with an already-wiped disk.
+    """
+    sealed_words = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
+    for path, karg in ESP_HASH_BOUND:
+        pinned = sealed_words.get(karg)
+        present = path in paths
+        if pinned is None and present:
+            raise InspectionError(
+                f"the ESP carries {path} but the sealed command line pins no {karg}; "
+                "an artefact nothing pins is an artefact anybody can replace"
+            )
+        if pinned is None:
+            continue
+        if not present:
+            raise InspectionError(
+                f"the sealed command line pins {karg} but the ESP carries no {path}; "
+                "this medium would refuse itself at install time"
+            )
+        observed = hashlib.sha256(read_file(path)).hexdigest()
+        if observed != pinned:
+            raise InspectionError(
+                f"the ESP's {path} hashes to {observed}, not the {pinned} the signed "
+                "command line seals"
+            )
+
+
 def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, str]]:
     paths = sorted(esp.walk())
     manifests = [path for path in paths if ESP_MANIFEST_RE.fullmatch(path)]
@@ -656,27 +1119,48 @@ def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, s
         if expected is not None and fields[key] != expected:
             raise InspectionError(f"BOOTAA64.EFI seals {key}={fields[key]}, expected {expected}")
 
-    words = cmdline.split()
-    has_autoinstall = words.count("neuralice.autoinstall=1") == 1
-    if has_autoinstall != (mode == "install"):
+    # THE WHOLE LINE, not three words of it. classify_sealed_cmdline is a closed
+    # world: every word must be one the grammar names, so `systemd.debug_shell`,
+    # `init=`, `rd.break`, `systemd.mask=`, `emergency` and every argument
+    # invented after this file was written are refused here -- before a medium
+    # carrying one is ever flashed. See image/installer/neural-ice-sealed-cmdline-grammar.sh.
+    sealed_mode = classify_sealed_cmdline(cmdline)
+    if sealed_mode != mode:
         raise InspectionError(
-            f"a {mode} medium {'carries' if has_autoinstall else 'lacks'} a sealed "
-            "neuralice.autoinstall=1, which is the wrong way round for this mode"
+            f"BOOTAA64.EFI's manifest says this is a {mode} medium, but its sealed "
+            f"command line is a {sealed_mode} one"
         )
-    target_words = [word for word in words if word.startswith("systemd.unit=")]
-    expected_target = "systemd.unit=neural-ice-installer.target"
-    if mode == "install" and target_words != [expected_target]:
-        raise InspectionError(
-            "an Install medium must seal exactly systemd.unit=neural-ice-installer.target"
-        )
-    if mode == "live" and target_words:
-        raise InspectionError("a Live medium must not seal an appliance or installer boot target")
+    # 🔴 THE ESP ARTEFACTS THE SIGNATURE PINS (independent review 2026-09-02,
+    # P0 #3). Checked by a pure function so image/test-installer-selector-grammar.sh
+    # can drive it on ordinary CI -- this suite needs veritysetup, a loop device
+    # and a real medium, and a control that only exists behind that fixture is a
+    # control nobody notices the loss of.
+    check_esp_hash_bound(set(paths), esp.read_file, cmdline)
     if not arguments.allow_unsigned and not pe_has_signature(blob):
         raise InspectionError("BOOTAA64.EFI carries no signature")
     return cmdline, fields
 
 
 def main() -> int:
+    # A PURE ENTRY POINT for the sealed command-line grammar. It exists so
+    # image/test-installer-selector-grammar.sh can drive this implementation --
+    # the one that guards a finished medium -- against the shell implementation
+    # the producer and the runtime share, on ordinary CI, with no veritysetup, no
+    # loop device and no medium. The grammar was previously reachable only
+    # through a full sealed-medium fixture, which SKIPs wherever the verity
+    # toolchain is absent; a control that disappears with its fixture is a
+    # control nobody notices the loss of (review 2026-09-02, P3).
+    if sys.argv[1:2] == ["--classify-cmdline"]:
+        if len(sys.argv) != 3:
+            print("usage: --classify-cmdline <sealed cmdline>", file=sys.stderr)
+            return 2
+        try:
+            print(classify_sealed_cmdline(sys.argv[2]))
+        except SelectorRefusal as refusal:
+            print(f"REFUSED {refusal.reason}", file=sys.stderr)
+            return 1
+        return 0
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw", required=True, type=Path)
     parser.add_argument("--expect-verity-root-hash", required=True)

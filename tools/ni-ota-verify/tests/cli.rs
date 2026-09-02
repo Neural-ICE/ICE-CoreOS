@@ -1787,6 +1787,32 @@ fn commit_seeds_advances_and_guards() {
 }
 
 #[test]
+fn ring_promotion_is_identical_bundle_transactional_and_forward_only() {
+    let fx = Fixture::new("commit-ring-promotion");
+    let bom = fx.write_bom("0.67.0", 67);
+    let cfg = fx.write_config(1, "device_channel=lab\n");
+    let commit = |active: &str, previous: &str| -> (i32, Value, String) {
+        run(Command::new(BIN)
+            .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+            .arg("commit")
+            .args(["--bom".as_ref(), bom.as_os_str()])
+            .args(["--config".as_ref(), cfg.as_os_str()])
+            .args(["--active-ring", active, "--previous-ring", previous]))
+    };
+
+    assert_eq!(commit("lab", "lab").0, 0);
+    assert_eq!(commit("beta", "lab").0, 0);
+    assert_eq!(commit("stable", "beta").0, 0);
+    let before = fs::read(fx.path("state/applied.json")).unwrap();
+    let (code, _, stderr) = commit("beta", "stable");
+    assert_eq!(code, 1);
+    assert!(stderr.contains("downgrade"));
+    assert_eq!(fs::read(fx.path("state/applied.json")).unwrap(), before);
+    let applied: Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(applied["active_ring"], "stable");
+}
+
+#[test]
 fn commit_creates_and_attests_an_absent_custom_parent() {
     let fx = Fixture::new("commit-custom-parent");
     let bom = fx.write_bom("0.44.7", 7);
@@ -2563,7 +2589,7 @@ fn capabilities_are_canonical_bounded_and_argument_free() {
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
-        b"{\"schema\":1,\"features\":[\"bundle-digest-v1\"]}\n"
+        b"{\"features\":[\"bundle-digest-v1\",\"delegated-rings-v1\",\"transactional-ring-state-v1\"],\"schema\":1}\n"
     );
     assert!(output.stdout.len() < 4096);
 

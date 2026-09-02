@@ -1,0 +1,70 @@
+# The ONLY thing a failed Neural ICE install does.
+#
+# 🔴 EVERY DIRECTIVE BELOW IS A BOUNDARY, NOT A PREFERENCE.
+#   - no ExecStart argument and StandardInput=null: this unit takes no operator
+#     input and the script parses none, so there is no command surface to reach;
+#   - the console is tty1 OUTPUT ONLY. Every login/shell surface is masked on an
+#     Install boot by image/installer/neural-ice-installer-runtime-generator --
+#     including emergency, rescue and debug-shell, which this unit replaces;
+#   - IPAddressDeny=any and RestrictAddressFamilies make "no network is touched"
+#     a kernel-enforced property rather than a claim about what the script runs;
+#   - ProtectSystem=strict with an empty ReadWritePaths= and no PrivateTmp means
+#     the failure surface cannot write anywhere at all. The evidence it reads was
+#     written by the installer before it failed, on a tmpfs, read-only from here;
+#   - DefaultDependencies=no because this unit must be startable in exactly the
+#     state a failed install leaves the machine in, including a wedged one.
+#
+# It is NOT sandboxed away from the power-off it must perform: the whole point of
+# the unit is that a failed install ends in a defined terminal state rather than
+# on an idle console. CAP_SYS_BOOT is the only capability it keeps.
+[Unit]
+Description=Neural ICE installer failure evidence and terminal action
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS
+DefaultDependencies=no
+Conflicts=neural-ice-autoinstall.service neural-ice-installer.target shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/neural-ice-installer-failure
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+# The script's own delay is bounded to 300 s by its policy reader; this is the
+# manager's independent bound on the same thing.
+TimeoutStartSec=600
+
+# Bounds that survive a wrong script.
+MemoryMax=64M
+TasksMax=16
+LimitNOFILE=64
+LimitCORE=0
+
+# Read-only, network-free, privilege-free apart from the reboot itself.
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @reboot
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=CAP_SYS_BOOT
+AmbientCapabilities=

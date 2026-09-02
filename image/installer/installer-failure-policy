@@ -1,0 +1,18 @@
+# THE TERMINAL ACTION OF A FAILED INSTALL, IN THE SIGNED READ-ONLY /usr.
+#
+# This file is inside the dm-verity extent whose root hash the signed UKI's
+# .cmdline seals, so both values below are covered by the medium's signature.
+# Neither is an operator's choice at failure time and neither can be edited on
+# the mutable ESP -- which is the whole reason the policy is not there.
+#
+# action         poweroff | reboot. Anything else is ignored and `poweroff` is
+#                used: a machine that powers off after a failed install cannot
+#                loop through the destructive path unattended.
+# delay_seconds  5..300. Long enough for an operator to read and photograph the
+#                failure code, short enough that a medium left in a machine does
+#                not sit on a console.
+#
+# image/installer/neural-ice-installer-failure.sh is the only reader; it bounds
+# and re-validates both fields rather than trusting this file's shape.
+action=poweroff
+delay_seconds=60

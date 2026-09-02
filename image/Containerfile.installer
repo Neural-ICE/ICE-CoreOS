@@ -23,10 +23,54 @@ COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-ba
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
 COPY image/installer/neural-ice-installer.target \
      /usr/lib/systemd/system/neural-ice-installer.target
+COPY image/installer/neural-ice-live.target \
+     /usr/lib/systemd/system/neural-ice-live.target
 COPY image/installer/neural-ice-installer-runtime-generator.sh \
      /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator
+# THE SEALED COMMAND-LINE GRAMMAR, in the immutable /usr next to the access
+# policy it is a sibling of. The early runtime generator and the autoinstaller
+# both source it from here, so the medium has exactly ONE definition of which
+# kernel command lines it may boot -- and it is inside the dm-verity root the
+# signed UKI seals, not beside it.
+COPY image/installer/neural-ice-sealed-cmdline-grammar.sh \
+     /usr/lib/neural-ice/sealed-cmdline-grammar.sh
+# THE LIVE MODE'S ONLY PRODUCT SURFACE: a bounded read-only diagnostic summary
+# on tty1. Live used to reach basic.target and stop, which is safe and
+# indistinguishable from a hung machine. It takes no input, opens no listener,
+# writes nothing and is denied IP traffic outright; see its unit for each bound.
+COPY image/installer/neural-ice-live-diagnostics.sh \
+     /usr/libexec/neural-ice-live-diagnostics
+COPY image/installer/neural-ice-live-diagnostics.service \
+     /usr/lib/systemd/system/neural-ice-live-diagnostics.service
+# 🔴 THE INSTALL FAILURE SINK (independent review 2026-09-02, P0 #1). The
+# autoinstall unit used to carry `OnFailure=emergency.target`, and the early
+# runtime generator unmasked emergency/rescue/debug-shell on every Install boot
+# so that sink would resolve -- so any failure of a destructive install ended on
+# a root shell on tty1. It now isolates onto a target that pulls exactly one
+# output-only service: a bounded, fixed-vocabulary failure code and an automatic
+# poweroff on the delay stated by the policy below, which lives in this immutable
+# /usr and is therefore covered by the dm-verity root hash the UKI seals.
+COPY image/installer/neural-ice-installer-failure.sh \
+     /usr/libexec/neural-ice-installer-failure
+COPY image/installer/neural-ice-installer-failure.service \
+     /usr/lib/systemd/system/neural-ice-installer-failure.service
+COPY image/installer/neural-ice-installer-failure.target \
+     /usr/lib/systemd/system/neural-ice-installer-failure.target
+COPY image/installer/installer-failure-policy \
+     /usr/lib/neural-ice/installer-failure-policy
+# 🔴 THE ONE SIGNATURE-POLICY READER (independent review 2026-09-02, P1 #2).
+# image/build-installer-usb.sh runs this same file on the build host before a
+# registry medium is cut, and ota/neural-ice-autoinstall.sh runs it twice at
+# install time -- once before the pull and once with the index and platform-child
+# digests the object resolved to. It lives in the immutable /usr the dm-verity
+# root hash covers, beside the sealed grammar, so the medium has exactly ONE
+# definition of what a signed docker scope has to state.
+COPY image/installer/neural-ice-registry-authorisation.py \
+     /usr/lib/neural-ice/registry-authorisation.py
 # Install boots must never start getty@tty1 (its start job would resolve the
-# autoinstall Conflicts= by stopping the install mid-flight). Live boots keep it.
+# autoinstall Conflicts= by stopping the install mid-flight). The distinct Live
+# target pulls no getty at all, so it cannot inherit the debug image's root
+# autologin or manufacture a second access path.
 RUN install -d -m 0755 /etc/systemd/system/getty@tty1.service.d
 COPY ota/neural-ice-getty-tty1-installer-skip.conf \
      /etc/systemd/system/getty@tty1.service.d/10-installer-skip.conf
@@ -47,7 +91,40 @@ RUN set -euxo pipefail; \
       /usr/local/libexec/neural-ice-lab-baseline-handoff \
       /usr/libexec/neural-ice-device-root \
       /usr/libexec/neural-ice-tpm-state \
+      /usr/libexec/neural-ice-live-diagnostics \
+      /usr/libexec/neural-ice-installer-failure \
       /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator; \
+    chmod 0644 /usr/lib/neural-ice/sealed-cmdline-grammar.sh \
+      /usr/lib/neural-ice/installer-failure-policy \
+      /usr/lib/neural-ice/registry-authorisation.py; \
+    bash -n /usr/libexec/neural-ice-installer-failure; \
+    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+      /usr/lib/neural-ice/registry-authorisation.py; \
+    # 🔴 THE MARKER THAT MAKES THE INSTALLER'S TEST SEAM IMPOSSIBLE HERE.
+    # ota/neural-ice-autoinstall.sh consults an environment override for its
+    # command-line file, sealed grammar, library directory, verity mount points,
+    # store mapper and TPM helper ONLY when NI_INSTALLER_TEST_SEAM=1, the process
+    # is unprivileged AND this file is absent. It is written into the read-only
+    # /usr the dm-verity root hash covers, so on every medium this repository cuts
+    # the third condition is false and the seam refuses even if the other two were
+    # somehow met. A release image that lost this marker is a release image whose
+    # trust gate could be pointed at a fixture: assert it, here, at build time.
+    printf 'neural-ice-coreos-release-image-v1\n' > /usr/lib/neural-ice/release-image; \
+    chmod 0444 /usr/lib/neural-ice/release-image; \
+    test -e /usr/lib/neural-ice/release-image; \
+    grep -q 'NI_RELEASE_IMAGE_MARKER="/usr/lib/neural-ice/release-image"' \
+      /usr/local/bin/neural-ice-autoinstall.sh; \
+    # The grammar must be SOURCEABLE by the generator that runs in early boot,
+    # and the diagnostics summary must be runnable, or a Live boot reaches
+    # nothing and an Install boot refuses itself. Assert both here rather than
+    # discovering it on hardware.
+    bash -n /usr/lib/neural-ice/sealed-cmdline-grammar.sh; \
+    bash -n /usr/libexec/neural-ice-live-diagnostics; \
+    # neural-ice-live-diagnostics.service is deliberately NOT enabled: the signed
+    # Live target already carries `Wants=` for it, so no /etc symlink and no
+    # persistent enablement is baked into a layer that also becomes the INSTALLED
+    # appliance. The installed system never selects that target.
+    test ! -e /etc/systemd/system/neural-ice-live.target.wants; \
     # The installer-only drop-in gates this enabled unit to the explicit
     # autoinstall entry.  Autoinstall removes that drop-in from the target
     # deployment before reboot, leaving the installed appliance enabled for

@@ -348,6 +348,11 @@ RUN set -euxo pipefail; \
 # The NVIDIA modules in driver-modules/ are already signed (sign-file).
 # PROD: replaced by a Neural ICE shim signed by Microsoft (see docs/ADR-0002).
 COPY image/signed-boot/ /
+COPY image/initramfs/91neural-ice-tpm-policy/ /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/
+# The tpm2_nvreadpublic parser the hook sources is the SAME file the OTA helper
+# sources (image/lib/tpm2-nv-public.sh); it is staged beside the module so dracut
+# embeds it in the signed UKI (review 2026-09-02, P0).
+COPY image/lib/tpm2-nv-public.sh /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/tpm2-nv-public.sh
 
 # --------------------------------------------------------------------------- #
 # 3) OS update = native bootc (public, free image) — no gate on the OS
@@ -356,6 +361,8 @@ COPY image/signed-boot/ /
 # First-boot SSH-key provisioning: lets a VANILLA install receive an operator
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
+COPY image/firstboot/neural-ice-seed-import.sh           /usr/local/bin/neural-ice-seed-import.sh
+COPY image/model-cache-contract.py                       /usr/libexec/neural-ice-model-cache-contract
 # TWO units, one script. Provisioning is ordered Before=sshd.service and writes
 # the key without ever starting or polling sshd (it cannot: the manager holds
 # the sshd job until the oneshot exits). Activation is ordered after both the
@@ -364,6 +371,9 @@ COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-i
 COPY image/firstboot/neural-ice-firstboot-sshkey.service          /usr/lib/systemd/system/neural-ice-firstboot-sshkey.service
 COPY image/firstboot/neural-ice-firstboot-sshkey-activate.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey-activate.service
 COPY image/firstboot/neural-ice-firstboot-tpm-ceremony.service /usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service
+COPY image/firstboot/neural-ice-seed-import.service /usr/lib/systemd/system/neural-ice-seed-import.service
+COPY image/firstboot/50-neural-ice-seed-import.conf /usr/lib/systemd/system/NetworkManager.service.d/40-neural-ice-seed-import.conf
+COPY image/firstboot/50-neural-ice-seed-import.conf /usr/lib/systemd/system/neural-ice-payload-apply.service.d/40-neural-ice-seed-import.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/sshd.service.d/50-neural-ice-tpm-ceremony.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/getty@.service.d/50-neural-ice-tpm-ceremony.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/serial-getty@.service.d/50-neural-ice-tpm-ceremony.conf
@@ -403,6 +413,7 @@ COPY image/lib/installer-ssh-key.sh /usr/lib/neural-ice/lib/installer-ssh-key.sh
 # second proves an image digest is authorised for this medium's profile before
 # anything on the target disk is touched (DESIGN-NOTE-0001, Findings 1 and 2).
 COPY image/lib/installer-payload.sh      /usr/lib/neural-ice/lib/installer-payload.sh
+COPY image/lib/tpm2-nv-public.sh         /usr/lib/neural-ice/lib/tpm2-nv-public.sh
 COPY image/lib/installer-trust.sh        /usr/lib/neural-ice/lib/installer-trust.sh
 COPY image/lib/release-authorization.sh  /usr/lib/neural-ice/lib/release-authorization.sh
 # The MEASURED hardware identity. `neuralice.hardware_target=` used to be a word
@@ -455,9 +466,9 @@ COPY image/mdns/neural-ice-hostname-init.sh /usr/local/bin/neural-ice-hostname-i
 # explicit operator-triggered reconnection, but never schedule it: trying DHCP
 # drops the working fallback for the duration of the DHCP timeout.
 COPY image/mdns/neural-ice-dhcp-retry.sh /usr/local/bin/neural-ice-dhcp-retry.sh
-# PRELOADED edition: the installer stages a ready-built podman overlay store onto the encrypted
-# data volume; we register it as a READ-ONLY additional image store so the appliance's images are
-# visible INSTANTLY at first boot — no `podman load`, no CPU re-hash/untar of ~20 GB.
+# SEED v2: firstboot imports the authenticated OCI closure into an encrypted,
+# read-only additional store. The store path is a permanent indirection through
+# the single offline generation commit pointer shared by content, models and HF.
 # IMPORTANT (field-learned 2026-07-03): containers-storage HARD-FAILS if an additionalimagestores
 # path does not exist (no silent skip) — so the directory must exist EVERYWHERE podman runs:
 #   - baked into the image (covers the LIVE installer, where the data volume isn't mounted),
@@ -472,9 +483,18 @@ COPY image/mdns/neural-ice-dhcp-retry.sh /usr/local/bin/neural-ice-dhcp-retry.sh
 # LATER drop-in that re-lists every store found in the vendor drop-ins plus ours.
 RUN set -euxo pipefail; \
     src=/etc/containers/storage.conf; \
-    store=/var/lib/neural-ice/data/seed-store; \
-    install -d -m 0700 "$store"; \
-    printf 'd /var/lib/neural-ice/data/seed-store 0700 root root -\n' \
+    store=/var/lib/neural-ice/data/seed-store/current; \
+    data=/var/lib/neural-ice/data; \
+    install -d -m 0700 "$data/offline-generations/empty/seed-store/graphroot" \
+      "$data/offline-generations/empty/content" "$data/offline-generations/empty/models" \
+      "$data/offline-generations/empty/hf-cache/hub" "$data/seed-store" \
+      "$data/content" "$data/models" "$data/hf-cache"; \
+    ln -s offline-generations/empty "$data/offline-current"; \
+    ln -s ../offline-current/seed-store/graphroot "$store"; \
+    ln -s ../offline-current/content "$data/content/current"; \
+    ln -s ../offline-current/models "$data/models/current"; \
+    ln -s ../offline-current/hf-cache/hub "$data/hf-cache/hub"; \
+    printf 'd /var/lib/neural-ice/data/offline-generations 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/seed-store/graphroot 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/content 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/models 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/hf-cache/hub 0700 root root -\nL /var/lib/neural-ice/data/offline-current - - - - offline-generations/empty\nd /var/lib/neural-ice/data/seed-store 0700 root root -\nL /var/lib/neural-ice/data/seed-store/current - - - - ../offline-current/seed-store/graphroot\nd /var/lib/neural-ice/data/content 0700 root root -\nL /var/lib/neural-ice/data/content/current - - - - ../offline-current/content\nd /var/lib/neural-ice/data/models 0700 root root -\nL /var/lib/neural-ice/data/models/current - - - - ../offline-current/models\nd /var/lib/neural-ice/data/hf-cache 0700 root root -\nL /var/lib/neural-ice/data/hf-cache/hub - - - - ../offline-current/hf-cache/hub\n' \
         > /usr/lib/tmpfiles.d/neural-ice-seed-store.conf; \
     install -d /etc/containers; \
     if [ ! -f "$src" ]; then \
@@ -510,6 +530,8 @@ RUN set -euxo pipefail; \
 # derivation (ICE-Fabric) — that product concern is NOT baked here.
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh \
+               /usr/local/bin/neural-ice-seed-import.sh \
+               /usr/libexec/neural-ice-model-cache-contract \
                /usr/local/bin/neural-ice-hostname-init.sh \
                /usr/local/bin/neural-ice-dhcp-retry.sh \
                /usr/local/bin/neural-ice-payload-apply.sh; \
@@ -518,6 +540,7 @@ RUN set -euxo pipefail; \
                      neural-ice-firstboot-tpm-ceremony.service \
                      neural-ice-firstboot-sshkey.service \
                      neural-ice-firstboot-sshkey-activate.service \
+                     neural-ice-seed-import.service \
                      neural-ice-hostname-init.service \
                      neural-ice-payload-apply.service \
                      avahi-daemon.service; \
@@ -683,6 +706,7 @@ RUN set -euxo pipefail; \
                /usr/lib/neural-ice/lib/hardware-identity.sh \
                /usr/lib/neural-ice/lib/access-policy.sh \
                /usr/lib/neural-ice/lib/installer-payload.sh \
+               /usr/lib/neural-ice/lib/tpm2-nv-public.sh \
                /usr/lib/neural-ice/lib/installer-trust.sh \
                /usr/lib/neural-ice/lib/release-authorization.sh \
                /usr/lib/neural-ice/lib/installer-ssh-key.sh; \
@@ -794,7 +818,9 @@ RUN set -euxo pipefail; \
     dracut --force --no-hostonly --kver "${KVER}" \
         "/usr/lib/modules/${KVER}/initramfs.img"; \
     listing="$(lsinitrd "/usr/lib/modules/${KVER}/initramfs.img")"; \
-    for required in gsp_ga10x.bin 90-neural-ice-nvidia-drm.conf vconsole.conf default8x16; do \
+    for required in gsp_ga10x.bin 90-neural-ice-nvidia-drm.conf vconsole.conf default8x16 \
+        91neural-ice-tpm-policy neural-ice-tpm-policy.sh neural-ice-tpm2-nv-public.sh \
+        tpm2_nvreadpublic tpm2_nvread; do \
         case "$listing" in \
           *"$required"*) ;; \
           *) echo "$required missing from the generated initramfs" >&2; exit 1 ;; \

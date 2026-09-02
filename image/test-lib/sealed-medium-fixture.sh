@@ -29,11 +29,28 @@
 #
 # ...and $RAW already holds one correctly assembled Install medium.
 
+# 🔴 A SKIP THAT EXITS 0 IS A GREEN RUN THAT BUILT AND INSPECTED NOTHING
+# (independent review 2026-09-02, P2 #1). This function `exit 0`s when any tool
+# is missing, so on a host without veritysetup the whole media suite printed
+# `SKIP: veritysetup unavailable` and returned SUCCESS -- and every selector,
+# ESP, payload and verity assertion inside it silently did not run.
+#
+# The skip stays, because a developer's laptop is not a build host and a suite
+# that cannot run is not a suite that failed. What is new is that CI SETS
+# NI_MEDIA_SUITE_REQUIRE_TOOLS=1, which turns every skip into a failure. The
+# verity-dependent suite is therefore REQUIRED in CI -- there is no environment
+# in which it is allowed to report green without having run.
 sealed_medium_require_tools() {
   local required
   for required in objdump objcopy sbsign sbverify openssl sha256sum python3 \
     mkfs.vfat mcopy mmd sgdisk veritysetup truncate; do
-    command -v "$required" >/dev/null 2>&1 || { echo "SKIP: $required unavailable" >&2; exit 0; }
+    command -v "$required" >/dev/null 2>&1 && continue
+    if [ "${NI_MEDIA_SUITE_REQUIRE_TOOLS:-0}" = 1 ]; then
+      echo "FAIL: $required is unavailable and NI_MEDIA_SUITE_REQUIRE_TOOLS=1; this suite may not skip here" >&2
+      exit 1
+    fi
+    echo "SKIP: $required unavailable" >&2
+    exit 0
   done
 }
 sealed_medium_require_tools
@@ -147,7 +164,8 @@ build_uki() { # $1=name  $2=extra kargs  $3...=env overrides
 # 3) BUILD THE REAL, SIGNED UKIs — one per MODE. A produced medium carries
 #    exactly one of them.
 # --------------------------------------------------------------------------- #
-build_uki installer-live "quiet" >/dev/null || fail "the Live UKI build failed"
+build_uki installer-live "quiet systemd.unit=neural-ice-live.target neuralice.live=1" >/dev/null \
+  || fail "the Live UKI build failed"
 build_uki installer-install "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0" >/dev/null \
   || fail "the Install UKI build failed"
 grep -qx 'signed=yes' "$SEALED/installer-install.efi.manifest" || fail "the Install UKI is not signed"
@@ -168,12 +186,35 @@ sbverify --cert "$TMP/uki.crt" "$SEALED/installer-install.efi" >/dev/null \
 RAW="$TMP/disk.raw"
 ESP="$TMP/esp.img"
 export MTOOLS_SKIP_CHECK=1
-make_esp() { # $1=uki path  $2=manifest path  $3=manifest name
+# 🔴 THE ESP CARRIES THE ARTEFACTS THE SIGNATURE PINS (independent review
+# 2026-09-02, P0 #3). A registry medium's sealed command line names the SHA-256
+# of `ice-coreos/release-authorization.json`, its detached signature and, on a
+# lab bench medium, the mirror CA. Every one of those lives on this MUTABLE vfat
+# partition, and the inspector recomputes each against the value the UKI seals.
+# So a fixture that stages a UKI and no ESP payload is a fixture that cannot
+# build the very medium the producer now cuts.
+#
+# Extra files are given as `::/path=<source>` pairs after the manifest name.
+make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=source
   rm -f "$ESP"; truncate -s 64M "$ESP"
   mkfs.vfat -F 32 -n EFI-SYSTEM "$ESP" >/dev/null
   mmd -i "$ESP" ::/EFI ::/EFI/BOOT ::/EFI/neural-ice
   mcopy -i "$ESP" "$1" '::/EFI/BOOT/BOOTAA64.EFI'
   mcopy -i "$ESP" "$2" "::/EFI/neural-ice/$3"
+  local pair destination source made_ice_coreos=0
+  shift 3
+  for pair in "$@"; do
+    destination="${pair%%=*}"; source="${pair#*=}"
+    case "$destination" in
+      ::/ice-coreos/*)
+        if [ "$made_ice_coreos" = 0 ]; then
+          mmd -i "$ESP" ::/ice-coreos
+          made_ice_coreos=1
+        fi
+        ;;
+    esac
+    mcopy -i "$ESP" "$source" "$destination"
+  done
 }
 make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest

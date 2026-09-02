@@ -752,6 +752,16 @@ export NI_TRUSTED_TIME_ISSUER=trusted-time.example.test   # REQUIRED — see bel
 
 cargo test --locked --all-targets           # default-feature unit tests
 cargo test --locked --features test-path-overrides  # unit + CLI tests; cosign is stubbed
+```
+
+`NI_OTA_COSIGN` (the cosign stub the CLI tests inject) exists only in the
+`test-path-overrides` build, and even there only for an unprivileged process
+outside a release image (`/usr/lib/neural-ice/release-image` absent). The
+default build the OS image ships never reads it and does not contain its name:
+`cargo test --locked` proves the environment is ignored through the real
+`verify_seed` entry, and CI greps the release binary for the string.
+
+```
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
 

@@ -72,6 +72,8 @@ pub(crate) struct AppliedStateV1 {
     pub(crate) bom_sha256: String,
     pub(crate) bundle_seq: u64,
     pub(crate) schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_ring: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2745,6 +2747,7 @@ mod tests {
         Candidate {
             legacy_root_media_independent: true,
             applied: AppliedStateV1 {
+                active_ring: None,
                 bom_sha256: "e".repeat(64),
                 bundle_seq: 1,
                 schema: "neural-ice-ota-applied-state-v1".into(),
@@ -2824,6 +2827,7 @@ mod tests {
             canonical_hash(b"{\"different\":true}\n").unwrap()
         };
         let applied = AppliedStateV1 {
+            active_ring: None,
             bom_sha256: format!("{:x}", spec.bundle)
                 .repeat(64)
                 .chars()

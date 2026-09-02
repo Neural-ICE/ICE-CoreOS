@@ -17,6 +17,23 @@ on:
       # and a build host, so it cannot be the FIRST thing that notices.
       - "image/Containerfile.installer"
       - "image/installer/**"
+      - "image/initramfs/**"
+      # 🔴 THE THREE HAND-MAINTAINED LISTS HAD DRIFTED (independent review
+      # 2026-09-02, P2 #1). Four files that decide whether a medium boots at all
+      # were in none of `paths:`, the shellcheck line or the execution step, and
+      # a change touching only the two new suites did not trigger this job.
+      # ci/test-suite-collection.sh now walks the tree and fails when any owned
+      # file is missing from any of the three; these globs are what keep the
+      # first of them from needing a new line per file.
+      - "image/test-*.sh"
+      - "image/*.py"
+      - "image/build-*.sh"
+      - "image/firstboot/**"
+      - "image/lib/**"
+      - "image/policy/**"
+      - "ota/**"
+      - "ci/**"
+      - "tools/ni-ota-verify/**"
       - "image/test-installer-systemd-lifecycle.sh"
       - "image/build-installer-usb.sh"
       - "image/lib/installer-ssh-key.sh"
@@ -114,6 +131,16 @@ on:
       - "image/test-installer-uki.sh"
       - "image/test-installer-media.sh"
       - "image/installer/**"
+      - "image/initramfs/**"
+      - "image/test-*.sh"
+      - "image/*.py"
+      - "image/build-*.sh"
+      - "image/firstboot/**"
+      - "image/lib/**"
+      - "image/policy/**"
+      - "ota/**"
+      - "ci/**"
+      - "tools/ni-ota-verify/**"
       - "image/test-installer-systemd-lifecycle.sh"
       - "image/test-lib/**"
       - "image/test-build-installer-root.sh"
@@ -184,44 +211,89 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - name: Validate shell syntax
         run: |
-          shellcheck ci/artifact-generation.sh ci/canonicalize-vmlinuz.sh \
-            ci/stage-artifacts.sh ci/stage-nvidia-userspace.sh \
-            ci/test-artifact-generation.sh ci/test-stage-nvidia-userspace.sh ci/build-image.sh \
-            ci/test-build-image-dispatch-contract.sh ci/test-open-core-boundary.sh \
-            ci/test-oci-signature-policy.sh image/policy/render-container-policy.sh \
-            ci/verify-build-context.sh ci/test-kernel-packaging-patch.sh \
-            ci/test-swtpm-monotonic-state.sh \
-            build/build-kernel.sh \
-            image/build-installer-usb.sh image/lib/installer-ssh-key.sh \
-            image/lib/access-policy.sh \
-            image/lib/installer-trust.sh image/lib/release-authorization.sh \
-            image/lib/hardware-identity.sh image/lib/signing-trust.sh \
-            image/build-installer-uki.sh image/build-installer-root.sh \
-            image/build-installer-payload.sh image/lib/installer-payload.sh \
-            image/initramfs/90neural-ice-installer-verity/module-setup.sh \
-            image/test-access-policy.sh image/test-installer-trust.sh \
-            image/test-installer-uki.sh image/test-release-authorization.sh \
-            image/test-installer-media.sh image/test-build-installer-root.sh \
-            image/installer/neural-ice-installer-runtime-generator.sh \
-            image/test-installer-systemd-lifecycle.sh \
-            image/test-lib/sealed-medium-fixture.sh \
-            image/test-installer-payload.sh \
-            image/test-hardware-identity.sh image/test-signing-trust.sh \
-            ota/neural-ice-access-profile-anchor.sh \
-            ota/test-neural-ice-access-profile-anchor.sh \
-            ota/neural-ice-tpm-state.sh \
-            ota/test-neural-ice-tpm-state.sh \
-            ota/neural-ice-autoinstall.sh ota/test-autoinstall-kargs.sh \
-            ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh \
-            image/mdns/neural-ice-hostname-init.sh image/mdns/neural-ice-dhcp-retry.sh \
-            ci/test-linklocal-fallback.sh
+          # 🔴 ENUMERATED FROM THE TREE, NOT FROM MEMORY (independent review
+          # 2026-09-02, P2 #1). This list used to be hand-maintained and had
+          # drifted: the sealed command-line grammar, the Live diagnostics
+          # summary and two whole suites were in none of the workflow's three
+          # lists. ci/test-suite-collection.sh now fails when any owned file is
+          # missing from any of them, so this list cannot silently shrink again.
+          # 🔴 image/lib/installer-payload.sh IS in this list as well as in the
+          # POSIX one below. It is sourced by five bash files, and shellcheck can
+          # only follow a `source` whose target it was also given -- omitting it
+          # turns five files into SC1091 informational findings, and shellcheck
+          # exits non-zero on those. Checked as bash here, as sh below.
+          shellcheck ci/artifact-generation.sh ci/build-image.sh ci/canonicalize-vmlinuz.sh \
+            ci/stage-artifacts.sh ci/stage-nvidia-userspace.sh ci/test-artifact-generation.sh \
+            ci/test-build-image-dispatch-contract.sh ci/test-fabric-coreos-differential.sh ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh \
+            ci/test-kernel-packaging-patch.sh ci/test-linklocal-fallback.sh ci/test-no-shim-chained-updater.sh \
+            ci/test-oci-signature-policy.sh ci/test-open-core-boundary.sh ci/test-open-core-workflow.sh \
+            ci/run-media-validation.sh \
+            ci/test-stage-nvidia-userspace.sh ci/test-suite-collection.sh ci/test-swtpm-monotonic-state.sh \
+            ci/verify-build-context.sh image/build-installer-payload.sh image/build-installer-root.sh \
+            image/build-installer-uki.sh image/build-installer-usb.sh image/build-preloaded.sh \
+            image/build-seed-v2.sh image/firstboot/neural-ice-firstboot-sshkey.sh image/firstboot/neural-ice-seed-import.sh image/installer/neural-ice-installer-failure.sh \
+            image/installer/neural-ice-installer-runtime-generator.sh image/installer/neural-ice-live-diagnostics.sh image/installer/neural-ice-sealed-cmdline-grammar.sh \
+            image/lib/access-policy.sh image/lib/hardware-identity.sh image/lib/installer-payload.sh image/lib/tpm2-nv-public.sh \
+            image/lib/installer-ssh-key.sh image/lib/installer-trust.sh image/lib/preloaded-output-set.sh \
+            image/lib/preloaded-sizing.sh image/lib/release-authorization.sh image/lib/signing-trust.sh \
+            image/policy/render-container-policy.sh image/test-access-policy.sh image/test-build-installer-root.sh \
+            image/test-hardware-identity.sh image/test-installer-failure-surface.sh image/test-installer-live-diagnostics.sh \
+            image/test-installer-media.sh image/test-installer-payload.sh image/test-installer-selector-grammar.sh \
+            image/test-installer-ssh-key.sh image/test-installer-systemd-lifecycle.sh image/test-installer-trust.sh \
+            image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
+            image/test-preloaded-sizing.sh image/test-registry-authorisation.sh image/test-release-authorization.sh \
+            image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-signing-trust.sh image/test-tpm-ceremony-systemd.sh \
+            image/test-tpm-policy-initramfs.sh \
+            image/test-verify-preloaded-media.sh ota/neural-ice-access-profile-anchor.sh ota/neural-ice-autoinstall.sh \
+            ota/neural-ice-device-root-tpm.sh ota/neural-ice-firstboot-tpm-ceremony.sh ota/neural-ice-lab-baseline-handoff.sh \
+            ota/neural-ice-tpm-policy-check.sh ota/neural-ice-tpm-state.sh ota/test-autoinstall-kargs.sh \
+            ota/test-neural-ice-access-profile-anchor.sh ota/test-neural-ice-device-root-tpm.sh ota/test-neural-ice-lab-baseline-handoff.sh \
+            ota/test-neural-ice-tpm-state.sh ota/test-tpm-signed-policy.sh
           # The initramfs hooks and the payload library are POSIX sh, on purpose:
           # they run in the initramfs /bin/sh AND are sourced by bash on the build
           # host and by the installer. Checking them as `sh` is what catches a
           # bashism that would only fail inside a signed UKI, on the appliance.
-          shellcheck -s sh image/lib/installer-payload.sh \
+          shellcheck -s sh image/lib/installer-payload.sh image/lib/tpm2-nv-public.sh \
             image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity.sh \
-            image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity-cmdline.sh
+            image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity-cmdline.sh \
+            image/initramfs/91neural-ice-tpm-policy/module-setup.sh \
+            image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh
+
+      - name: Validate every Python file this job owns
+        run: |
+          # Every Python file in the areas this job owns must at least PARSE, and
+          # the ones with their own suites are exercised below. A file that only
+          # ever ran on a build host is a file whose syntax error reaches a bench.
+          python3 - <<'PY'
+          import ast
+          import pathlib
+          import sys
+
+          files = [
+              "image/inspect-installer-media.py",
+              "image/installer/neural-ice-registry-authorisation.py",
+              "image/model-cache-contract.py",
+              "image/seed-tree-manifest.py",
+              "image/test-lib/unit-graph.py",
+              "image/test-seed-tree-manifest.py",
+              "image/verify-preloaded-media.py",
+              "ota/neural-ice-luks-token-evidence.py",
+              "ota/neural-ice-tpm-policy.py",
+              "ota/test-neural-ice-luks-token-evidence.py",
+          ]
+          missing = [f for f in files if not pathlib.Path(f).is_file()]
+          if missing:
+              print(f"::error::this workflow names Python files that do not exist: {missing}")
+              sys.exit(1)
+          for name in files:
+              try:
+                  ast.parse(pathlib.Path(name).read_text(encoding="utf-8"), filename=name)
+              except SyntaxError as error:
+                  print(f"::error file={name},line={error.lineno}::{error.msg}")
+                  sys.exit(1)
+          print(f"parsed {len(files)} Python files")
+          PY
+
       - name: Validate the installer image recipe
         run: |
           # A Containerfile has no linter here, so assert the properties that
@@ -314,11 +386,47 @@ jobs:
           # The one suite that uses the REAL toolchain end to end: real objcopy
           # assembles a real PE, real sbsign signs it, real sbverify verifies it,
           # and a real GPT medium with a real FAT ESP is read back WITHOUT root.
-          ./image/test-installer-media.sh
+          # 🔴 THE VERITY-DEPENDENT SUITE MAY NOT SKIP HERE (independent review
+          # 2026-09-02, P2 #1). image/test-lib/sealed-medium-fixture.sh `exit 0`s
+          # when a tool is missing, so on a host without veritysetup this suite
+          # printed `SKIP` and reported SUCCESS with nothing built or inspected.
+          # NI_MEDIA_SUITE_REQUIRE_TOOLS=1 turns every such skip into a failure:
+          # in CI the toolchain is installed above, so a skip here is a broken
+          # runner, not an environment.
+          if command -v veritysetup >/dev/null 2>&1; then
+            NI_MEDIA_SUITE_REQUIRE_TOOLS=1 ./image/test-installer-media.sh
+          else
+            ./ci/run-media-validation.sh
+          fi
           ./image/test-installer-systemd-lifecycle.sh
+          # The three suites the systemd-lifecycle suite also chains, run here in
+          # their own right so a change to that chaining cannot silently drop one.
+          ./image/test-installer-selector-grammar.sh
+          ./image/test-installer-live-diagnostics.sh
+          ./image/test-installer-failure-surface.sh
+          # The signed-media command-line grammar, the failure sink and the
+          # container signature policy are the three things that decide what a
+          # medium may do; the offline seed closure is what it may install.
+          ./image/test-registry-authorisation.sh
+          ./image/test-installer-ssh-key.sh
+          sudo ./image/test-installer-ssh-key.sh --root-seam-negative-only
+          ./image/test-tpm-policy-initramfs.sh
+          sudo ./image/test-tpm-policy-initramfs.sh
+          ./image/test-seed-firstboot-import.sh
           ./ota/test-autoinstall-kargs.sh
           ./ota/test-neural-ice-tpm-state.sh
           ./ota/test-neural-ice-access-profile-anchor.sh
+          # 🔴 AND THE THREE HAND-MAINTAINED LISTS ABOVE ARE CHECKED AGAINST THE
+          # TREE. A file added with no wiring fails here rather than being
+          # discovered by a reviewer months later.
+          ./ci/test-suite-collection.sh
+
+      # Producer/consumer wiring: the real producer must call its consumer both
+      # before and after READY, and the legacy overlay interface must refuse.
+      # Cryptographic and graph mutation coverage lives in the Rust verifier
+      # suite, which consumes Fabric's generated canonical fixture.
+      - name: Prove the offline seed closure end to end
+        run: ./image/test-seed-closure.sh
 
       # 🔴 THE SUITES MUST NOT HAVE SUBSTITUTED THEIR OWN CRYPTO. Every suite
       # above reports which stack it used, and a run that fell back to a shim is
@@ -333,7 +441,7 @@ jobs:
             *"cosign=real"*) ;;
             *) echo "::error::the release-authorization suite fell back to its openssl shim; cosign is the appliance's only signature stack and CI must exercise it"; exit 1 ;;
           esac
-          out="$(./image/test-installer-media.sh 2>&1)"
+          out="$(./ci/run-media-validation.sh 2>&1)"
           printf '%s\n' "$out"
           case "$out" in
             *"using the host's real veritysetup"*) ;;

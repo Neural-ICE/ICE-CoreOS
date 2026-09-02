@@ -154,7 +154,8 @@ case "\$attrs" in *ownerwrite*) raw=\$(( raw | 0x2 ));; esac
 printf '0x%s:\n' "\$index"
 name="\$( { printf '%s:%x:' "\$index" "\$raw"; cat "$NV/\$index/policy"; } | sha256sum | awk '{print \$1}')"
 printf '  name: 000b%s\n' "\${name:0:64}"
-printf '  attributes:\n    value: 0x%x\n' "\$raw"
+printf '  hash algorithm:\n    friendly: sha256\n    value: 0xB\n'
+printf '  attributes:\n    friendly: %s\n    value: 0x%x\n' "\$attrs" "\$raw"
 printf '  size: %s\n' "\$(cat "$NV/\$index/size")"
 printf '  authorization policy: %s\n' "\$(od -An -tx1 -v "$NV/\$index/policy" | tr -d '[:space:]')"
 if [[ -n "\$name_out" ]]; then
@@ -341,6 +342,10 @@ export NI_TPM_STATE_TESTING=1
 export NI_TPM_STATE_TEST_TOOLS="$TOOLS"
 export NI_TPM_STATE_TEST_RUN_DIR="$TMP/run"
 st() { bash "$SCRIPT" "$@"; }
+activate_pcr_policy() {
+  [ "$(st pcr-policy-check 1)" = 0 ] || fail "virgin PCR policy high-water check failed"
+  [ "$(st pcr-policy-activate 1)" = 1 ] || fail "initial PCR policy activation failed"
+}
 
 TARGET=nvidia-gb10-arm64
 POLICY=neural-ice-secureboot-lab-v1
@@ -369,6 +374,15 @@ rm -f "$OWNER_AUTH_MARK"
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4 >/dev/null 2>&1 \
   && fail "ceremony ran without device root and SRK"
 : > "$PERSIST/81010005"; : > "$PERSIST/81000001"
+activate_pcr_policy
+
+# Replay/lower/equal are refusals; only a strictly newer signed generation may
+# move the fixed 0x01500007 high-water, and check itself never mutates it.
+st pcr-policy-check 1 >/dev/null 2>&1 && fail "equal PCR policy sequence replayed"
+st pcr-policy-check 0 >/dev/null 2>&1 && fail "zero PCR policy sequence was accepted"
+[ "$(st pcr-policy-check 2)" = 1 ] || fail "next PCR policy sequence was refused"
+[ "$(st pcr-policy-activate 2)" = 2 ] || fail "next PCR policy sequence did not activate"
+st pcr-policy-activate 2 >/dev/null 2>&1 && fail "equal PCR policy activation replayed"
 
 # Interrupted ceremony: fixed state landed, owner auth did not. Deleting record
 # only, then record+freshness, must never make the mock call the TPM virgin once
@@ -383,6 +397,7 @@ st provisioning-status >/dev/null 2>&1 && fail "record deletion became virgin"
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4 >/dev/null 2>&1 \
   && fail "ceremony recreated a deleted record"
 rm -rf "${NV:?}"/*
+activate_pcr_policy
 
 # A process loss after successful changeauth is already a completed lifecycle:
 # the completion record and evidence digest were locked before the last
@@ -398,6 +413,7 @@ NI_TEST_INTERRUPT_AFTER_CHANGEAUTH=1 st ceremony-finalize customer-locked "$TARG
   "$install_at" "$freshness_at")" = complete ] \
   || fail "post-changeauth interruption was not recoverable as authenticated complete"
 rm -rf "${NV:?}"/*; rm -f "$OWNER_AUTH_MARK"
+activate_pcr_policy
 
 result="$(st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4)"
 read -r install_at freshness_at _ <<<"$result"
@@ -410,6 +426,7 @@ st provisioning-status >/dev/null 2>&1 && fail "deleting record+freshness became
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4 >/dev/null 2>&1 \
   && fail "ceremony recreated both deleted indices"
 rm -rf "${NV:?}"/*
+activate_pcr_policy
 
 result="$(st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4)"
 [ "$result" = "1 4 $EXPECT" ] || fail "ceremony returned unexpected evidence: $result"

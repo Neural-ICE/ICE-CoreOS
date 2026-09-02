@@ -23,9 +23,101 @@
 #
 set -euo pipefail
 
+# --------------------------------------------------------------------------- #
+# 🔴 EVERY PRODUCTION PATH IN THIS FILE IS FIXED AND ROOT-CUSTODIED (independent
+# review 2026-09-02, P0 #1, compounding issue).
+#
+# The command-line file, the sealed grammar, the installer library directory, the
+# verity mount points, the store mapper and the TPM state helper were all
+# `${VAR:-default}` -- so anything able to set an environment variable and exec
+# this script could replace the very inputs the trust gate reads, and the gate
+# would then validate a fixture. That was survivable only because it needed a
+# shell, and the shell is exactly what the failure-sink change above removes.
+#
+# The seam is now EXPLICIT and CANNOT EXIST IN A RELEASE IMAGE, on three
+# independent conditions, all required:
+#
+#   1. NI_INSTALLER_TEST_SEAM=1 must be set on purpose. Absent -- which is every
+#      boot of every medium -- not one override is consulted and every path below
+#      is the compiled-in literal.
+#   2. The process must be UNPRIVILEGED. A root process asking for test overrides
+#      is refused outright, so a privileged caller cannot use the seam even by
+#      setting the variable.
+#   3. /usr/lib/neural-ice/release-image must be ABSENT. image/Containerfile.installer
+#      stages that marker into the dm-verity-protected read-only /usr of every
+#      medium this repository cuts, so on a real medium condition 3 is false and
+#      the seam refuses even in the impossible case that 1 and 2 both hold.
+#
+# image/test-installer-selector-grammar.sh asserts all three, and
+# image/Containerfile.installer asserts the marker is present in the built image.
+# --------------------------------------------------------------------------- #
+readonly NI_RELEASE_IMAGE_MARKER="/usr/lib/neural-ice/release-image"
+NI_INSTALLER_TEST_SEAM="${NI_INSTALLER_TEST_SEAM:-}"
+if [[ -n "$NI_INSTALLER_TEST_SEAM" ]]; then
+  if [[ "$NI_INSTALLER_TEST_SEAM" != 1 ]] || (( EUID == 0 )) || [[ -e "$NI_RELEASE_IMAGE_MARKER" ]]; then
+    printf 'neural-ice-autoinstall: refused: test overrides are forbidden in a privileged process and cannot exist in a release image\n' >&2
+    exit 1
+  fi
+fi
+readonly NI_INSTALLER_TEST_SEAM
+
+# One production value, one optional override, and the override is reachable only
+# behind the armed seam above. Written as a function so a future path cannot be
+# added as a plain `${VAR:-default}` without standing out in review.
+ni_path() { # $1=environment variable name  $2=the production value
+  if [[ -n "$NI_INSTALLER_TEST_SEAM" && -n "${!1:-}" ]]; then
+    printf '%s' "${!1}"
+  else
+    printf '%s' "$2"
+  fi
+}
+
 readonly LOG_TAG="neural-ice-autoinstall"
 log()  { logger -t "$LOG_TAG" -- "$*"; printf '\n[%s] %s\n' "$LOG_TAG" "$*" > /dev/console 2>/dev/null || true; printf '[%s] %s\n' "$LOG_TAG" "$*" >&2; }
-die()  { log "FAILED in phase ${PHASE_ID}/${PHASE_TOTAL} (${PHASE_LABEL}): $*"; exit 1; }
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE FAILURE EVIDENCE. BOUNDED, STABLE, AND FREE OF EVERYTHING THAT COULD
+# CARRY AN OPERATOR'S OR AN ATTACKER'S BYTES.
+#
+# neural-ice-installer-failure.service is the only thing that renders a failure,
+# and it renders THIS file -- not the message. The message goes to the journal,
+# where the operator procedures reach it; the console gets:
+#
+#   code        a token from the closed per-phase vocabulary below. Authored
+#               here, never derived from an argument, a device, a digest, a key
+#               or anything read off a medium, a disk or the network.
+#   phase       the phase number and total, both authored here.
+#   stage       the phase's stable slug, from the same closed table.
+#   detail      the first 12 hex characters of the SHA-256 of the diagnostic
+#               message. It correlates the console with the journal line and is
+#               a one-way function of it: it can carry no readable fragment of a
+#               path, a key, a hostname or a customer's data.
+#
+# The directory is created by the unit (RuntimeDirectory=), root-only, BEFORE
+# ExecStart -- so there is no directory creation, no mkdir and no mode decision
+# anywhere on the failure path.
+# --------------------------------------------------------------------------- #
+readonly FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
+FAILURE_EVIDENCE="$(ni_path NEURALICE_FAILURE_EVIDENCE /run/neural-ice-installer-failure/evidence)"
+readonly FAILURE_EVIDENCE
+
+write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
+  local detail
+  detail="$(printf '%s' "${1:-}" | sha256sum 2>/dev/null | cut -c1-12)"
+  [[ "$detail" =~ ^[0-9a-f]{12}$ ]] || detail=unavailable
+  # A single overwrite, never an append: the sink reads the FIRST occurrence of
+  # each key, and a failure inside a failure must not be able to grow this file.
+  printf 'schema=%s\ncode=%s\nphase=%s\nphase_total=%s\nstage=%s\ndetail=%s\n' \
+    "$FAILURE_EVIDENCE_SCHEMA" "$PHASE_CODE" "$PHASE_ID" "$PHASE_TOTAL" \
+    "$PHASE_SLUG" "$detail" \
+    > "$FAILURE_EVIDENCE" 2>/dev/null || true
+}
+
+die()  {
+  write_failure_evidence "$*"
+  log "FAILED in phase ${PHASE_ID}/${PHASE_TOTAL} (${PHASE_LABEL}) [${PHASE_CODE}]: $*"
+  exit 1
+}
 
 # --------------------------------------------------------------------------- #
 # Console UX: the operator watches tty1 during a destructive install, so every
@@ -36,6 +128,28 @@ die()  { log "FAILED in phase ${PHASE_ID}/${PHASE_TOTAL} (${PHASE_LABEL}): $*"; 
 readonly PHASE_TOTAL=8
 PHASE_ID=0; PHASE_LABEL="startup"; PHASE_T0=$SECONDS
 
+# 🔴 THE CLOSED FAILURE VOCABULARY. One stable slug and one stable code per
+# phase, authored here and nowhere else. `die` puts the CODE on the console and
+# the message in the journal, so an operator reports a token this repository owns
+# rather than a sentence that may quote a path, a digest or a device.
+#
+# A number this table does not name is `unclassified`: an unnumbered phase is a
+# defect in this file, and it must be visible as one rather than silently
+# inheriting the previous phase's identity.
+declare -rA PHASE_SLUGS=(
+  [0]=startup
+  [1]=preflight-and-trust-gate
+  [2]=partition-and-encrypt
+  [3]=prepare-target-filesystem
+  [4]=write-deployment
+  [5]=stage-verified-seed
+  [6]=deployment-prep-and-device-root
+  [7]=selinux-labelling
+  [8]=finalize-and-escrow
+)
+PHASE_SLUG="${PHASE_SLUGS[0]}"
+PHASE_CODE="install-failed-${PHASE_SLUGS[0]}"
+
 fmt_dur() { # $1=seconds -> "12s" / "3m05s"
   if (( $1 >= 60 )); then printf '%dm%02ds' "$(( $1 / 60 ))" "$(( $1 % 60 ))"; else printf '%ds' "$1"; fi
 }
@@ -45,6 +159,8 @@ phase() { # $1=number  $2=label — close the previous phase, open the next
     log "[${PHASE_ID}/${PHASE_TOTAL}] done in $(fmt_dur $(( SECONDS - PHASE_T0 )))"
   fi
   PHASE_ID="$1"; PHASE_LABEL="$2"; PHASE_T0=$SECONDS
+  PHASE_SLUG="${PHASE_SLUGS[$1]:-unclassified}"
+  PHASE_CODE="install-failed-${PHASE_SLUG}"
   log "[${PHASE_ID}/${PHASE_TOTAL}] ${PHASE_LABEL} (t+$(fmt_dur "$SECONDS"))"
 }
 
@@ -124,7 +240,8 @@ copy_progress_start() { # $1=total-bytes  $2=dst-dir
 # The command line is read from ONE place, named once, so the suite can drive
 # these two functions against a fixture instead of grepping the source and
 # hoping. A control nothing exercises is a control nobody notices the loss of.
-readonly NEURALICE_CMDLINE_FILE="${NEURALICE_CMDLINE_FILE:-/proc/cmdline}"
+NEURALICE_CMDLINE_FILE="$(ni_path NEURALICE_CMDLINE_FILE /proc/cmdline)"
+readonly NEURALICE_CMDLINE_FILE
 
 karg_count() { # $1=key -> number of occurrences on the kernel command line
   awk -v k="$1=" 'BEGIN{n=0}{for (i=1;i<=NF;i++) if (index($i,k)==1) n++} END{print n+0}' \
@@ -143,25 +260,117 @@ karg_once() { # $1=key -> prints the single value, or nothing when absent
     "$NEURALICE_CMDLINE_FILE"
 }
 
-# OTA origin recorded on the installed system = the PUBLIC channel tag, so
-# `bootc upgrade` follows that channel from GHCR. Default = the imgref the CI baked into
-# THIS image (channel+variant self-description, e.g. :<channel>-debug), so a debug install
-# stays on the debug channel instead of jumping to :stable. Overridable via neuralice.imgref=.
-# USB installers ALWAYS pass neuralice.imgref=<packaged channel> (build-installer-usb.sh):
-# a promoted :stable image still carries its build channel (:beta) in the baked file
-# (promotion re-tags by digest, no rebuild — ADR-0005), so the karg is authoritative here.
-IMGREF="ghcr.io/neural-ice/neural-ice-coreos:stable"
-if [ -r /usr/lib/neural-ice/ota-imgref ]; then
-  IMGREF="$(tr -d '[:space:]' < /usr/lib/neural-ice/ota-imgref)"
+# --------------------------------------------------------------------------- #
+# 🔴 THE INSTALLER REVALIDATES ITS OWN AUTHORISATION, BEFORE ANYTHING ELSE.
+#
+# WHAT THIS CLOSES (independent review 2026-09-02, P1 #1). The only check that a
+# destructive install had actually been selected lived in the SERVICE:
+# neural-ice-autoinstall.service runs the runtime generator's `--check` as an
+# ExecStartPre. An ExecStartPre guards a unit, not an executable. Anything with a
+# shell -- a `systemd.debug_shell` root console on tty9, an emergency shell, a
+# rescue target, or a future defect in any of the above -- could simply run
+# /usr/local/bin/neural-ice-autoinstall.sh, and this script would have wiped the
+# internal disk without ever asking whether the boot it runs on was authorised to
+# install anything.
+#
+# So the gate is HERE, in the thing that does the destroying, and it runs before
+# the first line that reads an argument, writes a file or touches a disk. The
+# service keeps its ExecStartPre: two independent readers of one grammar is the
+# point, not a duplication to be tidied away.
+#
+# The grammar is image/installer/neural-ice-sealed-cmdline-grammar.sh -- a CLOSED
+# WORLD. `neuralice.autoinstall=1` being present is NOT sufficient and never was:
+# a line carrying it plus `systemd.debug_shell`, plus a second `systemd.unit=`,
+# plus `neuralice.live=1`, plus an argument nobody has invented yet, is not a line
+# this repository sealed, and this installer does not run on one.
+# --------------------------------------------------------------------------- #
+NEURALICE_SEALED_GRAMMAR="$(ni_path NEURALICE_SEALED_GRAMMAR /usr/lib/neural-ice/sealed-cmdline-grammar.sh)"
+readonly NEURALICE_SEALED_GRAMMAR
+
+require_signed_install_cmdline() {
+  [[ -r "$NEURALICE_SEALED_GRAMMAR" ]] \
+    || die "the sealed command-line grammar is unreadable ($NEURALICE_SEALED_GRAMMAR); this medium cannot establish that it was authorised to install anything"
+  # shellcheck source=image/installer/neural-ice-sealed-cmdline-grammar.sh
+  source "$NEURALICE_SEALED_GRAMMAR"
+  local mode
+  mode="$(ni_sealed_cmdline_classify_file "$NEURALICE_CMDLINE_FILE")" \
+    || die "the kernel command line is not a signed Neural ICE media grammar; refusing to install"
+  [[ "$mode" == install ]] \
+    || die "this boot's signed selector is '${mode}', not Install; refusing to install"
+  # The two words this script's destructive behaviour is keyed on, read again
+  # through this file's OWN reader. The grammar has already established them;
+  # asserting them here means a future edit that loosens the grammar still has to
+  # get past the installer.
+  [[ "$(karg_count neuralice.autoinstall)" == 1 && "$(karg_once neuralice.autoinstall)" == 1 ]] \
+    || die "the kernel command line does not carry exactly one neuralice.autoinstall=1; refusing to install"
+  [[ "$(karg_count neuralice.live)" == 0 ]] \
+    || die "the kernel command line claims a Live medium as well as an Install one; refusing to install"
+  log "signed Install selector revalidated by the installer itself (grammar: ${NEURALICE_SEALED_GRAMMAR})"
+}
+require_signed_install_cmdline
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE OTA ORIGIN. ONE CANONICAL AUTHORITY, DIGEST-PINNED, NO DEFAULT
+# (independent review 2026-09-02, P0 #3).
+#
+# WHAT THIS REPLACES. The compiled-in default was
+# `ghcr.io/neural-ice/neural-ice-coreos:stable` -- a MUTABLE TAG on a registry
+# that is not the release authority. An appliance whose medium sealed no origin
+# recorded that value, and every later `bootc upgrade` on that machine then
+# followed whatever a GHCR tag pointed at, for the life of the appliance. A
+# fallback nobody chose is still a decision, and this one decided the appliance's
+# entire future update path.
+#
+# THERE IS NO DEFAULT NOW. The origin comes from the signed UKI command line, or
+# from the file the CI baked into this medium's dm-verity-protected /usr, and
+# from nowhere else. Both are held to the SAME rule the sealed grammar enforces:
+# `<sealed release authority>/<repo>@sha256:<digest>`. An absent, tagged, or
+# foreign-authority origin is a refusal here, with the target disk untouched --
+# not an appliance that silently follows someone else's tag.
+# --------------------------------------------------------------------------- #
+# 🔴 THE AUTHORITY IS SEALED, NOT COMPILED IN. ICE-CoreOS is open core, and
+# ci/test-open-core-boundary.sh refuses the sovereign endpoint's bytes in every
+# Git-visible file -- an open repository that names the production registry has
+# published it. So the release authority arrives on the SIGNED command line, the
+# producer supplies it from outside this tree, and every origin reference is held
+# to exactly that one. `tools/ni-ota-verify`'s `--registry-host` is the same
+# decision, already made.
+NEURALICE_RELEASE_AUTHORITY="$(karg_once neuralice.release_authority)"
+readonly NEURALICE_RELEASE_AUTHORITY
+DEVICE_CHANNEL="$(karg_once neuralice.device_channel)"
+readonly DEVICE_CHANNEL
+[[ "$DEVICE_CHANNEL" =~ ^(lab|beta|stable)$ ]] \
+  || die "this install medium seals no valid lab/beta/stable device channel"
+NEURALICE_BAKED_IMGREF="$(ni_path NEURALICE_BAKED_IMGREF /usr/lib/neural-ice/ota-imgref)"
+readonly NEURALICE_BAKED_IMGREF
+
+imgref_is_canonical() { # $1=reference
+  local reference=$1 repository authority path
+  [[ -n "$NEURALICE_RELEASE_AUTHORITY" ]] || return 1
+  [[ "$reference" =~ ^(.+)@sha256:[0-9a-f]{64}$ ]] || return 1
+  repository="${reference%@sha256:*}"
+  [[ "$repository" == */* ]] || return 1
+  authority="${repository%%/*}"
+  path="${repository#*/}"
+  [[ "$authority" == "$NEURALICE_RELEASE_AUTHORITY" ]] || return 1
+  [[ "$path" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$ ]]
+}
+
+IMGREF=""
+if [[ -r "$NEURALICE_BAKED_IMGREF" ]]; then
+  IMGREF="$(tr -d '[:space:]' < "$NEURALICE_BAKED_IMGREF")"
 fi
+# The karg wins when present: a promoted image still carries its BUILD channel in
+# the baked file (promotion re-tags by digest, no rebuild -- ADR-0005), and the
+# producer seals the packaged origin into the signature.
 _imgref_karg="$(karg_once neuralice.imgref)"
 if [[ -n "$_imgref_karg" ]]; then
   IMGREF="$_imgref_karg"
 fi
-# The OTA origin is recorded on the appliance and followed by every later
-# `bootc upgrade`. A malformed one is a machine that silently stops updating.
-[[ "$IMGREF" =~ ^[A-Za-z0-9][A-Za-z0-9./_-]*(:[A-Za-z0-9][A-Za-z0-9._-]*)?(@sha256:[0-9a-f]{64})?$ ]] \
-  || die "neuralice.imgref is not a usable image reference: $IMGREF"
+[[ -n "$IMGREF" ]] \
+  || die "this medium seals no OTA origin and carries no baked one; refusing to install an appliance with no update path rather than inventing a default"
+imgref_is_canonical "$IMGREF" \
+  || die "the OTA origin must be <sealed release authority>/<repo>@sha256:<digest>; a mutable tag or a foreign registry would decide this appliance's every future upgrade. Got: $IMGREF"
 
 # --------------------------------------------------------------------------- #
 # Optional LAN registry mirror, for the deployment-bench path (FAB-0040).
@@ -292,41 +501,43 @@ PY
     || die "neuralice.osimage parser returned an incomplete repository authority"
   INSTALL_IMAGE_REPOSITORY="${_image_ref_lines[0]}"
   INSTALL_REGISTRY_AUTHORITY="${_image_ref_lines[1]}"
-  # Fail-closed on the property that actually protects this path. The medium
-  # runs a permissive DEFAULT so it can read its own local image, but it keeps
-  # the signed `docker` scopes; a registry pull is still verified against
-  # image-ci. If those scopes are gone, the pull would silently accept anything
-  # the network served -- refuse rather than install it.
-  python3 - "$INSTALL_IMAGE_REPOSITORY" "$INSTALL_REGISTRY_AUTHORITY" <<'PY' \
-    || die "this medium carries no explicitly configured signed docker scope for $INSTALL_IMAGE_REPOSITORY; refusing a registry install that nothing would verify"
-import json
-import sys
-repository = sys.argv[1]
-authority = sys.argv[2]
-docker = json.load(open("/etc/containers/policy.json")).get("transports", {}).get("docker", {})
-matches = [scope for scope in docker if repository == scope or repository.startswith(scope + "/")] if isinstance(docker, dict) else []
-sys.exit(0 if matches and all(scope.split("/", 1)[0] == authority for scope in matches) else 1)
-PY
+  # --------------------------------------------------------------------------- #
+  # 🔴 ONE SIGNATURE-POLICY READER, NOT TWO (independent review 2026-09-02,
+  # P1 #2).
+  #
+  # This used to be nine lines of inline Python that asked only whether SOME
+  # scope covering the repository existed under the expected authority. It never
+  # looked at the requirements, so a scope stating `insecureAcceptAnything`, a
+  # mistyped requirement type, an empty requirement list or a `signedIdentity`
+  # that binds nothing all passed -- and the producer's helper, which at least
+  # rejected `insecureAcceptAnything`, disagreed with it. Two readers of one file
+  # giving two different answers is not defence in depth.
+  #
+  # image/installer/neural-ice-registry-authorisation.py is now THE
+  # implementation, staged into this medium's signed read-only /usr, and this is
+  # a call to it. It is invoked TWICE on purpose:
+  #
+  #   here    before the pull, so a policy that would verify nothing refuses with
+  #           the target disk untouched;
+  #   below   after the pull, with the index and platform-child digests the
+  #           object actually resolved to -- the recursive proof. A policy
+  #           satisfied by any image in the repository is refused there even
+  #           though it covers exactly the right scope.
+  # --------------------------------------------------------------------------- #
+  [[ -f "$NEURALICE_REGISTRY_AUTHORISATION" && ! -L "$NEURALICE_REGISTRY_AUTHORISATION" ]] \
+    || die "this medium carries no registry signature-policy reader at $NEURALICE_REGISTRY_AUTHORISATION; refusing a registry install nothing would verify"
+  [[ -f "$NEURALICE_CONTAINER_POLICY" && ! -L "$NEURALICE_CONTAINER_POLICY" ]] \
+    || die "this medium carries no readable container signature policy at $NEURALICE_CONTAINER_POLICY"
+  registry_policy_authorised() { # extra arguments are passed through
+    python3 "$NEURALICE_REGISTRY_AUTHORISATION" \
+      --repository "$INSTALL_IMAGE_REPOSITORY" \
+      --authority "$INSTALL_REGISTRY_AUTHORITY" \
+      "$@" < "$NEURALICE_CONTAINER_POLICY"
+  }
+  registry_policy_authorised \
+    || die "this medium's container signature policy does not authorise a registry install of $INSTALL_IMAGE_REPOSITORY as a signed object; refusing an install nothing would verify"
 fi
 
-if [[ -n "$INSTALL_MIRROR" ]]; then
-  [ "$INSTALL_SOURCE" = registry ] \
-    || die "neuralice.mirror requires neuralice.source=registry and an explicit digest-pinned neuralice.osimage"
-  install -d -m 0755 /etc/containers/registries.conf.d
-  for _scope in neural-ice vendor; do
-    cat >> /etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf <<EOF
-[[registry]]
-location = "$INSTALL_REGISTRY_AUTHORITY/$_scope"
-
-  [[registry.mirror]]
-  location = "$INSTALL_MIRROR/$_scope"
-  insecure = true
-  pull-from-mirror = "digest-only"
-
-EOF
-  done
-  log "LAN registry mirror enabled for this install only: $INSTALL_MIRROR (digest-only, configured authority retained)"
-fi
 
 # System (root) LUKS volume size. Data volume takes the remaining space.
 # Overridable via neuralice.systemsize=<GiB>.
@@ -367,19 +578,33 @@ readonly DATA_MOUNT="/var/lib/neural-ice/data"
 # stops a consumed release authorization being replayed
 # (ota/neural-ice-tpm-highwater.sh). A wipe is exactly what an attacker does
 # before replaying, so neither can live on the disk being wiped.
-readonly TPM_STATE="${TPM_STATE:-/usr/libexec/neural-ice-tpm-state}"
+TPM_STATE="$(ni_path TPM_STATE /usr/libexec/neural-ice-tpm-state)"
+readonly TPM_STATE
+
+# The ONE signature-policy reader, and the file it reads. Both are fixed
+# production paths: the reader lives in the dm-verity-protected /usr the UKI
+# seals, and the policy is the medium's own, so neither is an argument.
+NEURALICE_REGISTRY_AUTHORISATION="$(ni_path NEURALICE_REGISTRY_AUTHORISATION /usr/lib/neural-ice/registry-authorisation.py)"
+readonly NEURALICE_REGISTRY_AUTHORISATION
+NEURALICE_CONTAINER_POLICY="$(ni_path NEURALICE_CONTAINER_POLICY /etc/containers/policy.json)"
+readonly NEURALICE_CONTAINER_POLICY
 
 # WHERE THE SEALED MEDIUM PUT ITSELF. The signed initramfs opened both
 # dm-verity extents, mounted them read-only and gave this system an overlay over
 # the first one (image/initramfs/90neural-ice-installer-verity). None of these
 # paths is a trust input: every one is re-proved below against the kernel's own
 # device-mapper and mount tables.
-readonly INSTALLER_STATE_DIR="${INSTALLER_STATE_DIR:-/run/neural-ice-installer}"
-readonly VERITY_ROOT_MOUNT="${VERITY_ROOT_MOUNT:-$INSTALLER_STATE_DIR/verity-root}"
-readonly STORE_MOUNT="${STORE_MOUNT:-$INSTALLER_STATE_DIR/store}"
-readonly STORE_MAPPER="${STORE_MAPPER:-neuralice-installer-store}"
+INSTALLER_STATE_DIR="$(ni_path INSTALLER_STATE_DIR /run/neural-ice-installer)"
+readonly INSTALLER_STATE_DIR
+VERITY_ROOT_MOUNT="$(ni_path VERITY_ROOT_MOUNT "$INSTALLER_STATE_DIR/verity-root")"
+readonly VERITY_ROOT_MOUNT
+STORE_MOUNT="$(ni_path STORE_MOUNT "$INSTALLER_STATE_DIR/store")"
+readonly STORE_MOUNT
+STORE_MAPPER="$(ni_path STORE_MAPPER neuralice-installer-store)"
+readonly STORE_MAPPER
 # The local name the sealed store gives the image this medium installs.
-readonly STORE_IMAGE_NAME="${STORE_IMAGE_NAME:-localhost/bootc}"
+STORE_IMAGE_NAME="$(ni_path STORE_IMAGE_NAME localhost/bootc)"
+readonly STORE_IMAGE_NAME
 
 # --------------------------------------------------------------------------- #
 # 0) Preconditions: a usable TPM2 must be present (PCR7 = Secure Boot state).
@@ -442,7 +667,7 @@ setenforce 0 2>/dev/null || true
 #     The first-boot service re-states all of this independently against the
 #     installed image's own /usr. Neither gate trusts the other.
 # --------------------------------------------------------------------------- #
-NEURALICE_INSTALLER_LIB_DIR="${NEURALICE_INSTALLER_LIB_DIR:-/usr/lib/neural-ice/lib}"
+NEURALICE_INSTALLER_LIB_DIR="$(ni_path NEURALICE_INSTALLER_LIB_DIR /usr/lib/neural-ice/lib)"
 # A base image built before the access policy existed has no libraries here, and
 # `source` would fail with a message about a missing file rather than about what
 # is actually wrong. Say it plainly: this installer cannot reason about that
@@ -489,7 +714,8 @@ source "$NEURALICE_INSTALLER_LIB_DIR/release-authorization.sh"
 #     and verifying the root afterwards would be verifying a copy of the answer.
 # --------------------------------------------------------------------------- #
 INSTALLER_CMDLINE="$(tr -d '\n' < "$NEURALICE_CMDLINE_FILE")"
-readonly VERITY_MAPPER="${VERITY_MAPPER:-neuralice-installer-root}"
+VERITY_MAPPER="$(ni_path VERITY_MAPPER neuralice-installer-root)"
+readonly VERITY_MAPPER
 # The gate is handed the MOUNT POINT the policy will be read from, not just a
 # mapper name. Proving that a correctly-hashed verity device exists somewhere
 # says nothing about what a policy file came from: the two must be the same
@@ -855,37 +1081,233 @@ log "Persistent SRK created and frozen at 0x81000001 before LUKS enrollment."
 #          LABEL out of the PULLED OBJECT and require exact agreement.
 #     A refusal at any step leaves a bootable machine.
 # --------------------------------------------------------------------------- #
+# 🔴 PLACED HERE ON PURPOSE. This block needs two things the earlier argument
+# parsing does not have yet: the SEALED ACCESS PROFILE (established by the trust
+# gate, §1a-0) and the LIVE DISK the payload partition identified (§1). Writing
+# the mirror transport before either existed is how a customer-locked medium
+# could have been given a lab host in its boot path with nothing to compare
+# against. It still runs BEFORE the pull and before any target mutation.
+# --------------------------------------------------------------------------- #
+# 🔴 THE MIRROR IS LAB TRANSPORT, PINNED AND DECLARED (independent review
+# 2026-09-02, P0 #3).
+#
+# WHAT THIS REPLACES. The mirror was written with `insecure = true` -- no CA, no
+# identity, nothing but a hostname -- and nothing tied it to the access profile
+# or to a stated release closure. Three consequences:
+#
+#   * a CUSTOMER-LOCKED appliance could be cut with a lab host in its boot path,
+#     and no digest argument makes that acceptable: it is a machine that must
+#     never depend on `.63`;
+#   * `insecure = true` means any host that answers on that name and port is the
+#     mirror, so the "transport" was unauthenticated even as transport;
+#   * nothing required the mirror to hold the release closure being installed,
+#     so a stale or partial cache produced a pull failure on a bench rather than
+#     a refusal before the disk was touched.
+#
+# All three are now sealed decisions. The grammar refuses a mirror outside
+# `lab-managed` and refuses one that does not seal both a CA digest and the exact
+# READY closure hash; this block re-states the profile rule against the anchor
+# it holds, pins the CA by the sealed digest, and requires the mirror to DECLARE
+# that exact closure before it is written into the transport configuration.
+#
+# The CA travels on the ESP because it is bench-specific and the medium is not.
+# The ESP is mutable, which is precisely why the digest that pins it is sealed in
+# the UKI command line rather than stored beside it.
+# --------------------------------------------------------------------------- #
+readonly MIRROR_READY_PATH=/v2/_neural-ice/ready
+readonly MIRROR_READY_SCHEMA=neural-ice-mirror-ready-v1
+readonly MIRROR_READY_MAX_BYTES=4096
+
+esp_staged_file() { # $1=basename $2=expected sha256 $3=destination -> stages it or fails
+  local name=$1 expected=$2 destination=$3 esp mountpoint mounted=0 observed
+  esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
+  [[ -n "${esp:-}" ]] || die "this medium carries no ESP to read ${name} from"
+  mountpoint="$(findmnt -nfo TARGET "/dev/$esp" 2>/dev/null | head -1)"
+  if [[ -z "$mountpoint" ]]; then
+    mountpoint=/run/neural-ice-installer/esp
+    install -d -m 0700 "$mountpoint"
+    mount -o ro,nodev,nosuid,noexec "/dev/$esp" "$mountpoint" \
+      || die "cannot mount the installer ESP read-only to read ${name}"
+    mounted=1
+  fi
+  if [[ -f "$mountpoint/ice-coreos/$name" && ! -L "$mountpoint/ice-coreos/$name" ]]; then
+    install -m 0600 "$mountpoint/ice-coreos/$name" "$destination" \
+      || die "cannot snapshot ${name} from the installer ESP"
+  else
+    (( mounted == 1 )) && umount "$mountpoint"
+    die "the installer ESP carries no ${name}; this medium's signature says it must"
+  fi
+  (( mounted == 1 )) && { umount "$mountpoint" || die "cannot unmount the installer ESP after reading ${name}"; }
+  # 🔴 THE HASH IS THE POINT. The ESP is a mutable vfat partition an attacker
+  # holding the medium can rewrite; the value it is compared against is inside
+  # the UKI's signed .cmdline. Compare AFTER the copy, on the bytes that will
+  # actually be used, so the file cannot change between the check and the use.
+  observed="$(sha256sum -- "$destination" | awk '{print tolower($1)}')"
+  [[ "$observed" == "$expected" ]] \
+    || die "the ESP's ${name} hashes to ${observed}, not the ${expected} this medium's signature seals"
+  return 0
+}
+
+# The TPM slot is authorised by an offline policy key, never by whatever PCR 7
+# happens to contain while this installer is running. All four values are in the
+# signed UKI command line; the release authorization independently repeats them
+# in device_policy for SEED v2.
+PCR_POLICY_DIGEST="$(karg_once neuralice.pcr_policy)"
+PCR_POLICY_KEY_SHA256="$(karg_once neuralice.pcr_policy_key)"
+PCR_POLICY_SIGNATURE_SHA256="$(karg_once neuralice.pcr_policy_signature)"
+PCR_POLICY_SEQ="$(karg_once neuralice.pcr_policy_seq)"
+[[ "$PCR_POLICY_DIGEST" =~ ^[0-9a-f]{64}$ && "$PCR_POLICY_KEY_SHA256" =~ ^[0-9a-f]{64}$ \
+   && "$PCR_POLICY_SIGNATURE_SHA256" =~ ^[0-9a-f]{64}$ && "$PCR_POLICY_SEQ" =~ ^[1-9][0-9]{0,18}$ ]] \
+  || die "this install medium does not seal one exact signed PCR policy generation"
+PCR_POLICY_KEY_RUNTIME=/run/neural-ice-installer/tpm2-pcr-public-key.pem
+PCR_POLICY_SIGNATURE_RUNTIME=/run/neural-ice-installer/tpm2-pcr-signature.json
+install -d -m 0700 /run/neural-ice-installer
+esp_staged_file tpm2-pcr-public-key.pem "$PCR_POLICY_KEY_SHA256" "$PCR_POLICY_KEY_RUNTIME"
+esp_staged_file tpm2-pcr-signature.json "$PCR_POLICY_SIGNATURE_SHA256" "$PCR_POLICY_SIGNATURE_RUNTIME"
+openssl pkey -pubin -in "$PCR_POLICY_KEY_RUNTIME" -noout >/dev/null \
+  || die "the sealed PCR policy public key is not a usable public key"
+if ! python3 - "$PCR_POLICY_SIGNATURE_RUNTIME" "$PCR_POLICY_DIGEST" <<'PCR_POLICY_PY'
+import base64, json, sys
+document=json.load(open(sys.argv[1],encoding="ascii"))
+entries=document.get("sha256") if isinstance(document,dict) else None
+if not isinstance(entries,list) or not any(
+    isinstance(e,dict) and isinstance(e.get("pol"),str)
+    and base64.b64decode(e["pol"],validate=True).hex()==sys.argv[2]
+    for e in entries):
+    raise SystemExit(1)
+PCR_POLICY_PY
+then
+  die "the signed PCR policy file does not contain the exact sealed PolicyPCR digest"
+fi
+PCR_POLICY_HIGH_WATER="$("$TPM_STATE" pcr-policy-check "$PCR_POLICY_SEQ")" \
+  || die "signed PCR policy sequence $PCR_POLICY_SEQ is replayed, stale or outside the TPM high-water window"
+[[ "$PCR_POLICY_HIGH_WATER" =~ ^[0-9]{1,16}$ && "$PCR_POLICY_SEQ" -gt "$PCR_POLICY_HIGH_WATER" ]] \
+  || die "TPM PCR policy high-water check returned malformed state"
+
+if [[ -n "$INSTALL_MIRROR" ]]; then
+  [ "$INSTALL_SOURCE" = registry ] \
+    || die "neuralice.mirror requires neuralice.source=registry and an explicit digest-pinned neuralice.osimage"
+  # The grammar has already refused this combination; the installer re-states it
+  # against the anchor IT read, because a gate that only exists in the grammar is
+  # a gate a future grammar edit can remove without anything noticing.
+  [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
+    || die "this medium seals access profile '${SEALED_ACCESS_PROFILE}' and names a LAN mirror; a customer appliance never depends on a lab host"
+  MIRROR_CA_SHA256="$(karg_once neuralice.mirror_ca_sha256)"
+  MIRROR_READY_SHA256="$(karg_once neuralice.mirror_ready)"
+  MIRROR_READY_MANIFEST_SHA256="$(karg_once neuralice.mirror_manifest)"
+  MIRROR_CACHE_GENERATION="$(karg_once neuralice.mirror_generation)"
+  [[ "$MIRROR_CA_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "a LAN mirror requires a sealed CA digest; this medium seals none"
+  [[ "$MIRROR_READY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "a LAN mirror requires a sealed READY release-closure hash; this medium seals none"
+  [[ "$MIRROR_READY_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ && "$MIRROR_CACHE_GENERATION" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || die "a LAN mirror requires a sealed READY manifest hash and positive cache generation"
+
+  MIRROR_CA_FILE=/run/neural-ice-installer/mirror-ca.crt
+  install -d -m 0700 /run/neural-ice-installer
+  esp_staged_file mirror-ca.crt "$MIRROR_CA_SHA256" "$MIRROR_CA_FILE"
+
+  # 🔴 THE MIRROR MUST DECLARE THE EXACT CLOSURE, over TLS pinned to that CA.
+  # A mirror that is merely reachable is not a mirror that holds this release: a
+  # stale or partial cache would otherwise be discovered as a pull failure after
+  # the disk was gone. `--cacert` with no CA bundle fallback means an unpinned
+  # host cannot answer, and the bounded read means a hostile one cannot answer at
+  # length.
+  _mirror_ready_json=/run/neural-ice-installer/mirror-ready.json
+  rm -f -- "$_mirror_ready_json"
+  curl --silent --show-error --fail --max-time 30 --max-filesize "$MIRROR_READY_MAX_BYTES" \
+    --proto '=https' --tlsv1.2 --cacert "$MIRROR_CA_FILE" \
+    --output "$_mirror_ready_json" "https://${INSTALL_MIRROR}${MIRROR_READY_PATH}" \
+    || die "the LAN mirror ${INSTALL_MIRROR} did not serve ${MIRROR_READY_PATH} over TLS pinned to this medium's sealed CA"
+  _mirror_ready_declared="$(python3 - "$_mirror_ready_json" "$MIRROR_READY_SCHEMA" <<'MIRROR_READY_PY'
+import json
+import re
+import sys
+
+path, schema = sys.argv[1:]
+with open(path, "rb") as handle:
+    document = json.loads(handle.read(4096))
+required = {"schema", "release_closure_sha256", "release_manifest_sha256",
+            "store_generation"}
+if not isinstance(document, dict) or set(document) != required or document.get("schema") != schema:
+    raise SystemExit(1)
+closure = document.get("release_closure_sha256")
+manifest = document.get("release_manifest_sha256")
+generation = document.get("store_generation")
+if (not isinstance(closure, str) or not re.fullmatch(r"[0-9a-f]{64}", closure)
+    or not isinstance(manifest, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest)
+    or not isinstance(generation, int) or isinstance(generation, bool) or generation < 1
+    ):
+    raise SystemExit(1)
+print(closure, manifest, generation, sep="\n")
+MIRROR_READY_PY
+  )" || die "the LAN mirror's READY receipt is not a bounded ${MIRROR_READY_SCHEMA} document"
+  mapfile -t _mirror_ready_fields <<<"$_mirror_ready_declared"
+  [[ "${_mirror_ready_fields[0]:-}" == "$MIRROR_READY_SHA256" \
+      && "${_mirror_ready_fields[1]:-}" == "$MIRROR_READY_MANIFEST_SHA256" \
+      && "${_mirror_ready_fields[2]:-}" == "$MIRROR_CACHE_GENERATION" ]] \
+    || die "the LAN mirror READY does not equal this medium's sealed closure/manifest/cache generation"
+
+  # The CA is what the container tooling trusts for this host, so the transport
+  # is authenticated as well as digest-pinned. `insecure` is gone: an unpinned
+  # host can no longer answer for the mirror name.
+  install -d -m 0755 "/etc/containers/certs.d/$INSTALL_MIRROR"
+  install -m 0644 "$MIRROR_CA_FILE" "/etc/containers/certs.d/$INSTALL_MIRROR/ca.crt"
+  install -d -m 0755 /etc/containers/registries.conf.d
+  for _scope in neural-ice vendor; do
+    cat >> /etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf <<EOF
+[[registry]]
+location = "$INSTALL_REGISTRY_AUTHORITY/$_scope"
+
+  [[registry.mirror]]
+  location = "$INSTALL_MIRROR/$_scope"
+  pull-from-mirror = "digest-only"
+
+EOF
+  done
+  log "LAN registry mirror enabled for this install only: $INSTALL_MIRROR (digest-only, CA pinned to ${MIRROR_CA_SHA256}, READY for release closure ${MIRROR_READY_SHA256}, canonical authority ${INSTALL_REGISTRY_AUTHORITY} retained)"
+fi
+
 RELEASE_AUTH_VERIFIED_REF=""
 source_imgref="containers-storage:$STORE_IMAGE_NAME"
 if [ "$INSTALL_SOURCE" = registry ]; then
   _relauth_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
   [[ -f "$_relauth_key" && ! -L "$_relauth_key" ]] \
     || die "the verified installer root carries no release-authorization public key"
-  # The authorization travels on the medium's ESP so a bench can carry a fresh
-  # one, but it is verified with the key inside the dm-verity-protected root and
-  # sealed by the UKI. Editable document, non-editable verifier.
-  _auth_esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
-  [[ -n "${_auth_esp:-}" ]] || die "a registry install requires a signed release authorization on the installer ESP, and no ESP was found"
-  _auth_mp="$(findmnt -nfo TARGET "/dev/$_auth_esp" 2>/dev/null | head -1)"
-  _auth_we_mounted=0
-  if [[ -z "$_auth_mp" ]]; then
-    _auth_mp="/run/neural-ice-release-auth-esp"
-    install -d -m 0700 "$_auth_mp"
-    mount -o ro "/dev/$_auth_esp" "$_auth_mp" \
-      || die "cannot mount the installer ESP read-only to read the release authorization"
-    _auth_we_mounted=1
-  fi
+  # --------------------------------------------------------------------------- #
+  # 🔴 THE AUTHORIZATION IS ON A MUTABLE ESP, AND ITS HASH IS IN THE SIGNATURE
+  # (independent review 2026-09-02, P0 #3).
+  #
+  # The document travels on the medium's ESP so a bench can carry a fresh one,
+  # and it is verified with the key inside the dm-verity-protected root whose
+  # identity the UKI pins by `neuralice.relauth_keyid`. That made the VERIFIER
+  # non-editable and left the DOCUMENT selectable: an attacker holding the medium
+  # could substitute any other correctly signed authorization -- for a different
+  # digest, a different profile, an older issuance -- and every check below would
+  # agree with it, because every check below asks about the document it was
+  # handed.
+  #
+  # The producer now hashes both files as it stages them and seals both digests
+  # into the UKI's .cmdline. They are compared HERE, on the snapshot that will
+  # actually be used, before a single field is parsed. The grammar refuses a
+  # registry medium that seals a source and not both digests, so there is no
+  # medium on which this check is absent.
+  # --------------------------------------------------------------------------- #
+  RELEASE_AUTH_DOC_SHA256="$(karg_once neuralice.relauth_sha256)"
+  RELEASE_AUTH_SIG_SHA256="$(karg_once neuralice.relauth_sig_sha256)"
+  [[ "$RELEASE_AUTH_DOC_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "this medium seals no release-authorization document digest; a registry install would then accept any correctly signed authorization the ESP happened to carry"
+  [[ "$RELEASE_AUTH_SIG_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "this medium seals no release-authorization signature digest"
+  [[ "$RELEASE_AUTH_DOC_SHA256" != "$RELEASE_AUTH_SIG_SHA256" ]] \
+    || die "this medium seals one digest for both the release authorization and its detached signature; that pins neither"
+
   _auth_scratch=/run/neural-ice-installer/release-auth
   rm -rf -- "$_auth_scratch"; install -d -m 0700 "$_auth_scratch"
-  for _auth_part in release-authorization.json release-authorization.sig; do
-    [[ -f "$_auth_mp/ice-coreos/$_auth_part" && ! -L "$_auth_mp/ice-coreos/$_auth_part" ]] \
-      || die "the installer ESP carries no ${_auth_part}; a registry install is not authorised without one"
-    install -m 0600 "$_auth_mp/ice-coreos/$_auth_part" "$_auth_scratch/$_auth_part" \
-      || die "cannot snapshot ${_auth_part} from the installer ESP"
-  done
-  if (( _auth_we_mounted == 1 )); then
-    umount "$_auth_mp" || die "cannot unmount the installer ESP after reading the release authorization"
-  fi
+  esp_staged_file release-authorization.json "$RELEASE_AUTH_DOC_SHA256" \
+    "$_auth_scratch/release-authorization.json"
+  esp_staged_file release-authorization.sig "$RELEASE_AUTH_SIG_SHA256" \
+    "$_auth_scratch/release-authorization.sig"
 
   release_auth_verify_signature "$_auth_scratch/release-authorization.json" \
     "$_auth_scratch/release-authorization.sig" "$_relauth_key" \
@@ -896,6 +1318,8 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   [[ "$AUTH_SCHEMA" == "$SEALED_RELAUTH_SCHEMA" ]] \
     || die "the release authorization schema '$AUTH_SCHEMA' is not the exact schema '$SEALED_RELAUTH_SCHEMA' sealed by this UKI"
   SIGNED_IMAGE_REPOSITORY="$(sed -n 's/^image_repository=//p' <<<"$RELEASE_AUTH")"
+  SIGNED_IMAGE_INDEX_DIGEST="$(sed -n 's/^image_index_digest=//p' <<<"$RELEASE_AUTH")"
+  SIGNED_IMAGE_MANIFEST_DIGEST="$(sed -n 's/^image_manifest_digest=//p' <<<"$RELEASE_AUTH")"
   SIGNED_REGISTRY_AUTHORITY="${SIGNED_IMAGE_REPOSITORY%%/*}"
   [[ "$SIGNED_IMAGE_REPOSITORY" == "$INSTALL_IMAGE_REPOSITORY" \
       && "$SIGNED_REGISTRY_AUTHORITY" == "$INSTALL_REGISTRY_AUTHORITY" ]] \
@@ -977,6 +1401,33 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   # this makes the property visible rather than inherited.
   [[ "$got_index" == "${OS_IMAGE##*@}" ]] \
     || die "the pulled object's index digest ($got_index) is not the requested one (${OS_IMAGE##*@})"
+  [[ "$got_manifest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "the pulled object reports a malformed platform manifest digest: $got_manifest"
+
+  # --------------------------------------------------------------------------- #
+  # 🔴 THE RECURSIVE PROOF: THE POLICY MUST BIND THE OBJECT, NOT THE REPOSITORY
+  # (independent review 2026-09-02, P1 #2).
+  #
+  # The gate before the pull proved the policy is object-binding in the abstract.
+  # This one names the two digests the object ACTUALLY resolved to -- the index
+  # that was asked for and the platform child it carries -- and re-asks the same
+  # implementation whether the covering scopes bind them.
+  #
+  # Why it is not the same question twice: a `signedIdentity` of
+  # `matchRepository` or `exactRepository` is satisfied by ANY correctly signed
+  # image in the repository, so a hostile mirror could answer a correct index
+  # request with a correctly signed SIBLING child and every scope check would
+  # still agree. Scope existence is not a signature over the object that was
+  # pulled. `release_auth_gate_pulled` below then requires those same two digests
+  # to be the pair the signed authorization names, so the identity binding and
+  # the authorization binding are two independent statements about one object.
+  # --------------------------------------------------------------------------- #
+  registry_policy_authorised --require-object-binding \
+    --index-digest "$got_index" --manifest-digest "$got_manifest" \
+    --authenticated-repository "$SIGNED_IMAGE_REPOSITORY" \
+    --authenticated-index-digest "$SIGNED_IMAGE_INDEX_DIGEST" \
+    --authenticated-manifest-digest "$SIGNED_IMAGE_MANIFEST_DIGEST" \
+    || die "this medium's container signature policy does not bind the pulled index/child pair; a policy satisfied by any image in $INSTALL_IMAGE_REPOSITORY cannot prove the recursive signature of this one"
 
   # Read the image's OWN statements about itself out of the pulled bytes. An
   # authorization is a claim ABOUT an image; it becomes a property OF the image
@@ -1032,6 +1483,126 @@ else
   RELEASE_AUTH_VERIFIED_REF="$source_imgref"
 fi
 readonly RELEASE_AUTH_VERIFIED_REF
+
+# --------------------------------------------------------------------------- #
+# 2c) 🔴 THE OFFLINE SEED, VERIFIED IN FULL BEFORE THE FIRST DISK MUTATION
+#     (independent review 2026-09-02, P0 #2).
+#
+# WHAT THIS REPLACES. Phase 5 mounted ANY block device carrying the partlabel
+# `ni-seed` and `cp -a`'d its `store`, `models` and `payload` directories onto
+# the already-formatted, already-encrypted data volume. There was no signature,
+# no release identity, no authorization, no access profile, no hardware target
+# and not one per-object digest -- and it happened AFTER wipefs, sfdisk,
+# luksFormat and mkfs. So modifying or replacing the mutable seed partition after
+# an off-device inspection, leaving the signed UKI untouched, put arbitrary
+# store, model and payload bytes inside the installed encrypted appliance; and
+# because the target was already destroyed, "refuse" could not mean "leave the
+# machine as it was".
+#
+# The seed is now a SEED v2 tree: content-addressed, signed, and named by the
+# release closure hash the UKI seals. Everything about it is proved HERE, with
+# the target disk untouched:
+#
+#   identity     the partition is found on THIS medium -- the disk the sealed
+#                payload partition identified -- and mounted read-only by its
+#                stable PARTUUID, nodev/nosuid/noexec, never by a name a second
+#                device could also claim;
+#   authority    tools/ni-ota-verify verifies the canonical release manifest and
+#                the release authorization against the key inside the dm-verity
+#                root, parses the manifest through the SAME canonical reader the
+#                OTA path uses, and requires its canonical digest to equal both
+#                the seed root's own name and the hash this UKI seals;
+#   closure      it then walks the OCI graph and the content/evidence stores:
+#                every referenced object present, every present object reachable,
+#                every object's bytes hashing to the name it is stored under, and
+#                nothing extra, unknown or unreachable anywhere in the tree;
+#   receipt      the seed's READY receipt is required and is NOT authority: not
+#                one digest above is skipped because it is present.
+#
+# A seed partition with no sealed closure, or a sealed closure with no seed, is a
+# refusal in both directions: a medium either carries the seed it was cut with or
+# carries none.
+# --------------------------------------------------------------------------- #
+NEURALICE_SEED_VERIFIER="$(ni_path NEURALICE_SEED_VERIFIER /usr/bin/ni-ota-verify)"
+readonly NEURALICE_SEED_VERIFIER
+readonly SEED_MOUNT="$INSTALLER_STATE_DIR/seed"
+SEED_CLOSURE="$(karg_once neuralice.seed_closure)"
+readonly SEED_CLOSURE
+SEED_MANIFEST_SHA256="$(karg_once neuralice.seed_manifest)"
+readonly SEED_MANIFEST_SHA256
+SEED_TRUSTED_NOW="$(karg_once neuralice.seed_trusted_now)"
+readonly SEED_TRUSTED_NOW
+SEED_VERIFIED_ROOT=""
+
+# The seed partition ON THIS MEDIUM, by stable identity. `live_disk` was
+# established from the SEALED PAYLOAD PARTITION, not from `findmnt /`, so this
+# cannot be pointed at a second USB stick that also carries the partlabel -- and
+# the PARTUUID is what is actually mounted, so the answer cannot change between
+# the lookup and the mount.
+seed_partition_partuuid() { # -> the PARTUUID, or nothing
+  local candidates
+  candidates="$(lsblk -rno NAME,PARTLABEL,PARTUUID "/dev/$live_disk" 2>/dev/null \
+    | awk '$2 == "ni-seed" { print $3 }')"
+  [[ -n "$candidates" ]] || return 0
+  (( "$(printf '%s\n' "$candidates" | grep -c .)" == 1 )) \
+    || die "this medium carries more than one ni-seed partition; refusing to choose which offline closure to install"
+  printf '%s' "$candidates"
+}
+
+_seed_partuuid="$(seed_partition_partuuid)"
+if [[ -n "$SEED_CLOSURE" ]]; then
+  [[ -n "$_seed_partuuid" ]] \
+    || die "this medium's signature seals offline release closure ${SEED_CLOSURE} and the medium carries no ni-seed partition"
+  _seed_device="/dev/disk/by-partuuid/$_seed_partuuid"
+  [[ -b "$_seed_device" ]] \
+    || die "the ni-seed partition has no stable by-partuuid node ($_seed_device); refusing to mount a seed by a name a second device could claim"
+  install -d -m 0700 "$SEED_MOUNT"
+  mount -o ro,nodev,nosuid,noexec,norecovery "$_seed_device" "$SEED_MOUNT" \
+    || die "cannot mount the offline seed read-only"
+  # The seed root is a directory NAMED by the closure hash. Reading it by name
+  # rather than searching for "the one directory in there" is what makes the
+  # sealed hash decide which tree is mounted-and-read, not the tree itself.
+  SEED_VERIFIED_ROOT="$SEED_MOUNT/seed/$SEED_CLOSURE"
+  [[ -d "$SEED_VERIFIED_ROOT" && ! -L "$SEED_VERIFIED_ROOT" ]] \
+    || die "the offline seed carries no seed/${SEED_CLOSURE} root; this is not the closure this medium was cut with"
+  # 🔴 THE HISTORICAL FORMAT IS REFUSED OUTRIGHT. A Podman overlay store is not a
+  # format anything can verify object by object, and it was the authority this
+  # whole finding is about. A medium carrying one is a medium from before the
+  # seed had a closure, and it does not install.
+  for _legacy in store models payload; do
+    [[ ! -e "$SEED_MOUNT/$_legacy" ]] \
+      || die "this seed carries the historical opaque '${_legacy}' tree; a Podman overlay store is not a verifiable offline closure and is no longer an install source"
+  done
+  [[ -x "$NEURALICE_SEED_VERIFIER" ]] \
+    || die "this medium carries no seed-closure verifier at ${NEURALICE_SEED_VERIFIER}; refusing to stage an offline closure nothing would verify"
+  _seed_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
+  [[ -f "$_seed_key" && ! -L "$_seed_key" ]] \
+    || die "the verified installer root carries no release-authorization public key to verify the offline seed with"
+  log "Verifying the offline release closure ${SEED_CLOSURE} before the target disk is touched…"
+  heartbeat_start "offline seed closure verification"
+  "$NEURALICE_SEED_VERIFIER" verify-seed-closure \
+    --seed-root "$SEED_VERIFIED_ROOT" \
+    --pubkey "$_seed_key" \
+    --registry-host "$NEURALICE_RELEASE_AUTHORITY" \
+    --hardware-target "$SEALED_HARDWARE_TARGET" \
+    --access-profile "$SEALED_ACCESS_PROFILE" \
+    --device-channel "$DEVICE_CHANNEL" \
+    --trust-policy-id "$SEALED_TRUST_POLICY_ID" \
+    --expect-closure "sha256:${SEED_CLOSURE}" \
+    --expect-manifest "sha256:${SEED_MANIFEST_SHA256}" \
+    --trusted-now "$SEED_TRUSTED_NOW" \
+    --pcr-policy-digest "$PCR_POLICY_DIGEST" \
+    --pcr-policy-public-key-sha256 "$PCR_POLICY_KEY_SHA256" \
+    --pcr-policy-signature-sha256 "$PCR_POLICY_SIGNATURE_SHA256" \
+    --pcr-policy-seq "$PCR_POLICY_SEQ" \
+    || die "the offline seed is not the signed release closure this medium seals; nothing has been written to the target disk"
+  bg_stop
+  log "Offline release closure verified in full: sha256:${SEED_CLOSURE} (every manifest, blob, model and evidence object present, reachable and digest-matched; no extra object)"
+else
+  [[ -z "$_seed_partuuid" ]] \
+    || die "this medium carries an ni-seed partition and its signature seals no offline release closure; an unauthorised seed is not staged"
+fi
+readonly SEED_VERIFIED_ROOT
 
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
@@ -1091,10 +1662,11 @@ enroll_luks() {  # $1=partition  $2=mapper-name
   kf="$(mktemp /run/nialuks.XXXXXX)"; head -c 64 /dev/urandom > "$kf"
   cryptsetup luksFormat --type luks2 --batch-mode --pbkdf argon2id "$part" "$kf" >/dev/null
   cryptsetup open "$part" "$name" --key-file "$kf" >/dev/null
-  # TPM2 sealed to PCR7 (Secure Boot state) -> survives kernel/bootc upgrades.
-  # Bootstrap keyfile = slot 0, TPM = slot 1, recovery = slot 2.
+  # PolicyAuthorize under the sealed offline key. `--tpm2-pcrs=` MUST be empty:
+  # its default is literal PCR7 and would silently reintroduce fleet lockout.
   systemd-cryptenroll --unlock-key-file="$kf" --tpm2-device=auto \
-    --tpm2-seal-key-handle=0x81000001 --tpm2-pcrs=7 "$part" >/dev/null
+    --tpm2-seal-key-handle=0x81000001 --tpm2-pcrs= \
+    --tpm2-public-key="$PCR_POLICY_KEY_RUNTIME" --tpm2-public-key-pcrs=7 "$part" >/dev/null
   # Escrow / client recovery key — the key is printed on stdout, prose on stderr.
   rec="$(systemd-cryptenroll --unlock-key-file="$kf" --recovery-key "$part" 2>/dev/null)"
   # Drop the bootstrap keyfile slot (slot 0): only TPM + recovery remain.
@@ -1120,6 +1692,11 @@ log "Encrypting data volume (TPM PCR7 + CLIENT recovery)…"
 DATA_RECOVERY="$(enroll_luks "$DATAP" data)"
 assert_luks_srk_token "$SYSP" /run/neural-ice-installer/system-luks-evidence.json
 assert_luks_srk_token "$DATAP" /run/neural-ice-installer/data-luks-evidence.json
+# This is the activation commit: both enrolled tokens have survived exact
+# readback under the signed PolicyAuthorize key. Only now may the TPM remember
+# the policy generation; a failed or partial enrollment burns no sequence.
+[[ "$("$TPM_STATE" pcr-policy-activate "$PCR_POLICY_SEQ")" == "$PCR_POLICY_SEQ" ]] \
+  || die "TPM refused to commit the activated PCR policy generation"
 
 mkfs.xfs -q -L sysroot /dev/mapper/system
 mkfs.xfs -q -L data    /dev/mapper/data
@@ -1143,6 +1720,9 @@ mkdir -p "$TGT/boot"
 mount "$BOOT" "$TGT/boot"
 mkdir -p "$TGT/boot/efi"
 mount "$ESP" "$TGT/boot/efi"
+install -d -m 0755 "$TGT/boot/efi/EFI/neural-ice"
+install -m 0644 "$PCR_POLICY_SIGNATURE_RUNTIME" "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr-signature.json"
+install -m 0644 "$PCR_POLICY_KEY_RUNTIME" "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr-public-key.pem"
 # Make the target (+ submounts) shared so they propagate into the container.
 mount --rbind "$TGT" "$TGT"
 mount --make-rshared "$TGT"
@@ -1218,6 +1798,10 @@ podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
     --karg "rd.luks.uuid=luks-$SYS_LUKS_UUID" \
     --karg "rd.luks.options=$SYS_LUKS_UUID=tpm2-device=auto" \
     --karg "systemd.mount-extra=/dev/mapper/data:$DATA_MOUNT:xfs:nofail" \
+    --karg "neuralice.pcr_policy=$PCR_POLICY_DIGEST" \
+    --karg "neuralice.pcr_policy_key=$PCR_POLICY_KEY_SHA256" \
+    --karg "neuralice.pcr_policy_signature=$PCR_POLICY_SIGNATURE_SHA256" \
+    --karg "neuralice.pcr_policy_seq=$PCR_POLICY_SEQ" \
     "${sshkey_karg[@]}" \
     "$TGT" \
   || die "bootc install to-filesystem failed"
@@ -1272,72 +1856,109 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 5b) PRELOADED seed staging (only if the installer media carries a seed partition).
-#     Copy the READY podman overlay store + the base HF models onto the (already-
-#     formatted, open) encrypted data volume. The image's storage.conf.d drop-in
-#     registers /var/lib/neural-ice/data/seed-store as a READ-ONLY additional image
-#     store, so the appliance sees the images INSTANTLY at first boot — no import,
-#     no `podman load`. The store files get the container_ro_file_t SELinux label so
-#     the container runtime can read them (the data volume is mounted without a
-#     context= override, so per-file xattr labels persist).
+# 5b) OFFLINE RELEASE CLOSURE staging (only when §2c verified one).
+#
+# This block used to describe copying "the READY podman overlay store + the base
+# HF models" onto the data volume, and that is exactly what P0 #2 was about: an
+# overlay store is opaque, so "READY" was a claim nothing could check, and the
+# copy happened after the disk was already destroyed. The seed is now a
+# content-addressed closure verified in §2c, and what follows stages THAT.
 # --------------------------------------------------------------------------- #
-SEED_PART="/dev/disk/by-partlabel/ni-seed"
-phase 5 "Seed staging (preloaded store + models → encrypted data volume)"
-# The seed-store dir must exist on the data volume in ALL editions — containers-storage
-# HARD-FAILS on a missing additionalimagestores path (no silent skip). LIGHT gets an empty
-# store; PRELOADED fills it below. (tmpfiles.d also recreates it on every boot.)
+phase 5 "Seed staging (verified offline release closure -> encrypted data volume)"
+# --------------------------------------------------------------------------- #
+# 🔴 THE SEED THAT IS STAGED HERE IS THE ONE §2c PROVED, AND IT IS STAGED BY
+# DIGEST (independent review 2026-09-02, P0 #2).
+#
+# WHAT THIS REPLACES. This phase used to mount `/dev/disk/by-partlabel/ni-seed`
+# -- any device that claimed the label -- and `cp -a` its `store`, `models` and
+# `payload` directories onto the already-encrypted data volume. Nothing about
+# those bytes had been checked, and the disk was already gone.
+#
+# Now nothing is mounted here at all: §2c mounted the seed read-only by stable
+# PARTUUID on this medium, verified the whole signed closure, and left it
+# mounted. This phase copies the CONTENT-ADDRESSED trees -- the OCI layout and
+# the content store, both named by digest -- onto the data volume, and then
+# re-reads every staged object and requires it to hash to its own name again.
+#
+# The re-read is not paranoia about the copy: the verification in §2c proved the
+# SOURCE, and this proves that what landed on the ENCRYPTED VOLUME is the same
+# set of objects. A `cp` that silently truncated on a full filesystem would
+# otherwise be discovered on first boot, on a machine with no installer left.
+# --------------------------------------------------------------------------- #
+# The seed-store dir must exist on the data volume in ALL editions -- containers-storage
+# HARD-FAILS on a missing additionalimagestores path (no silent skip). It stays
+# EMPTY here: the appliance's first boot imports from the verified OCI layout
+# below, by digest, rather than inheriting an opaque overlay store nothing could
+# verify. (tmpfiles.d also recreates it on every boot.)
 mkdir -p /run/seed-dst
 mount /dev/mapper/data /run/seed-dst
 mkdir -p /run/seed-dst/seed-store
-if [ -b "$SEED_PART" ]; then
-  mkdir -p /run/seed-src
-  mount -o ro "$SEED_PART" /run/seed-src
-  # Total size BEFORE the copy: this is the longest phase of the install
-  # (~90 % of wall-clock on a preloaded medium), so the console reporter can
-  # show real %/rate/ETA instead of leaving the operator blind.
+if [[ -n "$SEED_VERIFIED_ROOT" ]]; then
   seed_total=0
-  for _d in store models payload; do
-    if [ -d "/run/seed-src/$_d" ]; then
-      _sz="$(du -sb "/run/seed-src/$_d" | awk '{print $1}')"
-      seed_total=$(( seed_total + _sz ))
-    fi
-  done
-  log "PRELOADED: staging seed (overlay store + base models) onto the data volume — $(awk -v t="$seed_total" 'BEGIN{printf "%.1f", t / 2^30}') GiB total…"
+  seed_total="$(du -sb "$SEED_VERIFIED_ROOT" | awk '{print $1}')"
+  install -d -m 0755 /run/seed-dst/release
+  _seed_dst="/run/seed-dst/release/$SEED_CLOSURE"
+  # A partial destination from an interrupted earlier attempt is not a source of
+  # truth and is not merged with: it is removed and rebuilt.
+  rm -rf -- "$_seed_dst"
+  install -d -m 0755 "$_seed_dst"
+  log "OFFLINE: staging the verified release closure sha256:${SEED_CLOSURE} onto the data volume — $(awk -v t="$seed_total" 'BEGIN{printf "%.1f", t / 2^30}') GiB total…"
   copy_progress_start "$seed_total" /run/seed-dst
-  if [ -d /run/seed-src/store ]; then
-    cp -a /run/seed-src/store/. /run/seed-dst/seed-store/
-    # Label for the container runtime. Prefer the read-only image-store type; fall back to the
-    # universally-present container_file_t (readable by container_t). The store is used
-    # read-only via podman's additionalimagestores regardless of the exact type. The data
-    # volume is mounted without a context= override, so these per-file xattr labels persist.
-    chcon -R -t container_ro_file_t /run/seed-dst/seed-store 2>/dev/null \
-      || chcon -R -t container_file_t /run/seed-dst/seed-store 2>/dev/null \
-      || log "  warn: chcon on seed-store failed (SELinux off in installer?) — relabel on first boot if needed"
-    log "  images: staged as ready overlay store (zero first-boot import)"
-  fi
-  if [ -d /run/seed-src/models ]; then
-    mkdir -p /run/seed-dst/huggingface
-    cp -a /run/seed-src/models/. /run/seed-dst/huggingface/
-    log "  models: staged into data/huggingface"
-  fi
-  if [ -d /run/seed-src/payload ]; then
-    # Product payload (e.g. a private appliance layer). Applied ONCE on first
-    # boot by the image's generic neural-ice-payload-apply.service — the target
-    # /etc is read-only here (§6), so the installer only STAGES it on data.
-    mkdir -p /run/seed-dst/payload
-    cp -a /run/seed-src/payload/. /run/seed-dst/payload/
-    log "  payload: staged (applied on first boot by neural-ice-payload-apply)"
-  fi
+  cp -a "$SEED_VERIFIED_ROOT/." "$_seed_dst/" \
+    || die "cannot stage the verified release pack and object set onto the encrypted data volume"
   bg_stop
-  # The sync flushes the seed write-back and can itself run for minutes on a
-  # ~200 GiB copy — keep proving liveness until it returns.
   heartbeat_start "seed flush to disk (sync)"
   sync
   bg_stop
-  umount /run/seed-dst; umount /run/seed-src
-  log "PRELOADED: seed staged."
+
+  # 🔴 RE-VERIFY WHAT LANDED, not what was sent. The same verifier, the same
+  # sealed closure hash, the same key -- now against the copy on the encrypted
+  # volume. An install that cannot prove the staged closure must not report
+  # success and leave the appliance to discover it on first boot.
+  heartbeat_start "verifying the staged release closure on the data volume"
+  "$NEURALICE_SEED_VERIFIER" verify-seed-closure \
+    --seed-root "$_seed_dst" \
+    --pubkey "$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub" \
+    --registry-host "$NEURALICE_RELEASE_AUTHORITY" \
+    --hardware-target "$SEALED_HARDWARE_TARGET" \
+    --access-profile "$SEALED_ACCESS_PROFILE" \
+    --device-channel "$DEVICE_CHANNEL" \
+    --trust-policy-id "$SEALED_TRUST_POLICY_ID" \
+    --expect-closure "sha256:${SEED_CLOSURE}" \
+    --expect-manifest "sha256:${SEED_MANIFEST_SHA256}" \
+    --trusted-now "$SEED_TRUSTED_NOW" \
+    --pcr-policy-digest "$PCR_POLICY_DIGEST" \
+    --pcr-policy-public-key-sha256 "$PCR_POLICY_KEY_SHA256" \
+    --pcr-policy-signature-sha256 "$PCR_POLICY_SIGNATURE_SHA256" \
+    --pcr-policy-seq "$PCR_POLICY_SEQ" \
+    || die "the release closure staged onto the data volume does not verify; refusing to finish an install whose offline objects cannot be proved"
+  bg_stop
+  # Label for the container runtime. Prefer the read-only image-store type; fall
+  # back to the universally-present container_file_t (readable by container_t).
+  # The data volume is mounted without a context= override, so these per-file
+  # xattr labels persist.
+  chcon -R -t container_ro_file_t "$_seed_dst" 2>/dev/null \
+    || chcon -R -t container_file_t "$_seed_dst" 2>/dev/null \
+    || log "  warn: chcon on the staged release closure failed (SELinux off in installer?) — relabel on first boot if needed"
+  # The appliance's own pointer at the closure it was installed with. One line,
+  # digest only: first boot resolves the tree from it and re-verifies before it
+  # imports anything.
+  printf '%s\n' "sha256:${SEED_CLOSURE}" > /run/seed-dst/release/CLOSURE
+  printf '%s\n' "$NEURALICE_RELEASE_AUTHORITY" > /run/seed-dst/release/AUTHORITY
+  printf '%s\n' "$DEVICE_CHANNEL" > /run/seed-dst/release/CHANNEL
+  printf '%s\n' "$SEED_MANIFEST_SHA256" > /run/seed-dst/release/MANIFEST
+  printf '%s\n' "$SEED_TRUSTED_NOW" > /run/seed-dst/release/TRUSTED-NOW
+  printf '%s\n' "$PCR_POLICY_DIGEST" > /run/seed-dst/release/PCR-POLICY
+  printf '%s\n' "$PCR_POLICY_KEY_SHA256" > /run/seed-dst/release/PCR-POLICY-KEY
+  printf '%s\n' "$PCR_POLICY_SIGNATURE_SHA256" > /run/seed-dst/release/PCR-POLICY-SIGNATURE
+  printf '%s\n' "$PCR_POLICY_SEQ" > /run/seed-dst/release/PCR-POLICY-SEQ
+  sync
+  log "OFFLINE: release closure staged and re-verified on the encrypted data volume."
+  umount /run/seed-dst
+  umount "$SEED_MOUNT" || die "cannot unmount the offline seed after staging"
 else
-  log "No seed partition on the media (LIGHT install) — empty seed store only."
+  umount /run/seed-dst
+  log "No offline release closure on this medium (LIGHT install) — empty seed store only."
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1648,6 +2269,10 @@ if read -r _ < "$TTY" 2>/dev/null; then
   # and thrash if the operator pulls the USB a moment early — Codex #15).
   umount -R /run/seed-dst 2>/dev/null || true
   umount -R "$TGT"        2>/dev/null || true
+  # The offline seed is mounted READ-ONLY, so leaving it mounted cannot dirty
+  # anything; unmounting it is tidiness, and its failure is not a reason to stop
+  # a completed install from rebooting.
+  umount -R "$SEED_MOUNT" 2>/dev/null || true
   # IMMEDIATE forced reset: does NOT depend on writing/unmounting the USB fs (the
   # discarded installer media), so it survives an operator who pulls the USB a moment
   # too early instead of thrashing on I/O errors. Targets are already flushed above.

@@ -74,6 +74,7 @@ readonly PROFILE=customer-locked
 readonly TARGET=nvidia-gb10-arm64
 readonly POLICY=neural-ice-secureboot-lab-v1
 readonly FIRSTBOOT="$ROOT/ota/neural-ice-firstboot-tpm-ceremony.sh"
+PCR_POLICY_CANDIDATE=1
 
 clear_tpm() {
   tpm2_clear -c l >/dev/null 2>&1 || tpm2_clear -c p >/dev/null 2>&1 \
@@ -90,6 +91,22 @@ persist_prerequisites() {
   tpm2_evictcontrol -C o -c "$TMP/srk.ctx" 0x81000001 >/dev/null
   tpm2_flushcontext "$TMP/srk.ctx" >/dev/null 2>&1 || true
   tpm2_flushcontext -t >/dev/null 2>&1 || true
+  if ! tpm2_nvreadpublic 0x01500007 >/dev/null 2>&1; then
+    local candidate="$PCR_POLICY_CANDIDATE"
+    [[ "$(hw pcr-policy-check "$candidate")" == 0 ]] \
+      || fail "virgin signed PCR policy was refused"
+    [[ "$(hw pcr-policy-activate "$candidate")" == "$candidate" ]] \
+      || fail "signed PCR policy activation did not commit"
+    expect_refusal "activated PCR policy sequence replayed" \
+      hw pcr-policy-check "$candidate"
+    if (( candidate > 1 )); then
+      expect_refusal "lower PCR policy sequence replayed" \
+        hw pcr-policy-check "$(( candidate - 1 ))"
+    fi
+    [[ "$(hw pcr-policy-check "$(( candidate + 1 ))")" == "$candidate" ]] \
+      || fail "the next PCR policy generation was not eligible without mutation"
+    PCR_POLICY_CANDIDATE=$(( candidate + 1 ))
+  fi
 }
 abs_counter() {
   tpm2_nvread "$1" -C "$1" -s 8 -o "$TMP/value.bin" >/dev/null
@@ -115,7 +132,7 @@ interrupt_before_owner_auth() {
     && fail "injected owner-auth interruption succeeded"
   grep -Fq 'TPM refused to take a new owner authorization' <<<"$output" \
     || fail "ceremony failed before the injected owner-auth interruption: $output"
-  for index in 0x01500003 0x01500004 0x01500005 0x01500006; do
+  for index in 0x01500003 0x01500004 0x01500005 0x01500006 0x01500007; do
     tpm2_nvreadpublic "$index" >/dev/null \
       || fail "injected interruption did not leave completed fixed state at $index"
   done
@@ -140,7 +157,7 @@ tpm2_nvdefine 0x0150000f -C o -s 8 \
 expect_refusal "runtime read accepted missing install state" hw counter-read
 expect_refusal "runtime read accepted missing freshness state" hw freshness-read
 expect_refusal "profile-bind created missing runtime state" hw profile-bind "$PROFILE" "$TARGET" "$POLICY"
-for index in 0x01500003 0x01500004 0x01500005 0x01500006; do
+for index in 0x01500003 0x01500004 0x01500005 0x01500006 0x01500007; do
   expect_refusal "a runtime read created $index" tpm2_nvreadpublic "$index"
 done
 
@@ -312,7 +329,7 @@ for missing_input in device-root-v1.json srk-v1.tpm2b_public \
   owner-ceremony-intent-v1 owner-ceremony-install-identity-v1.json; do
   mv "$FB_STATE/$missing_input" "$FB_RUN/$missing_input.absent"
   expect_refusal "firstboot accepted missing installed input $missing_input" firstboot
-  [[ "$(hw provisioning-status)" == virgin ]] \
+  [[ "$(hw provisioning-status)" == pcr-policy-activated ]] \
     || fail "missing $missing_input mutated TPM provisioning state"
   mv "$FB_RUN/$missing_input.absent" "$FB_STATE/$missing_input"
 done
@@ -388,7 +405,7 @@ expect_refusal "second ceremony was idempotent success" hw ceremony-prepare "$PR
 [[ "$(firstboot status)" == complete ]] || fail "TPM-authenticated second boot was refused"
 
 # Runtime root cannot delete/recreate NV state or persistent objects after seal.
-for index in 0x01500003 0x01500004 0x01500005 0x01500006; do
+for index in 0x01500003 0x01500004 0x01500005 0x01500006 0x01500007; do
   expect_refusal "runtime root undefined $index after seal" tpm2_nvundefine "$index" -C o
   tpm2_nvreadpublic "$index" >/dev/null || fail "$index disappeared after refused undefine"
 done

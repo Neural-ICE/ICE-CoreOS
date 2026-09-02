@@ -102,8 +102,39 @@ grep -Fq 'neuralice.target must name a plain block device under /dev' "$AUTOINST
   || fail "the wipe target is not constrained to a plain /dev node"
 grep -Fq 'neuralice.systemsize must be a whole number of GiB' "$AUTOINSTALL" \
   || fail "the system size interpolated into sfdisk is not constrained"
-grep -Fq 'neuralice.imgref is not a usable image reference' "$AUTOINSTALL" \
-  || fail "the recorded OTA origin is not constrained"
+# 🔴 ONE CANONICAL ORIGIN, NO DEFAULT (independent review 2026-09-02, P0 #3).
+# The compiled-in fallback was `ghcr.io/neural-ice/neural-ice-coreos:stable` -- a
+# MUTABLE TAG on a registry that is not the release authority -- and an appliance
+# whose medium sealed no origin followed it for its whole life. Both halves are
+# asserted: the constraint exists, and the fallback is gone.
+grep -Fq 'the OTA origin must be <sealed release authority>/<repo>@sha256:<digest>' "$AUTOINSTALL" \
+  || fail "the recorded OTA origin is not constrained to the sealed digest-pinned authority"
+# 🔴 AND THE AUTHORITY IS NOT A LITERAL IN THIS TREE. ICE-CoreOS is open core;
+# ci/test-open-core-boundary.sh refuses the sovereign endpoint's bytes in every
+# Git-visible file. The authority therefore arrives on the SIGNED command line,
+# which is stronger than a constant: it is one value the signature covers rather
+# than one a fork can edit.
+grep -Fq 'NEURALICE_RELEASE_AUTHORITY="$(karg_once neuralice.release_authority)"' "$AUTOINSTALL" \
+  || fail "the installer no longer reads its release authority from the sealed command line"
+grep -Fq 'refusing to install an appliance with no update path rather than inventing a default' "$AUTOINSTALL" \
+  || fail "the installer still invents an OTA origin when the medium seals none"
+grep -vE '^[[:space:]]*#' "$AUTOINSTALL" | grep -Fq 'ghcr.io' \
+  && fail "the installer still carries a GHCR reference outside its comments"
+grep -Fq 'DEVICE_CHANNEL="$(karg_once neuralice.device_channel)"' "$AUTOINSTALL" \
+  || fail "the installer does not consume the device channel sealed by the UKI"
+grep -Fq 'printf '\''%s\n'\'' "$DEVICE_CHANNEL" > /run/seed-dst/release/CHANNEL' "$AUTOINSTALL" \
+  || fail "the verified seed handoff does not retain its signed device channel"
+
+# Literal current PCR7 is forbidden. The TPM slot must use PolicyAuthorize,
+# with the policy generation sealed in the UKI and checked before disk mutation.
+grep -vE '^[[:space:]]*#' "$AUTOINSTALL" | grep -Fq -- '--tpm2-pcrs=7' \
+  && fail "the installer still seals LUKS to the mutable current PCR7 value"
+for required in '--tpm2-pcrs=' '--tpm2-public-key="$PCR_POLICY_KEY_RUNTIME"' \
+  '--tpm2-public-key-pcrs=7' 'karg_once neuralice.pcr_policy_seq' \
+  'esp_staged_file tpm2-pcr-signature.json'; do
+  grep -Fq -- "$required" "$AUTOINSTALL" \
+    || fail "the signed PCR policy install gate is incomplete: $required"
+done
 
 # All installer-created firstboot inputs are atomically published and fsynced
 # before the recovery-key prompt can permit the first installed boot.

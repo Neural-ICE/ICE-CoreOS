@@ -63,7 +63,31 @@ fi
 check "the install source is an explicit kernel argument"    -F 'neuralice.source='
 check "the appliance image is an explicit kernel argument"   -F 'neuralice.osimage='
 check "the appliance image must be digest-pinned"            -F 'sha256:[0-9a-f]{64}'
-check "a registry install requires a signed docker scope"    -F 'refusing a registry install that nothing would verify'
+# 🔴 ONE SIGNATURE-POLICY READER, AND IT IS ASKED TWICE (independent review
+# 2026-09-02, P1 #2). The installer used to carry nine lines of inline Python
+# that checked only that SOME covering scope existed. It now calls the same
+# implementation the producer runs, from the signed read-only /usr -- once before
+# the pull, and once with the index and platform-child digests the object
+# actually resolved to, which is the recursive proof.
+check "a registry install requires a signed docker scope"    -F 'refusing an install nothing would verify'
+check "the policy reader is the shared one, from the signed /usr" \
+  -F '/usr/lib/neural-ice/registry-authorisation.py'
+check "the policy must bind the OBJECT, not just the repository" \
+  -F -- '--require-object-binding'
+check "the observed index/child pair is re-put to the policy reader" \
+  -F -- '--index-digest "$got_index" --manifest-digest "$got_manifest"'
+check "matchRepository is tied to the authenticated repository" \
+  -F -- '--authenticated-repository "$SIGNED_IMAGE_REPOSITORY"'
+check "matchRepository is tied to the authenticated index" \
+  -F -- '--authenticated-index-digest "$SIGNED_IMAGE_INDEX_DIGEST"'
+check "matchRepository is tied to the authenticated child" \
+  -F -- '--authenticated-manifest-digest "$SIGNED_IMAGE_MANIFEST_DIGEST"'
+check "optional cache READY uses Fabric store_generation" -F 'generation = document.get("store_generation")'
+if grep -q 'document.get("cache_generation")' "$S"; then
+  printf '  FAIL  optional cache READY still accepts the superseded cache_generation field\n'; fail=1
+else
+  printf '  ok    optional cache READY rejects superseded cache_generation\n'
+fi
 # The pulled bytes are re-checked, and BOTH digests are. For an OCI index,
 # `.Digest` is the PLATFORM CHILD manifest while `.RepoDigests` keeps the INDEX
 # digest that was asked for. Checking one of the two would let a hostile mirror

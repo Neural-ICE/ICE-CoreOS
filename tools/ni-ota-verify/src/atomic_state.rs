@@ -355,6 +355,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
     }
     let candidate = Candidate {
         applied: AppliedStateV1 {
+            active_ring: None,
             bom_sha256: bom_hash,
             bundle_seq: bom.bundle_seq,
             schema: "neural-ice-ota-applied-state-v1".into(),

@@ -229,6 +229,7 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), ContractError
                 tombstone.role.as_str(),
                 "image-ci"
                     | "licensing-bootstrap"
+                    | "release-lab"
                     | "release-beta"
                     | "release-stable"
                     | "trusted-time"
@@ -283,6 +284,10 @@ fn validate_key(key: &DelegatedKey) -> Result<(), ContractError> {
                 "spdx-sbom-attestation",
             ][..],
             &["beta", "stable"][..],
+        ),
+        "release-lab" => (
+            &["lab-publication-receipt", "lab-release-authorization"][..],
+            &["lab"][..],
         ),
         "release-beta" => (
             &["beta-publication-receipt", "beta-release-authorization"][..],
@@ -689,7 +694,7 @@ fn decode_pem(bytes: &[u8]) -> Result<Vec<u8>, String> {
     decode_base64(&body.replace('\n', ""))
 }
 
-fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
     if value.is_empty()
         || value
             .bytes()

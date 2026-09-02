@@ -76,6 +76,67 @@ internal disk, `live` does not — and it cannot be changed afterwards: the mode
 sealed into the one UKI the medium carries, and there is no second bootable
 object to choose instead. An operator who needs both cuts two media.
 
+Each mode is an **affirmative** sealed selector, not the absence of the other:
+`install` seals `neuralice.autoinstall=1` with `systemd.unit=neural-ice-installer.target`,
+and `live` seals `neuralice.live=1` with `systemd.unit=neural-ice-live.target`.
+
+Those two pairs are not the whole check. The signed command line is validated as
+a **closed grammar** — every word must be one
+`image/installer/neural-ice-sealed-cmdline-grammar.sh` names, so `systemd.debug_shell`,
+`init=`, `rd.break`, `systemd.mask=`, `systemd.wants=`, `emergency`, `rescue`,
+`single`, `selinux=0`, a second `systemd.unit=` and any argument invented after
+that file was written are all refused. A blocklist would be whack-a-mole; one
+missed word is one unauthenticated root shell on a medium whose entire safety
+argument is that it has none. The grammar is enforced in four places: the
+producer refuses to cut such a medium, `image/inspect-installer-media.py` refuses
+to accept one off-device, the early runtime generator refuses to boot one, and
+`ota/neural-ice-autoinstall.sh` revalidates it itself before its first mutation —
+because a service precondition guards a unit, not an executable a shell can run
+by hand.
+
+A boot the generator does not recognise reaches **nothing**: it masks every
+general boot target, the installer, every login surface and every debug/emergency
+/rescue shell *before* it classifies, and takes back only what a recognised
+grammar allows.
+
+**`live` is a non-destructive read-only diagnostics mode.** On tty1 it prints one
+bounded summary — the sealed trust anchor, the mode, Secure Boot state, the
+dm-verity mapping, the hardware, the storage it *enumerated* (nothing mounted,
+unlocked or read), network link state, and how to end the boot — and then stops.
+It has no shell, no login, no SSH, no installer and no operator input of any
+kind; it takes no arguments, opens no listener, is denied IP traffic outright
+(`IPAddressDeny=any`) and runs `ProtectSystem=strict` with no writable path. It
+is safe to boot on a machine holding customer data, and it no longer looks like a
+hung one.
+
+### Registry-backed installs
+
+`install` media default to installing the medium's own image. A **light** medium
+can instead pull a digest-pinned appliance image over the network
+(FAB-0040 deployment bench):
+
+```sh
+INSTALL_SOURCE=registry \
+OS_IMAGE='ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest>' \
+INSTALL_MIRROR='bench.example.test:5000' \
+  ./image/build-installer-usb.sh   # plus the same inputs as above
+```
+
+All three are **sealed into the signed UKI**, so a registry install is a property
+of a signature, not of a keystroke. `OS_IMAGE` must be digest-pinned with a
+canonical registry authority — a mutable tag is refused, because the digest is
+what makes consulting `INSTALL_MIRROR` safe (the mirror is `digest-only` and the
+signature policy is still evaluated against the original scope). The build also
+refuses to cut a registry medium whose own container signature policy carries no
+explicitly configured signed `docker` scope for that image: a pull nothing would
+verify is not an install.
+
+A media boot obtains networking without running the installed appliance's
+first-boot TPM ceremony: the runtime generator shadows the appliance's
+`50-neural-ice-tpm-ceremony.conf` drop-in on the five network units, under `/run`
+only. The installed appliance's ordering is untouched — with no media selector on
+the command line the generator emits nothing at all.
+
 None of the others has a default, and that is deliberate (docs/ADR-0015): the
 medium's access profile, the hardware it may install onto and the key that signs
 its boot chain are decisions, and a default would make them silently. Two of them

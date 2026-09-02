@@ -102,8 +102,64 @@ inspect >/dev/null 2>&1 \
 make_esp "$SEALED/installer-live.efi" "$SEALED/installer-live.efi.manifest" \
   installer-live.efi.manifest
 assemble "$ESP" "$SEALED/payload.img"
-inspect --expect-mode live >/dev/null || fail "a correct Live medium was refused"
+inspect --expect-mode live >"$TMP/inspect-live.out" || fail "a correct Live medium was refused"
+grep -q 'neuralice.live=1' "$TMP/inspect-live.out" \
+  || fail "the inspector did not surface the sealed Live selector"
+grep -q 'systemd.unit=neural-ice-live.target' "$TMP/inspect-live.out" \
+  || fail "the inspector did not surface the signed Live target"
 inspect >/dev/null 2>&1 && fail "a Live medium was accepted where an Install medium was expected"
+
+# Live is an affirmative signed mode, never whatever remains after removing the
+# autoinstall word. Missing, duplicated and mixed selectors all produce validly
+# signed UKIs here; the medium inspector must still refuse their grammar.
+build_uki live-missing-selector "quiet systemd.unit=neural-ice-live.target" >/dev/null \
+  || fail "the missing-Live-selector mutation UKI failed to build"
+build_uki live-duplicate-selector \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.live=1" >/dev/null \
+  || fail "the duplicate-Live-selector mutation UKI failed to build"
+build_uki live-mixed-selector \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.autoinstall=1" >/dev/null \
+  || fail "the mixed-selector mutation UKI failed to build"
+# ...and the mixture in the other direction: one well-formed Install target
+# selection that ALSO claims Live. Nothing about its shape is malformed, so only
+# the mutual exclusion refuses it -- and it is the mixture that would actually
+# run the destructive autoinstall.
+build_uki live-installer-target-mixed \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.live=1" \
+  >/dev/null || fail "the Install-target-mixed mutation UKI failed to build"
+# 🔴 AND THE ESCAPE FAMILY, ON REAL SIGNED BINARIES. Each of these is a validly
+# signed UKI whose .cmdline is a well-formed Live selection plus ONE extra word.
+# `systemd.debug_shell` is the one the independent review demonstrated end to end:
+# systemd-debug-generator starts an unauthenticated root shell on tty9, and the
+# destructive installer is one command away from it. The grammar these are
+# refused by is exercised exhaustively and without a medium in
+# image/test-installer-selector-grammar.sh; what is proved HERE is that the
+# refusal survives the whole path -- a real signed PE, a real FAT ESP, a real GPT
+# and the off-device inspector reading it back.
+build_uki live-debug-shell \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.debug_shell" \
+  >/dev/null || fail "the debug-shell mutation UKI failed to build"
+build_uki live-init-override \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 init=/bin/sh" \
+  >/dev/null || fail "the init-override mutation UKI failed to build"
+build_uki live-emergency \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 emergency" \
+  >/dev/null || fail "the emergency mutation UKI failed to build"
+build_uki live-permissive \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 enforcing=0" \
+  >/dev/null || fail "the permissive-SELinux mutation UKI failed to build"
+build_uki live-mask-diagnostics \
+  "quiet systemd.unit=neural-ice-live.target neuralice.live=1 systemd.mask=neural-ice-live-diagnostics.service" \
+  >/dev/null || fail "the unit-mask mutation UKI failed to build"
+for mutation in missing-selector duplicate-selector mixed-selector \
+  installer-target-mixed debug-shell init-override emergency permissive \
+  mask-diagnostics; do
+  make_esp "$SEALED/live-$mutation.efi" "$SEALED/live-$mutation.efi.manifest" \
+    installer-live.efi.manifest
+  assemble "$ESP" "$SEALED/payload.img"
+  inspect --expect-mode live >/dev/null 2>&1 \
+    && fail "a Live medium with the $mutation mutation was accepted"
+done
 make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest
 assemble "$ESP" "$SEALED/payload.img"
@@ -119,6 +175,114 @@ make_esp "$SEALED/installer-wrong-target.efi" \
 assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null 2>&1 \
   && fail "an Install medium selecting multi-user.target was accepted"
+# The same mixture judged as an INSTALL medium: exactly one systemd.unit=, the
+# correct target, the correct autoinstall word -- and a Live claim beside it.
+make_esp "$SEALED/live-installer-target-mixed.efi" \
+  "$SEALED/live-installer-target-mixed.efi.manifest" installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "an Install medium that also seals a Live selector was accepted"
+
+# THE REGISTRY-BACKED INSTALL, on a real signed medium. It is a supported
+# shipping contract, so a correctly sealed one must be ACCEPTED -- and every
+# malformed variant refused. A mutable tag is the interesting refusal: the digest
+# is what makes a LAN mirror safe to consult, so a tag would undo the property
+# the mirror rests on.
+registry_digest="sha256:$(printf '%064d' 7)"
+# 🔴 ONE CANONICAL ORIGIN, AND A MIRROR THAT IS ONLY TRANSPORT (independent
+# review 2026-09-02, P0 #3). This vector used to seal `ghcr.io/...` and a bare
+# mirror. Both are refusals now: the OS/source reference is exactly
+# `release.example.test/<repo>@sha256:<digest>`, a registry medium seals the
+# hashes of the release authorization its ESP must carry, and a mirror seals the
+# CA it is trusted with and the exact release closure it declares READY.
+registry_relauth="neuralice.relauth_sha256=$(printf 'a%.0s' {1..64}) neuralice.relauth_sig_sha256=$(printf 'b%.0s' {1..64})"
+registry_mirror_pin="neuralice.mirror_ca_sha256=$(printf 'c%.0s' {1..64}) neuralice.mirror_ready=$(printf 'd%.0s' {1..64}) neuralice.mirror_manifest=$(printf 'e%.0s' {1..64}) neuralice.mirror_generation=7"
+# The three ESP artefacts a registry medium's signature pins. The producer
+# computes each karg from the bytes it stages, so the fixture does the same:
+# write the bytes, then read their digests back. Naming a digest first and hoping
+# some content matches it is not a thing a producer can do either.
+python3 - "$TMP/relauth.json" "$TMP/relauth.sig" "$TMP/mirror-ca.crt" <<'PYEOF'
+import sys
+
+for index, path in enumerate(sys.argv[1:]):
+    with open(path, "wb") as handle:
+        handle.write(f"neural-ice media fixture artefact {index}\n".encode())
+PYEOF
+registry_relauth_sha="$(sha256sum "$TMP/relauth.json" | awk '{print $1}')"
+registry_relauth_sig_sha="$(sha256sum "$TMP/relauth.sig" | awk '{print $1}')"
+registry_mirror_ca_sha="$(sha256sum "$TMP/mirror-ca.crt" | awk '{print $1}')"
+registry_relauth="neuralice.relauth_sha256=${registry_relauth_sha} neuralice.relauth_sig_sha256=${registry_relauth_sig_sha}"
+registry_mirror_pin="neuralice.mirror_ca_sha256=${registry_mirror_ca_sha} neuralice.mirror_ready=$(printf 'd%.0s' {1..64}) neuralice.mirror_manifest=$(printf 'e%.0s' {1..64}) neuralice.mirror_generation=7"
+build_uki installer-registry \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest} ${registry_relauth} neuralice.mirror=bench.example.test:5000 ${registry_mirror_pin}" \
+  >/dev/null || fail "the registry-install UKI failed to build"
+registry_esp_files=(
+  "::/ice-coreos/release-authorization.json=$TMP/relauth.json"
+  "::/ice-coreos/release-authorization.sig=$TMP/relauth.sig"
+  "::/ice-coreos/mirror-ca.crt=$TMP/mirror-ca.crt"
+)
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest "${registry_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >"$TMP/inspect-registry.out" \
+  || { cat "$TMP/inspect-registry.out"; fail "a correctly sealed registry-install medium was refused"; }
+
+# 🔴 THE PIN IS A REAL COMPARISON. Replace one staged artefact with different
+# bytes -- the UKI is untouched, the signature is untouched -- and the medium
+# must be refused. Without this the assertion above would pass just as happily
+# against an inspector that never hashed anything.
+printf 'a substituted release authorization\n' > "$TMP/relauth-swapped.json"
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest \
+  "::/ice-coreos/release-authorization.json=$TMP/relauth-swapped.json" \
+  "::/ice-coreos/release-authorization.sig=$TMP/relauth.sig" \
+  "::/ice-coreos/mirror-ca.crt=$TMP/mirror-ca.crt"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium whose ESP release authorization was swapped after the cut was accepted"
+
+# ...and an artefact the signature pins but the ESP does not carry is a medium
+# that would refuse itself at install time. It is refused here instead.
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest \
+  "::/ice-coreos/release-authorization.sig=$TMP/relauth.sig" \
+  "::/ice-coreos/mirror-ca.crt=$TMP/mirror-ca.crt"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a registry medium missing the release authorization its signature pins was accepted"
+
+# Restore the good registry medium for the assertions that follow.
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest "${registry_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >"$TMP/inspect-registry.out" \
+  || fail "the restored registry medium was refused"
+grep -q 'neuralice.source=registry' "$TMP/inspect-registry.out" \
+  || fail "the inspector did not surface the sealed registry install source"
+grep -q "neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest}" \
+  "$TMP/inspect-registry.out" \
+  || fail "the inspector did not surface the sealed digest-pinned appliance image"
+grep -q 'neuralice.mirror=bench.example.test:5000' "$TMP/inspect-registry.out" \
+  || fail "the inspector did not surface the sealed mirror transport"
+build_uki installer-registry-tag \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable" \
+  >/dev/null || fail "the mutable-tag registry mutation UKI failed to build"
+build_uki installer-registry-orphan-mirror \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.mirror=bench.example.test" \
+  >/dev/null || fail "the orphan-mirror mutation UKI failed to build"
+build_uki installer-registry-no-image \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry" \
+  >/dev/null || fail "the imageless-registry mutation UKI failed to build"
+for mutation in registry-tag registry-orphan-mirror registry-no-image; do
+  make_esp "$SEALED/installer-$mutation.efi" "$SEALED/installer-$mutation.efi.manifest" \
+    installer-install.efi.manifest
+  assemble "$ESP" "$SEALED/payload.img"
+  inspect >/dev/null 2>&1 \
+    && fail "an Install medium with the $mutation mutation was accepted"
+done
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
 build_uki installer-duplicate-target \
   "quiet systemd.unit=neural-ice-installer.target systemd.unit=multi-user.target neuralice.autoinstall=1" \
   >/dev/null || fail "the duplicate-target mutation UKI failed to build"
@@ -198,7 +362,17 @@ assemble "$ESP" "$SEALED/payload.img"
 cp "$SEALED/payload.img" "$TMP/payload-mutated.img"
 STORE_OFF="$(sed -n 's/^region\.store-image=offset:\([0-9]*\),.*/\1/p' "$PAYLOAD_MANIFEST")"
 [ -n "$STORE_OFF" ] || fail "the payload manifest names no store-image offset"
-printf '\xff' | dd of="$TMP/payload-mutated.img" bs=1 seek="$STORE_OFF" conv=notrunc status=none
+python3 - "$TMP/payload-mutated.img" "$STORE_OFF" <<'PYEOF'
+import sys
+
+with open(sys.argv[1], "r+b") as image:
+    image.seek(int(sys.argv[2]))
+    original = image.read(1)
+    if len(original) != 1:
+        raise SystemExit("store mutation offset is outside the payload")
+    image.seek(-1, 1)
+    image.write(bytes([original[0] ^ 0xFF]))
+PYEOF
 assemble "$ESP" "$TMP/payload-mutated.img"
 inspect >/dev/null 2>&1 && fail "a medium whose sealed container store was modified was accepted"
 
@@ -210,7 +384,17 @@ inspect >/dev/null 2>&1 && fail "a medium whose sealed container store was modif
 cp "$SEALED/payload.img" "$TMP/payload-tree-mutated.img"
 TREE_OFF="$(sed -n 's/^region\.store-hash=offset:\([0-9]*\),.*/\1/p' "$PAYLOAD_MANIFEST")"
 [ -n "$TREE_OFF" ] || fail "the payload manifest names no store-hash offset"
-printf '\xff' | dd of="$TMP/payload-tree-mutated.img" bs=1 seek="$TREE_OFF" conv=notrunc status=none
+python3 - "$TMP/payload-tree-mutated.img" "$TREE_OFF" <<'PYEOF'
+import sys
+
+with open(sys.argv[1], "r+b") as image:
+    image.seek(int(sys.argv[2]))
+    original = image.read(1)
+    if len(original) != 1:
+        raise SystemExit("hash-tree mutation offset is outside the payload")
+    image.seek(-1, 1)
+    image.write(bytes([original[0] ^ 0xFF]))
+PYEOF
 assemble "$ESP" "$TMP/payload-tree-mutated.img"
 inspect >/dev/null 2>&1 \
   && fail "a medium whose sealed dm-verity hash tree was modified was accepted"
@@ -309,6 +493,10 @@ grep -Fq 'MEDIA_MODE' "$USB" \
   || fail "the media producer does not build a single-purpose medium"
 grep -Fq 'systemd.unit=neural-ice-installer.target' "$USB" \
   || fail "the media producer does not seal the dedicated fail-closed installer target"
+grep -Fq 'systemd.unit=neural-ice-live.target' "$USB" \
+  || fail "the media producer does not seal the dedicated Live target"
+grep -Fq 'neuralice.live=1' "$USB" \
+  || fail "the media producer does not seal an affirmative Live selector"
 
 HOOK="$ROOT/image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity.sh"
 [ -f "$HOOK" ] || fail "there is no initramfs hook to open the sealed payload"

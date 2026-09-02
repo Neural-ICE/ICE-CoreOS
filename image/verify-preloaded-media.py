@@ -657,6 +657,10 @@ def verify(arguments: argparse.Namespace) -> None:
         or expected_document.get("schema") != "neural-ice-offline-seed-tree-v1"
     ):
         raise GateError("expected seed manifest schema is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", arguments.release_closure_sha256):
+        raise GateError("expected release closure is not 64 lowercase hex")
+    if not re.fullmatch(r"[0-9a-f]{64}", arguments.release_manifest_sha256):
+        raise GateError("expected release manifest is not 64 lowercase hex")
     expected_baseline = expected_lab_baseline(arguments)
     expected_esp_key = expected_esp_authorized_keys(arguments)
 
@@ -802,6 +806,8 @@ def verify(arguments: argparse.Namespace) -> None:
                 "manifest_sha256": expected_sha,
                 "mount_options": ["nodev", "noexec", "nosuid", "ro"],
                 "partuuid": partuuid,
+                "release_closure_sha256": arguments.release_closure_sha256,
+                "release_manifest_sha256": arguments.release_manifest_sha256,
             },
             "esp_authorized_keys": esp_authorized_keys,
             "lab_baseline": lab_baseline,
@@ -849,6 +855,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw", required=True, type=Path)
     parser.add_argument("--expected-manifest", required=True, type=Path)
+    parser.add_argument("--release-closure-sha256", required=True)
+    parser.add_argument("--release-manifest-sha256", required=True)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--artifact-checksum", required=True, type=Path)
     parser.add_argument(
