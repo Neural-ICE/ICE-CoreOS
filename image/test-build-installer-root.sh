@@ -424,11 +424,14 @@ grep -Fq "BIB's raw data partition holds only" "$USB" \
 # The immutable installer image must contain both producer-side UKI tools that
 # the EL10 base omitted: cryptsetup's multicall link and the ARM64 systemd stub.
 INSTALLER_CONTAINERFILE="$ROOT/image/Containerfile.installer"
-grep -Fq -- "--disablerepo='*' --enablerepo=baseos --enablerepo=appstream" \
+grep -Fq -- 'systemd-boot-unsigned-257-31.el10.aarch64.rpm' \
   "$INSTALLER_CONTAINERFILE" \
-  || fail "installer-only package resolution is not restricted to the base OS repositories"
-grep -Fq -- '-y install systemd-boot-unsigned-257-31.el10' "$INSTALLER_CONTAINERFILE" \
-  || fail "the verified EL10 systemd-boot-unsigned EVR is not pinned"
+  || fail "the exact ARM64 systemd-boot-unsigned RPM is not pinned"
+grep -Fq -- 'd4370eabdbd2085b5e1679cf68f577bf9288ad22f8077f8f274c56857d342300' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the pinned systemd-boot-unsigned RPM has no immutable checksum"
+grep -Fq -- "dnf --disablerepo='*' -y install \"\$stub_rpm\"" "$INSTALLER_CONTAINERFILE" \
+  || fail "the verified local RPM install can still resolve mutable repository packages"
 grep -Fq 'ln -s /usr/sbin/cryptsetup /usr/sbin/veritysetup' "$INSTALLER_CONTAINERFILE" \
   || fail "the cryptsetup multicall veritysetup link is not created"
 grep -Fq 'veritysetup --help' "$INSTALLER_CONTAINERFILE" \

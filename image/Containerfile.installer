@@ -17,10 +17,19 @@ FROM ${BASE_IMAGE}
 # (util-linux), cryptsetup, systemd-cryptenroll, mkfs.fat/ext4/xfs.
 # cryptsetup 2.8 is a multi-call binary, but this base omitted the veritysetup
 # link that dracut resolves by name. The ARM64 systemd UKI stub is split into
-# systemd-boot-unsigned on EL10. Restrict package resolution to the base OS
-# repositories and pin the package to the base image's systemd EVR.
-RUN dnf --disablerepo='*' --enablerepo=baseos --enablerepo=appstream \
-      -y install systemd-boot-unsigned-257-31.el10 \
+# systemd-boot-unsigned on EL10. Fetch the exact ARM64 RPM and verify the
+# checksum published in the CentOS Stream 10 AppStream primary metadata. A
+# mirror removal may stop a rebuild, but mutable metadata or bytes can never
+# silently change the installer at this revision.
+RUN stub_rpm=/tmp/systemd-boot-unsigned-257-31.el10.aarch64.rpm \
+    && curl --proto '=https' --tlsv1.2 --fail --show-error --silent --location \
+      --output "$stub_rpm" \
+      https://mirror.stream.centos.org/10-stream/AppStream/aarch64/os/Packages/systemd-boot-unsigned-257-31.el10.aarch64.rpm \
+    && printf '%s  %s\n' \
+      d4370eabdbd2085b5e1679cf68f577bf9288ad22f8077f8f274c56857d342300 \
+      "$stub_rpm" | sha256sum --check --strict \
+    && dnf --disablerepo='*' -y install "$stub_rpm" \
+    && rm -f "$stub_rpm" \
     && dnf clean all \
     && if ! command -v veritysetup >/dev/null 2>&1; then \
          ln -s /usr/sbin/cryptsetup /usr/sbin/veritysetup; \

@@ -136,6 +136,7 @@ on:
       - "image/test-*.sh"
       - "image/*.py"
       - "image/build-*.sh"
+      - "image/config-installer*.toml"
       - "image/firstboot/**"
       - "image/lib/**"
       - "image/policy/**"
