@@ -14,8 +14,19 @@ FROM ${BASE_IMAGE}
 
 # All the partitioning/encryption tools required by the auto-install are
 # already in the CentOS Stream 10 bootc base: sfdisk/partx/wipefs/blkid/lsblk
-# (util-linux), cryptsetup, systemd-cryptenroll, mkfs.fat/ext4/xfs. Nothing to add
-# -> the installer stays free of any extra package.
+# (util-linux), cryptsetup, systemd-cryptenroll, mkfs.fat/ext4/xfs.
+# cryptsetup 2.8 is a multi-call binary, but this base omitted the veritysetup
+# link that dracut resolves by name. The ARM64 systemd UKI stub is split into
+# systemd-boot-unsigned on EL10. Restrict package resolution to the base OS
+# repositories and pin the package to the base image's systemd EVR.
+RUN dnf --disablerepo='*' --enablerepo=baseos --enablerepo=appstream \
+      -y install systemd-boot-unsigned-257-31.el10 \
+    && dnf clean all \
+    && if ! command -v veritysetup >/dev/null 2>&1; then \
+         ln -s /usr/sbin/cryptsetup /usr/sbin/veritysetup; \
+       fi \
+    && veritysetup --help >/dev/null \
+    && test -s /usr/lib/systemd/boot/efi/linuxaa64.efi.stub
 
 # Auto-install service (gated by the neuralice.autoinstall kernel argument).
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh

@@ -68,6 +68,53 @@ grep -q 'neuralice.relauth_schema=neural-ice-installer-release-authorization-v2'
 grep -q 'recomputed from the medium' "$TMP/inspect.out" \
   || fail "the inspector did not recompute the verity root hashes off the medium"
 
+# Public TPM policy material may travel on the mutable ESP only when the signed
+# UKI command line pins each file's digest.
+printf '%s\n' 'fixture TPM PCR public key' > "$TMP/tpm2-pcr-public-key.pem"
+printf '%s\n' '{"fixture":"TPM PCR signature"}' > "$TMP/tpm2-pcr-signature.json"
+tpm_key_sha="$(sha256sum "$TMP/tpm2-pcr-public-key.pem" | awk '{print $1}')"
+tpm_signature_sha="$(sha256sum "$TMP/tpm2-pcr-signature.json" | awk '{print $1}')"
+tpm_policy_sha="$(printf 'fixture TPM PCR policy' | sha256sum | awk '{print $1}')"
+build_uki installer-tpm-policy \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=${tpm_policy_sha} neuralice.pcr_policy_key=${tpm_key_sha} neuralice.pcr_policy_signature=${tpm_signature_sha} neuralice.pcr_policy_seq=7" \
+  >/dev/null || fail "the TPM-policy Install UKI failed to build"
+tpm_esp_files=(
+  "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key.pem"
+  "::/ice-coreos/tpm2-pcr-signature.json=$TMP/tpm2-pcr-signature.json"
+)
+make_esp "$SEALED/installer-tpm-policy.efi" \
+  "$SEALED/installer-tpm-policy.efi.manifest" installer-install.efi.manifest \
+  "${tpm_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null || fail "correctly hash-bound TPM public policy files were refused"
+
+printf '%s\n' 'substituted TPM PCR public key' > "$TMP/tpm2-pcr-public-key-swapped.pem"
+make_esp "$SEALED/installer-tpm-policy.efi" \
+  "$SEALED/installer-tpm-policy.efi.manifest" installer-install.efi.manifest \
+  "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key-swapped.pem" \
+  "::/ice-coreos/tpm2-pcr-signature.json=$TMP/tpm2-pcr-signature.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a TPM public key that no longer matches the signed digest was accepted"
+
+make_esp "$SEALED/installer-tpm-policy.efi" \
+  "$SEALED/installer-tpm-policy.efi.manifest" installer-install.efi.manifest \
+  "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key.pem"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium missing the TPM signature file its UKI pins was accepted"
+
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest "${tpm_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "TPM public policy files not pinned by the signed UKI were accepted"
+
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null || fail "the restored medium without optional TPM policy files was refused"
+
 # --------------------------------------------------------------------------- #
 # 5) THE REFUSALS. Each mutation is one way a medium can be wrong.
 # --------------------------------------------------------------------------- #

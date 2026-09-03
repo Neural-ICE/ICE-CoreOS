@@ -51,12 +51,16 @@ BASE_IMAGE="${BASE_IMAGE:-}"
 # Defaulting to the exact BASE_IMAGE preserves byte identity through installation.
 TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
+# skopeo 1.13.3 and the pinned bootc-image-builder cannot consume a local
+# containers-storage image by config digest. This name is only a transport
+# handle; every consumer below re-asserts that it resolves to INSTALLER_IMAGE_ID.
+INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-$INSTALLER_IMG}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
 OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
 OUT_NAME="${OUT_NAME:-}"            # if set, copy the final raw to <REPO>/<OUT_NAME>.img
 BG_SRC="${BG_SRC:-${REPO_ROOT}/image/branding/grub-bg.png}"
-CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer.toml}"
+CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer-default-size.toml}"
 BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
 # LAB-MANAGED media may carry ONE operator public key on the ESP. The expected
 # hash is mandatory so a mutable build-host pathname cannot silently change the
@@ -222,6 +226,8 @@ cleanup_lab_baseline_stage() {
 TARGET_PROOF_REF="${TARGET_PROOF_REF:-$TARGET_IMGREF}"
 [[ "$TARGET_PROOF_REF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_PROOF_REF must be a digest-pinned OCI reference" >&2; exit 1; }
+[[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+  || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
 
 if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
   if command -v skopeo >/dev/null 2>&1; then
@@ -371,12 +377,17 @@ echo "    installer image id: ${INSTALLER_IMAGE_REF} (every step below names thi
 # Assert the tag still points at the image this build produced. Called after each
 # step that could span a concurrent build.
 assert_installer_tag_unmoved() { # $1=what has just been done
-  local now
+  local now storage_now
   now="$(sudo podman image inspect --format '{{.Id}}' "$INSTALLER_IMG" 2>/dev/null \
     | tr -d '[:space:]' | sed 's/^sha256://')"
   [[ "$now" == "$INSTALLER_IMAGE_ID" ]] \
     || { echo "ERROR: ${INSTALLER_IMG} moved from ${INSTALLER_IMAGE_ID} to '${now:-nothing}' during $1; refusing to produce a medium assembled from two different images" >&2; exit 1; }
+  storage_now="$(sudo podman image inspect --format '{{.Id}}' "$INSTALLER_STORAGE_NAME" 2>/dev/null \
+    | tr -d '[:space:]' | sed 's/^sha256://')"
+  [[ "$storage_now" == "$INSTALLER_IMAGE_ID" ]] \
+    || { echo "ERROR: installer storage name ${INSTALLER_STORAGE_NAME} resolves to '${storage_now:-nothing}', not ${INSTALLER_IMAGE_ID}, during $1; refusing a mutable transport handle that is not bound to the sealed image" >&2; exit 1; }
 }
+assert_installer_tag_unmoved "the initial immutable-name binding"
 
 # --------------------------------------------------------------------------- #
 # The medium's THREE identities must agree BEFORE anything is sealed: the
@@ -435,6 +446,7 @@ sudo env \
   ROOT_IMAGE_OUT="$SEALED_DIR/installer-root.img" \
   STORE_IMAGE_OUT="$SEALED_DIR/installer-store.img" \
   STORE_IMAGE_NAME="$STORE_IMAGE_NAME" \
+  INSTALLER_STORAGE_NAME="$INSTALLER_STORAGE_NAME" \
   bash "$REPO_ROOT/image/build-installer-root.sh" \
   || { echo "ERROR: cannot build the sealed installer root and store" >&2; exit 1; }
 sudo chown -R "$(id -u):$(id -g)" "$SEALED_DIR" 2>/dev/null || true
@@ -754,11 +766,12 @@ SEALED_MODE="$(ni_sealed_cmdline_classify "$SEALED_CMDLINE")" \
   || { echo "ERROR: the sealed command line is a '${SEALED_MODE}' medium but this build was asked for '${MEDIA_MODE}'" >&2; exit 1; }
 echo "    sealed selector grammar : ${SEALED_MODE} (accepted by the same reader the medium boots with)"
 echo "==> bootc-image-builder --type raw  (${INSTALLER_IMAGE_REF})  config=${CONFIG}"
+assert_installer_tag_unmoved "the immediate pre-bootc-image-builder binding"
 sudo podman run --rm --privileged --security-opt label=type:unconfined_t \
   -v /var/lib/containers/storage:/var/lib/containers/storage \
   -v "$OUT":/output \
   -v "$CONFIG":/config.toml:ro \
-  "$BIB" build --type raw --local --config /config.toml "$INSTALLER_IMAGE_REF"
+  "$BIB" build --type raw --local --config /config.toml "$INSTALLER_STORAGE_NAME"
 assert_installer_tag_unmoved "the bootc-image-builder run"
 
 RAW="$OUT/image/disk.raw"
@@ -813,7 +826,7 @@ done
 
 PAYLOADPART_BYTES="$(part_bytes "$PAYLOADPART")"
 (( PAYLOADPART_BYTES >= PAYLOAD_BYTES )) \
-  || { echo "ERROR: the sealed payload is ${PAYLOAD_BYTES} bytes and the data partition holds only ${PAYLOADPART_BYTES}; raise customizations.filesystem minsize in ${CONFIG}" >&2; exit 1; }
+  || { echo "ERROR: the sealed payload is ${PAYLOAD_BYTES} bytes and BIB's raw data partition holds only ${PAYLOADPART_BYTES}; refusing rather than guessing a filesystem size" >&2; exit 1; }
 # Grow the payload image to the FULL partition, sparsely. Writing it then
 # overwrites every ostree byte in one pass -- the holes read back as the zeros
 # the header implies -- instead of leaving a tail of the old deployment behind
