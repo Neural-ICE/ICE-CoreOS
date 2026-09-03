@@ -53,8 +53,9 @@ TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
 # skopeo 1.13.3 and the pinned bootc-image-builder cannot consume a local
 # containers-storage image by config digest. This name is only a transport
-# handle; every consumer below re-asserts that it resolves to INSTALLER_IMAGE_ID.
-INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-$INSTALLER_IMG}"
+# handle. When the caller does not supply one, it is made task-unique from the
+# atomic build result below rather than sharing the mutable build tag.
+INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
 OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
@@ -74,6 +75,7 @@ LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
 LAB_BASELINE_SIGNATURE_FILE="${LAB_BASELINE_SIGNATURE_FILE:-}"
 LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
 LAB_BASELINE_STAGE_ROOT=""
+INSTALLER_IID_FILE=""
 LAB_BASELINE_HELPER="$REPO_ROOT/ota/neural-ice-lab-baseline-handoff.sh"
 # --------------------------------------------------------------------------- #
 # 🔴 THE SIGNED RELEASE AUTHORIZATION A REGISTRY MEDIUM CANNOT BOOT WITHOUT
@@ -194,12 +196,17 @@ source "$REPO_ROOT/image/lib/access-policy.sh"
 source "$REPO_ROOT/image/installer/neural-ice-sealed-cmdline-grammar.sh"
 
 cleanup_lab_baseline_stage() {
+  if [[ -n "$INSTALLER_IID_FILE" ]]; then
+    rm -f -- "$INSTALLER_IID_FILE"
+    INSTALLER_IID_FILE=""
+  fi
   if [[ -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
     chmod -R u+w -- "$LAB_BASELINE_STAGE_ROOT" 2>/dev/null || true
     rm -rf -- "$LAB_BASELINE_STAGE_ROOT"
     LAB_BASELINE_STAGE_ROOT=""
   fi
 }
+trap cleanup_lab_baseline_stage EXIT
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
@@ -226,8 +233,10 @@ cleanup_lab_baseline_stage() {
 TARGET_PROOF_REF="${TARGET_PROOF_REF:-$TARGET_IMGREF}"
 [[ "$TARGET_PROOF_REF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_PROOF_REF must be a digest-pinned OCI reference" >&2; exit 1; }
-[[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
-  || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
+if [[ -n "$INSTALLER_STORAGE_NAME" ]]; then
+  [[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+    || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
+fi
 
 if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
   if command -v skopeo >/dev/null 2>&1; then
@@ -282,7 +291,6 @@ case "$lab_baseline_input_count" in
       || { echo "ERROR: LAB baseline must be bound to the exact installed image digest" >&2; exit 1; }
     LAB_BASELINE_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ni-lab-baseline-media.XXXXXX")"
     chmod 0700 "$LAB_BASELINE_STAGE_ROOT"
-    trap cleanup_lab_baseline_stage EXIT
     bash "$LAB_BASELINE_HELPER" stage-media \
       "$LAB_BASELINE_BOM_FILE" "$LAB_BASELINE_BOM_SHA256" \
       "$LAB_BASELINE_SIGNATURE_FILE" "$LAB_BASELINE_SIGNATURE_SHA256" \
@@ -345,7 +353,10 @@ if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
     || { echo "ERROR: an operator SSH key requires a lab-managed base image (immutable access policy is '${base_policy:-unreadable}')" >&2; exit 1; }
   echo "    (base image access policy: ${base_policy} — an installer SSH key is permitted)"
 fi
+INSTALLER_IID_FILE="$(mktemp "${TMPDIR:-/tmp}/ni-installer-image-id.XXXXXX")"
+chmod 0600 "$INSTALLER_IID_FILE"
 sudo podman build --pull=never --platform linux/arm64 \
+  --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
@@ -353,25 +364,32 @@ sudo podman build --pull=never --platform linux/arm64 \
 # 🔴 ONE IMMUTABLE IDENTITY, RESOLVED HERE AND NOWHERE ELSE (review 2026-09-01,
 # P1 #1).
 #
-# `$INSTALLER_IMG` is a local TAG, i.e. a mutable pointer. Everything after this
-# line used to name it: the marker reads, the measured-identity list, the sealed
-# root build, the sealed store staging, the dracut run and bootc-image-builder.
-# Each of those is a separate resolution, and a concurrent build or a `podman
-# tag` between any two of them produced a medium whose halves are different
-# images -- both correctly hashed, both correctly signed, and installing bytes
-# the medium's own checks assume are something else.
+# `$INSTALLER_IMG` is a local TAG, i.e. a mutable pointer. Podman's iidfile is
+# written atomically by this exact build; resolving the shared tag afterwards
+# would let a concurrent successful build substitute its identity in the small
+# interval between build completion and `image inspect`.
 #
-# The tag is resolved ONCE, immediately after the build that produced it, and
-# every step below is handed $INSTALLER_IMAGE_REF instead. The tag is re-resolved
-# at the end and must not have moved: a build that raced with another one is a
-# refusal, not a medium.
+# Every step below receives that iidfile identity. A task-unique compatibility
+# tag is then bound from the immutable ID only for old skopeo/BIB consumers.
+# The shared build tag is still re-checked: movement is a refusal, not a medium.
 # --------------------------------------------------------------------------- #
-INSTALLER_IMAGE_ID="$(sudo podman image inspect --format '{{.Id}}' "$INSTALLER_IMG" 2>/dev/null \
-  | tr -d '[:space:]' | sed 's/^sha256://')"
+INSTALLER_IMAGE_REF="$(tr -d '[:space:]' < "$INSTALLER_IID_FILE")"
+rm -f -- "$INSTALLER_IID_FILE"
+INSTALLER_IID_FILE=""
+[[ "$INSTALLER_IMAGE_REF" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: podman build wrote no valid immutable identity to its iidfile" >&2; exit 1; }
+INSTALLER_IMAGE_ID="${INSTALLER_IMAGE_REF#sha256:}"
 [[ "$INSTALLER_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] \
   || { echo "ERROR: the installer image build produced no resolvable immutable image ID" >&2; exit 1; }
 readonly INSTALLER_IMAGE_ID
-readonly INSTALLER_IMAGE_REF="sha256:${INSTALLER_IMAGE_ID}"
+readonly INSTALLER_IMAGE_REF
+if [[ -z "$INSTALLER_STORAGE_NAME" ]]; then
+  INSTALLER_STORAGE_NAME="localhost/ice-coreos-installer:build-${INSTALLER_IMAGE_ID:0:16}"
+fi
+[[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+  || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
+sudo podman tag "$INSTALLER_IMAGE_REF" "$INSTALLER_STORAGE_NAME"
+readonly INSTALLER_STORAGE_NAME
 echo "    installer image id: ${INSTALLER_IMAGE_REF} (every step below names this, never the tag)"
 
 # Assert the tag still points at the image this build produced. Called after each

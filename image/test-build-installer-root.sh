@@ -23,6 +23,7 @@ EOF
 cat > "$TOOLS/umount" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_STATE/umount.args"
+[ "${MOCK_UMOUNT_FAIL:-0}" != 1 ] || exit 32
 rm -f "$MOCK_STATE/overlay-mounted"
 EOF
 
@@ -313,6 +314,18 @@ umount_arg="$(cat "$TMP/mounted-failure/umount.args")"
 [[ "$umount_arg" == "-- ${TMPDIR:-/tmp}/ni-installer-root."*"/store/overlay" ]] \
   || fail "cleanup targeted something other than the task-owned overlay graphroot: $umount_arg"
 
+# If the unmount itself fails, cleanup must preserve the invocation-owned work
+# tree rather than recurse through a still-live mount.
+out="$(build "$TMP/unmount-failure" MOCK_UMOUNT_FAIL=1 2>&1)" \
+  && fail "a failed overlay unmount unexpectedly reported success"
+grep -Fq 'preserving work directory' <<<"$out" \
+  || fail "failed unmount did not explain that the work tree was preserved: $out"
+preserved="$(sed -n 's/.*preserving work directory //p' <<<"$out" | tail -n1)"
+[[ "$preserved" == "${TMPDIR:-/tmp}/ni-installer-root."* && -d "$preserved" ]] \
+  || fail "failed unmount did not preserve its exact task-owned work tree: $preserved"
+rm -f "$TMP/unmount-failure/overlay-mounted"
+rm -rf -- "$preserved"
+
 # Restore the honest mock and assert what the manifest now records: the immutable
 # identity, on both halves, plus a digest of the four markers the runtime gate
 # reads back off the medium.
@@ -355,14 +368,18 @@ build "$TMP/marker-moved" >/dev/null || fail "the marker-mutation build failed"
 make_rootfs
 
 # --------------------------------------------------------------------------- #
-# 4c) AND THE MEDIA PRODUCER MUST RESOLVE THAT IDENTITY ONCE, then never name the
-#     tag again. A tag re-read per step is the finding one level up.
+# 4c) AND THE MEDIA PRODUCER MUST CAPTURE THAT IDENTITY ATOMICALLY, then never
+#     derive it from the mutable tag. A post-build tag inspect has a race window.
 # --------------------------------------------------------------------------- #
 USB="$ROOT/image/build-installer-usb.sh"
-grep -Fq 'INSTALLER_IMAGE_ID="$(sudo podman image inspect --format '"'"'{{.Id}}'"'"' "$INSTALLER_IMG"' "$USB" \
-  || fail "the media producer never resolves the installer image to an immutable ID"
-grep -Fq 'readonly INSTALLER_IMAGE_REF="sha256:${INSTALLER_IMAGE_ID}"' "$USB" \
+grep -Fq -- '--iidfile "$INSTALLER_IID_FILE"' "$USB" \
+  || fail "the media producer does not atomically capture the exact podman build result"
+grep -Fq 'INSTALLER_IMAGE_REF="$(tr -d '"'"'[:space:]'"'"' < "$INSTALLER_IID_FILE")"' "$USB" \
+  || fail "the media producer does not consume the atomic iidfile"
+grep -Fq 'readonly INSTALLER_IMAGE_REF' "$USB" \
   || fail "the media producer keeps no single immutable reference"
+grep -Fq 'INSTALLER_STORAGE_NAME="localhost/ice-coreos-installer:build-${INSTALLER_IMAGE_ID:0:16}"' "$USB" \
+  || fail "the legacy skopeo/BIB transport tag is not task-unique by default"
 grep -Fq 'INSTALLER_IMG="$INSTALLER_IMAGE_REF"' "$USB" \
   || fail "the sealed root builder is not handed the immutable image identity"
 grep -Fq 'INSTALLER_STORAGE_NAME="$INSTALLER_STORAGE_NAME"' "$USB" \
@@ -376,7 +393,7 @@ grep -Fq 'assert_installer_tag_unmoved "the immediate pre-bootc-image-builder bi
 # Every step AFTER the resolution must name the immutable reference. The tag may
 # only appear in the build that creates it and in the movement check itself.
 usb_after_resolve() {
-  awk '/^INSTALLER_IMAGE_ID=/{seen=1} seen' "$USB" | grep -vE '^[[:space:]]*#'
+  awk '/^INSTALLER_IMAGE_REF=/{seen=1} seen' "$USB" | grep -vE '^[[:space:]]*#'
 }
 usb_after_resolve | grep -n '"\$INSTALLER_IMG"' | grep -v 'podman image inspect' \
   && fail "a build step after the identity resolution still names the mutable installer tag"

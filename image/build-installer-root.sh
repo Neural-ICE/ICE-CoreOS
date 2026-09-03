@@ -128,9 +128,13 @@ cleanup() {
   # mktemp directory; no host or shared storage mount is ever targeted.
   if "$MOUNTPOINT_BIN" -q -- "$overlay_mount" 2>/dev/null; then
     if ! "$UMOUNT_BIN" -- "$overlay_mount" >/dev/null 2>&1; then
-      echo "build-installer-root: WARNING: cannot unmount task-owned $overlay_mount" >&2
-      (( exit_status != 0 )) || exit_status=1
+      echo "build-installer-root: WARNING: cannot unmount task-owned $overlay_mount; preserving work directory $WORK" >&2
+      return 1
     fi
+  fi
+  if "$MOUNTPOINT_BIN" -q -- "$overlay_mount" 2>/dev/null; then
+    echo "build-installer-root: WARNING: task-owned $overlay_mount remains mounted after unmount; preserving work directory $WORK" >&2
+    return 1
   fi
   if ! rm -rf -- "$WORK"; then
     echo "build-installer-root: WARNING: cannot remove task-owned work directory $WORK" >&2
