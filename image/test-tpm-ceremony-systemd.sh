@@ -59,11 +59,14 @@ for bridge in image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf \
   [[ ! -e "$ROOT/$bridge" ]] || fail "retired first-boot ceremony bridge is back in the tree: $bridge"
 done
 AUTOINSTALL="$ROOT/ota/neural-ice-autoinstall.sh"
-grep -Fq '"$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"' "$AUTOINSTALL" \
+# Literal source fragments, hence -F: the installer checks the appliance's OWN
+# /usr/lib unit and refuses PrivateTmp=yes and any tmpfiles-setup edge.
+# shellcheck disable=SC2016 # exact installer source assertion
+grep -Fq 'ceremony_unit="$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"' "$AUTOINSTALL" \
   || fail "the installer does not verify the pinned appliance's own first-boot ceremony unit"
-grep -Eq "grep -Eq '\^PrivateTmp=\(yes\|true\|on\|1\)" "$AUTOINSTALL" \
+grep -Fq "grep -Eq '^PrivateTmp=(yes|true|on|1)[[:space:]]*\$' \"\$ceremony_unit\"" "$AUTOINSTALL" \
   || fail "the installer does not refuse an appliance whose ceremony unit uses PrivateTmp=yes (re-adds After=tmpfiles-setup)"
-grep -Eq 'systemd-tmpfiles-setup\\.service. "\$ceremony_unit"' "$AUTOINSTALL" \
+grep -Fq "grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\\.service' \"\$ceremony_unit\"" "$AUTOINSTALL" \
   || fail "the installer does not refuse an appliance whose ceremony unit orders against tmpfiles-setup"
 ! grep -Fq 'etc/systemd/system-generators/neural-ice-firstboot-ceremony"' "$AUTOINSTALL" \
   || { grep -Fq 'retired first-boot ceremony bridge' "$AUTOINSTALL" \
