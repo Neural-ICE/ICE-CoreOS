@@ -120,7 +120,9 @@ assert_policy_medium_refused() { # $1=name $2=public key $3=signature JSON $4=me
     "::/ice-coreos/tpm2-pcr-public-key.pem=$key" \
     "::/ice-coreos/tpm2-pcr-signature.json=$document"
   assemble "$ESP" "$SEALED/payload.img"
-  inspect >/dev/null 2>&1 && fail "$message"
+  if inspect >/dev/null 2>&1; then
+    fail "$message"
+  fi
 }
 
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
