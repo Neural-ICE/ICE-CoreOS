@@ -65,21 +65,26 @@ done
 [[ -n "$out" ]] || exit 2
 cp "$MOCK_TPM_KEY_DER" "$out"
 EOF
-# A real TPM emits ECDSA as raw r||s with `-f plain`. Producing exactly that
-# shape is what makes the helper's DER encoder a tested component rather than an
-# assumption.
+# The helper must ask for `-f tss` (the TCG-marshalled TPMT_SIGNATURE, stable
+# across tpm2-tools releases) — `-f plain` is DER on tpm2-tools 5.6 and raw r||s
+# on older releases, and a QEMU first boot refused on that drift. The mock
+# refuses any other format and emits exactly the TPMT_SIGNATURE a TPM returns
+# (ECDSA, SHA-256, 32-byte r and s), so the helper's parser and DER encoder are
+# tested components rather than assumptions.
 cat > "$TOOLS/tpm2_sign" <<'EOF'
 #!/usr/bin/env bash
-out=""; message=""
+out=""; message=""; format=""
 while (( $# )); do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    -c|-g|-s|-f) shift 2 ;;
+    -f) format="$2"; shift 2 ;;
+    -c|-g|-s) shift 2 ;;
     -Q) shift ;;
     *) message="$1"; shift ;;
   esac
 done
 [[ -n "$out" && -n "$message" ]] || exit 2
+[[ "$format" == tss ]] || { echo "mock tpm2_sign: only -f tss is stable across releases" >&2; exit 2; }
 [[ ! -e "$MOCK_STATE/sign-fail" ]] || exit 7
 tmp="$(mktemp)"
 openssl dgst -sha256 -sign "$MOCK_TPM_KEY" -out "$tmp" "$message" || exit 2
@@ -87,16 +92,17 @@ python3 - "$tmp" "$out" <<'PY'
 import sys
 
 der = open(sys.argv[1], "rb").read()
-# Minimal DER SEQUENCE{INTEGER r, INTEGER s} -> the 64-byte r||s a TPM returns.
+# Minimal DER SEQUENCE{INTEGER r, INTEGER s} -> marshalled TPMT_SIGNATURE:
+# sigAlg TPM_ALG_ECDSA, hashAlg TPM_ALG_SHA256, TPM2B r, TPM2B s.
 assert der[0] == 0x30
 body = der[2:] if der[1] < 0x80 else der[2 + (der[1] & 0x7F):]
-out = b""
+out = (0x0018).to_bytes(2, "big") + (0x000B).to_bytes(2, "big")
 index = 0
 for _ in range(2):
     assert body[index] == 0x02
     length = body[index + 1]
     value = body[index + 2 : index + 2 + length].lstrip(b"\x00")
-    out += value.rjust(32, b"\x00")
+    out += (32).to_bytes(2, "big") + value.rjust(32, b"\x00")
     index += 2 + length
 open(sys.argv[2], "wb").write(out)
 PY
