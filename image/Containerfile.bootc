@@ -372,6 +372,13 @@ COPY image/firstboot/neural-ice-firstboot-sshkey.service          /usr/lib/syste
 COPY image/firstboot/neural-ice-firstboot-sshkey-activate.service /usr/lib/systemd/system/neural-ice-firstboot-sshkey-activate.service
 COPY image/firstboot/neural-ice-firstboot-tpm-ceremony.service /usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service
 COPY image/firstboot/neural-ice-seed-import.service /usr/lib/systemd/system/neural-ice-seed-import.service
+# Boot status screen on tty1 (every boot, non-interactive, secret-free). It is
+# the ONE unit that must run WHILE the ceremony below holds everything else, so
+# it is deliberately NOT in the hard-gate drop-in set and carries no edge to the
+# ceremony; image/test-status-screen.sh proves both. Error codes:
+# image/firstboot/status-error-codes.md.
+COPY image/firstboot/neural-ice-status-screen.sh      /usr/local/bin/neural-ice-status-screen.sh
+COPY image/firstboot/neural-ice-status-screen.service /usr/lib/systemd/system/neural-ice-status-screen.service
 COPY image/firstboot/50-neural-ice-seed-import.conf /usr/lib/systemd/system/NetworkManager.service.d/40-neural-ice-seed-import.conf
 COPY image/firstboot/50-neural-ice-seed-import.conf /usr/lib/systemd/system/neural-ice-payload-apply.service.d/40-neural-ice-seed-import.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/sshd.service.d/50-neural-ice-tpm-ceremony.conf
@@ -531,6 +538,7 @@ RUN set -euxo pipefail; \
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-firstboot-sshkey.sh \
                /usr/local/bin/neural-ice-seed-import.sh \
+               /usr/local/bin/neural-ice-status-screen.sh \
                /usr/libexec/neural-ice-model-cache-contract \
                /usr/local/bin/neural-ice-hostname-init.sh \
                /usr/local/bin/neural-ice-dhcp-retry.sh \
@@ -543,7 +551,11 @@ RUN set -euxo pipefail; \
                      neural-ice-seed-import.service \
                      neural-ice-hostname-init.service \
                      neural-ice-payload-apply.service \
+                     neural-ice-status-screen.service \
                      avahi-daemon.service; \
+    # The status screen is the one enabled unit that is NOT ceremony-gated (it
+    # watches the ceremony); it never gets a 50-neural-ice-tpm-ceremony.conf.
+    test ! -e /usr/lib/systemd/system/neural-ice-status-screen.service.d/50-neural-ice-tpm-ceremony.conf; \
     systemctl set-default multi-user.target
 
 # --- No unbidden egress ---------------------------------------------------- #

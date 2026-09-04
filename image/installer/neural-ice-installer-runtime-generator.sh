@@ -145,6 +145,9 @@ install -d -m 0755 "$EARLY_DIR"
 # serial autologin: Live gets no console login of its own, by design.
 readonly -a MASKED_UNITS=(
   neural-ice-firstboot-tpm-ceremony.service
+  # The appliance's tty1 boot status screen: on a medium boot tty1 belongs to
+  # the installer / Live diagnostics, and the screen would redraw over them.
+  neural-ice-status-screen.service
   neural-ice-firstboot-sshkey.service
   neural-ice-firstboot-sshkey-activate.service
   neural-ice-payload-apply.service

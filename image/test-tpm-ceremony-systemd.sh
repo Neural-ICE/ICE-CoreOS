@@ -354,5 +354,25 @@ for enabled in nvidia-device-nodes.service nvidia-cdi-generate.service \
     printf '%s\n' "${dropin_units[@]}" | grep -qx "$enabled" || fail "$enabled is enabled but not hard-gated"
   fi
 done
+# ...and the other way round: EVERY unit the block enables must be gated, carry
+# the edge in its own source (the sshkey pair), or be the ONE documented
+# exception -- the tty1 status screen, which exists to be visible WHILE the
+# ceremony holds everything else and is therefore ungated by design
+# (image/test-status-screen.sh proves it has no edge to the ceremony and no
+# 50-neural-ice-tpm-ceremony.conf). A second ungated unit fails here.
+ungated_allowed=(
+  neural-ice-firstboot-tpm-ceremony.service   # the gate itself
+  neural-ice-seed-import.service              # Before=network-pre, publishes the offline store the gated consumers read
+  neural-ice-firstboot-sshkey.service neural-ice-firstboot-sshkey-activate.service   # edge in their own source (asserted above)
+  neural-ice-status-screen.service            # the visible observer of the gate
+)
+while IFS= read -r enabled; do
+  printf '%s\n' "${dropin_units[@]}" "${ungated_allowed[@]}" | grep -qx "$enabled" \
+    || fail "$enabled is enabled by the image but neither hard-gated nor a documented exception"
+done < <(grep -oE '[A-Za-z0-9@._-]+\.(service|timer|socket|target)' <<<"$enable_block" | sort -u)
+grep -qx 'neural-ice-status-screen.service' <<<"$(grep -oE '[A-Za-z0-9@._-]+\.service' <<<"$enable_block")" \
+  || fail "the status screen is no longer enabled by the image"
+! printf '%s\n' "${dropin_units[@]}" | grep -qx 'neural-ice-status-screen.service' \
+  || fail "the status screen must not be in the ceremony hard-gate set"
 
 echo "TPM_CEREMONY_SYSTEMD_OFFLINE_TEST_OK (${#dropin_units[@]} direct consumers plus firstboot chain)"

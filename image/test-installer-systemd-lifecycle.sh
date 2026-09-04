@@ -81,7 +81,7 @@ registry_cmdline="$registry_cmdline neuralice.relauth_sig_sha256=$(printf '%064d
 run_generator "$registry_cmdline" "$TMP/registry"
 
 masked_units=(
-  neural-ice-firstboot-tpm-ceremony.service
+  neural-ice-firstboot-tpm-ceremony.service neural-ice-status-screen.service
   neural-ice-firstboot-sshkey.service neural-ice-firstboot-sshkey-activate.service
   neural-ice-payload-apply.service neural-ice-hostname-init.service
   neural-ice-dhcp-retry.service neural-ice-device-root.service
