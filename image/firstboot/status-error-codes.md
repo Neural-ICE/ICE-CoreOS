@@ -60,12 +60,32 @@ channel (`/var/lib/neural-ice/data/release/CHANNEL`, fallback `device_channel=`
 in `/etc/neural-ice/ota.conf`), DMI vendor + model + serial
 (`/sys/class/dmi/id`), hostname.
 
+**Identity policy.** The only device-identifying data on screen is what the
+chassis label already prints (DMI model + serial) plus the hostname the
+appliance broadcasts over mDNS. The short image digest identifies the
+appliance's **software version** (which build is running, for support), not
+the device: it is the same for every appliance on that release and is therefore
+not a fingerprint. Nothing else — no key, no LUKS/TPM material, no licence, no
+token, no hardware fingerprint — is read or printed; `image/test-status-screen.sh`
+holds the script to an explicit allow-list of readable paths.
+
+## Unknown state
+
+`systemctl show` failing is **not** a state. A unit the manager cannot answer
+for is shown as `probing...`, READY is withheld while any watched probe is
+unanswered, and no NI-Exx code is raised for it (an absent unit —
+`LoadState=not-found` — is different: it is skipped).
+
 ## Serial mirror (headless qualification)
 
-Every stable line is also written, **once per change**, to the first serial
-port present (`/dev/ttyAMA0`, then `/dev/ttyS0`) as plain
-`neural-ice-status: <text>` lines — never the per-second redraw, never the
-volatile rate/elapsed part. `image/qualify-installer-qemu.sh` captures that
+Every stable line is also written, **once per change**, to the kernel's own
+serial console as plain `neural-ice-status: <text>` lines — never the
+per-second redraw, never the volatile rate/elapsed part. The UART is taken from
+`/sys/class/tty/console/active` (virtual terminals excluded), then from
+`console=` on the kernel command line; only `ttyS<n>` and `ttyAMA<n>` qualify,
+because those are the two nodes the unit's `DeviceAllow=` opens (GB10 image:
+`ttyS0`; QEMU aarch64 `virt`: `ttyAMA0`). No serial console configured means no
+mirror, and the tty1 screen is unaffected. `image/qualify-installer-qemu.sh` captures that
 console, so a first-boot qualification can require:
 
 ```
@@ -84,4 +104,8 @@ session; on sealed variants nothing else writes there.
 The script exits on its own once READY has been shown for
 `NI_STATUS_READY_LINGER` seconds (default 10), or as soon as a tty1 owner —
 `getty@tty1.service` (debug variant) or `neural-ice-tui.service` (branded
-appliance) — is active. It is never restarted within a boot.
+appliance) — is active. Ownership is re-asked from the manager immediately
+before every write to tty1 (and in the exit handler): a frame prepared while
+the owner was starting is dropped, never drawn. The unit is never restarted
+within a boot and is stopped on shutdown (`Conflicts=`/`Before=shutdown.target`,
+`TimeoutStopSec=5`).

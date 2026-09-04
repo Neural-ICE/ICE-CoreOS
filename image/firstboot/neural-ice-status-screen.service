@@ -15,6 +15,10 @@ Documentation=https://github.com/Neural-ICE/ICE-CoreOS/blob/main/image/firstboot
 # with every path that is not there yet.
 DefaultDependencies=no
 After=local-fs.target systemd-vconsole-setup.service
+# DefaultDependencies=no also drops the implicit shutdown edge; restore exactly
+# that one so the unit is stopped (TimeoutStopSec applies) on poweroff/reboot.
+Conflicts=shutdown.target
+Before=shutdown.target
 # NOT gated by the ceremony: this is the one unit that must run WHILE the
 # ceremony runs. No Requires=/After= on neural-ice-firstboot-tpm-ceremony.service,
 # and no 50-neural-ice-tpm-ceremony.conf drop-in may ever target this unit
@@ -66,7 +70,14 @@ ProtectClock=yes
 # /sys/class/net and /sys/class/dmi/id, which stay readable.
 ProtectKernelTunables=yes
 # NOT PrivateNetwork / PrivateDevices: the receive counters come from the real
-# NICs in /sys/class/net and the screen is /dev/tty1.
+# NICs in /sys/class/net and the screen is /dev/tty1. The device cgroup is
+# closed instead: tty1 plus the two UARTs the script may select as the kernel
+# console (GB10 image: ttyS0; QEMU aarch64 virt: ttyAMA0), nothing else. A
+# UART node absent on this hardware is skipped by the manager with a warning.
+DevicePolicy=closed
+DeviceAllow=/dev/tty1 rw
+DeviceAllow=/dev/ttyS0 rw
+DeviceAllow=/dev/ttyAMA0 rw
 # AF_UNIX for systemctl (private manager socket), AF_NETLINK for `ip -4 addr`.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 IPAddressDeny=any

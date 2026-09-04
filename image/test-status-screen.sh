@@ -36,8 +36,10 @@ grep -qx 'DefaultDependencies=no' "$UNIT" || fail "status screen keeps default d
   || fail "status screen orders against sysinit/sockets/basic (the ceremony cycle set)"
 ! grep -E '^(After|Before|Requires|Wants|Requisite|BindsTo|PartOf|Conflicts)=.*neural-ice-firstboot-tpm-ceremony\.service' "$UNIT" \
   || fail "status screen has an edge to the ceremony; it must run WHILE the ceremony runs"
-! grep -E '^Conflicts=' "$UNIT" \
-  || fail "Conflicts= between two jobs of the boot transaction makes systemd drop one of them; the script polls the tty1 owners instead"
+! grep -E '^Conflicts=.*(getty|neural-ice-tui|neural-ice-firstboot-tpm-ceremony)' "$UNIT" \
+  || fail "Conflicts= against a tty1 owner or the ceremony: two conflicting jobs in one boot transaction make systemd drop one of them; the script polls the owners instead"
+{ grep -qx 'Conflicts=shutdown.target' "$UNIT" && grep -qx 'Before=shutdown.target' "$UNIT"; } \
+  || fail "DefaultDependencies=no drops the shutdown edge; without Conflicts=+Before=shutdown.target TimeoutStopSec never applies"
 grep -qx 'IgnoreOnIsolate=yes' "$UNIT" || fail "OnFailure=emergency.target isolate would tear the failure block down"
 grep -qx 'PrivateTmp=disconnected' "$UNIT" || fail "PrivateTmp must be disconnected: yes re-adds After=tmpfiles-setup"
 grep -qx 'Type=simple' "$UNIT" || fail "a oneshot here would hold getty/TUI until the screen exits"
@@ -55,20 +57,38 @@ for hard in 'ProtectSystem=strict' 'NoNewPrivileges=yes' 'CapabilityBoundingSet=
 done
 ! grep -E '^(ReadWritePaths|StateDirectory|RuntimeDirectory|CacheDirectory|LogsDirectory)=' "$UNIT" \
   || fail "a read-only observer needs no writable path"
+grep -qx 'DevicePolicy=closed' "$UNIT" || fail "device cgroup is not closed"
+for dev in /dev/tty1 /dev/ttyS0 /dev/ttyAMA0; do
+  grep -qx "DeviceAllow=$dev rw" "$UNIT" || fail "DeviceAllow= lacks $dev"
+done
+[[ "$(grep -c '^DeviceAllow=' "$UNIT")" -eq 3 ]] || fail "DeviceAllow= opens more than tty1 and the two UARTs"
+! grep -E '^PrivateDevices=yes' "$UNIT" || fail "PrivateDevices=yes would hide tty1 and the UARTs"
 grep -qx 'WantedBy=multi-user.target' "$UNIT" || fail "status screen is not pulled in by multi-user"
 grep -qx 'Environment=NI_STATUS_CEREMONY_TIMEOUT=[0-9]*' "$UNIT" || fail "ceremony timeout is not configurable from the unit"
 
 # The full effective unit must load and verify under a real systemd when one is
 # available (no unknown keys, no syntax error, no cycle it can see).
+# `PrivateTmp=disconnected` exists since systemd 257; the appliance runs 257
+# (CentOS Stream 10), a CI host may run 255 and would reject the directive as a
+# parse error. The static assertion above holds the real unit to `disconnected`;
+# an older host verifies a copy with that ONE line removed and says so.
 if command -v systemd-analyze >/dev/null 2>&1; then
   VROOT="$TMP/verify-root"
   mkdir -p "$VROOT/usr/lib/systemd/system" "$VROOT/usr/local/bin"
-  cp -- "$UNIT" "$VROOT/usr/lib/systemd/system/"
+  host_systemd="$(systemd-analyze --version 2>/dev/null | sed -nE '1s/^systemd ([0-9]+).*/\1/p')"
+  if [[ -n $host_systemd && $host_systemd -ge 257 ]]; then
+    cp -- "$UNIT" "$VROOT/usr/lib/systemd/system/"
+    verified="the shipped unit, byte for byte"
+  else
+    grep -vx 'PrivateTmp=disconnected' "$UNIT" > "$VROOT/usr/lib/systemd/system/neural-ice-status-screen.service"
+    verified="the shipped unit minus PrivateTmp=disconnected (host systemd ${host_systemd:-?} < 257 cannot parse it)"
+  fi
   cp -- "$SCRIPT" "$VROOT/usr/local/bin/neural-ice-status-screen.sh"
   chmod 0755 "$VROOT/usr/local/bin/neural-ice-status-screen.sh"
   out="$(systemd-analyze --root="$VROOT" verify neural-ice-status-screen.service 2>&1)" \
-    || fail "systemd-analyze verify rejects the status screen unit: $out"
-  ! grep -Eiq 'cycle|Unknown key|Failed to parse' <<<"$out" || fail "systemd-analyze verify flagged the unit: $out"
+    || fail "systemd-analyze verify rejects the status screen unit ($verified): $out"
+  ! grep -Eiq 'cycle|Unknown key|Failed to parse' <<<"$out" || fail "systemd-analyze verify flagged the unit ($verified): $out"
+  echo "systemd-analyze verify: $verified"
 fi
 
 # --- 1b. image wiring ----------------------------------------------------------
@@ -111,13 +131,16 @@ for pattern in "${forbidden[@]}"; do
   ! grep -Eiq -- "$pattern" "$CODE" || fail "status screen code mentions a forbidden path/word: $pattern"
 done
 # Every absolute path the code names must sit under the declared allow-list.
+# Nothing on it identifies the DEVICE beyond what the chassis label already
+# prints (DMI model + serial): the short bootc image digest in the header is
+# the appliance's software VERSION, not a device fingerprint, and is kept.
 allowed=(
   /usr/lib/os-release /usr/lib/neural-ice/version /usr/lib/neural-ice/status-screen
   /usr/lib/neural-ice/release-image /usr/lib/bootc/bound-images.d /usr/share/containers/systemd
   /etc/containers/systemd /etc/NetworkManager/system-connections /etc/neural-ice/ota.conf
   /var/lib/neural-ice/data/release/CHANNEL /var/lib/neural-ice/data/seed-store/current/overlay-images/images.json
   /var/lib/containers/storage/overlay-images/images.json /sys/class/net /sys/class/dmi/id
-  /proc/cmdline /proc/sys/kernel/hostname /dev/ttyAMA0 /dev/ttyS0 /dev/null
+  /proc/cmdline /proc/sys/kernel/hostname /sys/class/tty/console/active /dev /dev/null
 )
 while IFS= read -r found; do
   ok=0
@@ -135,6 +158,11 @@ while IFS= read -r l; do
   [[ $l == *'mgmt-*.nmconnection'* ]] || fail "status screen reads a NetworkManager profile other than mgmt-*: $l"
 done <<<"$nm_reads"
 grep -Fq "sed -n 's/^interface-name=//p' \"\$conn\"" "$CODE" || fail "status screen must extract only interface-name= from the mgmt profile"
+# The UART is the kernel's active console (then console=), never a guess, and
+# only the two nodes DeviceAllow= opens qualify.
+grep -Fq '/sys/class/tty/console/active' "$CODE" || fail "serial mirror does not read the kernel's active console list"
+grep -Fq 'console=tty' "$CODE" || fail "serial mirror does not fall back to console= on the kernel command line"
+grep -Fq '^tty(S|AMA)[0-9]+$' "$CODE" || fail "serial mirror may select a UART the unit's DeviceAllow= does not open"
 # Receive counters come from /sys/class/net statistics and nothing else.
 grep -Fq 'statistics/rx_bytes' "$CODE" || fail "receive rate is not derived from /sys/class/net statistics"
 ! grep -Eq '(^|[^A-Za-z])(ifconfig|ethtool|nmcli|ss|netstat|sar|iftop|vnstat|bmon)([^A-Za-z]|$)' "$CODE" \
@@ -160,6 +188,16 @@ cat > "$TOOLS/systemctl" <<'EOF'
 # `systemctl show -p A,B,... -- <unit>`: answer from the scene file
 # "<unit> <LoadState> <ActiveState> <SubState> <ConditionTimestampMonotonic> <ConditionResult>"
 unit=${*: -1}
+# Optional ownership flip: the Nth query of NI_TEST_FLIP_UNIT (and every later
+# one) answers `active`, modelling getty/the TUI taking tty1 between the loop's
+# snapshot and the write.
+if [[ -n ${NI_TEST_FLIP_UNIT:-} && $unit == "$NI_TEST_FLIP_UNIT" ]]; then
+  n=0; [[ -f $NI_TEST_FLIP_COUNTER ]] && n=$(<"$NI_TEST_FLIP_COUNTER")
+  n=$((n + 1)); printf '%s' "$n" > "$NI_TEST_FLIP_COUNTER"
+  if (( n >= NI_TEST_FLIP_AFTER )); then
+    printf 'LoadState=loaded\nActiveState=active\nSubState=running\nConditionTimestampMonotonic=0\nConditionResult=yes\n'; exit 0
+  fi
+fi
 state=$(awk -v u="$unit" '$1 == u { $1 = ""; print; exit }' "$NI_TEST_SCENE")
 if [[ -z $state ]]; then
   printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nConditionTimestampMonotonic=0\nConditionResult=no\n'; exit 0
@@ -182,7 +220,10 @@ make_fixture() { # fresh fixture root with a first-boot scene
     "$FX/root/var/lib/neural-ice/data/release" "$FX/root/var/lib/containers/storage/overlay-images" \
     "$FX/root/sys/class/net/enP7s7/statistics" "$FX/root/sys/class/net/enP7s7/device" \
     "$FX/root/sys/class/net/lo/statistics" "$FX/root/sys/class/net/veth0/statistics" \
-    "$FX/root/sys/class/dmi/id" "$FX/root/proc/sys/kernel"
+    "$FX/root/sys/class/dmi/id" "$FX/root/proc/sys/kernel" "$FX/root/sys/class/tty/console" "$FX/root/dev"
+  # The kernel console list names the UART the mirror must use (GB10 image: ttyS0).
+  printf 'tty0 ttyS0\n' > "$FX/root/sys/class/tty/console/active"
+  : > "$FX/root/dev/ttyS0"; : > "$FX/root/dev/ttyAMA0"; : > "$FX/root/dev/ttyTHS0"
   printf 'NAME="Neural ICE"\nPRETTY_NAME="Neural ICE CoreOS"\n' > "$FX/root/usr/lib/os-release"
   printf '0.51.11\n' > "$FX/root/usr/lib/neural-ice/version"
   printf '# product units appended by the branded derivation\nneural-ice-agentic-core.service\nnot a unit\n../../etc/shadow\n' \
@@ -225,14 +266,15 @@ set_state() { # <unit> <load> <active> <sub> [condts] [condres]
   sed -i "\|^${unit//\\/\\\\} |d" "$FX/scene"
   printf '%s %s %s %s %s %s\n' "$unit" "$2" "$3" "$4" "${5:-0}" "${6:-no}" >> "$FX/scene"
 }
-run_screen() { # [iterations] [interval] [extra env...] -> stdout stripped of ANSI, serial in $FX/serial
+run_screen() { # [iterations] [interval] [extra env...] -> stdout stripped of ANSI; serial lines land in $FX/root/dev/<uart>
   local iterations=${1:-1} interval=${2:-0}; shift 2 || true
-  : > "$FX/serial"
+  : > "$FX/root/dev/ttyS0"; : > "$FX/root/dev/ttyAMA0"; : > "$FX/root/dev/ttyTHS0"; rm -f "$FX/flip-counter"
   env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" NI_STATUS_TEST_SYSTEMCTL="$TOOLS/systemctl" \
     NI_STATUS_TEST_IP="$TOOLS/ip" NI_STATUS_TEST_ITERATIONS="$iterations" NI_STATUS_TEST_INTERVAL="$interval" \
-    NI_STATUS_TEST_SERIAL="$FX/serial" NI_TEST_SCENE="$FX/scene" NI_TEST_IPV4="$FX/ipv4" "$@" \
+    NI_TEST_SCENE="$FX/scene" NI_TEST_IPV4="$FX/ipv4" NI_TEST_FLIP_COUNTER="$FX/flip-counter" "$@" \
     bash "$SCRIPT" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'
 }
+serial_out() { cat "$FX/root/dev/ttyS0"; }
 expect() { grep -Fq -- "$2" <<<"$1" || fail "$3: expected '$2' in: $1"; }
 reject() { ! grep -Fq -- "$2" <<<"$1" || fail "$3: must not show '$2' in: $1"; }
 
@@ -255,17 +297,17 @@ reject "$out" 'FAILURE' "no failure on a healthy first boot"
 reject "$out" '/24' "prefix length is not shown"
 # The ostree fallback must not leak the full 64-hex checksum.
 ! grep -Eq '[0-9a-f]{20}' <<<"$out" || fail "a long hex string reached the screen"
-serial="$(<"$FX/serial")"
+serial="$(serial_out)"
 expect "$serial" 'neural-ice-status: Neural ICE CoreOS | OS 0.51.11 | image deploy ab0000000000 | channel beta-debug' "serial header"
 expect "$serial" 'neural-ice-status: model NVIDIA DGX Spark | serial SN-1234-5678' "serial identity"
 expect "$serial" 'neural-ice-status: [ .. ] Device trust: TPM owner ceremony running' "serial phase line"
 expect "$serial" 'neural-ice-status: [ .. ] Images: 1/2 present' "serial image counter"
 reject "$serial" 'RX ' "serial mirror never carries the volatile rate"
-[[ "$(grep -c 'neural-ice-status: ' "$FX/serial")" -eq 7 ]] || fail "serial mirror should print header(2) + five phases once: $serial"
+[[ "$(grep -c 'neural-ice-status: ' "$FX/root/dev/ttyS0")" -eq 7 ]] || fail "serial mirror should print header(2) + five phases once: $serial"
 
 # 3b. serial lines are emitted on CHANGE only; the redraw never repeats them.
 out="$(run_screen 3 0)"
-[[ "$(grep -c 'neural-ice-status: ' "$FX/serial")" -eq 7 ]] || fail "unchanged phases were re-mirrored to serial"
+[[ "$(grep -c 'neural-ice-status: ' "$FX/root/dev/ttyS0")" -eq 7 ]] || fail "unchanged phases were re-mirrored to serial"
 
 # 3c. receive rate from rx_bytes deltas, physical interfaces only.
 make_fixture
@@ -292,7 +334,7 @@ expect "$out" '[ OK ]  Images          2/2 present' "all images present"
 expect "$out" '[ OK ]  Core services   5/5 active' "all core services active"
 expect "$out" 'READY -- login available.' "READY line"
 [[ "$(grep -c 'READY -- login available' <<<"$out")" -eq 1 ]] || fail "READY with linger 0 must exit after one frame, got: $out"
-expect "$(<"$FX/serial")" 'neural-ice-status: READY -- login available' "serial READY marker for the QEMU harness"
+expect "$(serial_out)" 'neural-ice-status: READY -- login available' "serial READY marker for the QEMU harness"
 
 # 3e. a tty1 owner is active -> exit immediately, draw nothing.
 set_state 'getty@tty1.service' loaded active running
@@ -303,6 +345,70 @@ set_state neural-ice-tui.service loaded active running
 out="$(run_screen 5 0)"
 [[ -z $out ]] || fail "status screen must leave tty1 alone once the product TUI owns it: $out"
 
+# 3e-2. ownership changes BETWEEN the loop's snapshot and the write: the pre-write
+# re-check must drop the frame. getty@tty1 is queried once per iteration at the
+# top of the loop and once again just before the write; flipping on its 2nd
+# query means "inactive when scanned, active when about to draw".
+make_fixture
+out="$(run_screen 3 0 NI_TEST_FLIP_UNIT=getty@tty1.service NI_TEST_FLIP_AFTER=2)"
+[[ -z $out ]] || fail "a tty1 owner that appeared between snapshot and write must suppress the frame: $out"
+# ...and the same flip on the TUI, one iteration later: exactly one frame, then silence.
+out="$(run_screen 3 0 NI_TEST_FLIP_UNIT=neural-ice-tui.service NI_TEST_FLIP_AFTER=3)"
+[[ "$(grep -c 'NEURAL ICE   Neural ICE CoreOS' <<<"$out")" -eq 1 ]] \
+  || fail "after the TUI took tty1 mid-run no further frame may be drawn: $out"
+
+# 3e-3. systemctl failing is UNKNOWN, not "absent": no READY, no FAILURE, "probing".
+make_fixture
+out="$(run_screen 1 0 NI_STATUS_TEST_SYSTEMCTL=/bin/false NI_STATUS_READY_LINGER=0)"
+expect "$out" 'Storage         probing...' "unknown storage state shows probing"
+expect "$out" 'Device trust    probing...' "unknown ceremony state shows probing"
+expect "$out" 'Network         probing...' "unknown network state shows probing"
+expect "$out" 'Images          1/2 present -- probing...' "unknown import state still counts images but probes"
+expect "$out" 'Core services   0/5 active -- probing...' "unknown core services are counted, not skipped"
+expect "$out" 'Probing system state...' "footer says probing"
+reject "$out" 'READY' "a failing systemctl must never yield READY"
+reject "$out" 'FAILURE' "a failing systemctl is not an appliance failure"
+reject "$out" 'no separate data volume' "unknown must not be read as not-found"
+# A ready scene with ONE unknown probe is not ready either.
+make_fixture
+set_state neural-ice-firstboot-tpm-ceremony.service loaded active exited
+set_state NetworkManager.service loaded active running
+set_state neural-ice-payload-apply.service loaded active exited
+set_state avahi-daemon.service loaded active running
+set_state neural-ice-agentic-core.service loaded active running
+printf '[{"digest":"sha256:%064d"},{"digest":"sha256:%064d"}]\n' 1 2 > "$FX/root/var/lib/containers/storage/overlay-images/images.json"
+cat > "$TOOLS/systemctl-flaky" <<'EOS'
+#!/usr/bin/env bash
+[[ ${*: -1} == neural-ice-seed-import.service ]] && exit 1
+exec "$(dirname "$0")/systemctl" "$@"
+EOS
+chmod 0755 "$TOOLS/systemctl-flaky"
+out="$(run_screen 1 0 NI_STATUS_TEST_SYSTEMCTL="$TOOLS/systemctl-flaky" NI_STATUS_READY_LINGER=0)"
+reject "$out" 'READY' "one unanswered probe must block READY"
+expect "$out" 'probing...' "the unanswered probe is shown as probing"
+
+# 3e-4. serial UART = the kernel's active console, then console=; VTs and
+# other UARTs never qualify.
+make_fixture
+printf 'tty0 ttyAMA0\n' > "$FX/root/sys/class/tty/console/active"
+run_screen >/dev/null
+[[ -s $FX/root/dev/ttyAMA0 && ! -s $FX/root/dev/ttyS0 ]] || fail "QEMU aarch64 console ttyAMA0 was not selected from the active console list"
+make_fixture
+printf 'tty0\n' > "$FX/root/sys/class/tty/console/active"
+printf 'BOOT_IMAGE=(hd0)/vmlinuz console=tty1 console=ttyS0,115200 quiet\n' > "$FX/root/proc/cmdline"
+run_screen >/dev/null
+[[ -s $FX/root/dev/ttyS0 && ! -s $FX/root/dev/ttyAMA0 ]] || fail "console= on the kernel command line was not honoured when the active list has only a VT"
+make_fixture
+printf 'tty0\n' > "$FX/root/sys/class/tty/console/active"
+printf 'BOOT_IMAGE=(hd0)/vmlinuz quiet\n' > "$FX/root/proc/cmdline"
+out="$(run_screen)"
+[[ ! -s $FX/root/dev/ttyS0 && ! -s $FX/root/dev/ttyAMA0 ]] || fail "with no serial console configured nothing may be written to a UART"
+expect "$out" 'Core services' "no serial console must not affect the tty1 screen"
+make_fixture
+printf 'tty0 ttyTHS0\n' > "$FX/root/sys/class/tty/console/active"
+run_screen >/dev/null
+[[ ! -s $FX/root/dev/ttyTHS0 ]] || fail "a UART outside the unit's DeviceAllow= set was selected"
+
 # 3f. failure block: stable code, unit, serial, instruction; earliest phase wins.
 make_fixture
 set_state neural-ice-firstboot-tpm-ceremony.service loaded failed failed
@@ -312,7 +418,7 @@ expect "$out" 'unit:    neural-ice-firstboot-tpm-ceremony.service' "failing unit
 expect "$out" 'serial:  SN-1234-5678' "serial in the failure block"
 expect "$out" 'Contact Neural ICE support with this code and serial.' "support instruction"
 reject "$out" 'READY' "no READY on failure"
-expect "$(<"$FX/serial")" 'neural-ice-status: FAILURE NI-E02 (TPM ceremony) unit=neural-ice-firstboot-tpm-ceremony.service serial=SN-1234-5678' "serial failure marker"
+expect "$(serial_out)" 'neural-ice-status: FAILURE NI-E02 (TPM ceremony) unit=neural-ice-firstboot-tpm-ceremony.service serial=SN-1234-5678' "serial failure marker"
 set_state systemd-cryptsetup@data.service loaded failed failed
 out="$(run_screen)"
 expect "$out" 'FAILURE  NI-E01  (storage unlock)' "storage failure wins over a later phase"
@@ -355,4 +461,4 @@ reject "$out" 'FAILURE' "degraded inventory is not a failure"
 ! env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" bash "$SCRIPT" >/dev/null 2>&1 \
   || fail "test seam ran without an explicit systemctl"
 
-echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, 9 behaviour scenes)"
+echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, 13 behaviour scenes)"

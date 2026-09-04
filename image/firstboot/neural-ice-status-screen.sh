@@ -131,7 +131,11 @@ query_unit() { # <unit>
     esac
   done <<<"$out"
 }
-unit_absent() { [[ ${U_LOAD[$1]} == not-found || ${U_LOAD[$1]} == unknown ]]; }
+# `not-found` is an answer (the image does not ship the unit); `unknown` is NO
+# answer (systemctl failed). The two are never conflated: an absent unit is
+# skipped, an unknown one keeps the screen in "probing" and blocks READY.
+unit_absent() { [[ ${U_LOAD[$1]} == not-found ]]; }
+unit_unknown() { [[ ${U_LOAD[$1]} == unknown ]]; }
 unit_skipped() { # a unit whose Condition*= was evaluated and said no
   [[ ${U_ACTIVE[$1]} == inactive && ${U_CONDTS[$1]} != 0 && ${U_CONDRES[$1]} == no ]]
 }
@@ -314,14 +318,27 @@ flush_frame() { printf '%s[H%s%s[J' "$ESC" "$FRAME" "$ESC"; FRAME=""; }
 # hang on a wire nobody is listening to. The first failed write disables the
 # mirror for the rest of the boot.
 # ---------------------------------------------------------------------------
-SERIAL_DEV=""
-if [[ ${NI_STATUS_SCREEN_TESTING:-0} != 0 ]]; then
-  SERIAL_DEV=${NI_STATUS_TEST_SERIAL:-}
-else
-  for dev in /dev/ttyAMA0 /dev/ttyS0; do
-    if [[ -c $dev ]]; then SERIAL_DEV=$dev; break; fi
+# The UART is the kernel's own console choice, not a guess: the active console
+# list (/sys/class/tty/console/active, VTs excluded), then `console=` on the
+# kernel command line. Only ttyS<n>/ttyAMA<n> qualify -- those are the two the
+# unit's DeviceAllow= opens (GB10 image: ttyS0; QEMU aarch64 virt: ttyAMA0).
+serial_console_device() {
+  local name candidates=""
+  if [[ -r $(path /sys/class/tty/console/active) ]]; then
+    IFS= read -r candidates < "$(path /sys/class/tty/console/active)" || true
+  fi
+  candidates+=" $(grep -oE '(^| )console=tty[A-Za-z]*[0-9]+' "$(path /proc/cmdline)" 2>/dev/null | sed 's/.*console=//' | tr '\n' ' ')"
+  for name in $candidates; do
+    [[ $name =~ ^tty(S|AMA)[0-9]+$ ]] || continue
+    if [[ ${NI_STATUS_SCREEN_TESTING:-0} != 0 ]]; then
+      [[ -e $(path /dev/"$name") ]] && { path /dev/"$name"; return 0; }
+    else
+      [[ -c /dev/$name ]] && { printf '/dev/%s' "$name"; return 0; }
+    fi
   done
-fi
+  return 1
+}
+SERIAL_DEV=$(serial_console_device || true)
 declare -A MIRROR_LAST=()
 mirror() { # <key> <text>: write "neural-ice-status: <text>" to serial when it changed
   local key=$1 text=$2
@@ -334,7 +351,19 @@ mirror() { # <key> <text>: write "neural-ice-status: <text>" to serial when it c
   fi
 }
 
-finish() { cursor_show; printf '\n'; }
+# tty1 ownership, asked FRESH from the manager immediately before every write to
+# the screen: the loop's snapshot can be a second old, and getty/the TUI may
+# have taken tty1 in between. Once an owner is active nothing more is written.
+tty1_owner_active() {
+  local u
+  for u in "${TTY1_OWNERS[@]}"; do
+    query_unit "$u"
+    unit_active "$u" && return 0
+  done
+  return 1
+}
+DREW=0
+finish() { (( DREW )) || return 0; tty1_owner_active || { cursor_show; printf '\n'; }; }
 trap 'finish; exit 0' TERM INT HUP
 # First failure wins: the code shown is the earliest phase that broke.
 set_failure() { [[ -n $fail_code ]] || { fail_code=$1; fail_what=$2; fail_unit=$3; }; }
@@ -366,11 +395,18 @@ while :; do
 
   # Someone else owns tty1 now: leave quietly, whatever the state. Checked
   # BEFORE the first draw so a fast reboot never scribbles over a login prompt
-  # or the product TUI that already took the screen.
+  # or the product TUI that already took the screen (re-checked before the
+  # write itself, below).
   for u in "${TTY1_OWNERS[@]}"; do
-    if unit_active "$u"; then (( iteration > 1 )) && finish; exit 0; fi
+    if unit_active "$u"; then finish; exit 0; fi
   done
-  if (( iteration == 1 )); then cursor_hide; clear_screen; fi
+
+  # Did every probe answer? A systemctl failure is not a state.
+  probing=0
+  for u in "$UNIT_STORAGE" "$UNIT_DATA_MOUNT" "$UNIT_CEREMONY" "$UNIT_NETWORK" \
+           "$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD" "${CORE_SERVICES[@]}"; do
+    unit_unknown "$u" && { probing=1; break; }
+  done
 
   fail_code=""; fail_what=""; fail_unit=""
 
@@ -379,6 +415,8 @@ while :; do
     storage_mark=fail; storage_text="data volume could not be unlocked"
     unit_failed "$UNIT_STORAGE" && set_failure NI-E01 "storage unlock" "$UNIT_STORAGE"
     unit_failed "$UNIT_DATA_MOUNT" && set_failure NI-E01 "storage unlock" "$UNIT_DATA_MOUNT"
+  elif unit_unknown "$UNIT_STORAGE" || unit_unknown "$UNIT_DATA_MOUNT"; then
+    storage_mark="wait"; storage_text="probing..."
   elif unit_absent "$UNIT_STORAGE"; then
     storage_mark=ok; storage_text="system volume unlocked (no separate data volume)"
   elif unit_active "$UNIT_STORAGE" && { unit_active "$UNIT_DATA_MOUNT" || unit_absent "$UNIT_DATA_MOUNT"; }; then
@@ -396,6 +434,8 @@ while :; do
   if unit_failed "$UNIT_CEREMONY"; then
     trust_mark=fail; trust_text="TPM owner ceremony failed"
     set_failure NI-E02 "TPM ceremony" "$UNIT_CEREMONY"
+  elif unit_unknown "$UNIT_CEREMONY"; then
+    trust_mark="wait"; trust_text="probing..."
   elif unit_active "$UNIT_CEREMONY"; then
     trust_mark=ok; trust_text="device trust: sealed"; ceremony_done=1
   elif unit_absent "$UNIT_CEREMONY"; then
@@ -427,6 +467,8 @@ while :; do
   if unit_failed "$UNIT_NETWORK"; then
     net_mark=fail; net_text="network manager failed"
     set_failure NI-E03 "network" "$UNIT_NETWORK"
+  elif unit_unknown "$UNIT_NETWORK"; then
+    net_mark="wait"; net_text="probing..."
   elif [[ -z $iface ]]; then
     net_mark="wait"; net_text="no management interface found"
   else
@@ -451,6 +493,8 @@ while :; do
     img_mark=fail; img_text="$img_present/$img_total present -- image import failed"
     unit_failed "$UNIT_SEED_IMPORT" && set_failure NI-E04 "image pull" "$UNIT_SEED_IMPORT"
     unit_failed "$UNIT_PAYLOAD" && set_failure NI-E04 "image pull" "$UNIT_PAYLOAD"
+  elif unit_unknown "$UNIT_SEED_IMPORT" || unit_unknown "$UNIT_PAYLOAD"; then
+    img_mark="wait"; img_text="$img_present/$img_total present -- probing..."
   elif (( img_total == 0 )); then
     img_mark=skip; img_text="no product image inventory on this image"; images_done=1
   elif (( img_present >= img_total )); then
@@ -470,6 +514,8 @@ while :; do
   if [[ -n $core_failed ]]; then
     core_mark=fail; core_text="$core_ok/$core_total active -- failed:${core_failed}"
     set_failure NI-E05 "core service" "${core_failed# }"
+  elif (( probing )); then
+    core_mark="wait"; core_text="$core_ok/$core_total active -- probing..."
   elif (( core_total == 0 )); then
     core_mark=skip; core_text="no core services declared"
   elif (( core_ok >= core_total )); then
@@ -483,7 +529,7 @@ while :; do
   network_done=0
   { [[ $net_mark == ok ]] || unit_absent "$UNIT_NETWORK"; } && network_done=1
   ready=0
-  if [[ -z $fail_code ]] && (( ceremony_done && network_done && images_done && core_done )); then
+  if [[ -z $fail_code ]] && (( !probing && ceremony_done && network_done && images_done && core_done )); then
     ready=1
     (( READY_SINCE > 0 )) || READY_SINCE=$((SECONDS + 1))
   else
@@ -529,9 +575,15 @@ while :; do
   elif (( ready )); then
     line ""
     line " READY -- login available.  ($(fmt_duration "$uptime_s"))"
+  elif (( probing )); then
+    line " Probing system state... $(fmt_duration "$uptime_s")   This screen is informational only; no input is read."
   else
     line " Starting... $(fmt_duration "$uptime_s")   This screen is informational only; no input is read."
   fi
+  # The write itself: ask the manager once more, right now, whether tty1 has an
+  # owner. If it has, this frame is dropped and the screen is never touched again.
+  if tty1_owner_active; then FRAME=""; finish; exit 0; fi
+  if (( ! DREW )); then cursor_hide; clear_screen; DREW=1; fi
   flush_frame
 
   if (( ready )) && (( SECONDS + 1 - READY_SINCE >= READY_LINGER )); then break; fi
