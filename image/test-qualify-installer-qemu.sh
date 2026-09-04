@@ -37,9 +37,13 @@ for contract in \
   grep -Fq "$contract" "$HARNESS" || fail "the harness lost: $contract"
 done
 
-for state in virgin provisioned replay partial owner-auth; do
+for state in virgin preceremony equal replay partial owner-auth; do
   grep -Fq "$state" "$HARNESS" || fail "the harness lost TPM scenario $state"
 done
+
+# shellcheck disable=SC2016 # literal source contract is being matched
+grep -Fq 'sequence=$((policy_sequence - 1))' "$HARNESS" \
+  || fail "the harness has no explicit higher-policy pre-ceremony retry fixture"
 
 grep -Fq 'Tegra xHCI driver, which QEMU virt cannot emulate' "$HARNESS" \
   || fail "the harness hides the synthetic USB-controller limitation"

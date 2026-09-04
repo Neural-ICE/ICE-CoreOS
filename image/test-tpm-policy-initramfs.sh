@@ -203,6 +203,7 @@ test -n "$out" || exit 91
 [ -n "$auth" ] && [ "$auth" = "$index" ] || { echo "tpm2_nvread: owner hierarchy authorization failed (sealed)" >&2; exit 93; }
 : >"${NI_TEST_NVREAD_TRACE:-/dev/null}"
 case "${NI_TEST_COUNTER_SEQ:-7}" in
+  4) printf '\000\000\000\000\000\000\000\004' >"$out" ;;
   7) printf '\000\000\000\000\000\000\000\007' >"$out" ;;
   8) printf '\000\000\000\000\000\000\000\010' >"$out" ;;
   short) printf '\000\007' >"$out" ;;
@@ -361,6 +362,40 @@ for partial in 0x1500001 0x1500002 0x1500003 0x1500004 0x1500005 0x1500006; do
     NI_TEST_NV_SHAPE=tool-failure NI_TEST_NV_HANDLES="- $partial\n"
 done
 
+# A failed install that activated only the PCR policy counter has not started
+# the owner ceremony. Exact signed Install media may move that one counter to a
+# strictly newer, bounded generation; every other state remains a refusal.
+write_install_cmdline 5
+must_accept preceremony_retry run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 4
+must_refuse preceremony_equal_generation run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 3
+must_refuse preceremony_lower_generation run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 4101
+must_refuse preceremony_generation_gap_unbounded run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 5
+must_refuse preceremony_owner_auth_set run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n' NI_TEST_OWNER_AUTH_SET=1
+for partial in 0x1500001 0x1500002 0x1500003 0x1500004 0x1500005 0x1500006; do
+  must_refuse "preceremony_partial_${partial#0x}" run_hook \
+    NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES="- 0x1500007\n- $partial\n"
+done
+write_install_cmdline 5 'neuralice.live=1'
+must_refuse preceremony_live_selector run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+
+# Command-line words cannot turn an installed OS into signed installer media.
+# Without the initramfs marker, every installed boot remains equality-only.
+rm -f "$test_root/etc/neural-ice/installer-media"
+write_install_cmdline 5
+must_refuse installed_os_future_generation_with_install_selector run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+printf 'neural-ice-signed-installer-initramfs-v1\n' >"$test_root/etc/neural-ice/installer-media"
+
 write_install_cmdline 4097
 must_refuse virgin_install_sequence_above_initial_window run_hook NI_TEST_NV_SHAPE=tool-failure
 write_install_cmdline 1 'systemd.unit=neural-ice-installer.target'
@@ -383,6 +418,7 @@ printf 'neural-ice-signed-installer-initramfs-v1\n' >"$test_root/etc/neural-ice/
 
 # The parser is a dependency of the signed hook, not an optional refinement:
 # an initramfs without it refuses rather than falling back to a looser read.
+rm -f "$test_root/etc/neural-ice/installer-media"
 write_cmdline 7
 mv "$test_root/lib/neural-ice-tpm2-nv-public.sh" "$fixture/parser.aside"
 must_refuse parser_absent run_hook

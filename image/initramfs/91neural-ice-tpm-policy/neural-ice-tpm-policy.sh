@@ -1,8 +1,10 @@
 #!/bin/sh
 # This pre-trigger runs before cryptsetup.  The signed UKI carries the exact
 # PolicyAuthorize generation it was built for; the TPM counter is the durable
-# authority for whether that generation is active.  Equality is intentional:
-# lower is an old-UKI replay and higher is an interrupted activation.
+# authority for whether that generation is active. Installed boots require
+# equality. Signed Install media may advance it only while no owner ceremony or
+# other Neural ICE state exists, so an interrupted pre-ceremony install can be
+# retried without clearing the TPM.
 ni_die() {
   if type die >/dev/null 2>&1; then
     die "neural-ice PCR policy refused: $*"
@@ -56,7 +58,7 @@ ni_dynamic_mask=805308416     # 0x30000800
 ni_written=536870912          # 0x20000000
 ni_expected_policy=e8c02d3c5e701670cbaa327db1a2e9f3f41b2c22793e5c669a6e7f44b912f6c0
 ni_max=9007199254740991
-ni_initial_max=4096
+ni_max_activation_gap=4096
 
 ni_cmdline_text=$(cat "$ni_cmdline") || ni_die "kernel command line is unreadable"
 ni_requested_count=0
@@ -163,6 +165,81 @@ if [ -e "$ni_media_marker" ] || [ -L "$ni_media_marker" ]; then
   fi
   ni_installer_media=1
 fi
+
+ni_require_exact_install_boot() {
+  [ "$ni_installer_media" -eq 1 ] \
+    || ni_die "PCR policy advance requires a signed installer initramfs"
+  if ! { [ "$ni_unit_count" -eq 1 ] && [ "$ni_unit" = neural-ice-installer.target ] \
+    && [ "$ni_autoinstall_count" -eq 1 ] && [ "$ni_autoinstall" = 1 ] \
+    && [ "$ni_trust_count" -eq 1 ] && [ "$ni_trust" = neural-ice-installer-trust-v1 ] \
+    && [ "$ni_access_profile_count" -eq 1 ] \
+    && [ "$ni_hardware_target_count" -eq 1 ] \
+    && [ "$ni_payload_count" -eq 1 ] \
+    && [ "$ni_relauth_keyid_count" -eq 1 ] \
+    && [ "$ni_relauth_schema_count" -eq 1 ] \
+    && [ "$ni_relauth_schema" = neural-ice-installer-release-authorization-v2 ] \
+    && [ "$ni_rootverity_count" -eq 1 ] \
+    && [ "$ni_trust_policy_count" -eq 1 ] \
+    && [ "$ni_live_count" -eq 0 ]; }; then
+    ni_die "PCR policy advance is unavailable outside an exact Install boot"
+  fi
+  case "$ni_access_profile" in lab-managed|customer-locked|developer-diagnostic) ;; *)
+    ni_die "signed installer access profile is malformed"
+  esac
+  case "$ni_hardware_target" in ''|*[!A-Za-z0-9._/-]*) ni_die "signed installer hardware target is malformed" ;; esac
+  case "$ni_trust_policy" in ''|*[!A-Za-z0-9._/-]*) ni_die "signed installer trust policy is malformed" ;; esac
+  ni_hex64 "$ni_payload" || ni_die "signed installer payload digest is malformed"
+  ni_hex64 "$ni_relauth_keyid" || ni_die "signed installer release key identity is malformed"
+  ni_hex64 "$ni_rootverity" || ni_die "signed installer root verity hash is malformed"
+}
+
+# This is the only retry state admitted before the owner ceremony: no Neural
+# ICE NV state at 0x01500001..06, empty owner authorization, and either no PCR
+# policy counter for an initial install or the one validated counter for retry.
+ni_require_preceremony_state() { # $1=expected PCR policy index count
+  ni_expected_pcr_index_count=$1
+  ni_handles=$("$ni_tools/tpm2_getcap" handles-nv-index 2>/dev/null) \
+    || ni_die "TPM NV handles are unavailable"
+  ni_normalized_handles=$(printf '%s\n' "$ni_handles" | awk '
+    /^[[:space:]]*-[[:space:]]+0[xX][0-9a-fA-F]+[[:space:]]*$/ {
+      gsub(/^[[:space:]]*-[[:space:]]+/, "")
+      gsub(/[[:space:]]+$/, "")
+      print
+      next
+    }
+    NF { exit 1 }
+  ') || ni_die "TPM NV handle list is malformed"
+  ni_pcr_index_count=0
+  ni_other_state_count=0
+  for ni_handle in $ni_normalized_handles; do
+    ni_handle_value=$((ni_handle))
+    case "$ni_handle_value" in
+      "$((0x01500007))") ni_pcr_index_count=$((ni_pcr_index_count + 1)) ;;
+      "$((0x01500001))"|"$((0x01500002))"|"$((0x01500003))"|"$((0x01500004))"|"$((0x01500005))"|"$((0x01500006))")
+        ni_other_state_count=$((ni_other_state_count + 1))
+        ;;
+    esac
+  done
+  [ "$ni_pcr_index_count" -eq "$ni_expected_pcr_index_count" ] \
+    || ni_die "PCR policy high-water presence changed during pre-ceremony validation"
+  [ "$ni_other_state_count" -eq 0 ] \
+    || ni_die "another Neural ICE appliance state index exists before owner ceremony"
+
+  ni_properties=$("$ni_tools/tpm2_getcap" properties-variable 2>/dev/null) \
+    || ni_die "TPM permanent properties are unavailable"
+  ni_owner_auth=$(printf '%s\n' "$ni_properties" | awk -F: '
+    /^[[:space:]]*ownerAuthSet:[[:space:]]*[01][[:space:]]*$/ {
+      value=$2
+      gsub(/[^0-9]/, "", value)
+      print value
+      found++
+    }
+    END { exit found != 1 }
+  ') || ni_die "TPM owner authorization state is malformed"
+  [ "$ni_owner_auth" = 0 ] \
+    || ni_die "owner authorization is already set before the trusted ceremony"
+}
+
 if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
   ni_parsed=$(printf '%s\n' "$ni_public" | ni_tpm2_nv_public_parse "$ni_index") \
     || ni_die "PCR policy high-water public area is not the tpm2-tools contract"
@@ -202,84 +279,26 @@ if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
     *) ni_die "PCR policy high-water exceeds the safe integer ceiling" ;;
   esac
   ni_current=$((0x$ni_counter_hex))
-  [ "$ni_requested" -eq "$ni_current" ] \
-    || ni_die "signed UKI PCR policy sequence does not equal the durable TPM high-water"
+  if [ "$ni_installer_media" -eq 1 ]; then
+    ni_require_exact_install_boot
+    ni_require_preceremony_state 1
+    [ "$ni_requested" -gt "$ni_current" ] \
+      || ni_die "signed Install PCR policy sequence is not strictly newer than the durable TPM high-water"
+    [ $((ni_requested - ni_current)) -le "$ni_max_activation_gap" ] \
+      || ni_die "signed Install PCR policy sequence is more than $ni_max_activation_gap ahead of the durable TPM high-water"
+  else
+    [ "$ni_requested" -eq "$ni_current" ] \
+      || ni_die "signed UKI PCR policy sequence does not equal the durable TPM high-water"
+  fi
 else
-  # A signed Install UKI necessarily runs before its first LUKS enrollment can
-  # activate this counter. Treat absence as virgin only for that exact mode,
-  # only while the owner hierarchy is still empty, and only while no other
-  # appliance-state index exists. Every installed boot keeps the equality path
-  # above; an unreadable index must not be mistaken for an absent one.
-  if [ "$ni_installer_media" -ne 1 ]; then
-    ni_die "PCR policy high-water is absent outside a signed installer initramfs"
-  fi
-  if ! { [ "$ni_unit_count" -eq 1 ] && [ "$ni_unit" = neural-ice-installer.target ] \
-    && [ "$ni_autoinstall_count" -eq 1 ] && [ "$ni_autoinstall" = 1 ] \
-    && [ "$ni_trust_count" -eq 1 ] && [ "$ni_trust" = neural-ice-installer-trust-v1 ] \
-    && [ "$ni_access_profile_count" -eq 1 ] \
-    && [ "$ni_hardware_target_count" -eq 1 ] \
-    && [ "$ni_payload_count" -eq 1 ] \
-    && [ "$ni_relauth_keyid_count" -eq 1 ] \
-    && [ "$ni_relauth_schema_count" -eq 1 ] \
-    && [ "$ni_relauth_schema" = neural-ice-installer-release-authorization-v2 ] \
-    && [ "$ni_rootverity_count" -eq 1 ] \
-    && [ "$ni_trust_policy_count" -eq 1 ] \
-    && [ "$ni_live_count" -eq 0 ]; }; then
-    ni_die "PCR policy high-water public area is unavailable outside an exact Install boot"
-  fi
-  case "$ni_access_profile" in lab-managed|customer-locked|developer-diagnostic) ;; *)
-    ni_die "signed installer access profile is malformed"
-  esac
-  case "$ni_hardware_target" in ''|*[!A-Za-z0-9._/-]*) ni_die "signed installer hardware target is malformed" ;; esac
-  case "$ni_trust_policy" in ''|*[!A-Za-z0-9._/-]*) ni_die "signed installer trust policy is malformed" ;; esac
-  ni_hex64 "$ni_payload" || ni_die "signed installer payload digest is malformed"
-  ni_hex64 "$ni_relauth_keyid" || ni_die "signed installer release key identity is malformed"
-  ni_hex64 "$ni_rootverity" || ni_die "signed installer root verity hash is malformed"
+  # A signed Install UKI before any LUKS enrollment may initialize the PCR
+  # counter. An unreadable existing counter is never mistaken for absence.
+  ni_require_exact_install_boot
   if ! { [ "$ni_requested" -ge 1 ] 2>/dev/null \
-    && [ "$ni_requested" -le "$ni_initial_max" ] 2>/dev/null; }; then
+    && [ "$ni_requested" -le "$ni_max_activation_gap" ] 2>/dev/null; }; then
     ni_die "initial signed PCR policy sequence is outside the activation window"
   fi
-
-  ni_handles=$("$ni_tools/tpm2_getcap" handles-nv-index 2>/dev/null) \
-    || ni_die "TPM NV handles are unavailable"
-  ni_normalized_handles=$(printf '%s\n' "$ni_handles" | awk '
-    /^[[:space:]]*-[[:space:]]+0[xX][0-9a-fA-F]+[[:space:]]*$/ {
-      gsub(/^[[:space:]]*-[[:space:]]+/, "")
-      gsub(/[[:space:]]+$/, "")
-      print
-      next
-    }
-    NF { exit 1 }
-  ') || ni_die "TPM NV handle list is malformed"
-  ni_pcr_index_count=0
-  ni_other_state_count=0
-  for ni_handle in $ni_normalized_handles; do
-    ni_handle_value=$((ni_handle))
-    case "$ni_handle_value" in
-      "$((0x01500007))") ni_pcr_index_count=$((ni_pcr_index_count + 1)) ;;
-      "$((0x01500001))"|"$((0x01500002))"|"$((0x01500003))"|"$((0x01500004))"|"$((0x01500005))"|"$((0x01500006))")
-        ni_other_state_count=$((ni_other_state_count + 1))
-        ;;
-    esac
-  done
-  [ "$ni_pcr_index_count" -eq 0 ] \
-    || ni_die "PCR policy high-water exists but its public area is unreadable"
-  [ "$ni_other_state_count" -eq 0 ] \
-    || ni_die "PCR policy state is absent while another appliance state index exists"
-
-  ni_properties=$("$ni_tools/tpm2_getcap" properties-variable 2>/dev/null) \
-    || ni_die "TPM permanent properties are unavailable"
-  ni_owner_auth=$(printf '%s\n' "$ni_properties" | awk -F: '
-    /^[[:space:]]*ownerAuthSet:[[:space:]]*[01][[:space:]]*$/ {
-      value=$2
-      gsub(/[^0-9]/, "", value)
-      print value
-      found++
-    }
-    END { exit found != 1 }
-  ') || ni_die "TPM owner authorization state is malformed"
-  [ "$ni_owner_auth" = 0 ] \
-    || ni_die "PCR policy high-water is absent after owner authorization was sealed"
+  ni_require_preceremony_state 0
 fi
 
 [ "$ni_signature_count" -eq 1 ] \

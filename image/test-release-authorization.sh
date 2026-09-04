@@ -487,19 +487,21 @@ grep -Fq 'podman --cgroup-manager=cgroupfs --events-backend=file image mount "$O
 grep -Eq 'run --rm --entrypoint .+"\$OS_IMAGE" cat ' "$AUTOINSTALL" \
   && fail "the installer still executes a binary out of the candidate image to read its markers"
 
-# A new install may proceed only after proving the TPM has no prior or partial
-# provisioning state. The authorization sequence is persisted as first-boot
-# ceremony intent; runtime commands must not create or consume TPM state here.
-virgin_line="$(line_of '"$TPM_STATE" provisioning-status')"
+# An install may proceed only from an exact virgin or PCR-policy-only
+# pre-ceremony state. The authorization sequence is persisted as first-boot
+# ceremony intent; runtime commands must not create or consume freshness here.
+preceremony_line="$(line_of '"$TPM_STATE" provisioning-status')"
 intent_line="$(line_of '_initial_issuance_seq="${RELEASE_AUTH_ISSUANCE_SEQ:-0}"')"
 bootc_commit_line="$(line_of '|| die "bootc install to-filesystem failed"')"
-[ -n "$virgin_line" ] || fail "the installer never proves exact virgin TPM state"
+[ -n "$preceremony_line" ] || fail "the installer never proves bounded pre-ceremony TPM state"
 [ -n "$intent_line" ] || fail "the installer never persists the signed issuance sequence for the ceremony"
 [ -n "$bootc_commit_line" ] || fail "the installer has no identifiable bootc install commit boundary"
-[ "$virgin_line" -lt "$request_line" ] \
-  || fail "the installer authorises a request before proving exact virgin TPM state"
+[ "$preceremony_line" -lt "$request_line" ] \
+  || fail "the installer authorises a request before proving bounded pre-ceremony TPM state"
 [ "$intent_line" -gt "$bootc_commit_line" ] \
   || fail "the installer persists Fabric's issuance sequence before bootc install commits"
+grep -Fq 'virgin|pcr-policy-activated)' "$AUTOINSTALL" \
+  || fail "the installer does not limit retry admission to virgin or PCR-policy-only pre-ceremony state"
 grep -Fq '[[ "$RELEASE_AUTH_ISSUANCE_SEQ" == "$(sed -n '\''s/^issuance_seq=//p'\'' <<<"$RELEASE_AUTH")" ]]' "$AUTOINSTALL" \
   || fail "the installer does not prove it preserved Fabric's signed issuance sequence exactly"
 grep -Fq '"$TPM_STATE" freshness-read' "$AUTOINSTALL" \

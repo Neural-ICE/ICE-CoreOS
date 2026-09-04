@@ -20,7 +20,7 @@ for tool in swtpm tpm2_getcap tpm2_nvdefine tpm2_nvincrement tpm2_nvundefine \
   tpm2_nvread tpm2_nvwrite tpm2_nvwritelock tpm2_nvreadpublic \
   tpm2_startauthsession tpm2_policycommandcode tpm2_policyor tpm2_flushcontext \
   tpm2_changeauth tpm2_clear tpm2_createprimary tpm2_evictcontrol \
-  tpm2_readpublic cryptsetup truncate python3 flock sha256sum od head wc awk; do
+  tpm2_readpublic cryptsetup truncate python3 flock sha256sum od head wc awk cmp; do
   command -v "$tool" >/dev/null 2>&1 \
     || fail "$tool is unavailable; the real-TPM suite must not report green without it"
 done
@@ -345,6 +345,44 @@ for missing_input in device-root-v1.json srk-v1.tpm2b_public \
     || fail "missing $missing_input mutated TPM provisioning state"
   mv "$FB_RUN/$missing_input.absent" "$FB_STATE/$missing_input"
 done
+clear_tpm
+
+# A complete install may fail before the owner ceremony. Reinstall from a
+# strictly higher signed policy generation without clearing the TPM: only the
+# PCR policy counter moves, both persistent public identities remain byte-for-
+# byte stable, and the ordinary one-time ceremony still succeeds afterward.
+# Use the live absolute value: TPM Clear does not promise to reset the internal
+# counter floor, so fixed fixture numbers would make this real-TPM test false.
+persist_prerequisites
+[[ "$(hw provisioning-status)" == pcr-policy-activated ]] \
+  || fail "activated PCR policy was not identified as pre-ceremony state"
+tpm2_readpublic -Q -c 0x81010005 -f tpmt -o "$TMP/retry-device-root.before"
+tpm2_readpublic -Q -c 0x81000001 -f tpmt -o "$TMP/retry-srk.before"
+retry_high_water="$(abs_counter 0x01500007)"
+[[ "$retry_high_water" =~ ^[1-9][0-9]*$ ]] \
+  || fail "pre-ceremony fixture has no usable absolute PCR policy high-water"
+retry_candidate=$((retry_high_water + 1))
+[[ "$(hw pcr-policy-check "$retry_candidate")" == "$retry_high_water" ]] \
+  || fail "higher signed policy was not eligible for pre-ceremony retry"
+[[ "$(hw pcr-policy-activate "$retry_candidate")" == "$retry_candidate" ]] \
+  || fail "pre-ceremony retry did not activate the next policy generation"
+[[ "$(hw provisioning-status)" == pcr-policy-activated ]] \
+  || fail "higher policy activation changed the pre-ceremony state class"
+tpm2_readpublic -Q -c 0x81010005 -f tpmt -o "$TMP/retry-device-root.after"
+tpm2_readpublic -Q -c 0x81000001 -f tpmt -o "$TMP/retry-srk.after"
+cmp -s "$TMP/retry-device-root.before" "$TMP/retry-device-root.after" \
+  || fail "higher policy activation changed the device-root public identity"
+cmp -s "$TMP/retry-srk.before" "$TMP/retry-srk.after" \
+  || fail "higher policy activation changed the SRK public identity"
+prepare_firstboot_fixture
+firstboot >/dev/null \
+  || fail "mandatory ceremony failed after pre-ceremony retry"
+[[ "$(firstboot status)" == complete ]] \
+  || fail "mandatory ceremony was not complete after pre-ceremony retry"
+[[ "$(runtime_complete)" == complete ]] \
+  || fail "runtime rejected the ceremony completed after pre-ceremony retry"
+# Keep later fixtures above the TPM's process-lifetime counter floor.
+PCR_POLICY_CANDIDATE=$((retry_candidate + 1))
 clear_tpm
 
 # A forged legacy receipt and attacker-known owner authorization together are

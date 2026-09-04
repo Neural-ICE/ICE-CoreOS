@@ -308,6 +308,34 @@ slot 2   new policy                   enrolled, tested, THEN slot 1 retired
 Without it, re-enrolment is a cutover with no way back on a machine that may be
 unreachable.
 
+## 8bis · Reinstall before the owner ceremony, without TPM Clear
+
+A signed physical reinstall may preserve TPM state only in the narrow state
+where the previous installer activated PCR policy generation N and the mandatory
+first-boot owner ceremony never began:
+
+- `ownerAuthSet` is still `0`;
+- none of the Neural ICE NV indices `0x01500001` through `0x01500006` exists;
+- `0x01500007` is the sole Neural ICE state index and has the exact PCR policy
+  counter shape;
+- the new signed Install medium requests a generation strictly greater than N,
+  with a gap no larger than 4096.
+
+The initramfs proves this state before admitting the Install boot. The installer
+then performs the existing read-only `pcr-policy-check` before the target disk is
+wiped and advances the counter only after both new LUKS tokens have enrolled and
+read back successfully. The existing device-root is attested and reused. The
+existing SRK public identity is reused, persisted as ceremony intent, and bound
+into both new LUKS tokens; this retry path does not claim to validate a new SRK
+template.
+
+An equal or lower generation is replay and is refused. So is a gap above 4096,
+an owner authorization already set, any state at `0x01500001` through
+`0x01500006`, a malformed or unreadable PCR counter, a Live/recovery selector,
+or an Install-looking command line without the signed installer initramfs
+marker. A ceremony that began or completed still requires the existing signed
+physical recovery path, including TPM Clear with physical presence.
+
 ## 9 · Evidence
 
 All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.sh`.

@@ -375,6 +375,9 @@ st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4 >/dev/null 2>&1 \
   && fail "ceremony ran without device root and SRK"
 : > "$PERSIST/81010005"; : > "$PERSIST/81000001"
 activate_pcr_policy
+[ "$(st provisioning-status)" = pcr-policy-activated ] \
+  || fail "PCR-only pre-ceremony state was not identified"
+prerequisite_digest="$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")"
 
 # Replay/lower/equal are refusals; only a strictly newer signed generation may
 # move the fixed 0x01500007 high-water, and check itself never mutates it.
@@ -383,6 +386,12 @@ st pcr-policy-check 0 >/dev/null 2>&1 && fail "zero PCR policy sequence was acce
 [ "$(st pcr-policy-check 2)" = 1 ] || fail "next PCR policy sequence was refused"
 [ "$(st pcr-policy-activate 2)" = 2 ] || fail "next PCR policy sequence did not activate"
 st pcr-policy-activate 2 >/dev/null 2>&1 && fail "equal PCR policy activation replayed"
+[ "$(st provisioning-status)" = pcr-policy-activated ] \
+  || fail "higher PCR policy activation left the supported pre-ceremony state"
+[ "$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")" = "$prerequisite_digest" ] \
+  || fail "higher PCR policy activation changed persistent prerequisites"
+[ "$(st pcr-policy-check 3)" = 2 ] \
+  || fail "higher PCR policy activation did not persist as the durable high-water"
 
 # Interrupted ceremony: fixed state landed, owner auth did not. Deleting record
 # only, then record+freshness, must never make the mock call the TPM virgin once
