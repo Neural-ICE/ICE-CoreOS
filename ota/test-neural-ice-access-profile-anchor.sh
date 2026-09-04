@@ -424,8 +424,9 @@ refuse_tss() { # $1=label; the vector is already in place
     && fail "enrolment accepted a TPMT_SIGNATURE that is not ECDSA-P256/SHA-256: $1"
   grep -Fq 'not an ECDSA-P256/SHA-256 TPMT_SIGNATURE' <<< "$err" \
     || fail "TPMT_SIGNATURE vector '$1' refused for the wrong reason: $err"
-  [ ! -e "$dir/access-profile-v1.json" ] && [ ! -e "$dir/access-profile-v1.sig" ] \
-    || fail "a refused TPMT_SIGNATURE ($1) still left an anchor behind"
+  if [ -e "$dir/access-profile-v1.json" ] || [ -e "$dir/access-profile-v1.sig" ]; then
+    fail "a refused TPMT_SIGNATURE ($1) still left an anchor behind"
+  fi
   rm -f "$MOCK_STATE/sign-tss-override"
 }
 tss_vector "$MOCK_STATE/sign-tss-override" 0014 000b "$R32" "$S32";         refuse_tss rsassa-sigalg
