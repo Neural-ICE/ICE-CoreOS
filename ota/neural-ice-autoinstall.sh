@@ -668,8 +668,13 @@ systemd-cryptenroll --tpm2-device=list >/dev/null 2>&1 || die "systemd-cryptenro
 # the disk is gone.
 [[ -x "$TPM_STATE" ]] \
   || die "this medium carries no TPM state helper at $TPM_STATE; refusing an install whose anti-replay state and access-profile binding would have nowhere to live"
-[[ "$("$TPM_STATE" provisioning-status)" == virgin ]] \
-  || die "the TPM is not virgin; encrypted-volume reset cannot reset anti-rollback state — use signed physical recovery"
+TPM_PROVISIONING_STATUS="$("$TPM_STATE" provisioning-status)" \
+  || die "the TPM is not in a supported pre-ceremony state; encrypted-volume reset cannot reset completed or partial ceremony state — use signed physical recovery"
+case "$TPM_PROVISIONING_STATUS" in
+  virgin|pcr-policy-activated) ;;
+  *) die "the TPM state helper returned an unknown provisioning state" ;;
+esac
+readonly TPM_PROVISIONING_STATUS
 
 # Stop the boot splash so install progress (and the recovery key) is visible on
 # the console — the operator must not be blind during a destructive install.
@@ -987,7 +992,7 @@ TPM_PROFILE_BINDING="$("$TPM_STATE" profile-digest \
   "$SEALED_ACCESS_PROFILE" "$SEALED_HARDWARE_TARGET" "$SEALED_TRUST_POLICY_ID")" \
   || die "cannot derive this medium's access-profile binding"
 readonly TPM_PROFILE_BINDING
-log "TPM provisioning state is exactly virgin; the mandatory first-boot ceremony will bind $TPM_PROFILE_BINDING."
+log "TPM provisioning state is $TPM_PROVISIONING_STATUS with no owner-ceremony state; the mandatory first-boot ceremony will bind $TPM_PROFILE_BINDING."
 
 # The in-root marker is now a CROSS-CHECK, not the authority. The gate above
 # already required the two to agree; restating it here keeps the comparison
@@ -1468,8 +1473,9 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   # exactly what an attacker does before replaying. It is READ here and only
   # WRITTEN after the install commits, so a refused or crashed attempt does not
   # burn a valid authorization.
-  # The preflight above proved exact virgin state. Runtime freshness-read never
-  # maps absence to zero; zero is used only inside this trusted install path.
+  # The preflight above proved that no ceremony/freshness state exists. Runtime
+  # freshness-read never maps absence to zero; zero is used only inside this
+  # trusted pre-ceremony install path.
   RELEASE_AUTH_HIGH_WATER=0
   INSTALL_PLATFORM="$(podman version --format '{{.OsArch}}' 2>/dev/null || true)"
   [[ "$INSTALL_PLATFORM" =~ ^[a-z0-9]+/[a-z0-9]+(/v[0-9]+)?$ ]] \

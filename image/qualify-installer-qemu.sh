@@ -16,7 +16,7 @@ Usage:
 Options:
   --firmware-code FILE      AAVMF code image (default: AAVMF_CODE.secboot.fd)
   --source-transport TYPE   usb, virtio, or nvme (default: usb)
-  --tpm-state STATE         virgin, provisioned, replay, partial, or owner-auth
+  --tpm-state STATE         virgin, preceremony, equal, replay, partial, or owner-auth
   --policy-sequence N       signed media sequence (default: 1)
   --target-size SIZE        qemu-img size (default: 1T)
   --timeout SECONDS         bounded QEMU runtime (default: 900)
@@ -89,7 +89,10 @@ done
 [[ "$policy_sequence" =~ ^[1-9][0-9]{0,9}$ ]] || die "--policy-sequence is malformed"
 [[ "$target_size" =~ ^[1-9][0-9]*[KMGT]$ ]] || die "--target-size is malformed"
 case "$source_transport" in usb|virtio|nvme) ;; *) die "unsupported source transport" ;; esac
-case "$tpm_state" in virgin|provisioned|replay|partial|owner-auth) ;; *) die "unsupported TPM state" ;; esac
+case "$tpm_state" in virgin|preceremony|equal|replay|partial|owner-auth) ;; *) die "unsupported TPM state" ;; esac
+if [[ "$tpm_state" == preceremony && "$policy_sequence" -le 1 ]]; then
+  die "the preceremony retry scenario requires --policy-sequence greater than 1"
+fi
 case "$network" in none|restricted-user) ;; *) die "unsupported network mode" ;; esac
 if [[ -n "$ssh_port" ]]; then
   [[ "$ssh_port" =~ ^[1-9][0-9]{3,4}$ && "$ssh_port" -le 65535 ]] \
@@ -162,7 +165,7 @@ if [[ "$phase" == install && "$tpm_state" != virgin ]]; then
     owner-auth)
       tpm2_changeauth -c o neural-ice-qemu-synthetic-owner >/dev/null
       ;;
-    provisioned|replay)
+    preceremony|equal|replay)
       helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/ota/neural-ice-tpm-state.sh"
       [[ -x "$helper" ]] || die "TPM state helper is unavailable"
       tools=$work_dir/tpm-tools
@@ -174,8 +177,16 @@ if [[ "$phase" == install && "$tpm_state" != virgin ]]; then
         need "$tool"
         ln -s "$(command -v "$tool")" "$tools/$tool"
       done
-      sequence=$policy_sequence
-      [[ "$tpm_state" == replay ]] && sequence=$((policy_sequence + 1))
+      case "$tpm_state" in
+        preceremony)
+          # Model an installer that committed policy N-1 and failed before the
+          # owner ceremony. The real-swtpm suite separately proves persistent
+          # public-identity reuse across this counter-only transition.
+          sequence=$((policy_sequence - 1))
+          ;;
+        equal) sequence=$policy_sequence ;;
+        replay) sequence=$((policy_sequence + 1)) ;;
+      esac
       NI_TPM_STATE_TESTING=1 NI_TPM_STATE_TEST_TOOLS="$tools" \
         NI_TPM_STATE_TEST_RUN_DIR="$work_dir/tpm-run" \
         "$helper" pcr-policy-activate "$sequence" >/dev/null
@@ -252,10 +263,10 @@ case "$tpm_state" in
   # the recovery key. The serial-safe log marker contains no secret and is the
   # durable automation boundary the headless harness can observe.
   virgin) scenario_pattern='[8/8] done — install completed' ;;
-  provisioned) scenario_pattern='the TPM is not virgin' ;;
-  replay) scenario_pattern='PCR policy sequence does not equal the durable TPM high-water' ;;
-  partial) scenario_pattern='PCR policy state is absent while another appliance state index exists' ;;
-  owner-auth) scenario_pattern='PCR policy high-water is absent after owner authorization was sealed' ;;
+  preceremony) scenario_pattern='[8/8] done — install completed' ;;
+  equal|replay) scenario_pattern='signed Install PCR policy sequence is not strictly newer than the durable TPM high-water' ;;
+  partial) scenario_pattern='another Neural ICE appliance state index exists before owner ceremony' ;;
+  owner-auth) scenario_pattern='owner authorization is already set before the trusted ceremony' ;;
 esac
 
 all_expected_patterns_seen() {
@@ -311,30 +322,26 @@ done
 
 if [[ "$phase" == install ]]; then
   case "$tpm_state" in
-    virgin)
+    virgin|preceremony)
       grep -Fq '[8/8] done — install completed' "$console" \
-        || die "virgin scenario did not complete the installation"
+        || die "$tpm_state scenario did not complete the installation"
       ! grep -Eq '(^|[^A-Z])(FAILED|REFUSED|FATAL)([^A-Z]|$)' "$console" \
-        || die "virgin scenario emitted a failure after starting"
+        || die "$tpm_state scenario emitted a failure after starting"
       ;;
-    provisioned)
-      grep -Fq 'the TPM is not virgin' "$console" \
-        || die "provisioned scenario was not refused at installer preflight"
-      ;;
-    replay)
-      grep -Fq 'PCR policy sequence does not equal the durable TPM high-water' "$console" \
-        || die "replayed PCR policy sequence was not refused"
+    equal|replay)
+      grep -Fq 'signed Install PCR policy sequence is not strictly newer than the durable TPM high-water' "$console" \
+        || die "$tpm_state PCR policy scenario was not refused"
       ;;
     partial)
-      grep -Fq 'PCR policy state is absent while another appliance state index exists' "$console" \
+      grep -Fq 'another Neural ICE appliance state index exists before owner ceremony' "$console" \
         || die "partial TPM state was not refused"
       ;;
     owner-auth)
-      grep -Fq 'PCR policy high-water is absent after owner authorization was sealed' "$console" \
+      grep -Fq 'owner authorization is already set before the trusted ceremony' "$console" \
         || die "owner-authorized partial state was not refused"
       ;;
   esac
-  if [[ "$tpm_state" != virgin ]]; then
+  if [[ "$tpm_state" != virgin && "$tpm_state" != preceremony ]]; then
     qemu-img compare -q "$target" "$work_dir/target.empty.qcow2" \
       || die "$tpm_state refusal modified the virtual target"
   fi
