@@ -101,6 +101,10 @@ ESP_OPTIONAL = frozenset(
         # sealed in the UKI command line, which is what makes the ESP a carrier
         # rather than a chooser.
         "ice-coreos/mirror-ca.crt",
+        # Public TPM policy material is inert data. Its digest is sealed in the
+        # signed UKI command line and rechecked below before acceptance.
+        "ice-coreos/tpm2-pcr-public-key.pem",
+        "ice-coreos/tpm2-pcr-signature.json",
     }
 )
 # Every ESP artefact whose digest the sealed command line pins, and the karg that
@@ -110,6 +114,8 @@ ESP_HASH_BOUND = (
     ("ice-coreos/release-authorization.json", "neuralice.relauth_sha256"),
     ("ice-coreos/release-authorization.sig", "neuralice.relauth_sig_sha256"),
     ("ice-coreos/mirror-ca.crt", "neuralice.mirror_ca_sha256"),
+    ("ice-coreos/tpm2-pcr-public-key.pem", "neuralice.pcr_policy_key"),
+    ("ice-coreos/tpm2-pcr-signature.json", "neuralice.pcr_policy_signature"),
 )
 ESP_MANIFEST_RE = re.compile(r"^EFI/neural-ice/installer-(install|live)\.efi\.manifest$")
 
@@ -704,6 +710,17 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             continue
         if word == "quiet":
             if counts.get("quiet", 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
+        if word == "rd.systemd.gpt_auto=0":
+            # The signed initramfs supplies the one verified overlay root.
+            if counts.get("rd.systemd.gpt_auto", 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
+        if word == "luks=0":
+            # The live root inherits the future appliance's /etc/crypttab, but
+            # must not react when the installer creates the target LUKS labels.
+            if counts.get("luks", 0) != 1:
                 raise SelectorRefusal("duplicate-word")
             continue
         if word in (SEALED_INSTALL_TARGET, SEALED_LIVE_TARGET):

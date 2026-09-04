@@ -44,12 +44,13 @@ die() { echo "build-installer-root: ERROR: $*" >&2; exit 1; }
 # could see it -- yet bootc installs B while every medium-path check assumes A.
 #
 # The caller therefore supplies the IMAGE ID (the config digest), which cannot be
-# repointed, and this script resolves it exactly ONCE and uses that one value for
-# the mount, the store staging and the manifest.
+# repointed. The root is mounted by that ID; the skopeo-compatible local name is
+# separately re-bound to that same ID immediately before store staging.
 INSTALLER_IMG="${INSTALLER_IMG:-}"       # the image whose rootfs becomes the sealed root
 ROOT_IMAGE_OUT="${ROOT_IMAGE_OUT:-}"     # where the root squashfs is written
 STORE_IMAGE_OUT="${STORE_IMAGE_OUT:-}"   # where the store squashfs is written
 STORE_IMAGE_NAME="${STORE_IMAGE_NAME:-localhost/bootc}"
+INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-localhost/ice-coreos-installer:local}"
 MANIFEST_OUT="${MANIFEST_OUT:-${ROOT_IMAGE_OUT}.manifest}"
 
 # Tool overrides exist so the suite can drive every branch without podman, a
@@ -76,6 +77,8 @@ for required in INSTALLER_IMG ROOT_IMAGE_OUT STORE_IMAGE_OUT; do
 done
 [[ "$STORE_IMAGE_NAME" =~ ^[a-z0-9]([a-z0-9._/-]{0,126}[a-z0-9])?$ ]] \
   || die "STORE_IMAGE_NAME is not a plain local image name: $STORE_IMAGE_NAME"
+[[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+  || die "INSTALLER_STORAGE_NAME is not a tagged localhost image name: $INSTALLER_STORAGE_NAME"
 
 # A MUTABLE REFERENCE IS REFUSED OUTRIGHT, not silently resolved. Resolving a tag
 # here would reintroduce exactly the split this script exists to prevent: the
@@ -86,10 +89,11 @@ INSTALLER_IMAGE_ID="${INSTALLER_IMG#sha256:}"
 readonly INSTALLER_IMAGE_ID
 
 PODMAN_BIN="$(tool podman)"
+MOUNTPOINT_BIN="$(tool mountpoint)"
+UMOUNT_BIN="$(tool umount)"
 podman_run() { "$PODMAN_BIN" "$@"; }
 
-# The ONE resolution. Everything below names $INSTALLER_IMAGE_ID; nothing names
-# a tag, so there is no second lookup that could answer differently.
+# Prove the immutable ID itself resolves before reading any root bytes.
 RESOLVED_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "sha256:$INSTALLER_IMAGE_ID" 2>/dev/null \
   | tr -d '[:space:]' | sed 's/^sha256://')" \
   || die "cannot resolve the installer image ID $INSTALLER_IMAGE_ID in local storage"
@@ -113,11 +117,30 @@ sha256_of() { "$(tool sha256sum)" "$1" | awk '{print tolower($1)}'; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ni-installer-root.XXXXXX")"
 MOUNTED=""
 cleanup() {
+  local exit_status=$? overlay_mount="$WORK/store/overlay"
+  set +e
   if [[ -n "$MOUNTED" ]]; then
     podman_run image umount "sha256:$INSTALLER_IMAGE_ID" >/dev/null 2>&1 || true
     MOUNTED=""
   fi
-  rm -rf -- "$WORK"
+  # skopeo's destination containers-storage can leave its overlay graphroot
+  # mounted after a failed copy. This exact path is inside this invocation's
+  # mktemp directory; no host or shared storage mount is ever targeted.
+  if "$MOUNTPOINT_BIN" -q -- "$overlay_mount" 2>/dev/null; then
+    if ! "$UMOUNT_BIN" -- "$overlay_mount" >/dev/null 2>&1; then
+      echo "build-installer-root: WARNING: cannot unmount task-owned $overlay_mount; preserving work directory $WORK" >&2
+      return 1
+    fi
+  fi
+  if "$MOUNTPOINT_BIN" -q -- "$overlay_mount" 2>/dev/null; then
+    echo "build-installer-root: WARNING: task-owned $overlay_mount remains mounted after unmount; preserving work directory $WORK" >&2
+    return 1
+  fi
+  if ! rm -rf -- "$WORK"; then
+    echo "build-installer-root: WARNING: cannot remove task-owned work directory $WORK" >&2
+    (( exit_status != 0 )) || exit_status=1
+  fi
+  return "$exit_status"
 }
 trap cleanup EXIT
 
@@ -169,8 +192,17 @@ ROOT_IMAGE_BYTES="$(wc -c < "$ROOT_IMAGE_OUT" | tr -d '[:space:]')"
 echo "==> staging ${STORE_IMAGE_NAME} into a containers-storage"
 STORE_TREE="$WORK/store"
 mkdir -p -- "$STORE_TREE" "$WORK/runroot"
+# skopeo 1.13.3 cannot parse a containers-storage source addressed directly by
+# config digest. Use the stable local name only as its transport handle, after
+# independently proving that the name still resolves to the immutable ID from
+# which the sealed root was built.
+NAMED_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "$INSTALLER_STORAGE_NAME" 2>/dev/null \
+  | tr -d '[:space:]' | sed 's/^sha256://')" \
+  || die "cannot resolve the installer storage name $INSTALLER_STORAGE_NAME"
+[[ "$NAMED_IMAGE_ID" == "$INSTALLER_IMAGE_ID" ]] \
+  || die "installer storage name $INSTALLER_STORAGE_NAME resolves to '${NAMED_IMAGE_ID:-nothing}', not immutable image $INSTALLER_IMAGE_ID"
 "$(tool skopeo)" copy \
-  "containers-storage:sha256:${INSTALLER_IMAGE_ID}" \
+  "containers-storage:${INSTALLER_STORAGE_NAME}" \
   "containers-storage:[overlay@${STORE_TREE}+${WORK}/runroot]${STORE_IMAGE_NAME}" \
   || die "cannot stage the installer image into the medium image store"
 # A store the installer cannot read is a medium that cannot install. Assert the

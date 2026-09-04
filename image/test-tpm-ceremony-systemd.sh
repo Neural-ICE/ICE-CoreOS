@@ -26,6 +26,131 @@ grep -qx 'After=neural-ice-firstboot-tpm-ceremony.service' "$DROPIN" || fail "ga
 grep -qx 'OnFailure=emergency.target' "$UNIT" || fail "ceremony failure does not enter recovery"
 grep -qx 'OnFailureJobMode=isolate' "$UNIT" || fail "ceremony failure does not isolate recovery"
 grep -qx 'RequiredBy=multi-user.target' "$UNIT" || fail "multi-user readiness does not require ceremony success"
+grep -qx 'DefaultDependencies=no' "$UNIT" \
+  || fail "ceremony default dependencies would After=basic and cycle with sshd.socket"
+grep -qx 'After=local-fs.target' "$UNIT" \
+  || fail "ceremony is not ordered after local-fs"
+grep -Fq '/run/neural-ice-device-root' "$UNIT" \
+  || fail "ceremony sandbox cannot write the device-root runtime directory required by attest"
+grep -Fq '/run/neural-ice-tpm-state' "$UNIT" \
+  || fail "ceremony sandbox cannot write the TPM-state runtime directory"
+grep -Fq '/run/neural-ice-access-profile-anchor' "$UNIT" \
+  || fail "ceremony sandbox cannot write the access-profile-anchor runtime directory"
+grep -Fq '/run/cryptsetup' "$UNIT" \
+  || fail "ceremony sandbox cannot write /run/cryptsetup required to read LUKS2 metadata"
+! grep -E '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$UNIT" \
+  || fail "ceremony must not After= or Before= tmpfiles-setup (cycles with sysext)"
+! grep -E '^(After|Before)=.*sysinit\.target' "$UNIT" \
+  || fail "ceremony Before=sysinit cycles with sshd.socket After=sysinit"
+! grep -E '^(After|Before)=.*sockets\.target' "$UNIT" \
+  || fail "ceremony Before=sockets is not required and widens the sysinit cycle"
+# PrivateTmp=yes implicitly adds After=systemd-tmpfiles-setup.service (verified
+# on systemd 255 and 257 with `systemctl show -p After`); sysext/confext are
+# Requires=+After= this gate and Before= tmpfiles-setup, so `yes` is the cycle
+# that made systemd 257 skip sysext/confext on QEMU first boot. `disconnected`
+# keeps the private /tmp and adds no tmpfiles edge.
+grep -qx 'PrivateTmp=disconnected' "$UNIT" \
+  || fail "ceremony must use PrivateTmp=disconnected: PrivateTmp=yes re-adds After=tmpfiles-setup and cycles with sysext"
+# The /etc overlay + generator that bridged pre-re-pin appliance digests from
+# the medium is retired (2026-09-04 re-pin): the installer refuses an appliance
+# whose own unit still cycles, instead of patching it.
+for bridge in image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf \
+  image/firstboot/neural-ice-firstboot-ceremony-generator; do
+  [[ ! -e "$ROOT/$bridge" ]] || fail "retired first-boot ceremony bridge is back in the tree: $bridge"
+done
+AUTOINSTALL="$ROOT/ota/neural-ice-autoinstall.sh"
+! grep -Fq 'etc/systemd/system-generators/neural-ice-firstboot-ceremony"' "$AUTOINSTALL" \
+  || { grep -Fq 'retired medium bridge' "$AUTOINSTALL" \
+       || fail "the installer still stages the retired first-boot ceremony generator"; }
+
+# Run the installer's verification block itself against crafted deployments.
+# It must judge the EFFECTIVE unit (fragment + drop-ins, `Key = value`, line
+# continuations, last assignment wins), not the raw fragment text: a drop-in
+# that re-adds the cycle must be refused exactly like a cycling fragment.
+verify_start="$(grep -n '^ceremony_unit_name=neural-ice-firstboot-tpm-ceremony\.service$' "$AUTOINSTALL" | cut -d: -f1)"
+verify_end="$(grep -n '^log "first-boot ceremony unit verified on the pinned appliance' "$AUTOINSTALL" | cut -d: -f1)"
+[[ -n "$verify_start" && -n "$verify_end" && "$verify_start" -lt "$verify_end" ]] \
+  || fail "the installer's first-boot ceremony verification block is not where the test expects it"
+verify_tmp="$TMP/verify"
+mkdir -p "$verify_tmp"
+{
+  # shellcheck disable=SC2016 # shell source emitted verbatim into the harness
+  printf 'die() { printf "REFUSED: %%s\\n" "$*"; exit 3; }\nlog() { printf "OK: %%s\\n" "$*"; }\ndep="$1"\n'
+  sed -n "${verify_start},${verify_end}p" "$AUTOINSTALL"
+} > "$verify_tmp/verify.sh"
+verify_dep() { # <name> -> path of a deployment carrying the shipped unit
+  local d="$verify_tmp/$1"
+  mkdir -p "$d/usr/lib/systemd/system"
+  cp -- "$UNIT" "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+  printf '%s\n' "$d"
+}
+verify_expect() { # <accept|refuse> <dep> <message fragment>
+  local out
+  out="$(bash "$verify_tmp/verify.sh" "$2" 2>&1)" || true
+  case "$1" in
+    accept) [[ "$out" == OK:* ]] || fail "installer refused the shipped ceremony unit ($3): $out" ;;
+    refuse) [[ "$out" == REFUSED:*"$3"* ]] || fail "installer must refuse a deployment whose effective ceremony unit $3; got: $out" ;;
+  esac
+}
+d="$(verify_dep shipped)"
+verify_expect accept "$d" "as shipped"
+d="$(verify_dep dropin-tmpfiles)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+printf '[Unit]\nAfter = local-fs.target \\\n    systemd-tmpfiles-setup.service\n' \
+  > "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect refuse "$d" "orders against tmpfiles-setup"
+d="$(verify_dep dropin-privatetmp)"
+mkdir -p "$d/usr/lib/systemd/system/service.d"
+printf '[Service]\nPrivateTmp = yes\n' > "$d/usr/lib/systemd/system/service.d/90-test.conf"
+verify_expect refuse "$d" "PrivateTmp=yes"
+d="$(verify_dep dropin-defaultdeps)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+printf '[Unit]\nDefaultDependencies=yes\n' \
+  > "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect refuse "$d" "keeps default dependencies"
+d="$(verify_dep etc-override)"
+mkdir -p "$d/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+verify_expect refuse "$d" "overrides the pinned appliance's first-boot ceremony unit"
+d="$(verify_dep etc-bridge)"
+mkdir -p "$d/etc/systemd/system-generators"
+: > "$d/etc/systemd/system-generators/neural-ice-firstboot-ceremony"
+verify_expect refuse "$d" "retired first-boot ceremony medium bridge"
+d="$(verify_dep continuation-comment)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+printf '[Unit]\nAfter=local-fs.target \\\n# a comment inside the continuation is skipped by systemd\n  systemd-tmpfiles-setup.service\n' \
+  > "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect refuse "$d" "orders against tmpfiles-setup"
+d="$(verify_dep prefix-dropin-usr)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-.service.d"
+printf '[Unit]\nBefore=sysinit.target\n' > "$d/usr/lib/systemd/system/neural-ice-firstboot-.service.d/90-test.conf"
+verify_expect refuse "$d" "orders against sysinit.target"
+d="$(verify_dep prefix-dropin-etc)"
+mkdir -p "$d/etc/systemd/system/neural-ice-.service.d"
+printf '[Service]\nPrivateTmp=no\n' > "$d/etc/systemd/system/neural-ice-.service.d/90-test.conf"
+verify_expect refuse "$d" "overrides the pinned appliance's first-boot ceremony unit"
+d="$(verify_dep etc-service-d-privatetmp)"
+mkdir -p "$d/etc/systemd/system/service.d"
+printf '[Service]\nPrivateTmp=yes\n' > "$d/etc/systemd/system/service.d/90-test.conf"
+verify_expect refuse "$d" "PrivateTmp=yes"
+d="$(verify_dep benign-service-d)"
+mkdir -p "$d/usr/lib/systemd/system/service.d"
+printf '# Fedora ships this\n[Service]\nTimeoutStopFailureMode=abort\n' > "$d/usr/lib/systemd/system/service.d/10-timeout-abort.conf"
+verify_expect accept "$d" "with the distribution's benign service.d drop-in"
+d="$(verify_dep wrong-section)"
+sed -i 's/^DefaultDependencies=no$//' "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+printf '\n[Service]\nDefaultDependencies=no\n' >> "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+verify_expect refuse "$d" "keeps default dependencies"
+d="$(verify_dep dropin-no-section)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+printf 'PrivateTmp=yes\n' > "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect accept "$d" "a sectionless drop-in key is ignored by systemd, not applied"
+d="$(verify_dep symlink-dropin)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+ln -s /nonexistent/90-test.conf "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect refuse "$d" "is not a regular file"
+d="$(verify_dep no-unit)"
+rm -f -- "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+verify_expect refuse "$d" "ships no first-boot TPM ceremony unit"
 
 dropin_units=(
   sshd.service sshd.socket getty@.service serial-getty@.service autovt@.service

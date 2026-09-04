@@ -50,6 +50,9 @@ CONTAINERFILE="$ROOT/image/Containerfile.installer"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ni-failure-surface.XXXXXX")"
 trap 'chmod -R u+w "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 chmod 0755 "$TMP"
+mkdir "$TMP/efi"
+chmod 0777 "$TMP/efi"
+SINK_EFI="$TMP/efi/sink"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 for required in "$FAILURE" "$FAILURE_UNIT" "$FAILURE_TARGET" "$POLICY" \
@@ -67,6 +70,7 @@ render() { # $1=evidence file (or "") $2=policy file (or "") -> stdout
   local -a command=(env
     "NEURALICE_FAILURE_EVIDENCE=${1:-$TMP/no-such-evidence}"
     "NEURALICE_FAILURE_POLICY=${2:-$TMP/no-such-policy}"
+    "NEURALICE_EFI_FAILURE_EVIDENCE=$SINK_EFI"
     bash "$FAILURE" --dry-run)
   if (( EUID == 0 )); then
     chmod -R a+rX "$TMP" "$FAILURE" 2>/dev/null || true
@@ -79,6 +83,16 @@ render() { # $1=evidence file (or "") $2=policy file (or "") -> stdout
 write_evidence() { # $1=path, rest: literal lines
   local path=$1; shift
   printf '%s\n' "$@" > "$path"
+}
+
+assert_efi_evidence() { # $1=runtime evidence $2=EFI variable image
+  local evidence=$1 efi=$2 attributes
+  [ -f "$efi" ] || fail "the installer left no persistent EFI failure evidence"
+  attributes="$(od -An -tx1 -N4 "$efi" | tr -d '[:space:]')"
+  [ "$attributes" = 07000000 ] \
+    || fail "the persistent EFI evidence has attributes '$attributes', expected 07000000"
+  dd if="$efi" bs=1 skip=4 status=none | cmp -s - "$evidence" \
+    || fail "persistent EFI evidence differs from the bounded runtime evidence"
 }
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +109,7 @@ write_evidence "$TMP/nominal" \
 render "$TMP/nominal" "$POLICY" > "$TMP/out" 2>"$TMP/err" \
   || fail "the failure surface exited non-zero on well-formed evidence"
 [ ! -s "$TMP/err" ] || { cat "$TMP/err" >&2; fail "the failure surface wrote to stderr"; }
+assert_efi_evidence "$TMP/nominal" "$SINK_EFI"
 for phrase in 'INSTALL FAILED' 'install-failed-write-deployment' 'write-deployment' \
   '0123456789ab' 'There is no login' 'no shell and no recovery console' \
   'neural-ice-installer-failure-evidence-v1' 'poweroff'; do
@@ -261,8 +276,8 @@ unit_value() { awk -v k="$1" -v f="$2" 'index($0, k "=") == 1 { print substr($0,
   || fail "the failure unit may reach the network"
 [ "$(unit_value ProtectSystem "$FAILURE_UNIT")" = strict ] \
   || fail "the failure unit can write to the machine it is reporting a failure on"
-[ "$(unit_value ReadWritePaths "$FAILURE_UNIT")" = '' ] \
-  || fail "the failure unit was given a writable path"
+[ "$(unit_value ReadWritePaths "$FAILURE_UNIT")" = -/sys/firmware/efi/efivars ] \
+  || fail "the failure unit can write somewhere other than the one efivarfs directory, or fails to start when efivarfs is absent (missing '-' prefix)"
 [ "$(unit_value CapabilityBoundingSet "$FAILURE_UNIT")" = CAP_SYS_BOOT ] \
   || fail "the failure unit keeps capabilities beyond the power-off it exists to perform"
 grep -Eq '^PrivateTmp=' "$FAILURE_UNIT" \
@@ -283,6 +298,10 @@ grep -v '^[[:space:]]*#' "$AUTOINSTALL_UNIT" | grep -qiE 'emergency|rescue|debug
 for directive in RuntimeDirectory=neural-ice-installer-failure RuntimeDirectoryMode=0700 \
   RuntimeDirectoryPreserve=yes; do
   grep -qx "$directive" "$AUTOINSTALL_UNIT" || fail "the autoinstall unit lost $directive"
+done
+for stage in startup-generator startup-tpm; do
+  grep -Fq "stage=$stage" "$AUTOINSTALL_UNIT" \
+    || fail "an ExecStartPre refusal leaves no stable '$stage' evidence"
 done
 # ...and the two halves agree about WHERE the evidence is, by construction rather
 # than by two people remembering the same path.
@@ -322,11 +341,12 @@ ANCHOR="$ANCHOR neuralice.trust_policy_id=neural-ice-secureboot-lab-v1"
 run_installer() { # $1=cmdline $2=evidence path, rest: extra env assignments
   local cmdline=$1 evidence=$2; shift 2
   printf '%s\n' "$cmdline" > "$TMP/run-cmdline"
-  rm -f "$evidence"
+  rm -f "$evidence" "$TMP/induced-efi-evidence"
   env NI_INSTALLER_TEST_SEAM=1 \
       NEURALICE_CMDLINE_FILE="$TMP/run-cmdline" \
       NEURALICE_SEALED_GRAMMAR="$GRAMMAR" \
       NEURALICE_FAILURE_EVIDENCE="$evidence" \
+      NEURALICE_EFI_FAILURE_EVIDENCE="$TMP/induced-efi-evidence" \
       "$@" \
       bash "$AUTOINSTALL" >/dev/null 2>&1
 }
@@ -347,6 +367,7 @@ induce_run() { # $1=label $2=cmdline $3=expected code, rest: extra env
     || fail "[$label] the evidence carries no recognised schema"
   [ "$(evidence_field "$evidence" code)" = "$expected" ] \
     || fail "[$label] the evidence code is '$(evidence_field "$evidence" code)', expected '$expected'"
+  assert_efi_evidence "$evidence" "$TMP/induced-efi-evidence"
   # ...and the sink renders it, so the class ends on the fixed screen and not
   # anywhere else.
   render "$evidence" "$POLICY" > "$TMP/induced-out" 2>/dev/null \
@@ -477,12 +498,14 @@ for id in 1 2 3 4 5 6 7 8; do
     PHASE_TOTAL=8; PHASE_ID=0; PHASE_LABEL=startup; PHASE_T0=0; SECONDS=0
     FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
     FAILURE_EVIDENCE="$evidence"
+    EFI_FAILURE_EVIDENCE="$evidence.efi"
     # shellcheck source=/dev/null
     . "$TMP/phases.sh"
     phase "$id" "induced class $id"
     die "a diagnostic naming /dev/nvme0n1, ghcr.io/x@sha256:$(printf '%064d' 9) and an operator key"
   ) >/dev/null 2>&1 && fail "the installer's own die() returned success"
   [ -f "$evidence" ] || fail "phase $id produced no failure evidence"
+  assert_efi_evidence "$evidence" "$evidence.efi"
   [ "$(evidence_field "$evidence" stage)" = "${EXPECTED_SLUGS[$id]}" ] \
     || fail "phase $id reports stage '$(evidence_field "$evidence" stage)', expected '${EXPECTED_SLUGS[$id]}'"
   [ "$(evidence_field "$evidence" code)" = "install-failed-${EXPECTED_SLUGS[$id]}" ] \
@@ -513,6 +536,7 @@ done
   PHASE_CODE=install-failed-write-deployment
   FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
   FAILURE_EVIDENCE="$TMP/detail-b"
+  EFI_FAILURE_EVIDENCE="$TMP/detail-b.efi"
   # shellcheck source=/dev/null
   . "$TMP/phases.sh"
   die "a different diagnostic entirely"
@@ -529,6 +553,7 @@ done
   PHASE_TOTAL=8; PHASE_ID=0; PHASE_LABEL=startup; PHASE_T0=0; SECONDS=0
   FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
   FAILURE_EVIDENCE="$TMP/phase-unknown"
+  EFI_FAILURE_EVIDENCE="$TMP/phase-unknown.efi"
   # shellcheck source=/dev/null
   . "$TMP/phases.sh"
   phase 99 "a phase nobody numbered"

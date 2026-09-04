@@ -202,17 +202,47 @@ signing_payload() { # $1=json (LF-terminated)  $2=output path
   { printf '%s\0' "$ANCHOR_DOMAIN"; printf '%s' "${1%$'\n'}"; } > "$2"
 }
 
-# TPM ECDSA signatures come out as raw r||s; every verifier in this tree
-# (cosign, openssl, ni-ota-verify) speaks DER. Convert once, here, rather than
-# teaching each of them a second encoding.
-raw_to_der() { # $1=raw 64-byte signature path  $2=output DER path
+# The signature is requested as `-f tss`: the TCG-marshalled TPMT_SIGNATURE
+# (sigAlg, hashAlg, TPM2B r, TPM2B s), which is fixed by the TPM 2.0 Library
+# spec and does not move between tpm2-tools releases. (`-f plain` is NOT stable:
+# tpm2-tools 5.6 emits DER for ECDSA, earlier releases emitted raw r||s, and a
+# QEMU first boot refused on exactly that drift.) Every verifier in this tree
+# (cosign, openssl, ni-ota-verify) speaks DER; convert once, here, refusing
+# any algorithm, hash or length other than the ECDSA-P256/SHA-256 contract.
+tss_to_der() { # $1=TPMT_SIGNATURE path (tpm2_sign -f tss)  $2=output DER path
   "$(tool python3)" - "$1" "$2" <<'PYEOF'
 import sys
 
-raw = open(sys.argv[1], "rb").read()
-if len(raw) != 64:
-    print(f"TPM signature is {len(raw)} bytes, not the expected 64", file=sys.stderr)
+TPM_ALG_ECDSA = 0x0018
+TPM_ALG_SHA256 = 0x000B
+CURVE_BYTES = 32
+
+
+def refuse(reason: str) -> None:
+    print(f"TPM signature is not an ECDSA-P256/SHA-256 TPMT_SIGNATURE: {reason}", file=sys.stderr)
     raise SystemExit(1)
+
+
+tss = open(sys.argv[1], "rb").read()
+if len(tss) != 4 + 2 * (2 + CURVE_BYTES):
+    refuse(f"{len(tss)} bytes")
+if int.from_bytes(tss[0:2], "big") != TPM_ALG_ECDSA:
+    refuse("sigAlg is not TPM_ALG_ECDSA")
+if int.from_bytes(tss[2:4], "big") != TPM_ALG_SHA256:
+    refuse("hashAlg is not TPM_ALG_SHA256")
+
+
+def parameter(offset: int) -> tuple[bytes, int]:
+    size = int.from_bytes(tss[offset : offset + 2], "big")
+    if size != CURVE_BYTES:
+        refuse(f"ECC parameter is {size} bytes")
+    return tss[offset + 2 : offset + 2 + size], offset + 2 + size
+
+
+r, offset = parameter(4)
+s, offset = parameter(offset)
+if offset != len(tss):
+    refuse("trailing bytes")
 
 
 def integer(value: bytes) -> bytes:
@@ -222,7 +252,7 @@ def integer(value: bytes) -> bytes:
     return b"\x02" + bytes([len(trimmed)]) + trimmed
 
 
-body = integer(raw[:32]) + integer(raw[32:])
+body = integer(r) + integer(s)
 open(sys.argv[2], "wb").write(b"\x30" + bytes([len(body)]) + body)
 PYEOF
 }
@@ -269,10 +299,10 @@ enroll() {
 
   local json; json="$(anchor_json "$profile" "$target" "$policy_id" "$seq" "$DR_NAME" "$DR_SPKI_SHA256" "$stamp")"
   signing_payload "$json" "$WORK/payload"
-  "$(tool tpm2_sign)" -Q -c "$DEVICE_ROOT_HANDLE" -g sha256 -s ecdsa -f plain \
-    -o "$WORK/signature.raw" "$WORK/payload" \
+  "$(tool tpm2_sign)" -Q -c "$DEVICE_ROOT_HANDLE" -g sha256 -s ecdsa -f tss \
+    -o "$WORK/signature.tss" "$WORK/payload" \
     || die "the device root refused to sign the access-profile anchor"
-  raw_to_der "$WORK/signature.raw" "$WORK/signature.der" \
+  tss_to_der "$WORK/signature.tss" "$WORK/signature.der" \
     || die "cannot encode the device-root signature"
 
   # VERIFY WHAT WAS PRODUCED, not what was requested. An anchor whose signature

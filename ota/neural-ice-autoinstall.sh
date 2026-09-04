@@ -100,17 +100,33 @@ log()  { logger -t "$LOG_TAG" -- "$*"; printf '\n[%s] %s\n' "$LOG_TAG" "$*" > /d
 readonly FAILURE_EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
 FAILURE_EVIDENCE="$(ni_path NEURALICE_FAILURE_EVIDENCE /run/neural-ice-installer-failure/evidence)"
 readonly FAILURE_EVIDENCE
+# A failed installer powers off and its journal is volatile. Preserve the same
+# closed-vocabulary evidence -- never the diagnostic message -- in one
+# non-volatile EFI variable so a subsequent trusted boot can identify the
+# refusing gate even when tty1 was not visible. The GUID is UUIDv5(DNS,
+# installer-failure.neural-ice.ch), so this name is deterministic rather than an
+# allocation guessed independently by each build.
+EFI_FAILURE_EVIDENCE="$(ni_path NEURALICE_EFI_FAILURE_EVIDENCE /sys/firmware/efi/efivars/NeuralICEInstallerFailure-870a0500-25d2-574e-a1cc-79a69630bf96)"
+readonly EFI_FAILURE_EVIDENCE
 
 write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
-  local detail
+  local detail evidence
   detail="$(printf '%s' "${1:-}" | sha256sum 2>/dev/null | cut -c1-12)"
   [[ "$detail" =~ ^[0-9a-f]{12}$ ]] || detail=unavailable
   # A single overwrite, never an append: the sink reads the FIRST occurrence of
   # each key, and a failure inside a failure must not be able to grow this file.
-  printf 'schema=%s\ncode=%s\nphase=%s\nphase_total=%s\nstage=%s\ndetail=%s\n' \
+  printf -v evidence 'schema=%s\ncode=%s\nphase=%s\nphase_total=%s\nstage=%s\ndetail=%s\n' \
     "$FAILURE_EVIDENCE_SCHEMA" "$PHASE_CODE" "$PHASE_ID" "$PHASE_TOTAL" \
-    "$PHASE_SLUG" "$detail" \
-    > "$FAILURE_EVIDENCE" 2>/dev/null || true
+    "$PHASE_SLUG" "$detail"
+  printf '%s' "$evidence" > "$FAILURE_EVIDENCE" 2>/dev/null || true
+
+  # efivarfs requires a four-byte little-endian attributes prefix. 0x07 means
+  # NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS. Never remove or follow
+  # an existing object here: this is a best-effort evidence write on an already
+  # failing path, not authority to mutate an arbitrary filesystem object.
+  if [[ -d "${EFI_FAILURE_EVIDENCE%/*}" && ! -L "$EFI_FAILURE_EVIDENCE" ]]; then
+    printf '\x07\x00\x00\x00%s' "$evidence" > "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
+  fi
 }
 
 die()  {
@@ -794,6 +810,15 @@ readonly LIVE_PAYLOAD_NODE LIVE_PAYLOAD_DEVNO live_disk
 [[ -n "$live_disk" ]] || die "the sealed medium lookup returned no parent disk"
 log "Live media = /dev/$live_disk (payload partition $LIVE_PAYLOAD_NODE, $LIVE_PAYLOAD_DEVNO — excluded from target)"
 
+media_vfat_partition() {
+  lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null \
+    | awk '$2 == "vfat" && !found { print $1; found=1 }'
+}
+mounted_at() { # $1=device -> first mountpoint, or nothing
+  findmnt -nfo TARGET "$1" 2>/dev/null \
+    | awk 'NR == 1 { first=$0 } END { if (first != "") print first }'
+}
+
 # --------------------------------------------------------------------------- #
 # 🔴 WHAT THIS REPLACES (review 2026-09-01, P0 #1). This phase used to run
 # `bootc image copy-to-storage`, which duplicated the BOOTED ostree deployment
@@ -820,18 +845,59 @@ _store_driver="$(sed -n 's/^[[:space:]]*driver[[:space:]]*=[[:space:]]*"\([a-z0-
 # calls AND the bootc container below, which is bind-mounted over its own copy.
 # One file, one answer — a drop-in that a given c/storage release ignored would
 # fail open, with podman quietly resolving `localhost/bootc` to nothing.
-readonly INSTALLER_STORAGE_CONF=/run/neural-ice-installer/storage.conf
-install -d -m 0755 "$(dirname -- "$INSTALLER_STORAGE_CONF")"
+readonly INSTALLER_STORAGE_ROOT=/run/neural-ice-container-runtime
+readonly INSTALLER_STORAGE_CONF="$INSTALLER_STORAGE_ROOT/storage.conf"
+readonly INSTALLER_STORAGE_DROPINS="$INSTALLER_STORAGE_ROOT/empty-storage-conf.d"
+readonly INSTALLER_STORAGE_RUNROOT="$INSTALLER_STORAGE_ROOT/containers-runroot"
+readonly INSTALLER_STORAGE_GRAPHROOT="$INSTALLER_STORAGE_ROOT/containers-storage"
+# The live / is overlayfs. Merely placing these paths under /run is not enough:
+# the deliberately minimal installer boot does not guarantee that /run itself
+# has been mounted as tmpfs. containers/storage then sees an overlay graphroot
+# backed by overlayfs and `bootc install to-filesystem` refuses it after the
+# target has already been wiped. Mount this invocation's complete writable
+# storage root explicitly and prove the backing filesystem before Podman can
+# inspect the sealed read-only additional image store.
+[[ "$INSTALLER_STORAGE_ROOT" != "$INSTALLER_STATE_DIR" \
+   && "$INSTALLER_STORAGE_ROOT" != "$INSTALLER_STATE_DIR/"* ]] \
+  || die "the writable container runtime would cover the verified installer state"
+install -d -m 0755 "$INSTALLER_STORAGE_ROOT"
+mount -t tmpfs -o nodev,nosuid,mode=0755 \
+  neural-ice-installer-storage "$INSTALLER_STORAGE_ROOT" \
+  || die "cannot mount the installer's writable container storage on tmpfs"
+install -d -m 0700 "$INSTALLER_STORAGE_RUNROOT" "$INSTALLER_STORAGE_GRAPHROOT"
+install -d -m 0755 "$INSTALLER_STORAGE_DROPINS"
+[[ "$(findmnt -n -o FSTYPE --target "$INSTALLER_STORAGE_GRAPHROOT" 2>/dev/null)" == tmpfs ]] \
+  || die "the installer's writable container storage is not backed by tmpfs"
+installer_trust_assert_root_verity "$STORE_VERITY_HASH" "$STORE_MAPPER" "$STORE_MOUNT" \
+  "installer image store after writable-runtime mount" >/dev/null \
+  || die "the writable container runtime covered or changed the verified image store"
 cat > "$INSTALLER_STORAGE_CONF" <<EOF
 [storage]
 driver = "overlay"
-runroot = "/run/containers/storage"
-graphroot = "/var/lib/containers/storage"
+runroot = "$INSTALLER_STORAGE_RUNROOT"
+graphroot = "$INSTALLER_STORAGE_GRAPHROOT"
 
 [storage.options]
 additionalimagestores = ["$STORE_MOUNT"]
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+mountopt = "nodev"
 EOF
 export CONTAINERS_STORAGE_CONF="$INSTALLER_STORAGE_CONF"
+# The sealed store is produced by the same overlay implementation and carries
+# containers/storage's `.has-mount-program` marker. Supplying only driver =
+# "overlay" makes metadata inspection appear usable on some hosts, then bootc
+# refuses OpenImage after the target wipe. Prove both the helper/device and an
+# actual merged mount while this phase is still non-destructive.
+command -v fuse-overlayfs >/dev/null \
+  || die "the installer image has no fuse-overlayfs helper for its sealed image store"
+if [[ ! -c /dev/fuse ]]; then
+  modprobe fuse 2>/dev/null || true
+  udevadm settle 2>/dev/null || true
+fi
+[[ -c /dev/fuse ]] \
+  || die "the installer cannot access /dev/fuse for its sealed image store"
 # ASSERT THE OUTCOME, not the write. A store that podman cannot read produces a
 # medium that fails at `bootc install`, after the target disk has been destroyed.
 podman --cgroup-manager=cgroupfs --events-backend=file image exists "$STORE_IMAGE_NAME" \
@@ -842,6 +908,28 @@ MEDIUM_IMAGE_DIGEST="$(podman --cgroup-manager=cgroupfs --events-backend=file \
 [[ "$MEDIUM_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || die "the verified image store reports no usable digest for ${STORE_IMAGE_NAME}"
 readonly MEDIUM_IMAGE_DIGEST
+_medium_probe=neural-ice-installer-store-preflight
+podman --cgroup-manager=cgroupfs --events-backend=file \
+  create --network=none --name "$_medium_probe" --entrypoint /usr/bin/true \
+  "$STORE_IMAGE_NAME" >/dev/null \
+  || die "the verified image store cannot create a no-exec preflight container before the target wipe"
+_medium_mount="$(podman --cgroup-manager=cgroupfs --events-backend=file \
+  mount "$_medium_probe" 2>/dev/null)" \
+  || {
+    podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_medium_probe" >/dev/null 2>&1 || true
+    die "the verified image store cannot produce a no-exec merged filesystem before the target wipe"
+  }
+[[ -n "$_medium_mount" && -d "$_medium_mount" ]] \
+  || {
+    podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_medium_probe" >/dev/null 2>&1 || true
+    die "the verified image store produced no no-exec merged filesystem before the target wipe"
+  }
+if ! podman --cgroup-manager=cgroupfs --events-backend=file \
+    unmount "$_medium_probe" >/dev/null \
+  || ! podman --cgroup-manager=cgroupfs --events-backend=file \
+    rm "$_medium_probe" >/dev/null; then
+  die "the verified image store's no-exec pre-wipe mount cannot be released"
+fi
 log "Sealed image store registered read-only at $STORE_MOUNT; ${STORE_IMAGE_NAME} = ${MEDIUM_IMAGE_DIGEST} (no copy, dm-verity enforced)"
 
 # --------------------------------------------------------------------------- #
@@ -893,9 +981,9 @@ _sshkey_kargs="$(karg_count neuralice.sshkey)"
 if (( _sshkey_kargs == 1 )); then
   SSHKEY_ORIGIN="kernel command line"
 else
-  _usb_esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
+  _usb_esp="$(media_vfat_partition || true)"
   if [[ -n "${_usb_esp:-}" ]]; then
-    _esp_mp="$(findmnt -nfo TARGET "/dev/$_usb_esp" 2>/dev/null | head -1)"
+    _esp_mp="$(mounted_at "/dev/$_usb_esp" || true)"
     if [[ -n "$_esp_mp" ]] && [[ -e "$_esp_mp/ice-coreos/authorized_keys" || -L "$_esp_mp/ice-coreos/authorized_keys" ]]; then
       SSHKEY_ESP_FILE="$_esp_mp/ice-coreos/authorized_keys"
       SSHKEY_ORIGIN="installer ESP"
@@ -953,9 +1041,9 @@ fi
 readonly LAB_BASELINE_HANDOFF="/usr/local/libexec/neural-ice-lab-baseline-handoff"
 readonly LAB_BASELINE_SNAPSHOT="/run/neural-ice-installer/lab-baseline"
 LAB_BASELINE_PRESENT=0
-_lab_usb_esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
+_lab_usb_esp="$(media_vfat_partition || true)"
 if [[ -n "${_lab_usb_esp:-}" ]]; then
-  _lab_esp_mp="$(findmnt -nfo TARGET "/dev/$_lab_usb_esp" 2>/dev/null | head -1)"
+  _lab_esp_mp="$(mounted_at "/dev/$_lab_usb_esp" || true)"
   _lab_esp_we_mounted=0
   if [[ -z "$_lab_esp_mp" ]]; then
     _lab_esp_mp="/run/neural-ice-lab-esp"
@@ -1120,9 +1208,9 @@ readonly MIRROR_READY_MAX_BYTES=4096
 
 esp_staged_file() { # $1=basename $2=expected sha256 $3=destination -> stages it or fails
   local name=$1 expected=$2 destination=$3 esp mountpoint mounted=0 observed
-  esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
+  esp="$(media_vfat_partition || true)"
   [[ -n "${esp:-}" ]] || die "this medium carries no ESP to read ${name} from"
-  mountpoint="$(findmnt -nfo TARGET "/dev/$esp" 2>/dev/null | head -1)"
+  mountpoint="$(mounted_at "/dev/$esp" || true)"
   if [[ -z "$mountpoint" ]]; then
     mountpoint=/run/neural-ice-installer/esp
     install -d -m 0700 "$mountpoint"
@@ -1167,12 +1255,12 @@ esp_staged_file tpm2-pcr-signature.json "$PCR_POLICY_SIGNATURE_SHA256" "$PCR_POL
 openssl pkey -pubin -in "$PCR_POLICY_KEY_RUNTIME" -noout >/dev/null \
   || die "the sealed PCR policy public key is not a usable public key"
 if ! python3 - "$PCR_POLICY_SIGNATURE_RUNTIME" "$PCR_POLICY_DIGEST" <<'PCR_POLICY_PY'
-import base64, json, sys
+import json, re, sys
 document=json.load(open(sys.argv[1],encoding="ascii"))
 entries=document.get("sha256") if isinstance(document,dict) else None
 if not isinstance(entries,list) or not any(
     isinstance(e,dict) and isinstance(e.get("pol"),str)
-    and base64.b64decode(e["pol"],validate=True).hex()==sys.argv[2]
+    and re.fullmatch(r"[0-9a-f]{64}",e["pol"]) and e["pol"]==sys.argv[2]
     for e in entries):
     raise SystemExit(1)
 PCR_POLICY_PY
@@ -1779,14 +1867,26 @@ fi
 # The container that runs `bootc` is itself read out of the sealed store, and it
 # must see the SAME storage configuration this script does — otherwise the
 # `containers-storage:` source inside it would resolve against the container
-# image's own config and find nothing (or, worse, something else).
+# image's own config and find nothing (or, worse, something else). The appliance
+# carries a seed-store storage.conf.d drop-in which overrides
+# additionalimagestores. Export the complete config explicitly and cover that
+# drop-in directory with an immutable empty directory for this one container;
+# otherwise bootc resolves localhost/bootc against the future appliance seed
+# path rather than the dm-verity store on the installation medium.
+# No systemd.mask= karg for sysext/confext here: the ceremony/tmpfiles cycle
+# is broken at its source (PrivateTmp=disconnected in the appliance's own
+# unit, verified after finalize below), and a mask would have been a permanent
+# karg disabling the very root-capable-extension gate the image installs.
 heartbeat_start "bootc install to-filesystem"
 podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
   --net=host --log-driver=passthrough-tty --pid=host \
   --security-opt label=type:unconfined_t \
+  -e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf \
   -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
   -v "$STORE_MOUNT:$STORE_MOUNT:ro" \
+  -v "$INSTALLER_STORAGE_ROOT:$INSTALLER_STORAGE_ROOT" \
   -v "$INSTALLER_STORAGE_CONF:/etc/containers/storage.conf:ro" \
+  -v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro" \
   --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
   "$STORE_IMAGE_NAME" \
   bootc install to-filesystem \
@@ -2001,6 +2101,103 @@ rm -f -- "$installer_device_root_dropin" \
   || die "cannot remove the installer-only device-root Live guard"
 rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
 
+# The first-boot ceremony unit is the pinned appliance's own
+# (/usr/lib/systemd/system, shipped by ICE-CoreOS). Appliance digests before
+# the 2026-09-04 re-pin ordered it After=systemd-tmpfiles-setup.service
+# (explicitly and through PrivateTmp=yes) while systemd-sysext/confext are
+# Requires=+After= this gate and Before= tmpfiles-setup: an ordering cycle that
+# systemd 257 broke by skipping units at random on first boot. An /etc overlay
+# and a generator used to bridge that from the medium; the bridge was retired
+# at the re-pin. The installer now REFUSES such an image instead of patching
+# it: a medium must not silently repair the appliance it deploys.
+ceremony_unit_name=neural-ice-firstboot-tpm-ceremony.service
+ceremony_unit="$dep/usr/lib/systemd/system/$ceremony_unit_name"
+[[ -f "$ceremony_unit" && ! -L "$ceremony_unit" ]] \
+  || die "the pinned appliance image ships no first-boot TPM ceremony unit"
+# What systemd will run is the EFFECTIVE configuration: the fragment merged
+# with every *.conf drop-in that applies to the unit -- <unit>.d, each
+# dash-prefix directory (neural-.service.d, neural-ice-.service.d, ...) and the
+# type-wide service.d -- from every unit search path. `Key = value` is legal,
+# a trailing backslash continues onto the next non-comment line. Checking the
+# raw fragment alone would approve a unit whose drop-in re-adds the cycle.
+#
+# Two fail-closed rules keep this independent of systemd's precedence order:
+#   1. The deployment carries NO override of this unit outside /usr/lib: no
+#      unit file, <unit>.d or prefix .d under /etc, system.control or
+#      /usr/local. The appliance ships none there; the retired bridge staged
+#      exactly such an override from the medium.
+#   2. Every assignment of a judged directive, in the fragment and in any
+#      applicable drop-in, must be the safe value. A disagreement between two
+#      files is refused rather than resolved -- so "which one wins" never
+#      needs answering.
+ceremony_prefix_dirs=()
+ceremony_stem="${ceremony_unit_name%.service}"
+while [[ "$ceremony_stem" == *-* ]]; do
+  ceremony_stem="${ceremony_stem%-*}"
+  ceremony_prefix_dirs+=("${ceremony_stem}-.service.d")
+done
+for search_root in etc/systemd/system etc/systemd/system.control usr/local/lib/systemd/system; do
+  for override in "$ceremony_unit_name" "$ceremony_unit_name.d" "${ceremony_prefix_dirs[@]}"; do
+    [[ ! -e "$dep/$search_root/$override" && ! -L "$dep/$search_root/$override" ]] \
+      || die "the deployment overrides the pinned appliance's first-boot ceremony unit at /$search_root/$override (retired medium bridge, or a foreign drop-in); re-pin the medium"
+  done
+done
+for override in etc/systemd/system-generators/neural-ice-firstboot-ceremony etc/neural-ice/firstboot-tpm-ceremony.service; do
+  [[ ! -e "$dep/$override" && ! -L "$dep/$override" ]] \
+    || die "the deployment carries the retired first-boot ceremony medium bridge at /$override; re-pin the medium"
+done
+ceremony_sources=("$ceremony_unit")
+for search_root in usr/lib/systemd/system etc/systemd/system etc/systemd/system.control usr/local/lib/systemd/system; do
+  for dropin_dir in "$ceremony_unit_name.d" "${ceremony_prefix_dirs[@]}" service.d; do
+    [[ -d "$dep/$search_root/$dropin_dir" ]] || continue
+    for dropin in "$dep/$search_root/$dropin_dir"/*.conf; do
+      [[ -e "$dropin" || -L "$dropin" ]] || continue
+      # A symlink is judged HERE against the installer's root but read at boot
+      # inside the deployment: an absolute target points at two different files.
+      # Refuse the indirection rather than reason about it.
+      [[ ! -L "$dropin" && -f "$dropin" ]] \
+        || die "the first-boot ceremony drop-in $dropin is not a regular file (symlink or special file); re-pin the medium"
+      ceremony_sources+=("$dropin")
+    done
+  done
+done
+# One `Section.Key=value` line per effective assignment, systemd.syntax(7)
+# applied: comments dropped (also inside a continuation), backslash joins the
+# next non-comment line, whitespace around `=` and at both ends trimmed. The
+# section is carried because systemd IGNORES a key filed under the wrong one:
+# `DefaultDependencies=no` under [Service] leaves the unit with its defaults.
+# Each file restarts outside any section, so a drop-in's keys count only
+# under a header of its own.
+ceremony_effective="$(
+  for src in "${ceremony_sources[@]}"; do
+    printf '\n[]\n'; cat -- "$src"; printf '\n'
+  done | awk '
+    { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^[#;]/ { next }
+    pending != "" { line = pending " " line; pending = "" }
+    line ~ /\\$/ { pending = substr(line, 1, length(line) - 1); next }
+    line == "" { next }
+    line ~ /^\[.*\]$/ { section = substr(line, 2, length(line) - 2); next }
+    { key = line; sub(/[ \t]*=.*$/, "", key); val = line; sub(/^[^=]*=[ \t]*/, "", val)
+      if (index(line, "=")) print section "." key "=" val; else print section "." line }
+    END { if (pending != "") print section "." pending }'
+)"
+ceremony_values() { printf '%s\n' "$ceremony_effective" | grep -E "^$1=" | cut -d= -f2- | sort -u; }
+[[ "$(ceremony_values 'Unit\.DefaultDependencies')" == no ]] \
+  || die "the pinned appliance's first-boot ceremony unit keeps default dependencies (ordering cycle with sysext/confext); re-pin the medium to a fixed appliance digest"
+! printf '%s\n' "$ceremony_effective" | grep -Eq '^Unit\.(After|Before)=.*systemd-tmpfiles-setup\.service' \
+  || die "the pinned appliance's first-boot ceremony unit orders against tmpfiles-setup (ordering cycle with sysext/confext); re-pin the medium"
+! printf '%s\n' "$ceremony_effective" | grep -Eq '^Unit\.(After|Before)=.*sysinit\.target' \
+  || die "the pinned appliance's first-boot ceremony unit orders against sysinit.target (cycle with sshd.socket); re-pin the medium"
+while IFS= read -r private_tmp; do
+  case "$private_tmp" in
+    no|false|off|0|disconnected) ;;
+    *) die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=$private_tmp, which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium" ;;
+  esac
+done < <(ceremony_values 'Service\.PrivateTmp')
+unset -f ceremony_values
+log "first-boot ceremony unit verified on the pinned appliance (effective config over ${#ceremony_sources[@]} file(s): DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges, no /etc override)"
+
 # The medium runs with a permissive container-signature policy so bootc can read
 # its own local image through whatever transport it picks -- containers-storage
 # while the media is written, oci:/proc/self/fd/N during copy-to-storage. See
@@ -2203,14 +2400,14 @@ bg_stop
 # 7) Escrow the recovery keys: back up to the USB ESP + show the CLIENT key.
 # --------------------------------------------------------------------------- #
 stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-usb_esp="$(lsblk -rno NAME,FSTYPE "/dev/$live_disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')"
+usb_esp="$(media_vfat_partition || true)"
 usb_saved="(USB backup FAILED — record the key shown below NOW)"
 esp_mp=""; esp_we_mounted=0
 if [[ -n "${usb_esp:-}" ]]; then
   # The live system ALREADY mounts the USB EFI partition (e.g. at /boot/efi), so
   # mounting it a second time fails. Reuse the existing mountpoint (remount rw);
   # only mount it ourselves if it is not mounted yet.
-  esp_mp="$(findmnt -nfo TARGET "/dev/$usb_esp" 2>/dev/null | head -1)"
+  esp_mp="$(mounted_at "/dev/$usb_esp" || true)"
   if [[ -n "$esp_mp" ]]; then
     mount -o remount,rw "$esp_mp" 2>/dev/null || true
   else

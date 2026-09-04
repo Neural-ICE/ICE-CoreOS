@@ -51,12 +51,17 @@ BASE_IMAGE="${BASE_IMAGE:-}"
 # Defaulting to the exact BASE_IMAGE preserves byte identity through installation.
 TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}"
 INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
+# skopeo 1.13.3 and the pinned bootc-image-builder cannot consume a local
+# containers-storage image by config digest. This name is only a transport
+# handle. When the caller does not supply one, it is made task-unique from the
+# atomic build result below rather than sharing the mutable build tag.
+INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
 OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
 OUT_NAME="${OUT_NAME:-}"            # if set, copy the final raw to <REPO>/<OUT_NAME>.img
 BG_SRC="${BG_SRC:-${REPO_ROOT}/image/branding/grub-bg.png}"
-CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer.toml}"
+CONFIG="${CONFIG:-${REPO_ROOT}/image/config-installer-default-size.toml}"
 BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
 # LAB-MANAGED media may carry ONE operator public key on the ESP. The expected
 # hash is mandatory so a mutable build-host pathname cannot silently change the
@@ -70,6 +75,8 @@ LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
 LAB_BASELINE_SIGNATURE_FILE="${LAB_BASELINE_SIGNATURE_FILE:-}"
 LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
 LAB_BASELINE_STAGE_ROOT=""
+INSTALLER_IID_DIR=""
+INSTALLER_IID_FILE=""
 LAB_BASELINE_HELPER="$REPO_ROOT/ota/neural-ice-lab-baseline-handoff.sh"
 # --------------------------------------------------------------------------- #
 # 🔴 THE SIGNED RELEASE AUTHORIZATION A REGISTRY MEDIUM CANNOT BOOT WITHOUT
@@ -190,12 +197,21 @@ source "$REPO_ROOT/image/lib/access-policy.sh"
 source "$REPO_ROOT/image/installer/neural-ice-sealed-cmdline-grammar.sh"
 
 cleanup_lab_baseline_stage() {
+  if [[ -n "$INSTALLER_IID_FILE" ]]; then
+    rm -f -- "$INSTALLER_IID_FILE"
+    INSTALLER_IID_FILE=""
+  fi
+  if [[ -n "$INSTALLER_IID_DIR" ]]; then
+    rmdir -- "$INSTALLER_IID_DIR" 2>/dev/null || true
+    INSTALLER_IID_DIR=""
+  fi
   if [[ -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
     chmod -R u+w -- "$LAB_BASELINE_STAGE_ROOT" 2>/dev/null || true
     rm -rf -- "$LAB_BASELINE_STAGE_ROOT"
     LAB_BASELINE_STAGE_ROOT=""
   fi
 }
+trap cleanup_lab_baseline_stage EXIT
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
@@ -222,6 +238,10 @@ cleanup_lab_baseline_stage() {
 TARGET_PROOF_REF="${TARGET_PROOF_REF:-$TARGET_IMGREF}"
 [[ "$TARGET_PROOF_REF" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: TARGET_PROOF_REF must be a digest-pinned OCI reference" >&2; exit 1; }
+if [[ -n "$INSTALLER_STORAGE_NAME" ]]; then
+  [[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+    || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
+fi
 
 if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
   if command -v skopeo >/dev/null 2>&1; then
@@ -276,7 +296,6 @@ case "$lab_baseline_input_count" in
       || { echo "ERROR: LAB baseline must be bound to the exact installed image digest" >&2; exit 1; }
     LAB_BASELINE_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ni-lab-baseline-media.XXXXXX")"
     chmod 0700 "$LAB_BASELINE_STAGE_ROOT"
-    trap cleanup_lab_baseline_stage EXIT
     bash "$LAB_BASELINE_HELPER" stage-media \
       "$LAB_BASELINE_BOM_FILE" "$LAB_BASELINE_BOM_SHA256" \
       "$LAB_BASELINE_SIGNATURE_FILE" "$LAB_BASELINE_SIGNATURE_SHA256" \
@@ -339,7 +358,18 @@ if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
     || { echo "ERROR: an operator SSH key requires a lab-managed base image (immutable access policy is '${base_policy:-unreadable}')" >&2; exit 1; }
   echo "    (base image access policy: ${base_policy} — an installer SSH key is permitted)"
 fi
+# Podman creates its iidfile only after the build commits. Do not pre-create the
+# file with the invoking user's 0600 ownership: rootful Podman/Buildah may write
+# it from a remapped process and then fail after a successful image commit with
+# EACCES. A private task-owned directory gives the writer an absent pathname
+# while preserving atomic, non-shared capture of this exact build result.
+INSTALLER_IID_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ni-installer-image-id.XXXXXX")"
+chmod 0700 "$INSTALLER_IID_DIR"
+INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
+[[ ! -e "$INSTALLER_IID_FILE" ]] \
+  || { echo "ERROR: the private installer iidfile path already exists" >&2; exit 1; }
 sudo podman build --pull=never --platform linux/arm64 \
+  --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
@@ -347,36 +377,50 @@ sudo podman build --pull=never --platform linux/arm64 \
 # 🔴 ONE IMMUTABLE IDENTITY, RESOLVED HERE AND NOWHERE ELSE (review 2026-09-01,
 # P1 #1).
 #
-# `$INSTALLER_IMG` is a local TAG, i.e. a mutable pointer. Everything after this
-# line used to name it: the marker reads, the measured-identity list, the sealed
-# root build, the sealed store staging, the dracut run and bootc-image-builder.
-# Each of those is a separate resolution, and a concurrent build or a `podman
-# tag` between any two of them produced a medium whose halves are different
-# images -- both correctly hashed, both correctly signed, and installing bytes
-# the medium's own checks assume are something else.
+# `$INSTALLER_IMG` is a local TAG, i.e. a mutable pointer. Podman's iidfile is
+# written atomically by this exact build; resolving the shared tag afterwards
+# would let a concurrent successful build substitute its identity in the small
+# interval between build completion and `image inspect`.
 #
-# The tag is resolved ONCE, immediately after the build that produced it, and
-# every step below is handed $INSTALLER_IMAGE_REF instead. The tag is re-resolved
-# at the end and must not have moved: a build that raced with another one is a
-# refusal, not a medium.
+# Every step below receives that iidfile identity. A task-unique compatibility
+# tag is then bound from the immutable ID only for old skopeo/BIB consumers.
+# The shared build tag is still re-checked: movement is a refusal, not a medium.
 # --------------------------------------------------------------------------- #
-INSTALLER_IMAGE_ID="$(sudo podman image inspect --format '{{.Id}}' "$INSTALLER_IMG" 2>/dev/null \
-  | tr -d '[:space:]' | sed 's/^sha256://')"
+INSTALLER_IMAGE_REF="$(sudo cat -- "$INSTALLER_IID_FILE" | tr -d '[:space:]')"
+rm -f -- "$INSTALLER_IID_FILE"
+INSTALLER_IID_FILE=""
+rmdir -- "$INSTALLER_IID_DIR"
+INSTALLER_IID_DIR=""
+[[ "$INSTALLER_IMAGE_REF" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: podman build wrote no valid immutable identity to its iidfile" >&2; exit 1; }
+INSTALLER_IMAGE_ID="${INSTALLER_IMAGE_REF#sha256:}"
 [[ "$INSTALLER_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] \
   || { echo "ERROR: the installer image build produced no resolvable immutable image ID" >&2; exit 1; }
 readonly INSTALLER_IMAGE_ID
-readonly INSTALLER_IMAGE_REF="sha256:${INSTALLER_IMAGE_ID}"
+readonly INSTALLER_IMAGE_REF
+if [[ -z "$INSTALLER_STORAGE_NAME" ]]; then
+  INSTALLER_STORAGE_NAME="localhost/ice-coreos-installer:build-${INSTALLER_IMAGE_ID:0:16}"
+fi
+[[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+  || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
+sudo podman tag "$INSTALLER_IMAGE_REF" "$INSTALLER_STORAGE_NAME"
+readonly INSTALLER_STORAGE_NAME
 echo "    installer image id: ${INSTALLER_IMAGE_REF} (every step below names this, never the tag)"
 
 # Assert the tag still points at the image this build produced. Called after each
 # step that could span a concurrent build.
 assert_installer_tag_unmoved() { # $1=what has just been done
-  local now
+  local now storage_now
   now="$(sudo podman image inspect --format '{{.Id}}' "$INSTALLER_IMG" 2>/dev/null \
     | tr -d '[:space:]' | sed 's/^sha256://')"
   [[ "$now" == "$INSTALLER_IMAGE_ID" ]] \
     || { echo "ERROR: ${INSTALLER_IMG} moved from ${INSTALLER_IMAGE_ID} to '${now:-nothing}' during $1; refusing to produce a medium assembled from two different images" >&2; exit 1; }
+  storage_now="$(sudo podman image inspect --format '{{.Id}}' "$INSTALLER_STORAGE_NAME" 2>/dev/null \
+    | tr -d '[:space:]' | sed 's/^sha256://')"
+  [[ "$storage_now" == "$INSTALLER_IMAGE_ID" ]] \
+    || { echo "ERROR: installer storage name ${INSTALLER_STORAGE_NAME} resolves to '${storage_now:-nothing}', not ${INSTALLER_IMAGE_ID}, during $1; refusing a mutable transport handle that is not bound to the sealed image" >&2; exit 1; }
 }
+assert_installer_tag_unmoved "the initial immutable-name binding"
 
 # --------------------------------------------------------------------------- #
 # The medium's THREE identities must agree BEFORE anything is sealed: the
@@ -435,6 +479,7 @@ sudo env \
   ROOT_IMAGE_OUT="$SEALED_DIR/installer-root.img" \
   STORE_IMAGE_OUT="$SEALED_DIR/installer-store.img" \
   STORE_IMAGE_NAME="$STORE_IMAGE_NAME" \
+  INSTALLER_STORAGE_NAME="$INSTALLER_STORAGE_NAME" \
   bash "$REPO_ROOT/image/build-installer-root.sh" \
   || { echo "ERROR: cannot build the sealed installer root and store" >&2; exit 1; }
 sudo chown -R "$(id -u):$(id -g)" "$SEALED_DIR" 2>/dev/null || true
@@ -464,21 +509,41 @@ assert_installer_tag_unmoved "the sealed root and store build"
 # the one that was signed.
 # --------------------------------------------------------------------------- #
 echo "==> build the installer initramfs (dracut + neural-ice-installer-verity)"
-DRACUT_MODULE="$SEALED_DIR/dracut-module"
-rm -rf -- "$DRACUT_MODULE"; mkdir -p "$DRACUT_MODULE"
-cp -- "$REPO_ROOT/image/initramfs/90neural-ice-installer-verity"/*.sh "$DRACUT_MODULE/"
-cp -- "$REPO_ROOT/image/lib/installer-payload.sh" "$DRACUT_MODULE/installer-payload.sh"
+DRACUT_VERITY_MODULE="$SEALED_DIR/dracut-module-verity"
+DRACUT_TPM_MODULE="$SEALED_DIR/dracut-module-tpm-policy"
+rm -rf -- "$DRACUT_VERITY_MODULE" "$DRACUT_TPM_MODULE"
+mkdir -p "$DRACUT_VERITY_MODULE" "$DRACUT_TPM_MODULE"
+cp -- "$REPO_ROOT/image/initramfs/90neural-ice-installer-verity"/*.sh "$DRACUT_VERITY_MODULE/"
+cp -- "$REPO_ROOT/image/lib/installer-payload.sh" "$DRACUT_VERITY_MODULE/installer-payload.sh"
+cp -- "$REPO_ROOT/image/initramfs/91neural-ice-tpm-policy"/*.sh "$DRACUT_TPM_MODULE/"
+cp -- "$REPO_ROOT/image/initramfs/91neural-ice-tpm-policy"/*.service "$DRACUT_TPM_MODULE/"
+cp -- "$REPO_ROOT/image/initramfs/91neural-ice-tpm-policy"/*.conf "$DRACUT_TPM_MODULE/"
+cp -- "$REPO_ROOT/image/lib/tpm2-nv-public.sh" "$DRACUT_TPM_MODULE/tpm2-nv-public.sh"
+printf 'neural-ice-signed-installer-initramfs-v1\n' > "$DRACUT_TPM_MODULE/installer-media"
+chmod 0444 "$DRACUT_TPM_MODULE/installer-media"
 sudo podman run --rm --entrypoint '' \
-  -v "$DRACUT_MODULE":/ni-dracut:ro \
+  -v "$DRACUT_VERITY_MODULE":/ni-dracut-verity:ro \
+  -v "$DRACUT_TPM_MODULE":/ni-dracut-tpm-policy:ro \
   -v "$SEALED_DIR":/ni-out \
   "$INSTALLER_IMAGE_REF" bash -euxo pipefail -c '
     kver="$(ls -1 /usr/lib/modules | head -1)"
     [ -n "$kver" ]
     install -d -m 0755 /usr/lib/dracut/modules.d/90neural-ice-installer-verity
-    cp /ni-dracut/*.sh /usr/lib/dracut/modules.d/90neural-ice-installer-verity/
+    cp /ni-dracut-verity/*.sh /usr/lib/dracut/modules.d/90neural-ice-installer-verity/
     chmod 0755 /usr/lib/dracut/modules.d/90neural-ice-installer-verity/*.sh
-    dracut --force --no-hostonly --reproducible --add neural-ice-installer-verity \
+    install -d -m 0755 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy
+    cp /ni-dracut-tpm-policy/*.sh /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/
+    chmod 0755 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/*.sh
+    cp /ni-dracut-tpm-policy/installer-media /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/
+    chmod 0444 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/installer-media
+    dracut --force --no-hostonly --reproducible \
+      --add "neural-ice-installer-verity neural-ice-tpm-policy" \
       --kver "$kver" /ni-out/installer-initramfs.img
+    cmp <(lsinitrd -f /var/lib/dracut/hooks/pre-trigger/01-neural-ice-tpm-policy.sh \
+      /ni-out/installer-initramfs.img) /ni-dracut-tpm-policy/neural-ice-tpm-policy.sh
+    [ "$(lsinitrd -f /etc/neural-ice/installer-media /ni-out/installer-initramfs.img)" \
+      = neural-ice-signed-installer-initramfs-v1 ]
+    lsinitrd -f /usr/bin/tpm2_getcap /ni-out/installer-initramfs.img >/dev/null
     cp "/usr/lib/modules/$kver/vmlinuz" /ni-out/vmlinuz
     cp /usr/lib/os-release /ni-out/os-release
     # systemd-stub, from the image rather than the build host: the stub that
@@ -576,11 +641,18 @@ case "$MEDIA_MODE" in
     DEVICE_CHANNEL="${DEVICE_CHANNEL:-lab}"
     [[ "$DEVICE_CHANNEL" =~ ^(lab|beta|stable)$ ]] \
       || { echo "ERROR: DEVICE_CHANNEL must be lab, beta or stable" >&2; exit 1; }
-    UKI_KARGS=("quiet" "systemd.unit=neural-ice-installer.target" \
+    UKI_KARGS=("quiet" "rd.systemd.gpt_auto=0" "luks=0" "systemd.unit=neural-ice-installer.target" \
       "neuralice.autoinstall=1" "enforcing=0" \
       "neuralice.device_channel=${DEVICE_CHANNEL}" \
       "neuralice.release_authority=${RELEASE_AUTHORITY}" \
       "neuralice.imgref=${TARGET_IMGREF}")
+    if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+      # The ESP copy is operator-visible convenience, not authority. Seal the
+      # already validated public key into the signed UKI so replacing mutable
+      # vfat bytes cannot choose who gains access to the installed appliance.
+      _sshkey_b64="$(base64 -w0 < "$SSH_AUTHORIZED_KEYS_FILE")"
+      UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")
+    fi
     for _policy_file in "$PCR_POLICY_PUBLIC_KEY_FILE" "$PCR_POLICY_SIGNATURE_FILE"; do
       [[ -f "$_policy_file" && ! -L "$_policy_file" && -s "$_policy_file" ]] \
         || { echo "ERROR: signed PCR policy input is absent: $_policy_file" >&2; exit 1; }
@@ -708,7 +780,8 @@ case "$MEDIA_MODE" in
     # and its only permitted target. The early generator uses this closed pair
     # to suppress inherited installed-appliance lifecycles without inventing a
     # mutable menu/default path or opening a root login.
-    UKI_KARGS=("quiet" "systemd.unit=neural-ice-live.target" "neuralice.live=1")
+    UKI_KARGS=("quiet" "rd.systemd.gpt_auto=0" "luks=0" \
+      "systemd.unit=neural-ice-live.target" "neuralice.live=1")
     [[ "$INSTALL_SOURCE" == medium && -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
       || { echo "ERROR: a Live medium installs nothing; INSTALL_SOURCE/OS_IMAGE/INSTALL_MIRROR are meaningless on one" >&2; exit 1; }
     ;;
@@ -754,11 +827,12 @@ SEALED_MODE="$(ni_sealed_cmdline_classify "$SEALED_CMDLINE")" \
   || { echo "ERROR: the sealed command line is a '${SEALED_MODE}' medium but this build was asked for '${MEDIA_MODE}'" >&2; exit 1; }
 echo "    sealed selector grammar : ${SEALED_MODE} (accepted by the same reader the medium boots with)"
 echo "==> bootc-image-builder --type raw  (${INSTALLER_IMAGE_REF})  config=${CONFIG}"
+assert_installer_tag_unmoved "the immediate pre-bootc-image-builder binding"
 sudo podman run --rm --privileged --security-opt label=type:unconfined_t \
   -v /var/lib/containers/storage:/var/lib/containers/storage \
   -v "$OUT":/output \
   -v "$CONFIG":/config.toml:ro \
-  "$BIB" build --type raw --local --config /config.toml "$INSTALLER_IMAGE_REF"
+  "$BIB" build --type raw --local --config /config.toml "$INSTALLER_STORAGE_NAME"
 assert_installer_tag_unmoved "the bootc-image-builder run"
 
 RAW="$OUT/image/disk.raw"
@@ -813,7 +887,7 @@ done
 
 PAYLOADPART_BYTES="$(part_bytes "$PAYLOADPART")"
 (( PAYLOADPART_BYTES >= PAYLOAD_BYTES )) \
-  || { echo "ERROR: the sealed payload is ${PAYLOAD_BYTES} bytes and the data partition holds only ${PAYLOADPART_BYTES}; raise customizations.filesystem minsize in ${CONFIG}" >&2; exit 1; }
+  || { echo "ERROR: the sealed payload is ${PAYLOAD_BYTES} bytes and BIB's raw data partition holds only ${PAYLOADPART_BYTES}; refusing rather than guessing a filesystem size" >&2; exit 1; }
 # Grow the payload image to the FULL partition, sparsely. Writing it then
 # overwrites every ostree byte in one pass -- the holes read back as the zeros
 # the header implies -- instead of leaving a tail of the old deployment behind
@@ -851,7 +925,7 @@ done
 [[ -n "$ESPPART" ]] || { echo "ERROR: installer ESP not found" >&2; exit 1; }
 echo "    remaking the ESP (${ESPPART}) with a single signed EFI authority"
 zero_partition "$ESPPART"
-sudo mkfs.fat -F32 -n EFI-SYSTEM "$ESPPART" >/dev/null \
+sudo mkfs.fat -F32 -n NI-INSTALL "$ESPPART" >/dev/null \
   || { echo "ERROR: cannot remake the installer ESP" >&2; exit 1; }
 sudo partx -u "$LOOP" 2>/dev/null || true
 sudo udevadm settle

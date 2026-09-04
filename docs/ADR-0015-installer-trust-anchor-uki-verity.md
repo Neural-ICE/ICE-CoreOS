@@ -601,18 +601,24 @@ and not only in an exit status.
   offsets are computed rather than discovered, and the sealed cmdline's key order
   is a constant. `image/build-installer-uki.sh` emits a manifest that CI diffs, so
   a changed root hash or cmdline is a one-line diff rather than 40 MiB of PE.
-- **Runtime dependencies, all already in the image.** `veritysetup`, `losetup`
-  and the `overlay` module are needed in the INITRAMFS (dracut pulls them in via
-  `module-setup.sh`), and `tpm2_nvdefine` / `tpm2_nvincrement` / `tpm2_nvwrite` /
+- **Runtime dependencies are made explicit in the image.** `veritysetup`,
+  `losetup` and the `overlay` module are needed in the INITRAMFS (dracut pulls
+  them in via `module-setup.sh`). CentOS Stream 10's `cryptsetup` is a multicall
+  binary, so the installer image creates the omitted `/usr/sbin/veritysetup`
+  link. `tpm2_nvdefine` / `tpm2_nvincrement` / `tpm2_nvwrite` /
   `tpm2_nvwritelock` / `tpm2_nvreadpublic` / `tpm2_startauthsession` /
   `tpm2_policycommandcode` / `tpm2_policyor` join the tpm2-tools the device root
   already uses. `objcopy`, `mksquashfs` and `skopeo` are build-side only;
   `cosign`, `python3` and `openssl` were already the image's verification stack.
+  The EL10 ARM64 UKI stub is installed from the pinned
+  `systemd-boot-unsigned` package.
 - **The medium's shape changed** (amendment 2026-09-01 §B, §C). Two partitions
   carry anything: an ESP holding exactly `\EFI\BOOT\BOOTAA64.EFI` and one UKI
   build manifest, and `ni-installer-payload` holding the sealed payload. Every
-  other partition is zero. `image/config-installer.toml`'s filesystem must be
-  sized for the sealed payload, and the build refuses when it does not fit.
+  other partition is zero. The pinned BIB rejects filesystem customization for
+  raw images, so `image/config-installer-default-size.toml` intentionally leaves
+  its default layout unchanged; the producer measures the resulting data
+  partition and refuses the build when the sealed payload does not fit.
 - **`bootc image copy-to-storage` is gone.** The booted system is not an ostree
   deployment, so there was nothing for it to copy; the bytes are staged at build
   time and installed from in place through a read-only additional image store.

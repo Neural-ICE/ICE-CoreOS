@@ -65,38 +65,47 @@ done
 [[ -n "$out" ]] || exit 2
 cp "$MOCK_TPM_KEY_DER" "$out"
 EOF
-# A real TPM emits ECDSA as raw r||s with `-f plain`. Producing exactly that
-# shape is what makes the helper's DER encoder a tested component rather than an
-# assumption.
+# The helper must ask for `-f tss` (the TCG-marshalled TPMT_SIGNATURE, stable
+# across tpm2-tools releases) — `-f plain` is DER on tpm2-tools 5.6 and raw r||s
+# on older releases, and a QEMU first boot refused on that drift. The mock
+# refuses any other format and emits exactly the TPMT_SIGNATURE a TPM returns
+# (ECDSA, SHA-256, 32-byte r and s), so the helper's parser and DER encoder are
+# tested components rather than assumptions.
 cat > "$TOOLS/tpm2_sign" <<'EOF'
 #!/usr/bin/env bash
-out=""; message=""
+out=""; message=""; format=""
 while (( $# )); do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    -c|-g|-s|-f) shift 2 ;;
+    -f) format="$2"; shift 2 ;;
+    -c|-g|-s) shift 2 ;;
     -Q) shift ;;
     *) message="$1"; shift ;;
   esac
 done
 [[ -n "$out" && -n "$message" ]] || exit 2
+[[ "$format" == tss ]] || { echo "mock tpm2_sign: only -f tss is stable across releases" >&2; exit 2; }
 [[ ! -e "$MOCK_STATE/sign-fail" ]] || exit 7
+# Crafted TPMT_SIGNATURE bytes, emitted verbatim: the parser's refusals are
+# tested against exact malformed structures, not against whatever OpenSSL signs.
+if [[ -f "$MOCK_STATE/sign-tss-override" ]]; then cp "$MOCK_STATE/sign-tss-override" "$out"; exit 0; fi
 tmp="$(mktemp)"
 openssl dgst -sha256 -sign "$MOCK_TPM_KEY" -out "$tmp" "$message" || exit 2
 python3 - "$tmp" "$out" <<'PY'
 import sys
 
 der = open(sys.argv[1], "rb").read()
-# Minimal DER SEQUENCE{INTEGER r, INTEGER s} -> the 64-byte r||s a TPM returns.
+# Minimal DER SEQUENCE{INTEGER r, INTEGER s} -> marshalled TPMT_SIGNATURE:
+# sigAlg TPM_ALG_ECDSA, hashAlg TPM_ALG_SHA256, TPM2B r, TPM2B s.
 assert der[0] == 0x30
 body = der[2:] if der[1] < 0x80 else der[2 + (der[1] & 0x7F):]
-out = b""
+out = (0x0018).to_bytes(2, "big") + (0x000B).to_bytes(2, "big")
 index = 0
 for _ in range(2):
     assert body[index] == 0x02
     length = body[index + 1]
     value = body[index + 2 : index + 2 + length].lstrip(b"\x00")
-    out += value.rjust(32, b"\x00")
+    out += (32).to_bytes(2, "big") + value.rjust(32, b"\x00")
     index += 2 + length
 open(sys.argv[2], "wb").write(out)
 PY
@@ -390,6 +399,68 @@ refuse_enrol customer-locked nvidia-gb10-arm64 not-a-policy                 1 "$
 refuse_enrol customer-locked nvidia-gb10-arm64 neural-ice-secureboot-lab-v1 0 "$TS"
 refuse_enrol customer-locked nvidia-gb10-arm64 neural-ice-secureboot-lab-v1 1 yesterday
 refuse_enrol customer-locked nvidia-gb10-arm64 neural-ice-secureboot-lab-v1 1 "$TS" extra
+
+# --------------------------------------------------------------------------- #
+# 5b) THE TPMT_SIGNATURE PARSER REFUSES EVERYTHING BUT ECDSA-P256/SHA-256 WITH
+#     32-BYTE r AND s, AND ITS DER ENCODER FOLLOWS X.690 (minimal, positive
+#     INTEGERs). Deterministic vectors: a wrong algorithm, a wrong hash, a short
+#     parameter, a truncated structure and trailing bytes each refuse BEFORE any
+#     anchor is written; high-bit and leading-zero scalars encode exactly.
+# --------------------------------------------------------------------------- #
+tss_vector() { # $1=output  $2=sigAlg hex  $3=hashAlg hex  $4=r hex  $5=s hex  [$6=trailing hex]
+  python3 - "$@" <<'PY'
+import sys
+out, sig_alg, hash_alg, r, s = sys.argv[1:6]
+trailing = sys.argv[6] if len(sys.argv) > 6 else ""
+def tpm2b(h): b = bytes.fromhex(h); return len(b).to_bytes(2, "big") + b
+open(out, "wb").write(bytes.fromhex(sig_alg) + bytes.fromhex(hash_alg) + tpm2b(r) + tpm2b(s) + bytes.fromhex(trailing))
+PY
+}
+R32="$(printf '11%.0s' $(seq 32))"; S32="$(printf '22%.0s' $(seq 32))"
+refuse_tss() { # $1=label; the vector is already in place
+  local dir="$TMP/tss-$1"; mkdir -p "$dir"; identity "$dir/device-root-v1.json"
+  local err; err="$(anchor enroll "$dir/device-root-v1.json" "$dir" customer-locked \
+    nvidia-gb10-arm64 neural-ice-secureboot-lab-v1 1 "$TS" 2>&1 >/dev/null)" \
+    && fail "enrolment accepted a TPMT_SIGNATURE that is not ECDSA-P256/SHA-256: $1"
+  grep -Fq 'not an ECDSA-P256/SHA-256 TPMT_SIGNATURE' <<< "$err" \
+    || fail "TPMT_SIGNATURE vector '$1' refused for the wrong reason: $err"
+  if [ -e "$dir/access-profile-v1.json" ] || [ -e "$dir/access-profile-v1.sig" ]; then
+    fail "a refused TPMT_SIGNATURE ($1) still left an anchor behind"
+  fi
+  rm -f "$MOCK_STATE/sign-tss-override"
+}
+tss_vector "$MOCK_STATE/sign-tss-override" 0014 000b "$R32" "$S32";         refuse_tss rsassa-sigalg
+tss_vector "$MOCK_STATE/sign-tss-override" 0018 000c "$R32" "$S32";         refuse_tss sha384-hashalg
+tss_vector "$MOCK_STATE/sign-tss-override" 0018 000b "${R32:2}" "$S32";     refuse_tss short-r
+tss_vector "$MOCK_STATE/sign-tss-override" 0018 000b "$R32" "${S32}33";     refuse_tss long-s
+tss_vector "$MOCK_STATE/sign-tss-override" 0018 000b "$R32" "$S32" 00;      refuse_tss trailing-byte
+tss_vector "$MOCK_STATE/sign-tss-override" 0018 000b "$R32" "$S32"
+head -c 60 "$MOCK_STATE/sign-tss-override" > "$MOCK_STATE/truncated" \
+  && mv "$MOCK_STATE/truncated" "$MOCK_STATE/sign-tss-override";            refuse_tss truncated
+: > "$MOCK_STATE/sign-tss-override";                                        refuse_tss empty
+
+# The DER encoder, in isolation: a high-bit scalar gets a 0x00 pad (33-byte
+# INTEGER), leading zeros are stripped (never a non-minimal INTEGER), and an
+# all-zero scalar encodes as the single byte 0x00. openssl asn1parse is the
+# independent oracle, and the encoded r/s must round-trip byte for byte.
+tss_to_der_direct() { # $1=tss  $2=der — the helper's function, its python3 resolved to PATH
+  bash -c 'tool() { command -v "$1"; }; eval "$(sed -n "/^tss_to_der() {/,/^}/p" "$0")"; tss_to_der "$1" "$2"' \
+    "$SCRIPT" "$1" "$2"
+}
+HIGH_R="80$(printf '01%.0s' $(seq 31))"; ZERO_S="0000$(printf '7f%.0s' $(seq 30))"
+tss_vector "$TMP/der-in.tss" 0018 000b "$HIGH_R" "$ZERO_S"
+tss_to_der_direct "$TMP/der-in.tss" "$TMP/der-out.der" || fail "the DER encoder refused a valid TPMT_SIGNATURE"
+der_ints="$(openssl asn1parse -inform DER -in "$TMP/der-out.der" | awk -F'[: ]+' '/INTEGER/ { print tolower($NF) }' | tr '\n' ' ')"
+[ "$der_ints" = "$(tr '[:upper:]' '[:lower:]' <<< "$HIGH_R ${ZERO_S#0000} ")" ] \
+  || fail "DER INTEGERs do not round-trip r and s: $der_ints"
+# SEQUENCE(0x43) = INTEGER(33: pad + high-bit r) + INTEGER(30: s minus two
+# leading zero bytes).
+[ "$(xxd -p "$TMP/der-out.der" | tr -d '\n' | cut -c1-8)" = "30430221" ] \
+  || fail "high-bit r must be a 33-byte padded INTEGER and leading-zero s a 30-byte one (SEQUENCE 0x43)"
+tss_vector "$TMP/der-zero.tss" 0018 000b "$(printf '00%.0s' $(seq 32))" "$S32"
+tss_to_der_direct "$TMP/der-zero.tss" "$TMP/der-zero.der" || fail "the DER encoder refused an all-zero scalar"
+[ "$(openssl asn1parse -inform DER -in "$TMP/der-zero.der" | grep -c 'INTEGER *:00$')" = 1 ] \
+  || fail "an all-zero scalar must encode as INTEGER 00"
 
 # --------------------------------------------------------------------------- #
 # 6) THE TEST OVERRIDE MUST NOT BE A PRODUCTION BYPASS.

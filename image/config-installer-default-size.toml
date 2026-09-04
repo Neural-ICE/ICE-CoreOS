@@ -1,0 +1,3 @@
+# Intentionally empty: the pinned bootc-image-builder rejects
+# customizations.filesystem for raw images. Its default layout is accepted only
+# when the producer's measured payload-fit check also succeeds.

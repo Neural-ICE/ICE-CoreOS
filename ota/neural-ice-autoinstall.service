@@ -40,10 +40,10 @@ RuntimeDirectoryPreserve=yes
 # Conditions are intentionally not used here: a skipped required service is not
 # a failure.  This executable preflight makes an absent, duplicated or partial
 # signed selector fail the required installer target and isolate recovery.
-ExecStartPre=/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check
+ExecStartPre=/bin/bash -c '/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check || { rc=$?; printf "schema=neural-ice-installer-failure-evidence-v1\ncode=install-failed-startup\nphase=0\nphase_total=8\nstage=startup-generator\ndetail=2114bb6f4c84\n" > /run/neural-ice-installer-failure/evidence; exit "$rc"; }'
 # The TPM char device is udev-driven; make sure it exists before preflight.
 # Accept either node — the installer's own TPM preflight takes tpmrm0 OR tpm0.
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do { [ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ]; } && exit 0; sleep 1; done; echo "no /dev/tpmrm0 or /dev/tpm0" >&2; exit 1'
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do { [ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ]; } && exit 0; sleep 1; done; printf "schema=neural-ice-installer-failure-evidence-v1\ncode=install-failed-startup\nphase=0\nphase_total=8\nstage=startup-tpm\ndetail=385a1442a4ba\n" > /run/neural-ice-installer-failure/evidence; echo "no /dev/tpmrm0 or /dev/tpm0" >&2; exit 1'
 ExecStart=/usr/local/bin/neural-ice-autoinstall.sh
 # Interactive console: we must be able to DISPLAY and READ [Enter].
 StandardInput=tty-force

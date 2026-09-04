@@ -40,6 +40,7 @@ set -uo pipefail
 # Test seam: available only to an unprivileged process outside a release image.
 readonly RELEASE_IMAGE_MARKER=/usr/lib/neural-ice/release-image
 if [[ -n ${NEURALICE_FAILURE_EVIDENCE:-} || -n ${NEURALICE_FAILURE_POLICY:-} \
+   || -n ${NEURALICE_EFI_FAILURE_EVIDENCE:-} \
    || ${1:-} == --dry-run ]]; then
   [[ $EUID -ne 0 ]] || { printf 'neural-ice-installer-failure: test overrides are forbidden to root\n' >&2; exit 2; }
   [[ ! -e $RELEASE_IMAGE_MARKER ]] \
@@ -47,6 +48,7 @@ if [[ -n ${NEURALICE_FAILURE_EVIDENCE:-} || -n ${NEURALICE_FAILURE_POLICY:-} \
 fi
 readonly EVIDENCE_FILE="${NEURALICE_FAILURE_EVIDENCE:-/run/neural-ice-installer-failure/evidence}"
 readonly POLICY_FILE="${NEURALICE_FAILURE_POLICY:-/usr/lib/neural-ice/installer-failure-policy}"
+readonly EFI_EVIDENCE_FILE="${NEURALICE_EFI_FAILURE_EVIDENCE:-/sys/firmware/efi/efivars/NeuralICEInstallerFailure-870a0500-25d2-574e-a1cc-79a69630bf96}"
 DRY_RUN=0
 case "${1:-}" in
   '')        ;;
@@ -98,6 +100,16 @@ value() { # $1=key
   printf '%s' "${got:-unclassified}"
 }
 
+persist_efi_evidence() {
+  local payload
+  printf -v payload 'schema=%s\ncode=%s\nphase=%s\nphase_total=%s\nstage=%s\ndetail=%s\n' \
+    "$EVIDENCE_SCHEMA" "$(value code)" "$(value phase)" "$(value phase_total)" \
+    "$(value stage)" "$(value detail)"
+  if [[ -d "${EFI_EVIDENCE_FILE%/*}" && ! -L "$EFI_EVIDENCE_FILE" ]]; then
+    printf '\x07\x00\x00\x00%s' "$payload" > "$EFI_EVIDENCE_FILE" 2>/dev/null || true
+  fi
+}
+
 # --------------------------------------------------------------------------- #
 # THE TERMINAL ACTION, READ FROM THE SIGNED ROOT. The policy file lives in the
 # dm-verity-protected /usr the UKI's .cmdline seals by root hash, so the action
@@ -131,6 +143,7 @@ read_policy() { # -> "<action> <delay-seconds>"
 }
 
 read_evidence
+persist_efi_evidence
 read -r ACTION DELAY <<<"$(read_policy)"
 readonly ACTION DELAY
 

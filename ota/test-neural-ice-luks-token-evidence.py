@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -11,8 +13,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "ota/neural-ice-luks-token-evidence.py"
-SRK = bytes(range(64))
+SRK_BODY = bytes(range(90))
+SRK = struct.pack(">H", len(SRK_BODY)) + SRK_BODY
+SRK_NAME = b"\x00\x0b" + hashlib.sha256(SRK_BODY).digest()
+SERIALIZED_SRK = (
+    struct.pack(">I", 0x81000001)
+    + struct.pack(">H", len(SRK_NAME))
+    + SRK_NAME
+    + struct.pack(">I", 1)
+    + SRK
+)
 BLOB = bytes(range(96))
+PUBKEY = bytes(range(32, 128))
 POLICY = "ab" * 32
 
 
@@ -21,10 +33,12 @@ def token() -> dict[str, object]:
         "type": "systemd-tpm2",
         "keyslots": ["1"],
         "tpm2-blob": base64.b64encode(BLOB).decode(),
-        "tpm2-pcrs": [7],
+        "tpm2-pcrs": [],
+        "tpm2_pubkey": base64.b64encode(PUBKEY).decode(),
+        "tpm2_pubkey_pcrs": [7],
         "tpm2-pcr-bank": "sha256",
         "tpm2-policy-hash": POLICY,
-        "tpm2_srk": base64.b64encode(SRK).decode(),
+        "tpm2_srk": base64.b64encode(SERIALIZED_SRK).decode(),
     }
 
 
@@ -69,13 +83,17 @@ def main() -> None:
             "tpm2-pcr-bank",
             "tpm2-policy-hash",
             "tpm2-blob",
+            "tpm2_pubkey",
+            "tpm2_pubkey_pcrs",
             "tpm2_srk",
         ]:
             changed = metadata(); del changed["tokens"]["0"][field]
             refused(work, changed, f"missing {field}")
         for field, wrong in [
             ("keyslots", ["2"]),
-            ("tpm2-pcrs", [0, 7]),
+            ("tpm2-pcrs", [7]),
+            ("tpm2_pubkey", "AA=="),
+            ("tpm2_pubkey_pcrs", [0, 7]),
             ("tpm2-pcr-bank", "sha1"),
             ("tpm2-policy-hash", "AB" * 32),
             ("tpm2-blob", "AA=="),
@@ -91,6 +109,16 @@ def main() -> None:
         refused(work, missing_keyslot, "missing referenced keyslot")
         noncanonical = metadata(); noncanonical["tokens"]["0"]["tpm2_srk"] += "\n"
         refused(work, noncanonical, "noncanonical base64")
+        wrong_handle = metadata()
+        wrong_handle["tokens"]["0"]["tpm2_srk"] = base64.b64encode(
+            struct.pack(">I", 0x81000002) + SERIALIZED_SRK[4:]
+        ).decode()
+        refused(work, wrong_handle, "wrong persistent SRK handle")
+        wrong_name = metadata()
+        changed_name = bytearray(SERIALIZED_SRK)
+        changed_name[10] ^= 1
+        wrong_name["tokens"]["0"]["tpm2_srk"] = base64.b64encode(changed_name).decode()
+        refused(work, wrong_name, "unauthenticated SRK public area")
         duplicate_json = '{"keyslots":{},"keyslots":{},"tokens":{}}'
         result = run(work, {}, raw=duplicate_json)
         assert result.returncode == 1, "duplicate JSON key accepted"

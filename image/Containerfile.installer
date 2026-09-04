@@ -14,11 +14,83 @@ FROM ${BASE_IMAGE}
 
 # All the partitioning/encryption tools required by the auto-install are
 # already in the CentOS Stream 10 bootc base: sfdisk/partx/wipefs/blkid/lsblk
-# (util-linux), cryptsetup, systemd-cryptenroll, mkfs.fat/ext4/xfs. Nothing to add
-# -> the installer stays free of any extra package.
+# (util-linux), cryptsetup, systemd-cryptenroll, mkfs.fat/ext4/xfs.
+# `veritysetup` is a distinct EL10 package: a symlink to cryptsetup resolves by
+# name but silently exposes the LUKS applet, which cannot activate dm-verity.
+# Install the package release matching the base image's cryptsetup exactly.
+# The ARM64 systemd UKI stub is split into
+# systemd-boot-unsigned on EL10. Fetch the exact ARM64 RPM and verify the
+# checksum published in the CentOS Stream 10 AppStream primary metadata. A
+# mirror removal may stop a rebuild, but mutable metadata or bytes can never
+# silently change the installer at this revision.
+RUN stub_rpm=/tmp/systemd-boot-unsigned-257-31.el10.aarch64.rpm \
+    && curl --proto '=https' --tlsv1.2 --fail --show-error --silent --location \
+      --output "$stub_rpm" \
+      https://mirror.stream.centos.org/10-stream/AppStream/aarch64/os/Packages/systemd-boot-unsigned-257-31.el10.aarch64.rpm \
+    && printf '%s  %s\n' \
+      d4370eabdbd2085b5e1679cf68f577bf9288ad22f8077f8f274c56857d342300 \
+      "$stub_rpm" | sha256sum --check --strict \
+    && dnf --disablerepo='*' -y install "$stub_rpm" \
+    && rm -f "$stub_rpm" \
+    && verity_evr="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' cryptsetup)" \
+    && dnf --disablerepo='nvidia*' -y install \
+      "veritysetup-${verity_evr}" \
+      fuse-overlayfs-1.17-1.el10.aarch64 \
+    && dnf clean all \
+    && test ! -L /usr/sbin/veritysetup \
+    && veritysetup --help | grep -Fq -- '--panic-on-corruption' \
+    && test "$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' fuse-overlayfs)" = 1.17-1.el10.aarch64 \
+    && test -x /usr/bin/fuse-overlayfs \
+    && test -s /usr/lib/systemd/boot/efi/linuxaa64.efi.stub
+
+# The live UKI is rebuilt below by build-installer-usb.sh, but bootc installs
+# the source image's prebuilt /usr/lib/modules/<kver>/initramfs.img. Copying only
+# into the live dracut workspace therefore leaves first boot on the stale hook
+# inherited from BASE_IMAGE. Stage the checkout's complete installed-boot module
+# and regenerate that one generic initramfs now; the installer build then carries
+# the same bounded ESP coldplug and TPM policy parser on both sides of the reboot.
+COPY image/initramfs/91neural-ice-tpm-policy/module-setup.sh \
+     /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/module-setup.sh
+COPY image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh \
+     /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh
+COPY image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.service \
+     /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/neural-ice-tpm-policy.service
+COPY image/initramfs/91neural-ice-tpm-policy/systemd-cryptsetup-policy.conf \
+     /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/systemd-cryptsetup-policy.conf
+COPY image/lib/tpm2-nv-public.sh \
+     /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/tpm2-nv-public.sh
+RUN bash -euxo pipefail -c '\
+    shopt -s nullglob; \
+    kernels=(/usr/lib/modules/*); \
+    (( ${#kernels[@]} == 1 )); \
+    kver=${kernels[0]##*/}; \
+    initramfs=${kernels[0]}/initramfs.img; \
+    chmod 0755 \
+      /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/module-setup.sh \
+      /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh; \
+    chmod 0644 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/tpm2-nv-public.sh; \
+    chmod 0644 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/neural-ice-tpm-policy.service; \
+    chmod 0644 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/systemd-cryptsetup-policy.conf; \
+    dracut --force --no-hostonly --reproducible --kver "$kver" "$initramfs"; \
+    cmp \
+      <(lsinitrd -f /var/lib/dracut/hooks/pre-trigger/01-neural-ice-tpm-policy.sh "$initramfs") \
+      /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh; \
+    marker=$(lsinitrd -f /etc/neural-ice/installer-media "$initramfs" 2>/dev/null || true); \
+    if [[ -n "$marker" ]]; then \
+      echo "installed initramfs unexpectedly carries the installer-media marker" >&2; \
+      exit 1; \
+    fi; \
+    lsinitrd -f /usr/lib/systemd/system/neural-ice-tpm-policy.service "$initramfs" \
+      | grep -F "Before=cryptsetup-pre.target" >/dev/null; \
+    lsinitrd -f /etc/systemd/system/systemd-cryptsetup@.service.d/10-neural-ice-policy.conf "$initramfs" \
+      | grep -F "Requires=neural-ice-tpm-policy.service" >/dev/null'
 
 # Auto-install service (gated by the neuralice.autoinstall kernel argument).
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
+# Keep the destructive pre-activation token readback on the same checkout as
+# the installer. A stale helper inherited from BASE_IMAGE can invert the
+# PolicyAuthorize contract and reject a correctly enrolled target.
+COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luks-token-evidence
 COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-baseline-handoff
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
 COPY image/installer/neural-ice-installer.target \
@@ -89,6 +161,7 @@ COPY ota/neural-ice-device-root-installer-only.conf \
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
       /usr/local/libexec/neural-ice-lab-baseline-handoff \
+      /usr/libexec/neural-ice-luks-token-evidence \
       /usr/libexec/neural-ice-device-root \
       /usr/libexec/neural-ice-tpm-state \
       /usr/libexec/neural-ice-live-diagnostics \
@@ -98,8 +171,9 @@ RUN set -euxo pipefail; \
       /usr/lib/neural-ice/installer-failure-policy \
       /usr/lib/neural-ice/registry-authorisation.py; \
     bash -n /usr/libexec/neural-ice-installer-failure; \
-    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
-      /usr/lib/neural-ice/registry-authorisation.py; \
+    python3 -c 'import ast,sys; [ast.parse(open(path).read()) for path in sys.argv[1:]]' \
+      /usr/lib/neural-ice/registry-authorisation.py \
+      /usr/libexec/neural-ice-luks-token-evidence; \
     # 🔴 THE MARKER THAT MAKES THE INSTALLER'S TEST SEAM IMPOSSIBLE HERE.
     # ota/neural-ice-autoinstall.sh consults an environment override for its
     # command-line file, sealed grammar, library directory, verity mount points,

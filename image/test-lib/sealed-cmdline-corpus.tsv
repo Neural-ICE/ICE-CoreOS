@@ -35,9 +35,14 @@
 # THE TWO GRAMMARS A PRODUCER MAY CUT.
 # --------------------------------------------------------------------------- #
 install	yes	install: the exact produced Install line	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos@sha256:1111111111111111111111111111111111111111111111111111111111111111
+install	yes	install: the verified overlay disables GPT auto-root	quiet rd.systemd.gpt_auto=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
+refuse:duplicate-word	yes	install: duplicate GPT auto-root control	quiet rd.systemd.gpt_auto=0 rd.systemd.gpt_auto=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
+install	yes	install: inherited appliance crypttab disabled in live root	quiet luks=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
+refuse:duplicate-word	yes	install: duplicate live crypttab control	quiet luks=0 luks=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
 install	yes	install: without the optional OTA origin	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
 refuse:invalid-argument:neuralice.imgref	yes	origin: a MUTABLE TAG as the OTA origin every later upgrade follows	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos:stable
 live	yes	live: the exact produced Live line	quiet systemd.unit=neural-ice-live.target neuralice.live=1
+live	yes	live: inherited appliance crypttab disabled in diagnostics root	quiet luks=0 systemd.unit=neural-ice-live.target neuralice.live=1
 
 # --------------------------------------------------------------------------- #
 # THE REGISTRY-BACKED INSTALL. Supported, and only in exactly this shape.

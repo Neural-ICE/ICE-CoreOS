@@ -145,7 +145,7 @@ first_write_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luks
 # The SERVICE keeps its independent preflight: two readers of one grammar is the
 # point, and removing either is a regression rather than a tidy-up.
 AUTOINSTALL_UNIT="$ROOT/ota/neural-ice-autoinstall.service"
-grep -qx 'ExecStartPre=/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check' \
+grep -Fq 'ExecStartPre=/bin/bash -c '\''/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check || { rc=$?;' \
   "$AUTOINSTALL_UNIT" \
   || fail "the autoinstall unit lost its independent executable preflight"
 
@@ -295,6 +295,10 @@ while IFS=$'\t' read -r expected anchor label words; do
       || fail "[$label] the runtime generator refused a valid Install line"
     for unit in neural-ice-installer.target neural-ice-autoinstall.service; do
       masked "$TMP/v$vectors" "$unit" && fail "[$label] Install mode masked its own $unit"
+    done
+    for unit in neural-ice-sovereignty-egress.service neural-ice-sovereignty-egress.timer; do
+      masked "$TMP/v$vectors" "$unit" \
+        || fail "[$label] Install mode left inherited appliance lifecycle unit $unit reachable"
     done
     masked "$TMP/v$vectors" neural-ice-live.target \
       || fail "[$label] Install mode left the Live target reachable"

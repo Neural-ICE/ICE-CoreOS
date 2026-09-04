@@ -28,6 +28,7 @@ on:
       - "image/test-*.sh"
       - "image/*.py"
       - "image/build-*.sh"
+      - "image/config-installer*.toml"
       - "image/firstboot/**"
       - "image/lib/**"
       - "image/policy/**"
@@ -135,6 +136,7 @@ on:
       - "image/test-*.sh"
       - "image/*.py"
       - "image/build-*.sh"
+      - "image/config-installer*.toml"
       - "image/firstboot/**"
       - "image/lib/**"
       - "image/policy/**"
@@ -241,7 +243,8 @@ jobs:
             image/test-installer-media.sh image/test-installer-payload.sh image/test-installer-selector-grammar.sh \
             image/test-installer-ssh-key.sh image/test-installer-systemd-lifecycle.sh image/test-installer-trust.sh \
             image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
-            image/test-preloaded-sizing.sh image/test-registry-authorisation.sh image/test-release-authorization.sh \
+            image/test-preloaded-sizing.sh image/qualify-installer-qemu.sh image/test-qualify-installer-qemu.sh \
+            image/test-registry-authorisation.sh image/test-release-authorization.sh \
             image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-signing-trust.sh image/test-tpm-ceremony-systemd.sh \
             image/test-tpm-policy-initramfs.sh \
             image/test-verify-preloaded-media.sh ota/neural-ice-access-profile-anchor.sh ota/neural-ice-autoinstall.sh \
@@ -412,6 +415,10 @@ jobs:
           sudo ./image/test-installer-ssh-key.sh --root-seam-negative-only
           ./image/test-tpm-policy-initramfs.sh
           sudo ./image/test-tpm-policy-initramfs.sh
+          # The QEMU qualification harness grammar (arguments, refusals, expect/
+          # reject contract) is offline; the harness itself runs only on the
+          # KVM-capable GB10 host.
+          ./image/test-qualify-installer-qemu.sh
           ./image/test-seed-firstboot-import.sh
           ./ota/test-autoinstall-kargs.sh
           ./ota/test-neural-ice-tpm-state.sh
