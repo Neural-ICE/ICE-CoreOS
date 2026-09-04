@@ -24,6 +24,17 @@ grep -Fq 'systemd-cryptsetup@.service.d/10-neural-ice-policy.conf' \
   "$ROOT_DIR/image/initramfs/91neural-ice-tpm-policy/module-setup.sh"
 grep -Fq 'Requires=neural-ice-tpm-policy.service' \
   "$ROOT_DIR/image/initramfs/91neural-ice-tpm-policy/systemd-cryptsetup-policy.conf"
+# Initrd cleanup stops udev before switch-root. Keep udev available and ordered
+# for policy staging without propagating that intentional stop into cryptsetup.
+grep -Fxq 'Wants=systemd-udevd.service' \
+  "$ROOT_DIR/image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.service"
+if grep -Fxq 'Requires=systemd-udevd.service' \
+    "$ROOT_DIR/image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.service"; then
+  echo "TPM policy service hard-requires udev and can tear down the unlocked sysroot" >&2
+  exit 1
+fi
+grep -Fxq 'After=systemd-udevd.service' \
+  "$ROOT_DIR/image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.service"
 grep -Fq 'Before=cryptsetup-pre.target' \
   "$ROOT_DIR/image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.service"
 grep -Fq 'NEURALICE_TPM_POLICY_SERVICE=1' \
