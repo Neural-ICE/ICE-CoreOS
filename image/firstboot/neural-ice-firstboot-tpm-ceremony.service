@@ -1,7 +1,13 @@
 [Unit]
 Description=Neural ICE mandatory TPM owner ceremony and runtime trust gate
 Documentation=https://github.com/Neural-ICE/ICE-CoreOS/blob/main/docs/ADR-0015-installer-trust-anchor-uki-verity.md
-After=local-fs.target systemd-tmpfiles-setup.service
+# DefaultDependencies would After=basic.target and cycle with sshd.socket
+# (After=sysinit, Before=sockets). The pinned image also After=tmpfiles-setup;
+# systemd-sysext Requires this unit and is Before=tmpfiles-setup, which is
+# already a cycle. Do not After= or Before= tmpfiles or sysinit: consumers
+# already After= this unit, and sysext's Before=tmpfiles pulls it early enough.
+DefaultDependencies=no
+After=local-fs.target
 Before=network-pre.target network.target network-online.target systemd-user-sessions.service sshd.service
 OnFailure=emergency.target
 OnFailureJobMode=isolate
@@ -12,11 +18,16 @@ Type=oneshot
 ExecStart=/usr/libexec/neural-ice-firstboot-tpm-ceremony
 RemainAfterExit=yes
 UMask=0077
-RuntimeDirectory=neural-ice-owner-ceremony
+# ProtectSystem=strict remounts /run read-only except RuntimeDirectory and
+# ReadWritePaths. The ceremony execs device-root, tpm-state, access-profile
+# anchor and cryptsetup, each of which install(1)s its own /run directory.
+RuntimeDirectory=neural-ice-owner-ceremony neural-ice-device-root neural-ice-tpm-state neural-ice-access-profile-anchor
 RuntimeDirectoryMode=0700
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/neural-ice/ota /run/neural-ice-owner-ceremony
+ReadWritePaths=/var/lib/neural-ice/ota /run/neural-ice-owner-ceremony /run/neural-ice-device-root /run/neural-ice-tpm-state /run/neural-ice-access-profile-anchor /run/cryptsetup
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 RequiredBy=multi-user.target

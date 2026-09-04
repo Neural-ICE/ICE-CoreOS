@@ -374,7 +374,16 @@ make_rootfs
 USB="$ROOT/image/build-installer-usb.sh"
 grep -Fq -- '--iidfile "$INSTALLER_IID_FILE"' "$USB" \
   || fail "the media producer does not atomically capture the exact podman build result"
-grep -Fq 'INSTALLER_IMAGE_REF="$(tr -d '"'"'[:space:]'"'"' < "$INSTALLER_IID_FILE")"' "$USB" \
+grep -Fq 'INSTALLER_IID_DIR="$(mktemp -d ' "$USB" \
+  || fail "the media producer does not isolate its atomic iidfile in a private directory"
+grep -Fq 'INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"' "$USB" \
+  || fail "the media producer does not give Podman an absent iidfile path"
+grep -Fq '[[ ! -e "$INSTALLER_IID_FILE" ]]' "$USB" \
+  || fail "the media producer can hand Podman a pre-existing, permission-incompatible iidfile"
+if grep -F 'INSTALLER_IID_FILE="$(mktemp ' "$USB" >/dev/null; then
+  fail "the media producer pre-creates Podman's iidfile"
+fi
+grep -Fq 'INSTALLER_IMAGE_REF="$(sudo cat -- "$INSTALLER_IID_FILE" | tr -d '"'"'[:space:]'"'"')"' "$USB" \
   || fail "the media producer does not consume the atomic iidfile"
 grep -Fq 'readonly INSTALLER_IMAGE_REF' "$USB" \
   || fail "the media producer keeps no single immutable reference"
@@ -422,7 +431,7 @@ grep -Fq "BIB's raw data partition holds only" "$USB" \
   || fail "the producer no longer refuses a sealed payload that does not fit"
 
 # The immutable installer image must contain both producer-side UKI tools that
-# the EL10 base omitted: cryptsetup's multicall link and the ARM64 systemd stub.
+# the EL10 base omitted: the real veritysetup applet and the ARM64 systemd stub.
 INSTALLER_CONTAINERFILE="$ROOT/image/Containerfile.installer"
 grep -Fq -- 'systemd-boot-unsigned-257-31.el10.aarch64.rpm' \
   "$INSTALLER_CONTAINERFILE" \
@@ -432,10 +441,73 @@ grep -Fq -- 'd4370eabdbd2085b5e1679cf68f577bf9288ad22f8077f8f274c56857d342300' \
   || fail "the pinned systemd-boot-unsigned RPM has no immutable checksum"
 grep -Fq -- "dnf --disablerepo='*' -y install \"\$stub_rpm\"" "$INSTALLER_CONTAINERFILE" \
   || fail "the verified local RPM install can still resolve mutable repository packages"
-grep -Fq 'ln -s /usr/sbin/cryptsetup /usr/sbin/veritysetup' "$INSTALLER_CONTAINERFILE" \
-  || fail "the cryptsetup multicall veritysetup link is not created"
-grep -Fq 'veritysetup --help' "$INSTALLER_CONTAINERFILE" \
-  || fail "the installer image build does not prove veritysetup resolves"
+grep -Fq 'verity_evr="$(rpm -q --qf' "$INSTALLER_CONTAINERFILE" \
+  || fail "the veritysetup package is not pinned to the base cryptsetup release"
+grep -Fq '"veritysetup-${verity_evr}"' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the real EL10 veritysetup package is not installed"
+grep -Fq 'fuse-overlayfs-1.17-1.el10.aarch64' "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer does not pin the overlay helper required by its sealed store"
+grep -Fq "test -x /usr/bin/fuse-overlayfs" "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer image build does not prove the pinned overlay helper is executable"
+grep -Fq 'test ! -L /usr/sbin/veritysetup' "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer image build does not reject the broken cryptsetup symlink"
+grep -Fq 'COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luks-token-evidence' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer silently inherits a stale destructive token validator from its base image"
+grep -Fq 'COPY image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer image does not carry the first-boot ceremony sysinit drop-in"
+grep -Fq 'COPY image/firstboot/neural-ice-firstboot-tpm-ceremony.service' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer image does not carry the first-boot ceremony unit override"
+grep -Fq 'COPY image/firstboot/neural-ice-firstboot-ceremony-generator' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer image does not carry the first-boot ceremony generator"
+grep -Fq '/usr/lib/neural-ice/firstboot-tpm-ceremony.service' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not replace the first-boot ceremony unit on the deployment"
+grep -Fq '/usr/lib/neural-ice/firstboot-ceremony-sysinit.conf' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not stage the first-boot ceremony sysinit drop-in onto the deployment"
+grep -Fq '/etc/systemd/system-generators/neural-ice-firstboot-ceremony' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not stage the first-boot ceremony systemd generator"
+grep -Fq 'chcon -t systemd_unit_file_t' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not relabel the first-boot ceremony unit overlay after setfiles"
+grep -Fq 'chcon -t systemd_generic_generator_exec_t' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not relabel the first-boot ceremony generator after setfiles"
+grep -Fq -- '--karg "systemd.mask=systemd-sysext.service"' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not mask systemd-sysext to break the first-boot ceremony/tmpfiles cycle"
+grep -Fq -- '--karg "systemd.mask=systemd-confext.service"' \
+  "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not mask systemd-confext to break the first-boot ceremony/tmpfiles cycle"
+grep -Fq 'COPY image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installed deployment silently inherits a stale TPM initramfs hook from its base image"
+grep -Fq 'COPY image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.service' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installed deployment has no ordered TPM policy staging service before cryptsetup"
+grep -Fq 'COPY image/initramfs/91neural-ice-tpm-policy/systemd-cryptsetup-policy.conf' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "a direct dracut cryptsetup start does not require TPM policy staging"
+grep -Fq 'dracut --force --no-hostonly --reproducible --kver "$kver" "$initramfs"' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installed deployment does not regenerate its initramfs after staging the local TPM hook"
+grep -Fq 'installed initramfs unexpectedly carries the installer-media marker' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installed initramfs is not proved distinct from the virgin-only installer initramfs"
+grep -Fq 'lsinitrd -f /usr/lib/systemd/system/neural-ice-tpm-policy.service' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installed initramfs is not proved to contain the cryptsetup ordering service"
+grep -Fq 'lsinitrd -f /etc/systemd/system/systemd-cryptsetup@.service.d/10-neural-ice-policy.conf' \
+  "$INSTALLER_CONTAINERFILE" \
+  || fail "the installed initramfs is not proved to order direct cryptsetup starts after policy staging"
+grep -Fq "grep -Fq -- '--panic-on-corruption'" "$INSTALLER_CONTAINERFILE" \
+  || fail "the installer image build does not prove the required verity option exists"
 grep -Fq 'test -s /usr/lib/systemd/boot/efi/linuxaa64.efi.stub' "$INSTALLER_CONTAINERFILE" \
   || fail "the installer image build does not prove the ARM64 UKI stub is present"
 
@@ -468,11 +540,38 @@ grep -Fq 'additionalimagestores = ["$STORE_MOUNT"]' "$AUTOINSTALL" \
   || fail "the installer does not register the verified store as a read-only additional image store"
 grep -Fq 'export CONTAINERS_STORAGE_CONF="$INSTALLER_STORAGE_CONF"' "$AUTOINSTALL" \
   || fail "the installer's own podman calls do not use the storage configuration it wrote"
+grep -Fq 'graphroot = "$INSTALLER_STORAGE_GRAPHROOT"' "$AUTOINSTALL" \
+  || fail "the installer does not keep its writable image graph off the verified root overlay"
+grep -Fq 'runroot = "$INSTALLER_STORAGE_RUNROOT"' "$AUTOINSTALL" \
+  || fail "the installer does not keep its containers runroot in the runtime tmpfs"
+grep -Fq 'mount_program = "/usr/bin/fuse-overlayfs"' "$AUTOINSTALL" \
+  || fail "the installer does not select the mount program used to produce its sealed overlay store"
+grep -Fq 'readonly INSTALLER_STORAGE_ROOT=/run/neural-ice-container-runtime' "$AUTOINSTALL" \
+  || fail "the writable container runtime can share the verified installer's mount hierarchy"
+grep -Fq 'mount -t tmpfs -o nodev,nosuid,mode=0755' "$AUTOINSTALL" \
+  || fail "the installer assumes /run is tmpfs instead of mounting a proved writable storage backing"
+grep -Fq 'findmnt -n -o FSTYPE --target "$INSTALLER_STORAGE_GRAPHROOT"' "$AUTOINSTALL" \
+  || fail "the installer does not prove that its writable container graph is backed by tmpfs"
+grep -Fq '|| die "the installer'\''s writable container storage is not backed by tmpfs"' "$AUTOINSTALL" \
+  || fail "the installer does not refuse an overlay-on-overlay writable container graph"
+grep -Fq '"installer image store after writable-runtime mount"' "$AUTOINSTALL" \
+  || fail "the installer does not re-prove its sealed store after mounting the writable runtime"
+grep -Fq 'media_vfat_partition()' "$AUTOINSTALL" \
+  || fail "the installer has no pipefail-safe ESP selector"
+if grep -E 'lsblk .*awk .*exit' "$AUTOINSTALL" >/dev/null; then
+  fail "the installer can SIGPIPE lsblk while selecting the ESP"
+fi
 # The WHOLE command, not a substring of it: an assertion that matched
 # `true image exists …` would survive the control being removed.
 exists_line="$(line_of 'podman --cgroup-manager=cgroupfs --events-backend=file image exists "$STORE_IMAGE_NAME"')"
 [ -n "$exists_line" ] \
   || fail "the installer never asks podman to resolve the image in the verified store"
+create_line="$(line_of 'create --network=none --name "$_medium_probe" --entrypoint /usr/bin/true')"
+[ -n "$create_line" ] \
+  || fail "the installer never creates its sealed-store no-exec preflight container"
+mount_line="$(line_of 'mount "$_medium_probe"')"
+[ -n "$mount_line" ] \
+  || fail "the installer never proves a sealed-store container can be mounted without execution before wiping the target"
 grep -Fq '|| die "the verified image store does not offer ${STORE_IMAGE_NAME}' "$AUTOINSTALL" \
   || fail "the installer does not REFUSE when the verified store offers no installable image"
 destructive_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luksFormat)' \
@@ -480,10 +579,20 @@ destructive_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luks
 [ -n "$destructive_line" ] || fail "cannot locate the first destructive write in the autoinstaller"
 [ "$exists_line" -lt "$destructive_line" ] \
   || fail "the store is proved resolvable at line $exists_line, AFTER the first disk write at line $destructive_line"
+[ "$create_line" -lt "$destructive_line" ] \
+  || fail "the store is proved container-creatable at line $create_line, AFTER the first disk write at line $destructive_line"
+[ "$mount_line" -lt "$destructive_line" ] \
+  || fail "the store is proved mountable at line $mount_line, AFTER the first disk write at line $destructive_line"
 grep -Fq -- '-v "$STORE_MOUNT:$STORE_MOUNT:ro"' "$AUTOINSTALL" \
   || fail "the bootc container cannot see the verified store"
+grep -Fq -- '-v "$INSTALLER_STORAGE_ROOT:$INSTALLER_STORAGE_ROOT"' "$AUTOINSTALL" \
+  || fail "the bootc container cannot see the proved tmpfs-backed writable storage runtime"
 grep -Fq -- '-v "$INSTALLER_STORAGE_CONF:/etc/containers/storage.conf:ro"' "$AUTOINSTALL" \
   || fail "the bootc container resolves containers-storage against its own configuration, not the medium's"
+grep -Fq -- '-e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf' "$AUTOINSTALL" \
+  || fail "bootc can ignore the bound complete storage config and load appliance defaults"
+grep -Fq -- '-v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro"' "$AUTOINSTALL" \
+  || fail "the appliance seed-store drop-in can override the installer's sealed additional image store"
 # The object must not change between the proof and the install: a second,
 # writable store shadowing `localhost/bootc` is exactly what the digest re-check
 # exists to see.

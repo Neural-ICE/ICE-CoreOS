@@ -412,6 +412,21 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
         (( ${seen[quiet]:-0} == 1 )) || { _ni_sealed_refuse duplicate-word; return 1; }
         continue
         ;;
+      rd.systemd.gpt_auto=0)
+        # The signed initramfs mounts its own dm-verity-backed overlay at
+        # /sysroot. systemd-gpt-auto must not race it or wait for a second root.
+        (( ${seen[rd.systemd.gpt_auto]:-0} == 1 )) \
+          || { _ni_sealed_refuse duplicate-word; return 1; }
+        continue
+        ;;
+      luks=0)
+        # The verified root is also the appliance image being installed. Its
+        # /etc/crypttab belongs to the future target, not to this live boot:
+        # reacting to freshly-created *-luks labels would race the installer.
+        (( ${seen[luks]:-0} == 1 )) \
+          || { _ni_sealed_refuse duplicate-word; return 1; }
+        continue
+        ;;
       "$NI_SEALED_INSTALL_TARGET"|"$NI_SEALED_LIVE_TARGET")
         continue
         ;;

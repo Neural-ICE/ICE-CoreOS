@@ -136,6 +136,28 @@ for required in '--tpm2-pcrs=' '--tpm2-public-key="$PCR_POLICY_KEY_RUNTIME"' \
     || fail "the signed PCR policy install gate is incomplete: $required"
 done
 
+# Execute the exact inline validator used before the target disk is selected.
+# systemd's signed-PCR JSON stores `pol` as 64 lowercase hexadecimal characters
+# (the emitter and the real-TPM proof use that format), not as base64.
+awk 'index($0, "<<'\''PCR_POLICY_PY'\''") {copy=1; next}
+     copy && $0 == "PCR_POLICY_PY" {exit}
+     copy {print}' "$AUTOINSTALL" > "$TMP/pcr-policy-validator.py"
+grep -q '^import json, re, sys$' "$TMP/pcr-policy-validator.py" \
+  || fail "cannot extract the installer's PCR policy validator"
+policy_digest="$(printf 'a%.0s' {1..64})"
+printf '{"sha256":[{"pol":"%s"}]}\n' "$policy_digest" > "$TMP/pcr-policy.json"
+python3 "$TMP/pcr-policy-validator.py" "$TMP/pcr-policy.json" "$policy_digest" \
+  || fail "the installer refuses the exact hexadecimal PolicyPCR digest emitted for systemd"
+printf '{"sha256":[{"pol":"YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="}]}\n' \
+  > "$TMP/pcr-policy.json"
+if python3 "$TMP/pcr-policy-validator.py" "$TMP/pcr-policy.json" "$policy_digest"; then
+  fail "the installer accepts a base64 lookalike instead of systemd's hexadecimal PolicyPCR digest"
+fi
+printf '{"sha256":[{"pol":"%s"}]}\n' "${policy_digest/a/b}" > "$TMP/pcr-policy.json"
+if python3 "$TMP/pcr-policy-validator.py" "$TMP/pcr-policy.json" "$policy_digest"; then
+  fail "the installer accepts a different PolicyPCR digest"
+fi
+
 # All installer-created firstboot inputs are atomically published and fsynced
 # before the recovery-key prompt can permit the first installed boot.
 for required in \

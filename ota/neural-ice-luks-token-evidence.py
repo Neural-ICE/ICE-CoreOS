@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 
@@ -40,6 +41,33 @@ def canonical_base64(value: object, field: str) -> bytes:
     return decoded
 
 
+def serialized_srk_public(value: bytes) -> bytes:
+    # systemd stores an Esys_TR_Serialize() record in `tpm2_srk`, while
+    # `systemd-analyze srk` emits the embedded TPM2B_PUBLIC. Keep this parser
+    # closed: handle || TPM2B_NAME || has-resource || TPM2B_PUBLIC, no suffix.
+    if len(value) < 4 + 2 + 34 + 4 + 2:
+        raise Refusal("tpm2_srk serialization is too short")
+    handle = struct.unpack_from(">I", value, 0)[0]
+    if handle != 0x81000001:
+        raise Refusal("tpm2_srk does not name persistent handle 0x81000001")
+    name_size = struct.unpack_from(">H", value, 4)[0]
+    name_end = 6 + name_size
+    if name_size != 34 or name_end + 4 + 2 > len(value):
+        raise Refusal("tpm2_srk carries no canonical sha256 TPM Name")
+    name = value[6:name_end]
+    if name[:2] != b"\x00\x0b":
+        raise Refusal("tpm2_srk Name does not use sha256")
+    if struct.unpack_from(">I", value, name_end)[0] != 1:
+        raise Refusal("tpm2_srk is not a serialized public resource")
+    public = value[name_end + 4 :]
+    public_size = struct.unpack_from(">H", public, 0)[0]
+    if public_size == 0 or public_size + 2 != len(public):
+        raise Refusal("tpm2_srk TPM2B_PUBLIC has a non-canonical length")
+    if hashlib.sha256(public[2:]).digest() != name[2:]:
+        raise Refusal("tpm2_srk Name does not authenticate its TPM2B_PUBLIC")
+    return public
+
+
 def evidence(metadata_path: Path, expected_srk_path: Path) -> dict[str, object]:
     try:
         metadata = json.loads(
@@ -71,8 +99,10 @@ def evidence(metadata_path: Path, expected_srk_path: Path) -> dict[str, object]:
         raise Refusal("systemd-tpm2 token does not name one existing canonical keyslot")
     keyslot = token_keyslots[0]
 
-    if token.get("tpm2-pcrs") != [7]:
-        raise Refusal("systemd-tpm2 token is not bound to exactly PCR 7")
+    if token.get("tpm2-pcrs") != []:
+        raise Refusal("systemd-tpm2 token carries a literal PCR policy")
+    if token.get("tpm2_pubkey_pcrs") != [7]:
+        raise Refusal("systemd-tpm2 signed policy is not bound to exactly PCR 7")
     if token.get("tpm2-pcr-bank") != "sha256":
         raise Refusal("systemd-tpm2 token does not use the sha256 PCR bank")
     policy_hash = token.get("tpm2-policy-hash")
@@ -82,7 +112,11 @@ def evidence(metadata_path: Path, expected_srk_path: Path) -> dict[str, object]:
     blob = canonical_base64(token.get("tpm2-blob"), "tpm2-blob")
     if len(blob) < 32:
         raise Refusal("systemd-tpm2 sealed object is implausibly short")
-    srk = canonical_base64(token.get("tpm2_srk"), "tpm2_srk")
+    pubkey = canonical_base64(token.get("tpm2_pubkey"), "tpm2_pubkey")
+    if len(pubkey) < 32:
+        raise Refusal("systemd-tpm2 policy public key is implausibly short")
+    serialized_srk = canonical_base64(token.get("tpm2_srk"), "tpm2_srk")
+    srk = serialized_srk_public(serialized_srk)
     try:
         expected_srk = expected_srk_path.read_bytes()
     except OSError as error:
@@ -96,6 +130,7 @@ def evidence(metadata_path: Path, expected_srk_path: Path) -> dict[str, object]:
         "pcr_bank": "sha256",
         "pcrs": [7],
         "policy_hash": policy_hash,
+        "policy_public_key_sha256": hashlib.sha256(pubkey).hexdigest(),
         "schema": "neural-ice-luks-token-evidence-v1",
         "sealed_object_sha256": hashlib.sha256(blob).hexdigest(),
         "srk_sha256": hashlib.sha256(srk).hexdigest(),

@@ -75,6 +75,7 @@ LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
 LAB_BASELINE_SIGNATURE_FILE="${LAB_BASELINE_SIGNATURE_FILE:-}"
 LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
 LAB_BASELINE_STAGE_ROOT=""
+INSTALLER_IID_DIR=""
 INSTALLER_IID_FILE=""
 LAB_BASELINE_HELPER="$REPO_ROOT/ota/neural-ice-lab-baseline-handoff.sh"
 # --------------------------------------------------------------------------- #
@@ -199,6 +200,10 @@ cleanup_lab_baseline_stage() {
   if [[ -n "$INSTALLER_IID_FILE" ]]; then
     rm -f -- "$INSTALLER_IID_FILE"
     INSTALLER_IID_FILE=""
+  fi
+  if [[ -n "$INSTALLER_IID_DIR" ]]; then
+    rmdir -- "$INSTALLER_IID_DIR" 2>/dev/null || true
+    INSTALLER_IID_DIR=""
   fi
   if [[ -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
     chmod -R u+w -- "$LAB_BASELINE_STAGE_ROOT" 2>/dev/null || true
@@ -353,8 +358,16 @@ if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
     || { echo "ERROR: an operator SSH key requires a lab-managed base image (immutable access policy is '${base_policy:-unreadable}')" >&2; exit 1; }
   echo "    (base image access policy: ${base_policy} — an installer SSH key is permitted)"
 fi
-INSTALLER_IID_FILE="$(mktemp "${TMPDIR:-/tmp}/ni-installer-image-id.XXXXXX")"
-chmod 0600 "$INSTALLER_IID_FILE"
+# Podman creates its iidfile only after the build commits. Do not pre-create the
+# file with the invoking user's 0600 ownership: rootful Podman/Buildah may write
+# it from a remapped process and then fail after a successful image commit with
+# EACCES. A private task-owned directory gives the writer an absent pathname
+# while preserving atomic, non-shared capture of this exact build result.
+INSTALLER_IID_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ni-installer-image-id.XXXXXX")"
+chmod 0700 "$INSTALLER_IID_DIR"
+INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
+[[ ! -e "$INSTALLER_IID_FILE" ]] \
+  || { echo "ERROR: the private installer iidfile path already exists" >&2; exit 1; }
 sudo podman build --pull=never --platform linux/arm64 \
   --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
@@ -373,9 +386,11 @@ sudo podman build --pull=never --platform linux/arm64 \
 # tag is then bound from the immutable ID only for old skopeo/BIB consumers.
 # The shared build tag is still re-checked: movement is a refusal, not a medium.
 # --------------------------------------------------------------------------- #
-INSTALLER_IMAGE_REF="$(tr -d '[:space:]' < "$INSTALLER_IID_FILE")"
+INSTALLER_IMAGE_REF="$(sudo cat -- "$INSTALLER_IID_FILE" | tr -d '[:space:]')"
 rm -f -- "$INSTALLER_IID_FILE"
 INSTALLER_IID_FILE=""
+rmdir -- "$INSTALLER_IID_DIR"
+INSTALLER_IID_DIR=""
 [[ "$INSTALLER_IMAGE_REF" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: podman build wrote no valid immutable identity to its iidfile" >&2; exit 1; }
 INSTALLER_IMAGE_ID="${INSTALLER_IMAGE_REF#sha256:}"
@@ -494,21 +509,41 @@ assert_installer_tag_unmoved "the sealed root and store build"
 # the one that was signed.
 # --------------------------------------------------------------------------- #
 echo "==> build the installer initramfs (dracut + neural-ice-installer-verity)"
-DRACUT_MODULE="$SEALED_DIR/dracut-module"
-rm -rf -- "$DRACUT_MODULE"; mkdir -p "$DRACUT_MODULE"
-cp -- "$REPO_ROOT/image/initramfs/90neural-ice-installer-verity"/*.sh "$DRACUT_MODULE/"
-cp -- "$REPO_ROOT/image/lib/installer-payload.sh" "$DRACUT_MODULE/installer-payload.sh"
+DRACUT_VERITY_MODULE="$SEALED_DIR/dracut-module-verity"
+DRACUT_TPM_MODULE="$SEALED_DIR/dracut-module-tpm-policy"
+rm -rf -- "$DRACUT_VERITY_MODULE" "$DRACUT_TPM_MODULE"
+mkdir -p "$DRACUT_VERITY_MODULE" "$DRACUT_TPM_MODULE"
+cp -- "$REPO_ROOT/image/initramfs/90neural-ice-installer-verity"/*.sh "$DRACUT_VERITY_MODULE/"
+cp -- "$REPO_ROOT/image/lib/installer-payload.sh" "$DRACUT_VERITY_MODULE/installer-payload.sh"
+cp -- "$REPO_ROOT/image/initramfs/91neural-ice-tpm-policy"/*.sh "$DRACUT_TPM_MODULE/"
+cp -- "$REPO_ROOT/image/initramfs/91neural-ice-tpm-policy"/*.service "$DRACUT_TPM_MODULE/"
+cp -- "$REPO_ROOT/image/initramfs/91neural-ice-tpm-policy"/*.conf "$DRACUT_TPM_MODULE/"
+cp -- "$REPO_ROOT/image/lib/tpm2-nv-public.sh" "$DRACUT_TPM_MODULE/tpm2-nv-public.sh"
+printf 'neural-ice-signed-installer-initramfs-v1\n' > "$DRACUT_TPM_MODULE/installer-media"
+chmod 0444 "$DRACUT_TPM_MODULE/installer-media"
 sudo podman run --rm --entrypoint '' \
-  -v "$DRACUT_MODULE":/ni-dracut:ro \
+  -v "$DRACUT_VERITY_MODULE":/ni-dracut-verity:ro \
+  -v "$DRACUT_TPM_MODULE":/ni-dracut-tpm-policy:ro \
   -v "$SEALED_DIR":/ni-out \
   "$INSTALLER_IMAGE_REF" bash -euxo pipefail -c '
     kver="$(ls -1 /usr/lib/modules | head -1)"
     [ -n "$kver" ]
     install -d -m 0755 /usr/lib/dracut/modules.d/90neural-ice-installer-verity
-    cp /ni-dracut/*.sh /usr/lib/dracut/modules.d/90neural-ice-installer-verity/
+    cp /ni-dracut-verity/*.sh /usr/lib/dracut/modules.d/90neural-ice-installer-verity/
     chmod 0755 /usr/lib/dracut/modules.d/90neural-ice-installer-verity/*.sh
-    dracut --force --no-hostonly --reproducible --add neural-ice-installer-verity \
+    install -d -m 0755 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy
+    cp /ni-dracut-tpm-policy/*.sh /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/
+    chmod 0755 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/*.sh
+    cp /ni-dracut-tpm-policy/installer-media /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/
+    chmod 0444 /usr/lib/dracut/modules.d/91neural-ice-tpm-policy/installer-media
+    dracut --force --no-hostonly --reproducible \
+      --add "neural-ice-installer-verity neural-ice-tpm-policy" \
       --kver "$kver" /ni-out/installer-initramfs.img
+    cmp <(lsinitrd -f /var/lib/dracut/hooks/pre-trigger/01-neural-ice-tpm-policy.sh \
+      /ni-out/installer-initramfs.img) /ni-dracut-tpm-policy/neural-ice-tpm-policy.sh
+    [ "$(lsinitrd -f /etc/neural-ice/installer-media /ni-out/installer-initramfs.img)" \
+      = neural-ice-signed-installer-initramfs-v1 ]
+    lsinitrd -f /usr/bin/tpm2_getcap /ni-out/installer-initramfs.img >/dev/null
     cp "/usr/lib/modules/$kver/vmlinuz" /ni-out/vmlinuz
     cp /usr/lib/os-release /ni-out/os-release
     # systemd-stub, from the image rather than the build host: the stub that
@@ -606,11 +641,18 @@ case "$MEDIA_MODE" in
     DEVICE_CHANNEL="${DEVICE_CHANNEL:-lab}"
     [[ "$DEVICE_CHANNEL" =~ ^(lab|beta|stable)$ ]] \
       || { echo "ERROR: DEVICE_CHANNEL must be lab, beta or stable" >&2; exit 1; }
-    UKI_KARGS=("quiet" "systemd.unit=neural-ice-installer.target" \
+    UKI_KARGS=("quiet" "rd.systemd.gpt_auto=0" "luks=0" "systemd.unit=neural-ice-installer.target" \
       "neuralice.autoinstall=1" "enforcing=0" \
       "neuralice.device_channel=${DEVICE_CHANNEL}" \
       "neuralice.release_authority=${RELEASE_AUTHORITY}" \
       "neuralice.imgref=${TARGET_IMGREF}")
+    if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+      # The ESP copy is operator-visible convenience, not authority. Seal the
+      # already validated public key into the signed UKI so replacing mutable
+      # vfat bytes cannot choose who gains access to the installed appliance.
+      _sshkey_b64="$(base64 -w0 < "$SSH_AUTHORIZED_KEYS_FILE")"
+      UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")
+    fi
     for _policy_file in "$PCR_POLICY_PUBLIC_KEY_FILE" "$PCR_POLICY_SIGNATURE_FILE"; do
       [[ -f "$_policy_file" && ! -L "$_policy_file" && -s "$_policy_file" ]] \
         || { echo "ERROR: signed PCR policy input is absent: $_policy_file" >&2; exit 1; }
@@ -738,7 +780,8 @@ case "$MEDIA_MODE" in
     # and its only permitted target. The early generator uses this closed pair
     # to suppress inherited installed-appliance lifecycles without inventing a
     # mutable menu/default path or opening a root login.
-    UKI_KARGS=("quiet" "systemd.unit=neural-ice-live.target" "neuralice.live=1")
+    UKI_KARGS=("quiet" "rd.systemd.gpt_auto=0" "luks=0" \
+      "systemd.unit=neural-ice-live.target" "neuralice.live=1")
     [[ "$INSTALL_SOURCE" == medium && -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
       || { echo "ERROR: a Live medium installs nothing; INSTALL_SOURCE/OS_IMAGE/INSTALL_MIRROR are meaningless on one" >&2; exit 1; }
     ;;
@@ -882,7 +925,7 @@ done
 [[ -n "$ESPPART" ]] || { echo "ERROR: installer ESP not found" >&2; exit 1; }
 echo "    remaking the ESP (${ESPPART}) with a single signed EFI authority"
 zero_partition "$ESPPART"
-sudo mkfs.fat -F32 -n EFI-SYSTEM "$ESPPART" >/dev/null \
+sudo mkfs.fat -F32 -n NI-INSTALL "$ESPPART" >/dev/null \
   || { echo "ERROR: cannot remake the installer ESP" >&2; exit 1; }
 sudo partx -u "$LOOP" 2>/dev/null || true
 sudo udevadm settle

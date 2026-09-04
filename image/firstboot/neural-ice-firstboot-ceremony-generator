@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs on the installed appliance at systemd generator time. The pinned
+# image unit After=tmpfiles-setup cycles with systemd-sysext; /etc drop-in
+# After= reset is not reliable on systemd 257. A generated unit overrides
+# /usr/lib and does not depend on that reset.
+set -euo pipefail
+umask 022
+
+normal_dir=${1:?}
+[[ "$normal_dir" == /* && "$normal_dir" != / ]] || exit 1
+[[ -d "$normal_dir" && ! -L "$normal_dir" ]] || exit 1
+
+src=/etc/neural-ice/firstboot-tpm-ceremony.service
+[[ -f "$src" && ! -L "$src" ]] || exit 1
+grep -Fq 'DefaultDependencies=no' "$src" || exit 1
+! grep -E '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$src" || exit 1
+! grep -E '^(After|Before)=.*sysinit\.target' "$src" || exit 1
+install -m 0644 -- "$src" "$normal_dir/neural-ice-firstboot-tpm-ceremony.service"

@@ -168,6 +168,8 @@ readonly -a MASKED_UNITS=(
   user@.service
   bootc-fetch-apply-updates.service
   bootc-fetch-apply-updates.timer
+  neural-ice-sovereignty-egress.service
+  neural-ice-sovereignty-egress.timer
   systemd-sysext.service
   systemd-confext.service
 )

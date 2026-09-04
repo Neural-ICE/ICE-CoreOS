@@ -532,8 +532,8 @@ if grep -vE '^[[:space:]]*#' "$USB" | grep -Eq 'chainloader|menuentry|grub\.cfg|
 fi
 grep -Fq 'zero_partition "$BOOTPART"' "$USB" \
   || fail "the media producer does not overwrite the boot partition bib wrote a kernel onto"
-grep -Fq 'mkfs.fat -F32 -n EFI-SYSTEM "$ESPPART"' "$USB" \
-  || fail "the media producer does not remake the ESP from scratch"
+grep -Fq 'mkfs.fat -F32 -n NI-INSTALL "$ESPPART"' "$USB" \
+  || fail "the media producer does not remake the ESP with its unambiguous installer label"
 grep -Fq 'zero_partition "$ESPPART"' "$USB" \
   || fail "the media producer does not overwrite the ESP before remaking it; deleted files leave their bytes"
 grep -Fq 'MEDIA_MODE' "$USB" \
@@ -542,6 +542,12 @@ grep -Fq 'systemd.unit=neural-ice-installer.target' "$USB" \
   || fail "the media producer does not seal the dedicated fail-closed installer target"
 grep -Fq 'systemd.unit=neural-ice-live.target' "$USB" \
   || fail "the media producer does not seal the dedicated Live target"
+grep -Fq 'rd.systemd.gpt_auto=0' "$USB" \
+  || fail "the media producer lets systemd-gpt-auto compete with its verified overlay root"
+grep -Fq '"luks=0"' "$USB" \
+  || fail "the media producer lets the inherited appliance crypttab race target encryption"
+grep -Fq 'UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")' "$USB" \
+  || fail "the installer SSH key remains replaceable on mutable vfat instead of sealed in the UKI"
 grep -Fq 'neuralice.live=1' "$USB" \
   || fail "the media producer does not seal an affirmative Live selector"
 

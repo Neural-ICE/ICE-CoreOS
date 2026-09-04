@@ -26,6 +26,38 @@ grep -qx 'After=neural-ice-firstboot-tpm-ceremony.service' "$DROPIN" || fail "ga
 grep -qx 'OnFailure=emergency.target' "$UNIT" || fail "ceremony failure does not enter recovery"
 grep -qx 'OnFailureJobMode=isolate' "$UNIT" || fail "ceremony failure does not isolate recovery"
 grep -qx 'RequiredBy=multi-user.target' "$UNIT" || fail "multi-user readiness does not require ceremony success"
+grep -qx 'DefaultDependencies=no' "$UNIT" \
+  || fail "ceremony default dependencies would After=basic and cycle with sshd.socket"
+grep -qx 'After=local-fs.target' "$UNIT" \
+  || fail "ceremony is not ordered after local-fs"
+grep -Fq '/run/neural-ice-device-root' "$UNIT" \
+  || fail "ceremony sandbox cannot write the device-root runtime directory required by attest"
+grep -Fq '/run/neural-ice-tpm-state' "$UNIT" \
+  || fail "ceremony sandbox cannot write the TPM-state runtime directory"
+grep -Fq '/run/neural-ice-access-profile-anchor' "$UNIT" \
+  || fail "ceremony sandbox cannot write the access-profile-anchor runtime directory"
+grep -Fq '/run/cryptsetup' "$UNIT" \
+  || fail "ceremony sandbox cannot write /run/cryptsetup required to read LUKS2 metadata"
+! grep -E '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$UNIT" \
+  || fail "ceremony must not After= or Before= tmpfiles-setup (cycles with sysext)"
+! grep -E '^(After|Before)=.*sysinit\.target' "$UNIT" \
+  || fail "ceremony Before=sysinit cycles with sshd.socket After=sysinit"
+! grep -E '^(After|Before)=.*sockets\.target' "$UNIT" \
+  || fail "ceremony Before=sockets is not required and widens the sysinit cycle"
+SYSINIT_DROPIN="$ROOT/image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf"
+GENERATOR="$ROOT/image/firstboot/neural-ice-firstboot-ceremony-generator"
+grep -qx 'DefaultDependencies=no' "$SYSINIT_DROPIN" \
+  || fail "pinned-digest ceremony drop-in does not disable default dependencies"
+grep -qx 'After=' "$SYSINIT_DROPIN" \
+  || fail "pinned-digest ceremony drop-in does not reset After="
+! grep -E '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$SYSINIT_DROPIN" \
+  || fail "pinned-digest drop-in Before=tmpfiles self-cycles when After= reset is ignored"
+! grep -E '^(After|Before)=.*sysinit\.target' "$SYSINIT_DROPIN" \
+  || fail "pinned-digest drop-in Before=sysinit cycles with sshd.socket"
+[[ -f "$GENERATOR" && ! -L "$GENERATOR" ]] \
+  || fail "the first-boot ceremony generator is missing"
+grep -Fq '/etc/neural-ice/firstboot-tpm-ceremony.service' "$GENERATOR" \
+  || fail "the generator does not install the staged ceremony unit"
 
 dropin_units=(
   sshd.service sshd.socket getty@.service serial-getty@.service autovt@.service

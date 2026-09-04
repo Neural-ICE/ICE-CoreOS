@@ -712,6 +712,17 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             if counts.get("quiet", 0) != 1:
                 raise SelectorRefusal("duplicate-word")
             continue
+        if word == "rd.systemd.gpt_auto=0":
+            # The signed initramfs supplies the one verified overlay root.
+            if counts.get("rd.systemd.gpt_auto", 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
+        if word == "luks=0":
+            # The live root inherits the future appliance's /etc/crypttab, but
+            # must not react when the installer creates the target LUKS labels.
+            if counts.get("luks", 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
         if word in (SEALED_INSTALL_TARGET, SEALED_LIVE_TARGET):
             continue
         if word == SEALED_INSTALL_SELECTOR:

@@ -466,8 +466,13 @@ grep -Eq '^Requires=.*neural-ice-autoinstall\.service' "$TARGET" \
   || fail "the installer target does not require autoinstall success"
 grep -Eq '^After=.*neural-ice-autoinstall\.service' "$TARGET" \
   || fail "the installer target can become active before autoinstall completes"
-grep -qx 'ExecStartPre=/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check' "$AUTOINSTALL_UNIT" \
+# The preflight is wrapped so a refusal also writes failure evidence for the
+# installer failure surface; what must not change is that the generator's
+# --check runs as an ExecStartPre and its exit status still fails the unit.
+grep -Eq '^ExecStartPre=.*/usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator --check( |$)' "$AUTOINSTALL_UNIT" \
   || fail "autoinstall has no executable signed-cmdline preflight"
+grep -Eq '^ExecStartPre=.*neural-ice-installer-runtime-generator --check \|\| \{ rc=\$\?;.*exit "\$rc"; \}' "$AUTOINSTALL_UNIT" \
+  || fail "the wrapped signed-cmdline preflight does not propagate the generator exit status"
 grep -qx 'OnFailure=neural-ice-installer-failure.target' "$AUTOINSTALL_UNIT" \
   || fail "autoinstall failure does not enter the fixed output-only failure sink"
 # The evidence the sink renders is created by THIS unit, root-only, before

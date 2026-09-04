@@ -1,0 +1,15 @@
+[Unit]
+Description=Neural ICE signed TPM PCR policy staging
+DefaultDependencies=no
+ConditionPathExists=!/etc/neural-ice/installer-media
+Requires=systemd-udevd.service
+After=systemd-udevd.service
+Before=cryptsetup-pre.target
+
+[Service]
+Type=oneshot
+Environment=NEURALICE_TPM_POLICY_SERVICE=1
+ExecStart=/var/lib/dracut/hooks/pre-trigger/01-neural-ice-tpm-policy.sh
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console

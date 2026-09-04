@@ -8,9 +8,10 @@
 #     including emergency, rescue and debug-shell, which this unit replaces;
 #   - IPAddressDeny=any and RestrictAddressFamilies make "no network is touched"
 #     a kernel-enforced property rather than a claim about what the script runs;
-#   - ProtectSystem=strict with an empty ReadWritePaths= and no PrivateTmp means
-#     the failure surface cannot write anywhere at all. The evidence it reads was
-#     written by the installer before it failed, on a tmpfs, read-only from here;
+#   - ProtectSystem=strict and the one exact efivarfs ReadWritePaths= exception
+#     let the surface persist only its bounded failure token across poweroff.
+#     The evidence it reads was written by the installer before it failed, on a
+#     root-only tmpfs;
 #   - DefaultDependencies=no because this unit must be startable in exactly the
 #     state a failed install leaves the machine in, including a wedged one.
 #
@@ -50,7 +51,7 @@ RestrictAddressFamilies=AF_UNIX
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=
+ReadWritePaths=/sys/firmware/efi/efivars
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
