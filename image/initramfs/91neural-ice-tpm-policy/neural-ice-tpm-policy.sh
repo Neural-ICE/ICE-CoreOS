@@ -183,7 +183,13 @@ if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
 
   ni_counter_file=${ni_root}/run/neural-ice-pcr-policy-counter
   mkdir -p "$(dirname "$ni_counter_file")" || ni_die "cannot create counter workspace"
-  "$ni_tools/tpm2_nvread" -s 8 -o "$ni_counter_file" "$ni_index" >/dev/null 2>&1 \
+  # -C <index>: authorize the read with the index's own (empty) authValue —
+  # the counter is defined `authread|ownerread`. Without -C, tpm2_nvread
+  # authorizes through the OWNER hierarchy, which the first-boot ceremony
+  # seals; the first reboot after the ceremony then died here with "high-water
+  # is unreadable" on QEMU. The OS-side reader (neural-ice-tpm-state) already
+  # uses -C <index>; this hook must never authorize with a hierarchy.
+  "$ni_tools/tpm2_nvread" -C "$ni_index" -s 8 -o "$ni_counter_file" "$ni_index" >/dev/null 2>&1 \
     || ni_die "PCR policy high-water is unreadable"
   [ "$(wc -c < "$ni_counter_file")" -eq 8 ] || ni_die "PCR policy high-water is truncated"
   ni_counter_hex=$(od -An -tx1 -v "$ni_counter_file" | tr -d '[:space:]' | tr 'A-F' 'a-f')

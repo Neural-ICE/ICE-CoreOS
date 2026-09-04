@@ -175,11 +175,21 @@ exit 0
 EOF2
 cat >"$tools/tpm2_nvread" <<'EOF2'
 #!/bin/sh
-out=
+# Models a TPM whose owner hierarchy the first-boot ceremony has sealed: a read
+# authorized by a hierarchy (no -C, or -C o/p/e) fails exactly as tpm2_nvread
+# does after the ceremony; only the index's own empty authValue reads.
+out=; auth=; index=
 while [ "$#" -gt 0 ]; do
-  case "$1" in -o) out=$2; shift 2 ;; *) shift ;; esac
+  case "$1" in
+    -o) out=$2; shift 2 ;;
+    -C) auth=$2; shift 2 ;;
+    -s) shift 2 ;;
+    0x*) index=$1; shift ;;
+    *) shift ;;
+  esac
 done
 test -n "$out" || exit 91
+[ -n "$auth" ] && [ "$auth" = "$index" ] || { echo "tpm2_nvread: owner hierarchy authorization failed (sealed)" >&2; exit 93; }
 : >"${NI_TEST_NVREAD_TRACE:-/dev/null}"
 case "${NI_TEST_COUNTER_SEQ:-7}" in
   7) printf '\000\000\000\000\000\000\000\007' >"$out" ;;
