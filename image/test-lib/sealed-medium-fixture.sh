@@ -171,8 +171,10 @@ build_uki installer-live "quiet systemd.unit=neural-ice-live.target neuralice.li
 # and its ESP carriers. The Live UKI above deliberately carries neither.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
   -out "$TMP/pcr-policy.key" >/dev/null 2>&1
+FIXTURE_PCR_POLICY_KEY_FILE="$TMP/sealed-medium-tpm2-pcr-public-key.pem"
+FIXTURE_PCR_POLICY_SIGNATURE_FILE="$TMP/sealed-medium-tpm2-pcr-signature.json"
 openssl pkey -in "$TMP/pcr-policy.key" -pubout \
-  -out "$TMP/tpm2-pcr-public-key.pem" >/dev/null 2>&1
+  -out "$FIXTURE_PCR_POLICY_KEY_FILE" >/dev/null 2>&1
 PCR_POLICY_DIGEST="$(printf 'sealed medium PCR policy' | sha256sum | awk '{print $1}')"
 python3 - "$PCR_POLICY_DIGEST" "$TMP/pcr-policy.bin" <<'PYEOF'
 import sys
@@ -181,15 +183,15 @@ PYEOF
 openssl dgst -sha256 -sign "$TMP/pcr-policy.key" \
   -out "$TMP/pcr-policy.sig" "$TMP/pcr-policy.bin"
 PCR_POLICY_FINGERPRINT="$(
-  openssl rsa -pubin -in "$TMP/tpm2-pcr-public-key.pem" \
+  openssl rsa -pubin -in "$FIXTURE_PCR_POLICY_KEY_FILE" \
     -RSAPublicKey_out -outform DER 2>/dev/null | sha256sum | awk '{print $1}'
 )"
 PCR_POLICY_SIGNATURE_B64="$(base64 -w0 < "$TMP/pcr-policy.sig")"
 printf '{"sha256":[{"pcrs":[7],"pkfp":"%s","pol":"%s","sig":"%s"}]}\n' \
   "$PCR_POLICY_FINGERPRINT" "$PCR_POLICY_DIGEST" "$PCR_POLICY_SIGNATURE_B64" \
-  > "$TMP/tpm2-pcr-signature.json"
-PCR_POLICY_KEY_SHA256="$(sha256sum "$TMP/tpm2-pcr-public-key.pem" | awk '{print $1}')"
-PCR_POLICY_SIGNATURE_SHA256="$(sha256sum "$TMP/tpm2-pcr-signature.json" | awk '{print $1}')"
+  > "$FIXTURE_PCR_POLICY_SIGNATURE_FILE"
+PCR_POLICY_KEY_SHA256="$(sha256sum "$FIXTURE_PCR_POLICY_KEY_FILE" | awk '{print $1}')"
+PCR_POLICY_SIGNATURE_SHA256="$(sha256sum "$FIXTURE_PCR_POLICY_SIGNATURE_FILE" | awk '{print $1}')"
 PCR_POLICY_FIELDS="neuralice.pcr_policy=$PCR_POLICY_DIGEST neuralice.pcr_policy_key=$PCR_POLICY_KEY_SHA256 neuralice.pcr_policy_signature=$PCR_POLICY_SIGNATURE_SHA256 neuralice.pcr_policy_seq=7"
 
 build_uki installer-install \
@@ -239,10 +241,10 @@ make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=
   if [[ "${uki##*/}" == installer-install.efi \
      && "${OMIT_DEFAULT_PCR_POLICY:-0}" != 1 ]]; then
     (( has_policy_key == 1 )) || pairs+=(
-      "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key.pem"
+      "::/ice-coreos/tpm2-pcr-public-key.pem=$FIXTURE_PCR_POLICY_KEY_FILE"
     )
     (( has_policy_json == 1 )) || pairs+=(
-      "::/ice-coreos/tpm2-pcr-signature.json=$TMP/tpm2-pcr-signature.json"
+      "::/ice-coreos/tpm2-pcr-signature.json=$FIXTURE_PCR_POLICY_SIGNATURE_FILE"
     )
   fi
   for pair in "${pairs[@]}"; do
@@ -260,8 +262,8 @@ make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=
 }
 make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest \
-  "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key.pem" \
-  "::/ice-coreos/tpm2-pcr-signature.json=$TMP/tpm2-pcr-signature.json"
+  "::/ice-coreos/tpm2-pcr-public-key.pem=$FIXTURE_PCR_POLICY_KEY_FILE" \
+  "::/ice-coreos/tpm2-pcr-signature.json=$FIXTURE_PCR_POLICY_SIGNATURE_FILE"
 
 PAYLOAD_BYTES="$(wc -c < "$SEALED/payload.img" | tr -d '[:space:]')"
 PAYLOAD_MIB=$(( (PAYLOAD_BYTES + 1048575) / 1048576 + 1 ))
