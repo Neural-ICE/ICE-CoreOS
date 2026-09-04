@@ -32,8 +32,8 @@ What it proves
   -- so the destructive mode is a property of a signature, not of a keystroke;
 * the UKI carries a signature directory (i.e. it was actually signed), unless
   ``--allow-unsigned`` says an unsigned medium was built on purpose;
-* when TPM policy material is present, the staged multi-entry signature JSON
-  contains the exact PCR7 PolicyPCR digest the signed UKI seals;
+* an Install medium's staged multi-entry signature JSON cryptographically
+  authorises the exact PCR7 PolicyPCR digest the signed UKI seals;
 * the payload header's SHA-256 is the digest the UKI seals, EVERY region hashes
   to what that header says, and -- the part a manifest can never establish --
   the dm-verity root hashes of the installer root image and of the container
@@ -61,12 +61,16 @@ the one that was missing.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
 import re
 import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterator
 
@@ -1097,10 +1101,15 @@ def check_esp_hash_bound(paths: set[str], read_file, cmdline: str) -> None:
 
 
 def check_tpm_policy_document(paths: set[str], read_file, cmdline: str) -> None:
-    """Prove the staged systemd policy document contains the sealed generation."""
+    """Prove the staged systemd policy cryptographically authorises generation."""
     signature_path = "ice-coreos/tpm2-pcr-signature.json"
+    public_key_path = "ice-coreos/tpm2-pcr-public-key.pem"
     if signature_path not in paths:
         return
+    if public_key_path not in paths:
+        raise InspectionError(
+            "the staged TPM policy JSON has no staged public key"
+        )
     sealed_words = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
     expected = sealed_words.get("neuralice.pcr_policy")
     if expected is None:
@@ -1109,28 +1118,115 @@ def check_tpm_policy_document(paths: set[str], read_file, cmdline: str) -> None:
             "neuralice.pcr_policy"
         )
     raw = read_file(signature_path)
-    if len(raw) > MAX_SECTION_BYTES:
+    public_key = read_file(public_key_path)
+    if len(raw) > MAX_SECTION_BYTES or len(public_key) > MAX_SECTION_BYTES:
         raise InspectionError(
-            f"the staged TPM policy JSON exceeds {MAX_SECTION_BYTES} bytes"
+            f"staged TPM policy material exceeds {MAX_SECTION_BYTES} bytes"
         )
     try:
         document = json.loads(raw.decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InspectionError(f"the staged TPM policy JSON is malformed: {error}") from error
     entries = document.get("sha256") if isinstance(document, dict) else None
-    covered = (
-        isinstance(entries, list)
-        and any(
-            isinstance(entry, dict)
-            and entry.get("pcrs") == [7]
-            and entry.get("pol") == expected
-            for entry in entries
+    if not isinstance(entries, list):
+        raise InspectionError("the staged TPM policy JSON has no sha256 entry list")
+
+    try:
+        fingerprint_result = subprocess.run(
+            [
+                "openssl", "rsa", "-pubin", "-RSAPublicKey_out",
+                "-outform", "DER",
+            ],
+            input=public_key, capture_output=True, check=False,
         )
-    )
+    except OSError as error:
+        raise InspectionError(f"cannot execute openssl: {error}") from error
+    if fingerprint_result.returncode != 0 or not fingerprint_result.stdout:
+        raise InspectionError("the staged TPM policy public key is not usable RSA")
+    expected_fingerprint = hashlib.sha256(fingerprint_result.stdout).hexdigest()
+
+    digest_re = re.compile(r"[0-9a-f]{64}")
+    covered = False
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} is not an object"
+            )
+        pcrs = entry.get("pcrs")
+        if (
+            not isinstance(pcrs, list)
+            or not pcrs
+            or any(
+                isinstance(pcr, bool)
+                or not isinstance(pcr, int)
+                or pcr < 0
+                or pcr > 23
+                for pcr in pcrs
+            )
+            or len(set(pcrs)) != len(pcrs)
+        ):
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has invalid pcrs"
+            )
+        fingerprint = entry.get("pkfp")
+        if not isinstance(fingerprint, str) or not digest_re.fullmatch(fingerprint):
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has invalid pkfp"
+            )
+        policy = entry.get("pol")
+        if not isinstance(policy, str) or not digest_re.fullmatch(policy):
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has invalid pol"
+            )
+        signature_text = entry.get("sig")
+        if not isinstance(signature_text, str):
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has invalid sig"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has invalid sig"
+            ) from error
+        if (
+            not signature
+            or base64.b64encode(signature).decode("ascii") != signature_text
+        ):
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has invalid sig"
+            )
+        if (
+            pcrs != [7]
+            or policy != expected
+            or fingerprint != expected_fingerprint
+        ):
+            continue
+        with tempfile.TemporaryDirectory(prefix="ni-media-policy.") as directory:
+            signature_file = Path(directory) / "signature"
+            public_key_file = Path(directory) / "public.pem"
+            signature_file.write_bytes(signature)
+            public_key_file.write_bytes(public_key)
+            try:
+                verification = subprocess.run(
+                    [
+                        "openssl", "dgst", "-sha256", "-verify",
+                        str(public_key_file), "-signature", str(signature_file),
+                    ],
+                    input=bytes.fromhex(policy), capture_output=True, check=False,
+                )
+            except OSError as error:
+                raise InspectionError(f"cannot execute openssl: {error}") from error
+        if verification.returncode != 0:
+            raise InspectionError(
+                f"the staged TPM policy sha256 entry {index} has a signature "
+                "that does not verify over pol"
+            )
+        covered = True
     if not covered:
         raise InspectionError(
-            "the staged TPM policy JSON does not contain the PCR7 PolicyPCR "
-            f"digest {expected} sealed by the signed command line"
+            "the staged TPM policy JSON does not cryptographically authorise "
+            f"the PCR7 PolicyPCR digest {expected} sealed by the signed command line"
         )
 
 

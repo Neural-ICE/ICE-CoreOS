@@ -151,6 +151,13 @@ def write(name, mutate):
         json.dumps(candidate, separators=(",", ":")), encoding="ascii"
     )
 
+def prepend(name, entry):
+    candidate = copy.deepcopy(document)
+    candidate["sha256"].insert(0, entry)
+    pathlib.Path(out_dir, name).write_text(
+        json.dumps(candidate, separators=(",", ":")), encoding="ascii"
+    )
+
 write("missing-live-signature.json", lambda e: e[live].pop("sig"))
 write("missing-sealed-signature.json", lambda e: e[sealed].pop("sig"))
 write("malformed-signature.json", lambda e: e[live].__setitem__("sig", "***"))
@@ -159,12 +166,34 @@ write(
     "signature-for-another-policy.json",
     lambda e: e[live].__setitem__("sig", entries[sealed]["sig"]),
 )
+prepend("non-object-before-valid.json", "not-an-entry")
+for field, value in (
+    ("pcrs", [True]),
+    ("pkfp", "not-a-fingerprint"),
+    ("pol", "not-a-policy"),
+    ("sig", "***"),
+):
+    malformed = copy.deepcopy(entries[sealed])
+    malformed[field] = value
+    prepend(f"malformed-{field}-before-valid.json", malformed)
+invalid_signature = copy.deepcopy(entries[sealed])
+invalid_signature["sig"] = entries[live]["sig"]
+prepend("invalid-signature-before-valid.json", invalid_signature)
 PY
 for mutation in missing-live-signature missing-sealed-signature \
   malformed-signature wrong-fingerprint signature-for-another-policy; do
   if run_guard ok "$TMP/$mutation.json" >/dev/null 2>"$TMP/err"; then
     fail "$mutation was accepted as cryptographically authorised coverage"
   fi
+done
+for mutation in non-object-before-valid malformed-pcrs-before-valid \
+  malformed-pkfp-before-valid malformed-pol-before-valid \
+  malformed-sig-before-valid invalid-signature-before-valid; do
+  if run_guard ok "$TMP/$mutation.json" >/dev/null 2>"$TMP/err"; then
+    fail "$mutation was skipped before a later valid signed entry"
+  fi
+  grep -Fq "entry 0" "$TMP/err" \
+    || fail "$mutation did not report the deterministic malformed entry index"
 done
 if run_guard ok "$TMP/covered.json" "$TMP/wrong.pub" >/dev/null 2>"$TMP/err"; then
   fail "entries signed by another RSA key were accepted"
@@ -329,34 +358,60 @@ fi
 # The build-plane assertion accepts a multi-entry document whose sealed digest
 # is not first, but rejects malformed or uncovered material even when its file
 # hash could otherwise be sealed into a UKI command line.
-python3 - "$ROOT/image/inspect-installer-media.py" "$SEALED_POLICY" "$LIVE_POLICY" <<'PY'
+python3 - "$ROOT/image/inspect-installer-media.py" "$SEALED_POLICY" \
+  "$TMP/covered.json" "$TMP/policy.pub" "$TMP/wrong.pub" <<'PY'
+import copy
 import importlib.util
+import json
 import pathlib
 import sys
 
 spec = importlib.util.spec_from_file_location("installer_media", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-expected, other = sys.argv[2:]
-path = "ice-coreos/tpm2-pcr-signature.json"
+expected, document_path, public_key_path, wrong_key_path = sys.argv[2:]
+signature_path = "ice-coreos/tpm2-pcr-signature.json"
+key_path = "ice-coreos/tpm2-pcr-public-key.pem"
 cmdline = f"neuralice.pcr_policy={expected}"
+covered = pathlib.Path(document_path).read_bytes()
+public_key = pathlib.Path(public_key_path).read_bytes()
+wrong_key = pathlib.Path(wrong_key_path).read_bytes()
+paths = {signature_path, key_path}
 
-covered = (
-    f'{{"sha256":[{{"pcrs":[7],"pol":"{other}"}},'
-    f'{{"pcrs":[7],"pol":"{expected}"}}]}}\n'
-).encode("ascii")
-module.check_tpm_policy_document({path}, lambda unused: covered, cmdline)
+def check(document, key=public_key):
+    files = {signature_path: document, key_path: key}
+    module.check_tpm_policy_document(paths, files.__getitem__, cmdline)
 
-for refused in (
-    f'{{"sha256":[{{"pcrs":[11],"pol":"{expected}"}}]}}'.encode("ascii"),
-    b'{"sha256":[',
+check(covered)
+parsed = json.loads(covered)
+entries = {entry["pol"]: entry for entry in parsed["sha256"]}
+other = next(policy for policy in entries if policy != expected)
+
+unsigned = copy.deepcopy(parsed)
+next(entry for entry in unsigned["sha256"] if entry["pol"] == expected).pop("sig")
+wrong_signature = copy.deepcopy(parsed)
+next(
+    entry for entry in wrong_signature["sha256"] if entry["pol"] == expected
+)["sig"] = entries[other]["sig"]
+malformed_before_valid = copy.deepcopy(parsed)
+malformed_before_valid["sha256"].insert(0, "not-an-entry")
+uncovered = copy.deepcopy(parsed)
+uncovered["sha256"] = [entries[other]]
+
+for label, refused, key in (
+    ("unsigned", json.dumps(unsigned).encode(), public_key),
+    ("wrong key", covered, wrong_key),
+    ("signature for another policy", json.dumps(wrong_signature).encode(), public_key),
+    ("malformed before valid", json.dumps(malformed_before_valid).encode(), public_key),
+    ("uncovered", json.dumps(uncovered).encode(), public_key),
+    ("malformed JSON", b'{"sha256":[', public_key),
 ):
     try:
-        module.check_tpm_policy_document({path}, lambda unused, data=refused: data, cmdline)
+        check(refused, key)
     except module.InspectionError:
         pass
     else:
-        raise SystemExit("FAIL: artifact inspection accepted invalid TPM policy JSON")
+        raise SystemExit(f"FAIL: artifact inspection accepted {label} policy JSON")
 print("PCR7_ARTIFACT_INSPECTION_OK")
 PY
 

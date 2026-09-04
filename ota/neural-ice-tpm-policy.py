@@ -339,34 +339,71 @@ def signature_policy_digests(path, pubkey_pem, pcr_index, alg="sha256"):
     )
     expected_fingerprint = pubkey_fingerprint(pubkey_pem)
     authorised = set()
-    for entry in entries:
+    fingerprint_re = re.compile(r"[0-9a-f]{64}")
+    for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
-            continue
-        if entry.get("pcrs") != [pcr_index]:
-            continue
-        if entry.get("pkfp") != expected_fingerprint:
-            continue
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} is not an object"
+            )
+        pcrs = entry.get("pcrs")
+        if (
+            not isinstance(pcrs, list)
+            or not pcrs
+            or any(
+                isinstance(pcr, bool)
+                or not isinstance(pcr, int)
+                or pcr < 0
+                or pcr > 23
+                for pcr in pcrs
+            )
+            or len(set(pcrs)) != len(pcrs)
+        ):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid pcrs"
+            )
+        fingerprint = entry.get("pkfp")
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint_re.fullmatch(fingerprint)
+        ):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid pkfp"
+            )
         policy = entry.get("pol")
         if not isinstance(policy, str) or not digest_re.fullmatch(policy):
-            continue
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid pol"
+            )
         signature_text = entry.get("sig")
         if not isinstance(signature_text, str):
-            continue
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid sig"
+            )
         try:
             signature = base64.b64decode(signature_text, validate=True)
-        except (ValueError, binascii.Error):
-            continue
-        # validate=True rejects whitespace/non-alphabet bytes; the round trip
-        # additionally rejects non-canonical padding spellings systemd would
-        # not emit. An empty signature is never an authorised entry.
+        except (ValueError, binascii.Error) as error:
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid sig"
+            ) from error
         if (
             not signature
             or base64.b64encode(signature).decode("ascii") != signature_text
         ):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid sig"
+            )
+
+        if pcrs != [pcr_index]:
+            continue
+        if fingerprint != expected_fingerprint:
             continue
         policy_bytes = bytes.fromhex(policy)
-        if verify_detached_policy_signature(pubkey_pem, policy_bytes, signature):
-            authorised.add(policy)
+        if not verify_detached_policy_signature(pubkey_pem, policy_bytes, signature):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has a signature "
+                "that does not verify over pol"
+            )
+        authorised.add(policy)
     return sorted(authorised)
 
 
