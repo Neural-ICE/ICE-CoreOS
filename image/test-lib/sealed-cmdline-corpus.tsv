@@ -22,6 +22,8 @@
 #   expected  install | live | refuse:<stable-reason-token>
 #   anchor    yes       = prepend the eight sealed trust fields (lab-managed)
 #             customer  = the same eight, with access_profile=customer-locked
+#             no-policy = prepend trust fields but not the mandatory Install
+#                         PCR tuple (only for missing-field refusal vectors)
 #             no        = <words> is the whole command line, which is how the
 #                         missing-anchor cases are stated
 #   label     what the vector is about
@@ -36,6 +38,10 @@
 # --------------------------------------------------------------------------- #
 install	yes	install: the exact produced Install line	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos@sha256:1111111111111111111111111111111111111111111111111111111111111111
 install	yes	install: the verified overlay disables GPT auto-root	quiet rd.systemd.gpt_auto=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
+refuse:missing-install-pcr-policy:neuralice.pcr_policy	no-policy	install: missing sealed PCR policy digest	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy_key=5555555555555555555555555555555555555555555555555555555555555555 neuralice.pcr_policy_signature=6666666666666666666666666666666666666666666666666666666666666666 neuralice.pcr_policy_seq=7
+refuse:missing-install-pcr-policy:neuralice.pcr_policy_key	no-policy	install: missing sealed PCR public-key digest	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=4444444444444444444444444444444444444444444444444444444444444444 neuralice.pcr_policy_signature=6666666666666666666666666666666666666666666666666666666666666666 neuralice.pcr_policy_seq=7
+refuse:missing-install-pcr-policy:neuralice.pcr_policy_signature	no-policy	install: missing sealed PCR signature-file digest	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=4444444444444444444444444444444444444444444444444444444444444444 neuralice.pcr_policy_key=5555555555555555555555555555555555555555555555555555555555555555 neuralice.pcr_policy_seq=7
+refuse:missing-install-pcr-policy:neuralice.pcr_policy_seq	no-policy	install: missing sealed PCR policy sequence	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=4444444444444444444444444444444444444444444444444444444444444444 neuralice.pcr_policy_key=5555555555555555555555555555555555555555555555555555555555555555 neuralice.pcr_policy_signature=6666666666666666666666666666666666666666666666666666666666666666
 refuse:duplicate-word	yes	install: duplicate GPT auto-root control	quiet rd.systemd.gpt_auto=0 rd.systemd.gpt_auto=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
 install	yes	install: inherited appliance crypttab disabled in live root	quiet luks=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0
 refuse:duplicate-word	yes	install: duplicate live crypttab control	quiet luks=0 luks=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0

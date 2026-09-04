@@ -142,7 +142,7 @@ done
 # focused suite wired beside this one.
 grep -Fq '"$TPM_POLICY_TOOL" --pcr 7 --alg sha256 verify-live-coverage' "$AUTOINSTALL" \
   || fail "the installer does not use the authoritative helper for live PCR7 coverage"
-grep -Fq 'NI-P7-COVERAGE: live SHA-256 PCR7 is unreadable, malformed, or uncovered' "$AUTOINSTALL" \
+grep -Fq 'NI-P7-COVERAGE: live SHA-256 PCR7 is unreadable, malformed, unsigned, signed by another key, or uncovered' "$AUTOINSTALL" \
   || fail "the live PCR7 refusal has no stable diagnostic"
 
 # All installer-created firstboot inputs are atomically published and fsynced

@@ -65,6 +65,10 @@ run_generator() { # $1=cmdline $2=output-root [--check]
 }
 
 install_cmdline="$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0"
+install_cmdline="$install_cmdline neuralice.pcr_policy=$(printf '%064d' 7)"
+install_cmdline="$install_cmdline neuralice.pcr_policy_key=$(printf '%064d' 8)"
+install_cmdline="$install_cmdline neuralice.pcr_policy_signature=$(printf '%064d' 9)"
+install_cmdline="$install_cmdline neuralice.pcr_policy_seq=7"
 run_generator "$install_cmdline" "$TMP/install"
 run_generator "$install_cmdline" "$TMP/check" --check
 live_cmdline="$ANCHOR quiet systemd.unit=neural-ice-live.target neuralice.live=1"

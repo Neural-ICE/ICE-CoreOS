@@ -132,10 +132,16 @@ assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null 2>&1 \
   && fail "TPM public policy files not pinned by the signed UKI were accepted"
 
+OMIT_DEFAULT_PCR_POLICY=1 make_esp \
+  "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "an Install medium without mandatory TPM policy files was accepted"
 make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest
 assemble "$ESP" "$SEALED/payload.img"
-inspect >/dev/null || fail "the restored medium without optional TPM policy files was refused"
+inspect >/dev/null || fail "the restored Install medium with mandatory TPM policy files was refused"
 
 # --------------------------------------------------------------------------- #
 # 5) THE REFUSALS. Each mutation is one way a medium can be wrong.

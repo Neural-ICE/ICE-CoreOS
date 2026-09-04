@@ -753,6 +753,18 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             continue
         raise SelectorRefusal(f"word-not-in-grammar:{key}")
 
+    if mode == "install":
+        for policy_key in (
+            "neuralice.pcr_policy",
+            "neuralice.pcr_policy_key",
+            "neuralice.pcr_policy_signature",
+            "neuralice.pcr_policy_seq",
+        ):
+            if policy_key not in optional:
+                raise SelectorRefusal(
+                    f"missing-install-pcr-policy:{policy_key}"
+                )
+
     # ----------------------------------------------------------------------- #
     # THE REGISTRY-INSTALL CONTRACT, stated once so the producer, the generator
     # and the installer cannot disagree about which combinations are meaningful.
@@ -1122,6 +1134,20 @@ def check_tpm_policy_document(paths: set[str], read_file, cmdline: str) -> None:
         )
 
 
+def check_required_pcr_policy_material(paths: set[str], mode: str) -> None:
+    """Require both hash-bound PCR policy carriers on destructive media."""
+    if mode != "install":
+        return
+    for policy_path in (
+        "ice-coreos/tpm2-pcr-public-key.pem",
+        "ice-coreos/tpm2-pcr-signature.json",
+    ):
+        if policy_path not in paths:
+            raise InspectionError(
+                f"an Install medium carries no mandatory {policy_path}"
+            )
+
+
 def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, str]]:
     paths = sorted(esp.walk())
     manifests = [path for path in paths if ESP_MANIFEST_RE.fullmatch(path)]
@@ -1188,6 +1214,7 @@ def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, s
             f"BOOTAA64.EFI's manifest says this is a {mode} medium, but its sealed "
             f"command line is a {sealed_mode} one"
         )
+    check_required_pcr_policy_material(set(paths), mode)
     # 🔴 THE ESP ARTEFACTS THE SIGNATURE PINS (independent review 2026-09-02,
     # P0 #3). Checked by a pure function so image/test-installer-selector-grammar.sh
     # can drive it on ordinary CI -- this suite needs veritysetup, a loop device

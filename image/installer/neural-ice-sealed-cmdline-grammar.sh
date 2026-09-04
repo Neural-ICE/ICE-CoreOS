@@ -462,6 +462,20 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
     return 1
   done
 
+  # Every destructive Install medium carries one complete signed-PCR policy
+  # generation. Live media may omit it because they never enroll or unlock a
+  # target volume. Keeping these four fields mandatory as a group prevents an
+  # Install UKI that is correctly signed yet can only discover its missing
+  # recovery contract after selecting a target.
+  if [[ "$mode" == install ]]; then
+    local policy_key
+    for policy_key in neuralice.pcr_policy neuralice.pcr_policy_key \
+      neuralice.pcr_policy_signature neuralice.pcr_policy_seq; do
+      [[ -n "${optional_seen[$policy_key]:-}" ]] \
+        || { _ni_sealed_refuse "missing-install-pcr-policy:$policy_key"; return 1; }
+    done
+  fi
+
   # ------------------------------------------------------------------------- #
   # 4) THE REGISTRY-INSTALL CONTRACT, stated once so producer, generator and
   #    installer cannot disagree about which combinations are meaningful.

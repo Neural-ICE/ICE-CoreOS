@@ -183,6 +183,8 @@ RUN set -euxo pipefail; \
       /usr/libexec/neural-ice-luks-token-evidence; \
     /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
       | grep -Fq -- '--signature-json'; \
+    /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
+      | grep -Fq -- '--public-key'; \
     # 🔴 THE MARKER THAT MAKES THE INSTALLER'S TEST SEAM IMPOSSIBLE HERE.
     # ota/neural-ice-autoinstall.sh consults an environment override for its
     # command-line file, sealed grammar, library directory, verity mount points,

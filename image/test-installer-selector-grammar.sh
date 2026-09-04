@@ -61,6 +61,11 @@ anchor_for() { # $1=access profile -> the eight sealed trust fields
   printf '%s' "$anchor"
 }
 ANCHOR="$(anchor_for lab-managed)"
+PCR_POLICY_FIELDS="neuralice.pcr_policy=$(printf '%064d' 4)"
+PCR_POLICY_FIELDS="$PCR_POLICY_FIELDS neuralice.pcr_policy_key=$(printf '%064d' 5)"
+PCR_POLICY_FIELDS="$PCR_POLICY_FIELDS neuralice.pcr_policy_signature=$(printf '%064d' 6)"
+PCR_POLICY_FIELDS="$PCR_POLICY_FIELDS neuralice.pcr_policy_seq=7"
+ANCHOR_INSTALL="$ANCHOR $PCR_POLICY_FIELDS"
 # 🔴 THE SECOND ANCHOR (independent review 2026-09-02, P0 #3). A `customer-locked`
 # medium may not name a LAN mirror at all: a mirror puts a lab host in the boot
 # path of a machine that must never depend on one, and no digest argument makes
@@ -272,8 +277,17 @@ while IFS=$'\t' read -r expected anchor label words; do
   case "$expected" in ''|'#'*) continue ;; esac
   vectors=$(( vectors + 1 ))
   case "$anchor" in
-    yes)      cmdline="$ANCHOR ${words:-}" ;;
-    customer) cmdline="$ANCHOR_CUSTOMER ${words:-}" ;;
+    yes)
+      cmdline="$ANCHOR ${words:-}"
+      [[ "${words:-}" != *"systemd.unit=neural-ice-installer.target"* ]] \
+        || cmdline="$cmdline $PCR_POLICY_FIELDS"
+      ;;
+    customer)
+      cmdline="$ANCHOR_CUSTOMER ${words:-}"
+      [[ "${words:-}" != *"systemd.unit=neural-ice-installer.target"* ]] \
+        || cmdline="$cmdline $PCR_POLICY_FIELDS"
+      ;;
+    no-policy) cmdline="$ANCHOR ${words:-}" ;;
     no)       cmdline="${words:-}" ;;
     *)        fail "[$label] unknown anchor column '$anchor'" ;;
   esac
@@ -395,7 +409,7 @@ installer_gate "quiet neuralice.autoinstall=1" \
   && fail "the installer would run on a bare neuralice.autoinstall=1 with no anchor and no target"
 installer_gate "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 systemd.debug_shell" \
   && fail "the installer would run on a line carrying a root debug shell"
-installer_gate "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0" \
+installer_gate "$ANCHOR_INSTALL quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0" \
   || fail "the installer refuses the exact signed Install grammar it exists to serve"
 
 # ...and it refuses when the grammar itself is unavailable, rather than assuming.
@@ -457,6 +471,33 @@ PYEOF
 }
 
 esp_digest() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
+pcr_material() { # $1=mode, rest=paths -> inspector's mandatory carrier check
+  python3 - "$INSPECTOR" "$@" <<'PYEOF'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("inspector", sys.argv[1])
+inspector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(inspector)
+try:
+    inspector.check_required_pcr_policy_material(set(sys.argv[3:]), sys.argv[2])
+except inspector.InspectionError:
+    raise SystemExit(1)
+PYEOF
+}
+
+pcr_material live \
+  || fail "a Live medium was incorrectly required to carry Install PCR policy material"
+pcr_material install \
+  && fail "an Install medium with neither mandatory PCR policy carrier was accepted"
+pcr_material install ice-coreos/tpm2-pcr-public-key.pem \
+  && fail "an Install medium with only the PCR public key was accepted"
+pcr_material install ice-coreos/tpm2-pcr-signature.json \
+  && fail "an Install medium with only the PCR signature JSON was accepted"
+pcr_material install ice-coreos/tpm2-pcr-public-key.pem \
+  ice-coreos/tpm2-pcr-signature.json \
+  || fail "an Install medium carrying both mandatory PCR policy files was refused"
+
 relauth_content='an authorization'
 relauth_sig_content='a detached signature'
 mirror_ca_content='a PEM certificate'
