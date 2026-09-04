@@ -20,6 +20,8 @@ it would look exactly like a correct one.
 
 import argparse
 import hashlib
+import json
+import re
 import struct
 import subprocess
 import sys
@@ -134,21 +136,47 @@ def replay(events, pcr_index, alg="sha256"):
 
 
 def live_pcr(pcr_index, alg="sha256"):
-    out = subprocess.run(["tpm2_pcrread", f"{alg}:{pcr_index}"],
-                         capture_output=True, text=True, check=True).stdout
-    # tpm2_pcrread prints "    7 : 0x<HEX>" under a "  sha256:" heading. Match on
-    # the index as a token rather than a prefix: "7:" also prefixes "70:", and
-    # spacing varies between tpm2-tools releases.
-    for line in out.splitlines():
-        parts = line.strip().split(":", 1)
-        if len(parts) != 2 or parts[0].strip() != str(pcr_index):
+    try:
+        result = subprocess.run(
+            ["tpm2_pcrread", f"{alg}:{pcr_index}"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError as error:
+        raise EventLogError(f"cannot execute tpm2_pcrread: {error}") from error
+    if result.returncode != 0:
+        raise EventLogError(
+            f"tpm2_pcrread {alg}:{pcr_index} failed with status "
+            f"{result.returncode}"
+        )
+
+    # tpm2-tools emits a bank heading followed by "<index> : 0x<HEX>". Accept
+    # exactly that documented shape, in the requested bank, exactly once. A
+    # short value, a duplicate line or a value outside the bank section is not a
+    # PCR reading the installer may use to decide whether wiping a disk is safe.
+    matches = []
+    in_requested_bank = False
+    expected_hex = hashlib.new(alg).digest_size * 2
+    value_re = re.compile(
+        rf"^{pcr_index}\s*:\s*0x([0-9A-Fa-f]{{{expected_hex}}})$"
+    )
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped == f"{alg}:":
+            in_requested_bank = True
             continue
-        value = parts[1].strip()
-        if not value.lower().startswith("0x"):
+        if re.fullmatch(r"[A-Za-z0-9_-]+:", stripped):
+            in_requested_bank = False
             continue
-        return bytes.fromhex(value[2:])
-    raise EventLogError(f"tpm2_pcrread returned no value for {alg}:{pcr_index}; "
-                        f"output was:\n{out}")
+        if in_requested_bank:
+            match = value_re.fullmatch(stripped)
+            if match:
+                matches.append(bytes.fromhex(match.group(1)))
+    if len(matches) != 1:
+        raise EventLogError(
+            f"tpm2_pcrread returned {len(matches)} well-formed values for "
+            f"{alg}:{pcr_index}; expected exactly one"
+        )
+    return matches[0]
 
 
 def cmd_selfcheck(args):
@@ -260,6 +288,92 @@ def pcr_policy_digest(pcr_index, value, alg="sha256"):
     TPM_CC_PolicyPCR = 0x0000017F
     return hashlib.new(alg, zero + struct.pack(">I", TPM_CC_PolicyPCR)
                        + selection + digest_tpm).digest()
+
+
+SIGNATURE_JSON_MAX_BYTES = 1 << 20
+
+
+def signature_policy_digests(path, pcr_index, alg="sha256"):
+    """Return all valid policy digests and those explicitly selecting one PCR."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(SIGNATURE_JSON_MAX_BYTES + 1)
+    except OSError as error:
+        raise EventLogError(f"cannot read signed PCR policy JSON: {error}") from error
+    if len(raw) > SIGNATURE_JSON_MAX_BYTES:
+        raise EventLogError(
+            f"signed PCR policy JSON exceeds {SIGNATURE_JSON_MAX_BYTES} bytes"
+        )
+    try:
+        document = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EventLogError(f"signed PCR policy JSON is malformed: {error}") from error
+
+    entries = document.get(alg) if isinstance(document, dict) else None
+    if not isinstance(entries, list):
+        raise EventLogError(f"signed PCR policy JSON has no {alg} entry list")
+
+    digest_re = re.compile(
+        rf"[0-9a-f]{{{hashlib.new(alg).digest_size * 2}}}"
+    )
+    available = set()
+    selected = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        policy = entry.get("pol")
+        if not isinstance(policy, str) or not digest_re.fullmatch(policy):
+            continue
+        available.add(policy)
+        if entry.get("pcrs") == [pcr_index]:
+            selected.add(policy)
+    if not available:
+        raise EventLogError(
+            f"signed PCR policy JSON carries no valid {alg} PolicyPCR digest"
+        )
+    return sorted(available), sorted(selected)
+
+
+def cmd_verify_live_coverage(args):
+    """Refuse unless the staged systemd signature JSON covers live PCR state."""
+    available, selected = signature_policy_digests(
+        args.signature_json, args.pcr, args.alg
+    )
+    print(
+        "installer PCR guard: available PolicyPCR digests: "
+        + ", ".join(available),
+        file=sys.stderr,
+    )
+    if args.required_policy_digest not in selected:
+        raise EventLogError(
+            "signed PCR policy JSON does not contain the policy generation "
+            f"digest sealed by this installer under pcrs=[{args.pcr}]"
+        )
+
+    measured = live_pcr(args.pcr, args.alg)
+    expected_size = hashlib.new(args.alg).digest_size
+    if len(measured) != expected_size:
+        raise EventLogError(
+            f"live {args.alg} PCR {args.pcr} is {len(measured)} bytes, "
+            f"expected {expected_size}"
+        )
+    policy = pcr_policy_digest(args.pcr, measured, args.alg)
+    print(
+        f"installer PCR guard: live {args.alg} PCR {args.pcr}: "
+        f"{measured.hex()}",
+        file=sys.stderr,
+    )
+    print(
+        f"installer PCR guard: computed PolicyPCR digest: {policy.hex()}",
+        file=sys.stderr,
+    )
+    if policy.hex() not in selected:
+        raise EventLogError(
+            f"live {args.alg} PCR {args.pcr} is not covered by an entry whose "
+            f"pcrs field is exactly [{args.pcr}]"
+        )
+    print(measured.hex(), policy.hex(), ",".join(available))
+    return 0
 
 
 def cmd_predict(args):
@@ -409,6 +523,12 @@ def main():
     pd = sub.add_parser("policy-digest",
                         help="policyDigest for a PCR value (check vs tpm2_createpolicy)")
     pd.add_argument("--value", required=True, metavar="HEX")
+    vc = sub.add_parser(
+        "verify-live-coverage",
+        help="refuse unless signed policy JSON covers the live PCR value",
+    )
+    vc.add_argument("--signature-json", required=True)
+    vc.add_argument("--required-policy-digest", required=True)
     sr = sub.add_parser("sign-request",
                         help="write the bytes the Owner signs (no private key here)")
     sr.add_argument("--pol", required=True, metavar="HEX")
@@ -423,6 +543,7 @@ def main():
     try:
         return {"selfcheck": cmd_selfcheck, "show": cmd_show,
                 "predict": cmd_predict, "policy-digest": cmd_policy_digest,
+                "verify-live-coverage": cmd_verify_live_coverage,
                 "sign-request": cmd_sign_request, "emit": cmd_emit}[args.cmd](args)
     except EventLogError as e:
         print(f"error: {e}", file=sys.stderr)

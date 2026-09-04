@@ -1249,24 +1249,27 @@ PCR_POLICY_SEQ="$(karg_once neuralice.pcr_policy_seq)"
   || die "this install medium does not seal one exact signed PCR policy generation"
 PCR_POLICY_KEY_RUNTIME=/run/neural-ice-installer/tpm2-pcr-public-key.pem
 PCR_POLICY_SIGNATURE_RUNTIME=/run/neural-ice-installer/tpm2-pcr-signature.json
+readonly TPM_POLICY_TOOL=/usr/lib/neural-ice/tpm-policy.py
 install -d -m 0700 /run/neural-ice-installer
 esp_staged_file tpm2-pcr-public-key.pem "$PCR_POLICY_KEY_SHA256" "$PCR_POLICY_KEY_RUNTIME"
 esp_staged_file tpm2-pcr-signature.json "$PCR_POLICY_SIGNATURE_SHA256" "$PCR_POLICY_SIGNATURE_RUNTIME"
 openssl pkey -pubin -in "$PCR_POLICY_KEY_RUNTIME" -noout >/dev/null \
   || die "the sealed PCR policy public key is not a usable public key"
-if ! python3 - "$PCR_POLICY_SIGNATURE_RUNTIME" "$PCR_POLICY_DIGEST" <<'PCR_POLICY_PY'
-import json, re, sys
-document=json.load(open(sys.argv[1],encoding="ascii"))
-entries=document.get("sha256") if isinstance(document,dict) else None
-if not isinstance(entries,list) or not any(
-    isinstance(e,dict) and isinstance(e.get("pol"),str)
-    and re.fullmatch(r"[0-9a-f]{64}",e["pol"]) and e["pol"]==sys.argv[2]
-    for e in entries):
-    raise SystemExit(1)
-PCR_POLICY_PY
-then
-  die "the signed PCR policy file does not contain the exact sealed PolicyPCR digest"
+if ! PCR_POLICY_LIVE_RESULT="$(
+  "$TPM_POLICY_TOOL" --pcr 7 --alg sha256 verify-live-coverage \
+    --signature-json "$PCR_POLICY_SIGNATURE_RUNTIME" \
+    --required-policy-digest "$PCR_POLICY_DIGEST"
+)"; then
+  die "NI-P7-COVERAGE: live SHA-256 PCR7 is unreadable, malformed, or uncovered by the staged signed policy"
 fi
+read -r LIVE_PCR7 LIVE_PCR7_POLICY AVAILABLE_PCR7_POLICIES <<<"$PCR_POLICY_LIVE_RESULT"
+[[ "$LIVE_PCR7" =~ ^[0-9a-f]{64}$ && "$LIVE_PCR7_POLICY" =~ ^[0-9a-f]{64}$ \
+   && "$AVAILABLE_PCR7_POLICIES" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]] \
+  || die "NI-P7-COVERAGE: the immutable TPM policy helper returned malformed coverage evidence"
+readonly LIVE_PCR7 LIVE_PCR7_POLICY AVAILABLE_PCR7_POLICIES
+log "Live SHA-256 PCR7 = $LIVE_PCR7"
+log "Live PCR7 PolicyPCR digest = $LIVE_PCR7_POLICY"
+log "Available signed PolicyPCR digests = $AVAILABLE_PCR7_POLICIES"
 PCR_POLICY_HIGH_WATER="$("$TPM_STATE" pcr-policy-check "$PCR_POLICY_SEQ")" \
   || die "signed PCR policy sequence $PCR_POLICY_SEQ is replayed, stale or outside the TPM high-water window"
 [[ "$PCR_POLICY_HIGH_WATER" =~ ^[0-9]{1,16}$ && "$PCR_POLICY_SEQ" -gt "$PCR_POLICY_HIGH_WATER" ]] \
@@ -1811,6 +1814,10 @@ mount "$ESP" "$TGT/boot/efi"
 install -d -m 0755 "$TGT/boot/efi/EFI/neural-ice"
 install -m 0644 "$PCR_POLICY_SIGNATURE_RUNTIME" "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr-signature.json"
 install -m 0644 "$PCR_POLICY_KEY_RUNTIME" "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr-public-key.pem"
+install -m 0644 /dev/null "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr7-at-install.txt"
+printf 'schema=1\npcr7_sha256=%s\npolicy_pcr_sha256=%s\navailable_policy_pcr_sha256=%s\n' \
+  "$LIVE_PCR7" "$LIVE_PCR7_POLICY" "$AVAILABLE_PCR7_POLICIES" \
+  > "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr7-at-install.txt"
 # Make the target (+ submounts) shared so they propagate into the container.
 mount --rbind "$TGT" "$TGT"
 mount --make-rshared "$TGT"
@@ -2049,6 +2056,9 @@ if [[ -n "$SEED_VERIFIED_ROOT" ]]; then
   printf '%s\n' "$SEED_MANIFEST_SHA256" > /run/seed-dst/release/MANIFEST
   printf '%s\n' "$SEED_TRUSTED_NOW" > /run/seed-dst/release/TRUSTED-NOW
   printf '%s\n' "$PCR_POLICY_DIGEST" > /run/seed-dst/release/PCR-POLICY
+  printf '%s\n' "$LIVE_PCR7" > /run/seed-dst/release/PCR7-LIVE
+  printf '%s\n' "$LIVE_PCR7_POLICY" > /run/seed-dst/release/PCR7-POLICY
+  printf '%s\n' "$AVAILABLE_PCR7_POLICIES" > /run/seed-dst/release/PCR7-POLICIES
   printf '%s\n' "$PCR_POLICY_KEY_SHA256" > /run/seed-dst/release/PCR-POLICY-KEY
   printf '%s\n' "$PCR_POLICY_SIGNATURE_SHA256" > /run/seed-dst/release/PCR-POLICY-SIGNATURE
   printf '%s\n' "$PCR_POLICY_SEQ" > /run/seed-dst/release/PCR-POLICY-SEQ

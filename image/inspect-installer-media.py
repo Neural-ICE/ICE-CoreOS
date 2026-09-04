@@ -32,6 +32,8 @@ What it proves
   -- so the destructive mode is a property of a signature, not of a keystroke;
 * the UKI carries a signature directory (i.e. it was actually signed), unless
   ``--allow-unsigned`` says an unsigned medium was built on purpose;
+* when TPM policy material is present, the staged multi-entry signature JSON
+  contains the exact PCR7 PolicyPCR digest the signed UKI seals;
 * the payload header's SHA-256 is the digest the UKI seals, EVERY region hashes
   to what that header says, and -- the part a manifest can never establish --
   the dm-verity root hashes of the installer root image and of the container
@@ -61,6 +63,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import ipaddress
+import json
 import re
 import struct
 import sys
@@ -1081,6 +1084,44 @@ def check_esp_hash_bound(paths: set[str], read_file, cmdline: str) -> None:
             )
 
 
+def check_tpm_policy_document(paths: set[str], read_file, cmdline: str) -> None:
+    """Prove the staged systemd policy document contains the sealed generation."""
+    signature_path = "ice-coreos/tpm2-pcr-signature.json"
+    if signature_path not in paths:
+        return
+    sealed_words = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
+    expected = sealed_words.get("neuralice.pcr_policy")
+    if expected is None:
+        raise InspectionError(
+            "the ESP carries TPM policy JSON but the signed command line seals no "
+            "neuralice.pcr_policy"
+        )
+    raw = read_file(signature_path)
+    if len(raw) > MAX_SECTION_BYTES:
+        raise InspectionError(
+            f"the staged TPM policy JSON exceeds {MAX_SECTION_BYTES} bytes"
+        )
+    try:
+        document = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InspectionError(f"the staged TPM policy JSON is malformed: {error}") from error
+    entries = document.get("sha256") if isinstance(document, dict) else None
+    covered = (
+        isinstance(entries, list)
+        and any(
+            isinstance(entry, dict)
+            and entry.get("pcrs") == [7]
+            and entry.get("pol") == expected
+            for entry in entries
+        )
+    )
+    if not covered:
+        raise InspectionError(
+            "the staged TPM policy JSON does not contain the PCR7 PolicyPCR "
+            f"digest {expected} sealed by the signed command line"
+        )
+
+
 def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, str]]:
     paths = sorted(esp.walk())
     manifests = [path for path in paths if ESP_MANIFEST_RE.fullmatch(path)]
@@ -1153,6 +1194,7 @@ def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, s
     # and a real medium, and a control that only exists behind that fixture is a
     # control nobody notices the loss of.
     check_esp_hash_bound(set(paths), esp.read_file, cmdline)
+    check_tpm_policy_document(set(paths), esp.read_file, cmdline)
     if not arguments.allow_unsigned and not pe_has_signature(blob):
         raise InspectionError("BOOTAA64.EFI carries no signature")
     return cmdline, fields

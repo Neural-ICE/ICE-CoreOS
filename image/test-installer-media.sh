@@ -69,12 +69,16 @@ grep -q 'recomputed from the medium' "$TMP/inspect.out" \
   || fail "the inspector did not recompute the verity root hashes off the medium"
 
 # Public TPM policy material may travel on the mutable ESP only when the signed
-# UKI command line pins each file's digest.
+# UKI command line pins each file's digest, and the policy JSON must contain the
+# exact sealed generation. Put the sealed digest second to prove a multi-entry
+# document is accepted rather than accidentally checking only its first entry.
 printf '%s\n' 'fixture TPM PCR public key' > "$TMP/tpm2-pcr-public-key.pem"
-printf '%s\n' '{"fixture":"TPM PCR signature"}' > "$TMP/tpm2-pcr-signature.json"
+tpm_policy_sha="$(printf 'fixture TPM PCR policy' | sha256sum | awk '{print $1}')"
+other_tpm_policy_sha="$(printf 'other fixture TPM PCR policy' | sha256sum | awk '{print $1}')"
+printf '{"sha256":[{"pcrs":[7],"pol":"%s"},{"pcrs":[7],"pol":"%s"}]}\n' \
+  "$other_tpm_policy_sha" "$tpm_policy_sha" > "$TMP/tpm2-pcr-signature.json"
 tpm_key_sha="$(sha256sum "$TMP/tpm2-pcr-public-key.pem" | awk '{print $1}')"
 tpm_signature_sha="$(sha256sum "$TMP/tpm2-pcr-signature.json" | awk '{print $1}')"
-tpm_policy_sha="$(printf 'fixture TPM PCR policy' | sha256sum | awk '{print $1}')"
 build_uki installer-tpm-policy \
   "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=${tpm_policy_sha} neuralice.pcr_policy_key=${tpm_key_sha} neuralice.pcr_policy_signature=${tpm_signature_sha} neuralice.pcr_policy_seq=7" \
   >/dev/null || fail "the TPM-policy Install UKI failed to build"
@@ -87,6 +91,24 @@ make_esp "$SEALED/installer-tpm-policy.efi" \
   "${tpm_esp_files[@]}"
 assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null || fail "correctly hash-bound TPM public policy files were refused"
+
+# Hash binding alone is insufficient: a signer can accidentally cut a medium
+# whose staged JSON is valid but covers only another machine. Seal the hash of
+# that internally consistent wrong document and require the inspector to catch
+# the missing PolicyPCR digest before the medium leaves the build plane.
+printf '{"sha256":[{"pcrs":[7],"pol":"%s"}]}\n' \
+  "$other_tpm_policy_sha" > "$TMP/tpm2-pcr-signature-uncovered.json"
+uncovered_signature_sha="$(sha256sum "$TMP/tpm2-pcr-signature-uncovered.json" | awk '{print $1}')"
+build_uki installer-tpm-policy-uncovered \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=${tpm_policy_sha} neuralice.pcr_policy_key=${tpm_key_sha} neuralice.pcr_policy_signature=${uncovered_signature_sha} neuralice.pcr_policy_seq=7" \
+  >/dev/null || fail "the uncovered-policy mutation UKI failed to build"
+make_esp "$SEALED/installer-tpm-policy-uncovered.efi" \
+  "$SEALED/installer-tpm-policy-uncovered.efi.manifest" installer-install.efi.manifest \
+  "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key.pem" \
+  "::/ice-coreos/tpm2-pcr-signature.json=$TMP/tpm2-pcr-signature-uncovered.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium whose hash-bound TPM policy JSON omits its sealed PolicyPCR digest was accepted"
 
 printf '%s\n' 'substituted TPM PCR public key' > "$TMP/tpm2-pcr-public-key-swapped.pem"
 make_esp "$SEALED/installer-tpm-policy.efi" \

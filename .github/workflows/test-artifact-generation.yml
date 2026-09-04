@@ -251,6 +251,7 @@ jobs:
             image/test-verify-preloaded-media.sh ota/neural-ice-access-profile-anchor.sh ota/neural-ice-autoinstall.sh \
             ota/neural-ice-device-root-tpm.sh ota/neural-ice-firstboot-tpm-ceremony.sh ota/neural-ice-lab-baseline-handoff.sh \
             ota/neural-ice-tpm-policy-check.sh ota/neural-ice-tpm-state.sh ota/test-autoinstall-kargs.sh \
+            ota/test-installer-pcr7-coverage.sh \
             ota/test-neural-ice-access-profile-anchor.sh ota/test-neural-ice-device-root-tpm.sh ota/test-neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-tpm-state.sh ota/test-tpm-signed-policy.sh
           # The initramfs hooks and the payload library are POSIX sh, on purpose:
@@ -426,6 +427,7 @@ jobs:
           ./image/test-qualify-installer-qemu.sh
           ./image/test-seed-firstboot-import.sh
           ./ota/test-autoinstall-kargs.sh
+          ./ota/test-installer-pcr7-coverage.sh
           ./ota/test-neural-ice-tpm-state.sh
           ./ota/test-neural-ice-access-profile-anchor.sh
           # 🔴 AND THE THREE HAND-MAINTAINED LISTS ABOVE ARE CHECKED AGAINST THE
