@@ -87,15 +87,6 @@ RUN bash -euxo pipefail -c '\
 
 # Auto-install service (gated by the neuralice.autoinstall kernel argument).
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
-# Pinned appliance digests still ship the first-boot ceremony After=tmpfiles
-# with DefaultDependencies=yes. The installer stages this drop-in onto the
-# deployment /etc so first boot cannot form a sockets/sysext ordering cycle.
-COPY image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf \
-     /usr/lib/neural-ice/firstboot-ceremony-sysinit.conf
-COPY image/firstboot/neural-ice-firstboot-tpm-ceremony.service \
-     /usr/lib/neural-ice/firstboot-tpm-ceremony.service
-COPY image/firstboot/neural-ice-firstboot-ceremony-generator \
-     /usr/lib/neural-ice/firstboot-ceremony-generator
 # Keep the destructive pre-activation token readback on the same checkout as
 # the installer. A stale helper inherited from BASE_IMAGE can invert the
 # PolicyAuthorize contract and reject a correctly enrolled target.
@@ -175,13 +166,11 @@ RUN set -euxo pipefail; \
       /usr/libexec/neural-ice-tpm-state \
       /usr/libexec/neural-ice-live-diagnostics \
       /usr/libexec/neural-ice-installer-failure \
-      /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator \
-      /usr/lib/neural-ice/firstboot-ceremony-generator; \
+      /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator; \
     chmod 0644 /usr/lib/neural-ice/sealed-cmdline-grammar.sh \
       /usr/lib/neural-ice/installer-failure-policy \
       /usr/lib/neural-ice/registry-authorisation.py; \
     bash -n /usr/libexec/neural-ice-installer-failure; \
-    bash -n /usr/lib/neural-ice/firstboot-ceremony-generator; \
     python3 -c 'import ast,sys; [ast.parse(open(path).read()) for path in sys.argv[1:]]' \
       /usr/lib/neural-ice/registry-authorisation.py \
       /usr/libexec/neural-ice-luks-token-evidence; \

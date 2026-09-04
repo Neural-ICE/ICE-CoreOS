@@ -51,22 +51,23 @@ grep -Fq '/run/cryptsetup' "$UNIT" \
 # keeps the private /tmp and adds no tmpfiles edge.
 grep -qx 'PrivateTmp=disconnected' "$UNIT" \
   || fail "ceremony must use PrivateTmp=disconnected: PrivateTmp=yes re-adds After=tmpfiles-setup and cycles with sysext"
-SYSINIT_DROPIN="$ROOT/image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf"
-GENERATOR="$ROOT/image/firstboot/neural-ice-firstboot-ceremony-generator"
-grep -qx 'DefaultDependencies=no' "$SYSINIT_DROPIN" \
-  || fail "pinned-digest ceremony drop-in does not disable default dependencies"
-grep -qx 'After=' "$SYSINIT_DROPIN" \
-  || fail "pinned-digest ceremony drop-in does not reset After="
-! grep -E '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$SYSINIT_DROPIN" \
-  || fail "pinned-digest drop-in Before=tmpfiles self-cycles when After= reset is ignored"
-! grep -E '^(After|Before)=.*sysinit\.target' "$SYSINIT_DROPIN" \
-  || fail "pinned-digest drop-in Before=sysinit cycles with sshd.socket"
-[[ -f "$GENERATOR" && ! -L "$GENERATOR" ]] \
-  || fail "the first-boot ceremony generator is missing"
-grep -Fq '/etc/neural-ice/firstboot-tpm-ceremony.service' "$GENERATOR" \
-  || fail "the generator does not install the staged ceremony unit"
-grep -Eq '^! grep -Eq .\^PrivateTmp=\(yes\|true\|on\|1\)' "$GENERATOR" \
-  || fail "the generator does not refuse a staged unit with PrivateTmp=yes (re-adds After=tmpfiles-setup)"
+# The /etc overlay + generator that bridged pre-re-pin appliance digests from
+# the medium is retired (2026-09-04 re-pin): the installer refuses an appliance
+# whose own unit still cycles, instead of patching it.
+for bridge in image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf \
+  image/firstboot/neural-ice-firstboot-ceremony-generator; do
+  [[ ! -e "$ROOT/$bridge" ]] || fail "retired first-boot ceremony bridge is back in the tree: $bridge"
+done
+AUTOINSTALL="$ROOT/ota/neural-ice-autoinstall.sh"
+grep -Fq '"$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"' "$AUTOINSTALL" \
+  || fail "the installer does not verify the pinned appliance's own first-boot ceremony unit"
+grep -Eq "grep -Eq '\^PrivateTmp=\(yes\|true\|on\|1\)" "$AUTOINSTALL" \
+  || fail "the installer does not refuse an appliance whose ceremony unit uses PrivateTmp=yes (re-adds After=tmpfiles-setup)"
+grep -Eq 'systemd-tmpfiles-setup\\.service. "\$ceremony_unit"' "$AUTOINSTALL" \
+  || fail "the installer does not refuse an appliance whose ceremony unit orders against tmpfiles-setup"
+! grep -Fq 'etc/systemd/system-generators/neural-ice-firstboot-ceremony"' "$AUTOINSTALL" \
+  || { grep -Fq 'retired first-boot ceremony bridge' "$AUTOINSTALL" \
+       || fail "the installer still stages the retired first-boot ceremony generator"; }
 
 dropin_units=(
   sshd.service sshd.socket getty@.service serial-getty@.service autovt@.service

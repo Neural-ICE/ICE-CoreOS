@@ -455,30 +455,21 @@ grep -Fq 'test ! -L /usr/sbin/veritysetup' "$INSTALLER_CONTAINERFILE" \
 grep -Fq 'COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luks-token-evidence' \
   "$INSTALLER_CONTAINERFILE" \
   || fail "the installer silently inherits a stale destructive token validator from its base image"
-grep -Fq 'COPY image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf' \
+# The pre-re-pin bridge (drop-in + unit copy + generator staged from the medium
+# onto the deployment /etc) is retired. The medium must not carry it, and the
+# installer must instead refuse an appliance whose own unit still cycles.
+! grep -Eq 'COPY image/firstboot/(10-neural-ice-firstboot-ceremony-sysinit\.conf|neural-ice-firstboot-ceremony-generator|neural-ice-firstboot-tpm-ceremony\.service)' \
   "$INSTALLER_CONTAINERFILE" \
-  || fail "the installer image does not carry the first-boot ceremony sysinit drop-in"
-grep -Fq 'COPY image/firstboot/neural-ice-firstboot-tpm-ceremony.service' \
-  "$INSTALLER_CONTAINERFILE" \
-  || fail "the installer image does not carry the first-boot ceremony unit override"
-grep -Fq 'COPY image/firstboot/neural-ice-firstboot-ceremony-generator' \
-  "$INSTALLER_CONTAINERFILE" \
-  || fail "the installer image does not carry the first-boot ceremony generator"
-grep -Fq '/usr/lib/neural-ice/firstboot-tpm-ceremony.service' \
+  || fail "the installer image still carries the retired first-boot ceremony bridge"
+! grep -Fq '/usr/lib/neural-ice/firstboot-ceremony-generator' "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer still stages the retired first-boot ceremony generator"
+! grep -Fq 'chcon -t systemd_generic_generator_exec_t' "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer still relabels a first-boot ceremony generator overlay"
+grep -Fq 'ceremony_unit="$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"' \
   "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not replace the first-boot ceremony unit on the deployment"
-grep -Fq '/usr/lib/neural-ice/firstboot-ceremony-sysinit.conf' \
-  "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not stage the first-boot ceremony sysinit drop-in onto the deployment"
-grep -Fq '/etc/systemd/system-generators/neural-ice-firstboot-ceremony' \
-  "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not stage the first-boot ceremony systemd generator"
-grep -Fq 'chcon -t systemd_unit_file_t' \
-  "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not relabel the first-boot ceremony unit overlay after setfiles"
-grep -Fq 'chcon -t systemd_generic_generator_exec_t' \
-  "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not relabel the first-boot ceremony generator after setfiles"
+  || fail "the installer does not verify the pinned appliance's own first-boot ceremony unit"
+grep -Fq 'retired first-boot ceremony bridge' "$ROOT/ota/neural-ice-autoinstall.sh" \
+  || fail "the installer does not refuse a deployment that still carries the retired ceremony bridge"
 # The ceremony/tmpfiles cycle is broken at its source (PrivateTmp=disconnected
 # in the ceremony unit). A systemd.mask= karg on sysext/confext would persist
 # across every bootc upgrade and disable the root-capable-extension gate.

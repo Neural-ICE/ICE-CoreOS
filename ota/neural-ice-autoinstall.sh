@@ -2101,56 +2101,34 @@ rm -f -- "$installer_device_root_dropin" \
   || die "cannot remove the installer-only device-root Live guard"
 rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
 
-# The baked ceremony unit After=tmpfiles-setup plus Requires= from sysext
-# (Before=tmpfiles) is an ordering cycle; first boot then skips tmpfiles-setup
-# and isolates emergency. systemd 257 did not honour an empty After= drop-in
-# reset on QEMU, and Before=tmpfiles/sysinit on the overlay re-closed the
-# loop. Replace the image unit, drop Before=tmpfiles/sysinit, and generate
-# the same unit at boot so /usr/lib cannot win.
-ceremony_sysinit_src=/usr/lib/neural-ice/firstboot-ceremony-sysinit.conf
-ceremony_unit_src=/usr/lib/neural-ice/firstboot-tpm-ceremony.service
-ceremony_generator_src=/usr/lib/neural-ice/firstboot-ceremony-generator
-[[ -f "$ceremony_sysinit_src" && ! -L "$ceremony_sysinit_src" ]] \
-  || die "the first-boot ceremony sysinit drop-in is absent from this medium"
-[[ -f "$ceremony_unit_src" && ! -L "$ceremony_unit_src" ]] \
-  || die "the first-boot ceremony unit is absent from this medium"
-[[ -f "$ceremony_generator_src" && ! -L "$ceremony_generator_src" ]] \
-  || die "the first-boot ceremony generator is absent from this medium"
-install -d -m 0755 -- \
-  "$dep/etc/neural-ice" \
-  "$dep/etc/systemd/system-generators" \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d" \
-  || die "cannot prepare the first-boot ceremony overlay directories"
-install -m 0644 -- "$ceremony_unit_src" \
-  "$dep/etc/neural-ice/firstboot-tpm-ceremony.service" \
-  || die "cannot stage the first-boot TPM ceremony unit for the generator"
-install -m 0644 -- "$ceremony_unit_src" \
+# The first-boot ceremony unit is the pinned appliance's own
+# (/usr/lib/systemd/system, shipped by ICE-CoreOS). Appliance digests before
+# the 2026-09-04 re-pin ordered it After=systemd-tmpfiles-setup.service
+# (explicitly and through PrivateTmp=yes) while systemd-sysext/confext are
+# Requires=+After= this gate and Before= tmpfiles-setup: an ordering cycle that
+# systemd 257 broke by skipping units at random on first boot. An /etc overlay
+# and a generator used to bridge that from the medium; the bridge was retired
+# at the re-pin. The installer now REFUSES such an image instead of patching
+# it: a medium must not silently repair the appliance it deploys.
+ceremony_unit="$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+[[ -f "$ceremony_unit" && ! -L "$ceremony_unit" ]] \
+  || die "the pinned appliance image ships no first-boot TPM ceremony unit"
+grep -qx 'DefaultDependencies=no' "$ceremony_unit" \
+  || die "the pinned appliance's first-boot ceremony unit keeps default dependencies (ordering cycle with sysext/confext); re-pin the medium to a fixed appliance digest"
+! grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$ceremony_unit" \
+  || die "the pinned appliance's first-boot ceremony unit orders against tmpfiles-setup (ordering cycle with sysext/confext); re-pin the medium"
+! grep -Eq '^(After|Before)=.*sysinit\.target' "$ceremony_unit" \
+  || die "the pinned appliance's first-boot ceremony unit orders against sysinit.target (cycle with sshd.socket); re-pin the medium"
+! grep -Eq '^PrivateTmp=(yes|true|on|1)[[:space:]]*$' "$ceremony_unit" \
+  || die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=yes, which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium"
+for bridge in \
   "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
-  || die "cannot replace the first-boot TPM ceremony unit on the deployment"
-install -m 0755 -- "$ceremony_generator_src" \
   "$dep/etc/systemd/system-generators/neural-ice-firstboot-ceremony" \
-  || die "cannot install the first-boot ceremony systemd generator"
-install -m 0644 -- "$ceremony_sysinit_src" \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/10-sysinit-order.conf" \
-  || die "cannot stage the first-boot ceremony After= reset drop-in"
-grep -Fq 'DefaultDependencies=no' \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
-  || die "the first-boot ceremony unit was not staged"
-grep -Fq 'DefaultDependencies=no' \
-  "$dep/etc/neural-ice/firstboot-tpm-ceremony.service" \
-  || die "the generator ceremony unit was not staged"
-! grep -E '^(After|Before)=.*systemd-tmpfiles-setup\.service' \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
-  || die "the staged ceremony unit still names tmpfiles-setup"
-! grep -E '^(After|Before)=.*sysinit\.target' \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
-  || die "the staged ceremony unit still names sysinit.target"
-grep -Fq 'DefaultDependencies=no' \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/10-sysinit-order.conf" \
-  || die "the first-boot ceremony sysinit drop-in was not staged"
-[[ -x "$dep/etc/systemd/system-generators/neural-ice-firstboot-ceremony" ]] \
-  || die "the first-boot ceremony generator is not executable"
-log "staged first-boot ceremony overlay (DefaultDependencies=no, no tmpfiles/sysinit edges)"
+  "$dep/etc/neural-ice/firstboot-tpm-ceremony.service"; do
+  [[ ! -e "$bridge" && ! -L "$bridge" ]] \
+    || die "the deployment carries a retired first-boot ceremony bridge at $bridge"
+done
+log "first-boot ceremony unit verified on the pinned appliance (DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges)"
 
 # The medium runs with a permissive container-signature policy so bootc can read
 # its own local image through whatever transport it picks -- containers-storage
@@ -2333,27 +2311,8 @@ stat -c %C "$dep/etc" | grep -q ':etc_t:' \
   || die "deployment /etc is still not etc_t after setfiles — refusing to ship"
 stat -c %C /run/seed-dst | grep -Eq ':(var_lib_t|var_t):' \
   || die "data volume root is still unlabeled after setfiles — refusing to ship"
-# setfiles maps /etc/systemd/system/*.service to etc_t on this policy (there is
-# no /etc/systemd/system → systemd_unit_file_t rule; only system.control).
-# systemd 257 in enforcing then keeps the vendor fragment, so the image unit's
-# After=tmpfiles-setup still cycles with sysext. Generators under /etc are
-# likewise etc_t and not executable. Restore the types the vendor units use.
-chcon -t systemd_unit_file_t -- \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d" \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/10-sysinit-order.conf" \
-  || die "cannot label the first-boot ceremony systemd overlay"
-chcon -t systemd_generic_generator_exec_t -- \
-  "$dep/etc/systemd/system-generators/neural-ice-firstboot-ceremony" \
-  || die "cannot label the first-boot ceremony systemd generator"
-stat -c %C "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
-  | grep -q ':systemd_unit_file_t:' \
-  || die "the first-boot ceremony unit overlay is not systemd_unit_file_t"
-stat -c %C "$dep/etc/systemd/system-generators/neural-ice-firstboot-ceremony" \
-  | grep -q ':systemd_generic_generator_exec_t:' \
-  || die "the first-boot ceremony generator is not executable under SELinux"
 umount /run/seed-dst 2>/dev/null || true
-log "SELinux: labels applied and verified (deployment /etc = etc_t, ceremony overlay = systemd unit/generator types, data = policy defaults)."
+log "SELinux: labels applied and verified (deployment /etc = etc_t, data = policy defaults)."
 
 # --------------------------------------------------------------------------- #
 # 6) DATA volume config is NOT written post-install (an ostree deployment's /etc

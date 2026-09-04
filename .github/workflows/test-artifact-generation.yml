@@ -233,7 +233,7 @@ jobs:
             ci/test-stage-nvidia-userspace.sh ci/test-suite-collection.sh ci/test-swtpm-monotonic-state.sh \
             ci/verify-build-context.sh image/build-installer-payload.sh image/build-installer-root.sh \
             image/build-installer-uki.sh image/build-installer-usb.sh image/build-preloaded.sh \
-            image/build-seed-v2.sh image/firstboot/neural-ice-firstboot-ceremony-generator image/firstboot/neural-ice-firstboot-sshkey.sh image/firstboot/neural-ice-seed-import.sh image/installer/neural-ice-installer-failure.sh \
+            image/build-seed-v2.sh image/firstboot/neural-ice-firstboot-sshkey.sh image/firstboot/neural-ice-seed-import.sh image/installer/neural-ice-installer-failure.sh \
             image/installer/neural-ice-installer-runtime-generator.sh image/installer/neural-ice-live-diagnostics.sh image/installer/neural-ice-sealed-cmdline-grammar.sh \
             image/lib/access-policy.sh image/lib/hardware-identity.sh image/lib/installer-payload.sh image/lib/tpm2-nv-public.sh \
             image/lib/installer-ssh-key.sh image/lib/installer-trust.sh image/lib/preloaded-output-set.sh \
