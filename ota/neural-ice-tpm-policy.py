@@ -19,10 +19,15 @@ it would look exactly like a correct one.
 """
 
 import argparse
+import base64
+import binascii
 import hashlib
+import json
+import re
 import struct
 import subprocess
 import sys
+import tempfile
 
 # TPM_ALG_ID -> (name, digest length). Only what a PCR 7 replay needs.
 ALGS = {0x0004: ("sha1", 20), 0x000B: ("sha256", 32),
@@ -134,21 +139,47 @@ def replay(events, pcr_index, alg="sha256"):
 
 
 def live_pcr(pcr_index, alg="sha256"):
-    out = subprocess.run(["tpm2_pcrread", f"{alg}:{pcr_index}"],
-                         capture_output=True, text=True, check=True).stdout
-    # tpm2_pcrread prints "    7 : 0x<HEX>" under a "  sha256:" heading. Match on
-    # the index as a token rather than a prefix: "7:" also prefixes "70:", and
-    # spacing varies between tpm2-tools releases.
-    for line in out.splitlines():
-        parts = line.strip().split(":", 1)
-        if len(parts) != 2 or parts[0].strip() != str(pcr_index):
+    try:
+        result = subprocess.run(
+            ["tpm2_pcrread", f"{alg}:{pcr_index}"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError as error:
+        raise EventLogError(f"cannot execute tpm2_pcrread: {error}") from error
+    if result.returncode != 0:
+        raise EventLogError(
+            f"tpm2_pcrread {alg}:{pcr_index} failed with status "
+            f"{result.returncode}"
+        )
+
+    # tpm2-tools emits a bank heading followed by "<index> : 0x<HEX>". Accept
+    # exactly that documented shape, in the requested bank, exactly once. A
+    # short value, a duplicate line or a value outside the bank section is not a
+    # PCR reading the installer may use to decide whether wiping a disk is safe.
+    matches = []
+    in_requested_bank = False
+    expected_hex = hashlib.new(alg).digest_size * 2
+    value_re = re.compile(
+        rf"^{pcr_index}\s*:\s*0x([0-9A-Fa-f]{{{expected_hex}}})$"
+    )
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped == f"{alg}:":
+            in_requested_bank = True
             continue
-        value = parts[1].strip()
-        if not value.lower().startswith("0x"):
+        if re.fullmatch(r"[A-Za-z0-9_-]+:", stripped):
+            in_requested_bank = False
             continue
-        return bytes.fromhex(value[2:])
-    raise EventLogError(f"tpm2_pcrread returned no value for {alg}:{pcr_index}; "
-                        f"output was:\n{out}")
+        if in_requested_bank:
+            match = value_re.fullmatch(stripped)
+            if match:
+                matches.append(bytes.fromhex(match.group(1)))
+    if len(matches) != 1:
+        raise EventLogError(
+            f"tpm2_pcrread returned {len(matches)} well-formed values for "
+            f"{alg}:{pcr_index}; expected exactly one"
+        )
+    return matches[0]
 
 
 def cmd_selfcheck(args):
@@ -262,6 +293,180 @@ def pcr_policy_digest(pcr_index, value, alg="sha256"):
                        + selection + digest_tpm).digest()
 
 
+SIGNATURE_JSON_MAX_BYTES = 1 << 20
+
+
+def verify_detached_policy_signature(pubkey_pem, policy, signature):
+    """Verify systemd's RSA/SHA-256 signature over the raw PolicyPCR digest."""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="ni-policy-signature.") as handle:
+            handle.write(signature)
+            handle.flush()
+            result = subprocess.run(
+                [
+                    "openssl", "dgst", "-sha256", "-verify", pubkey_pem,
+                    "-signature", handle.name,
+                ],
+                input=policy, capture_output=True, check=False,
+            )
+    except OSError as error:
+        raise EventLogError(f"cannot execute openssl: {error}") from error
+    return result.returncode == 0
+
+
+def signature_policy_digests(path, pubkey_pem, pcr_index, alg="sha256"):
+    """Return PolicyPCR digests cryptographically authorised for one PCR."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(SIGNATURE_JSON_MAX_BYTES + 1)
+    except OSError as error:
+        raise EventLogError(f"cannot read signed PCR policy JSON: {error}") from error
+    if len(raw) > SIGNATURE_JSON_MAX_BYTES:
+        raise EventLogError(
+            f"signed PCR policy JSON exceeds {SIGNATURE_JSON_MAX_BYTES} bytes"
+        )
+    try:
+        document = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EventLogError(f"signed PCR policy JSON is malformed: {error}") from error
+
+    entries = document.get(alg) if isinstance(document, dict) else None
+    if not isinstance(entries, list):
+        raise EventLogError(f"signed PCR policy JSON has no {alg} entry list")
+
+    digest_re = re.compile(
+        rf"[0-9a-f]{{{hashlib.new(alg).digest_size * 2}}}"
+    )
+    expected_fingerprint = pubkey_fingerprint(pubkey_pem)
+    authorised = set()
+    fingerprint_re = re.compile(r"[0-9a-f]{64}")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} is not an object"
+            )
+        pcrs = entry.get("pcrs")
+        if (
+            not isinstance(pcrs, list)
+            or not pcrs
+            or any(
+                isinstance(pcr, bool)
+                or not isinstance(pcr, int)
+                or pcr < 0
+                or pcr > 23
+                for pcr in pcrs
+            )
+            or len(set(pcrs)) != len(pcrs)
+        ):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid pcrs"
+            )
+        fingerprint = entry.get("pkfp")
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint_re.fullmatch(fingerprint)
+        ):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid pkfp"
+            )
+        policy = entry.get("pol")
+        if not isinstance(policy, str) or not digest_re.fullmatch(policy):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid pol"
+            )
+        signature_text = entry.get("sig")
+        if not isinstance(signature_text, str):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid sig"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid sig"
+            ) from error
+        if (
+            not signature
+            or base64.b64encode(signature).decode("ascii") != signature_text
+        ):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has invalid sig"
+            )
+
+        if pcrs != [pcr_index]:
+            continue
+        if fingerprint != expected_fingerprint:
+            continue
+        policy_bytes = bytes.fromhex(policy)
+        if not verify_detached_policy_signature(pubkey_pem, policy_bytes, signature):
+            raise EventLogError(
+                f"signed PCR policy JSON {alg} entry {index} has a signature "
+                "that does not verify over pol"
+            )
+        authorised.add(policy)
+    return sorted(authorised)
+
+
+def cmd_verify_live_coverage(args):
+    """Refuse unless the staged systemd signature JSON covers live PCR state."""
+    measured_hex = "unavailable"
+    policy_hex = "unavailable"
+    available = []
+    refusal = None
+    try:
+        available = signature_policy_digests(
+            args.signature_json, args.public_key, args.pcr, args.alg
+        )
+    except EventLogError as error:
+        refusal = error
+
+    try:
+        measured = live_pcr(args.pcr, args.alg)
+        expected_size = hashlib.new(args.alg).digest_size
+        if len(measured) != expected_size:
+            raise EventLogError(
+                f"live {args.alg} PCR {args.pcr} is {len(measured)} bytes, "
+                f"expected {expected_size}"
+            )
+        measured_hex = measured.hex()
+        policy_hex = pcr_policy_digest(args.pcr, measured, args.alg).hex()
+    except EventLogError as error:
+        if refusal is None:
+            refusal = error
+
+    print(
+        f"installer PCR guard: {len(available)} verified PolicyPCR digest(s): "
+        + ", ".join(available[:8]),
+        file=sys.stderr,
+    )
+    print(
+        f"installer PCR guard: live {args.alg} PCR {args.pcr}: "
+        f"{measured_hex}",
+        file=sys.stderr,
+    )
+    print(
+        f"installer PCR guard: computed PolicyPCR digest: {policy_hex}",
+        file=sys.stderr,
+    )
+    # stdout is a bounded-shape machine channel the installer captures even on
+    # refusal, so its existing failure evidence can survive a powered-off boot.
+    print(measured_hex, policy_hex, ",".join(available) or "none")
+
+    if refusal is not None:
+        raise refusal
+    if args.required_policy_digest not in available:
+        raise EventLogError(
+            "signed PCR policy JSON does not contain the policy generation "
+            f"digest sealed by this installer under pcrs=[{args.pcr}]"
+        )
+    if policy_hex not in available:
+        raise EventLogError(
+            f"live {args.alg} PCR {args.pcr} is not covered by an entry whose "
+            f"pcrs and pkfp fields select [{args.pcr}] and the staged public key"
+        )
+    return 0
+
+
 def cmd_predict(args):
     blob = open(args.eventlog, "rb").read()
     events = parse_eventlog(blob)
@@ -313,9 +518,19 @@ def pubkey_fingerprint(pubkey_pem):
     reasonable person assumes. Established empirically against a signature file
     produced by systemd-measure; the wrong encoding yields a JSON systemd
     silently declines to use."""
-    der = subprocess.run(["openssl", "rsa", "-pubin", "-in", pubkey_pem,
-                          "-RSAPublicKey_out", "-outform", "DER"],
-                         capture_output=True, check=True).stdout
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "rsa", "-pubin", "-in", pubkey_pem,
+                "-RSAPublicKey_out", "-outform", "DER",
+            ],
+            capture_output=True, check=False,
+        )
+    except OSError as error:
+        raise EventLogError(f"cannot execute openssl: {error}") from error
+    if result.returncode != 0 or not result.stdout:
+        raise EventLogError("the staged policy public key is not a usable RSA key")
+    der = result.stdout
     return hashlib.sha256(der).hexdigest()
 
 
@@ -337,24 +552,13 @@ def cmd_sign_request(args):
 
 def cmd_emit(args):
     """Build the systemd signature JSON, refusing to emit one that cannot work."""
-    import base64
-    import json
-    import os
-
     pol = bytes.fromhex(args.pol)
     sig = open(args.sig, "rb").read()
 
     # Verify before emitting. A signature file that does not verify produces an
     # appliance that falls back to its recovery key at the worst moment, and the
     # JSON looks perfectly well-formed either way.
-    with open("/tmp/.ni-pol.bin", "wb") as f:
-        f.write(pol)
-    try:
-        ok = subprocess.run(["openssl", "dgst", "-sha256", "-verify", args.pubkey,
-                             "-signature", args.sig, "/tmp/.ni-pol.bin"],
-                            capture_output=True).returncode == 0
-    finally:
-        os.unlink("/tmp/.ni-pol.bin")
+    ok = verify_detached_policy_signature(args.pubkey, pol, sig)
     if not ok:
         print("🔴 the signature does not verify against this public key over this "
               "policy digest; refusing to emit a file the appliance would reject",
@@ -409,6 +613,13 @@ def main():
     pd = sub.add_parser("policy-digest",
                         help="policyDigest for a PCR value (check vs tpm2_createpolicy)")
     pd.add_argument("--value", required=True, metavar="HEX")
+    vc = sub.add_parser(
+        "verify-live-coverage",
+        help="refuse unless signed policy JSON covers the live PCR value",
+    )
+    vc.add_argument("--signature-json", required=True)
+    vc.add_argument("--public-key", required=True)
+    vc.add_argument("--required-policy-digest", required=True)
     sr = sub.add_parser("sign-request",
                         help="write the bytes the Owner signs (no private key here)")
     sr.add_argument("--pol", required=True, metavar="HEX")
@@ -423,6 +634,7 @@ def main():
     try:
         return {"selfcheck": cmd_selfcheck, "show": cmd_show,
                 "predict": cmd_predict, "policy-digest": cmd_policy_digest,
+                "verify-live-coverage": cmd_verify_live_coverage,
                 "sign-request": cmd_sign_request, "emit": cmd_emit}[args.cmd](args)
     except EventLogError as e:
         print(f"error: {e}", file=sys.stderr)

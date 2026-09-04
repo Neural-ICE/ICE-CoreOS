@@ -105,14 +105,22 @@ write_evidence "$TMP/nominal" \
   'phase=4' \
   'phase_total=8' \
   'stage=write-deployment' \
-  'detail=0123456789ab'
+  'detail=0123456789ab' \
+  'pcr7=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'pcr7_policy=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+  'pcr7_verified=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+  'pcr7_verified_count=2'
 render "$TMP/nominal" "$POLICY" > "$TMP/out" 2>"$TMP/err" \
   || fail "the failure surface exited non-zero on well-formed evidence"
 [ ! -s "$TMP/err" ] || { cat "$TMP/err" >&2; fail "the failure surface wrote to stderr"; }
 assert_efi_evidence "$TMP/nominal" "$SINK_EFI"
 for phrase in 'INSTALL FAILED' 'install-failed-write-deployment' 'write-deployment' \
   '0123456789ab' 'There is no login' 'no shell and no recovery console' \
-  'neural-ice-installer-failure-evidence-v1' 'poweroff'; do
+  'neural-ice-installer-failure-evidence-v1' 'poweroff' \
+  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+  'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+  'verified count     2'; do
   grep -Fq "$phrase" "$TMP/out" || { cat "$TMP/out"; fail "the failure screen never states: $phrase"; }
 done
 grep -Fq '4 / 8' "$TMP/out" || { cat "$TMP/out"; fail "the failure screen does not state which stage failed"; }
@@ -122,7 +130,9 @@ grep -Fq 'DRY-RUN: would poweroff after 60 seconds' "$TMP/out" \
 # --------------------------------------------------------------------------- #
 # 2) IT IS A CONSOLE, NOT A DIAGNOSTIC DUMP. Whatever the installer knew, the
 #    screen must carry none of it: no path, no device, no digest of a key, no
-#    hostname, no image reference, no operator input.
+#    hostname, no image reference, no operator input. PCR7 and PolicyPCR are the
+#    explicit non-secret exception: bounded values needed to diagnose why the
+#    fail-closed preflight rejected this machine.
 # --------------------------------------------------------------------------- #
 for leaked in '/dev/' '/usr/' '/run/' 'sha256:' '@sha256' 'registry.' 'ghcr.io' \
   'authorized_keys' 'neuralice.'; do
@@ -153,6 +163,17 @@ hostile_case 'unknown key' \
   'target_disk=/dev/nvme0n1'
 grep -Fq 'secretkeymaterial' "$TMP/hostile" && fail "an unknown evidence key reached the console"
 grep -Fq '/dev/nvme0n1' "$TMP/hostile" && fail "an unknown evidence key reached the console"
+
+# PCR diagnostics are public measurements, but only exact bounded hexadecimal
+# shapes are admitted. They cannot become a second arbitrary console channel.
+hostile_case 'malformed PCR diagnostic' \
+  'pcr7=secret-from-an-untrusted-diagnostic' \
+  'pcr7_policy=../../customer-data' \
+  'pcr7_verified=aaaaaaaa,bbbbbbbb'
+grep -Fq 'secret-from-an-untrusted-diagnostic' "$TMP/hostile" \
+  && fail "a malformed PCR diagnostic reached the console"
+grep -Fq 'customer-data' "$TMP/hostile" \
+  && fail "a malformed PolicyPCR diagnostic reached the console"
 
 # A value outside the shape is `unclassified`, never printed raw.
 hostile_case 'terminal escape in a value' \
@@ -261,7 +282,7 @@ grep -Eq '\b(bash|sh|dash)[[:space:]]+-[a-z]*i|\bagetty\b|\b/bin/login\b|\bsocat
 grep -Eq '(^|[^0-9])>[[:space:]]*/(etc|var|usr|boot|run|sysroot)/' "$TMP/code" \
   && fail "the failure surface writes into a system directory"
 reads="$(grep -cE '\bread[[:space:]]+-|(^|[;|&][[:space:]]*)read[[:space:]]+[A-Za-z_]' "$TMP/code" || true)"
-loop_reads="$(grep -cE 'while IFS= read -r [a-z_]+; do$|^read -r [A-Z ]+<<<' "$TMP/code" || true)"
+loop_reads="$(grep -cE 'while IFS= read -r [a-z_]+; do$|^read -r [A-Z ]+<<<|IFS=, read -r -a verified_policies <<<' "$TMP/code" || true)"
 [ "$reads" = "$loop_reads" ] \
   || fail "the failure surface has $reads uses of read but only $loop_reads are fixed-input parses"
 
@@ -381,6 +402,10 @@ induce_run() { # $1=label $2=cmdline $3=expected code, rest: extra env
 }
 
 INSTALL_LINE="$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0"
+INSTALL_LINE="$INSTALL_LINE neuralice.pcr_policy=$(printf '%064d' 4)"
+INSTALL_LINE="$INSTALL_LINE neuralice.pcr_policy_key=$(printf '%064d' 5)"
+INSTALL_LINE="$INSTALL_LINE neuralice.pcr_policy_signature=$(printf '%064d' 6)"
+INSTALL_LINE="$INSTALL_LINE neuralice.pcr_policy_seq=7"
 LIVE_LINE="$ANCHOR quiet systemd.unit=neural-ice-live.target neuralice.live=1"
 
 # The preflight classes: an unauthorised selector, a Live medium, an unreadable

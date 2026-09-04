@@ -242,8 +242,8 @@ write_cmdline() {
   printf 'quiet neuralice.pcr_policy_seq=%s neuralice.pcr_policy_signature=%s\n' "$1" "$HASH" >"$cmdline"
 }
 write_install_cmdline() {
-  printf 'quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_profile=lab-managed neuralice.hardware_target=nvidia-gb10-arm64 neuralice.payload=%s neuralice.relauth_keyid=%s neuralice.relauth_schema=neural-ice-installer-release-authorization-v2 neuralice.rootverity=%s neuralice.trust_policy_id=neural-ice-secureboot-lab-v1 neuralice.pcr_policy_seq=%s neuralice.pcr_policy_signature=%s %s\n' \
-    "$HASH" "$HASH" "$HASH" "$1" "$HASH" "${2:-}" >"$cmdline"
+  printf 'quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_profile=lab-managed neuralice.hardware_target=nvidia-gb10-arm64 neuralice.payload=%s neuralice.relauth_keyid=%s neuralice.relauth_schema=neural-ice-installer-release-authorization-v2 neuralice.rootverity=%s neuralice.trust_policy_id=neural-ice-secureboot-lab-v1 neuralice.pcr_policy=%s neuralice.pcr_policy_key=%s neuralice.pcr_policy_seq=%s neuralice.pcr_policy_signature=%s %s\n' \
+    "$HASH" "$HASH" "$HASH" "$HASH" "$HASH" "$1" "$HASH" "${2:-}" >"$cmdline"
 }
 cases=0
 must_refuse() {

@@ -69,12 +69,32 @@ grep -q 'recomputed from the medium' "$TMP/inspect.out" \
   || fail "the inspector did not recompute the verity root hashes off the medium"
 
 # Public TPM policy material may travel on the mutable ESP only when the signed
-# UKI command line pins each file's digest.
-printf '%s\n' 'fixture TPM PCR public key' > "$TMP/tpm2-pcr-public-key.pem"
-printf '%s\n' '{"fixture":"TPM PCR signature"}' > "$TMP/tpm2-pcr-signature.json"
+# UKI command line pins each file's digest, and the policy JSON must contain the
+# exact sealed generation. Put the sealed digest second to prove a multi-entry
+# document is accepted rather than accidentally checking only its first entry.
+cp "$FIXTURE_PCR_POLICY_KEY_FILE" "$TMP/tpm2-pcr-public-key.pem"
+tpm_policy_sha="$PCR_POLICY_DIGEST"
+other_tpm_policy_sha="$(printf 'other fixture TPM PCR policy' | sha256sum | awk '{print $1}')"
+python3 - "$other_tpm_policy_sha" "$TMP/other-policy.bin" <<'PYEOF'
+import sys
+open(sys.argv[2], "wb").write(bytes.fromhex(sys.argv[1]))
+PYEOF
+openssl dgst -sha256 -sign "$TMP/pcr-policy.key" \
+  -out "$TMP/other-policy.sig" "$TMP/other-policy.bin"
+other_policy_signature_b64="$(base64 -w0 < "$TMP/other-policy.sig")"
+python3 - "$FIXTURE_PCR_POLICY_SIGNATURE_FILE" "$TMP/tpm2-pcr-signature.json" \
+  "$PCR_POLICY_FINGERPRINT" "$other_tpm_policy_sha" \
+  "$other_policy_signature_b64" <<'PYEOF'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="ascii"))
+document["sha256"].insert(
+    0,
+    {"pcrs": [7], "pkfp": sys.argv[3], "pol": sys.argv[4], "sig": sys.argv[5]},
+)
+json.dump(document, open(sys.argv[2], "w", encoding="ascii"), separators=(",", ":"))
+PYEOF
 tpm_key_sha="$(sha256sum "$TMP/tpm2-pcr-public-key.pem" | awk '{print $1}')"
 tpm_signature_sha="$(sha256sum "$TMP/tpm2-pcr-signature.json" | awk '{print $1}')"
-tpm_policy_sha="$(printf 'fixture TPM PCR policy' | sha256sum | awk '{print $1}')"
 build_uki installer-tpm-policy \
   "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=${tpm_policy_sha} neuralice.pcr_policy_key=${tpm_key_sha} neuralice.pcr_policy_signature=${tpm_signature_sha} neuralice.pcr_policy_seq=7" \
   >/dev/null || fail "the TPM-policy Install UKI failed to build"
@@ -87,6 +107,87 @@ make_esp "$SEALED/installer-tpm-policy.efi" \
   "${tpm_esp_files[@]}"
 assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null || fail "correctly hash-bound TPM public policy files were refused"
+
+assert_policy_medium_refused() { # $1=name $2=public key $3=signature JSON $4=message
+  local name=$1 key=$2 document=$3 message=$4 key_sha document_sha
+  key_sha="$(sha256sum "$key" | awk '{print $1}')"
+  document_sha="$(sha256sum "$document" | awk '{print $1}')"
+  build_uki "$name" \
+    "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=${tpm_policy_sha} neuralice.pcr_policy_key=${key_sha} neuralice.pcr_policy_signature=${document_sha} neuralice.pcr_policy_seq=7" \
+    >/dev/null || fail "the $name mutation UKI failed to build"
+  make_esp "$SEALED/$name.efi" "$SEALED/$name.efi.manifest" \
+    installer-install.efi.manifest \
+    "::/ice-coreos/tpm2-pcr-public-key.pem=$key" \
+    "::/ice-coreos/tpm2-pcr-signature.json=$document"
+  assemble "$ESP" "$SEALED/payload.img"
+  if inspect >/dev/null 2>&1; then
+    fail "$message"
+  fi
+}
+
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out "$TMP/inspector-wrong.key" >/dev/null 2>&1
+openssl pkey -in "$TMP/inspector-wrong.key" -pubout \
+  -out "$TMP/inspector-wrong.pub" >/dev/null 2>&1
+assert_policy_medium_refused inspector-wrong-policy-key \
+  "$TMP/inspector-wrong.pub" "$TMP/tpm2-pcr-signature.json" \
+  "a hash-bound policy signed by another key was accepted"
+
+python3 - "$TMP/tpm2-pcr-signature.json" \
+  "$TMP/tpm2-pcr-signature-unsigned.json" "$tpm_policy_sha" \
+  "$TMP/tpm2-pcr-signature-malformed-entry.json" \
+  "$TMP/tpm2-pcr-signature-malformed-sig.json" <<'PYEOF'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="ascii"))
+unsigned = json.loads(json.dumps(document))
+next(entry for entry in unsigned["sha256"] if entry["pol"] == sys.argv[3]).pop("sig")
+json.dump(unsigned, open(sys.argv[2], "w", encoding="ascii"), separators=(",", ":"))
+malformed = json.loads(json.dumps(document))
+malformed["sha256"].insert(0, "not-an-entry")
+json.dump(malformed, open(sys.argv[4], "w", encoding="ascii"), separators=(",", ":"))
+malformed_sig = json.loads(json.dumps(document))
+next(
+    entry for entry in malformed_sig["sha256"] if entry["pol"] == sys.argv[3]
+)["sig"] = "***"
+json.dump(
+    malformed_sig, open(sys.argv[5], "w", encoding="ascii"), separators=(",", ":")
+)
+PYEOF
+assert_policy_medium_refused inspector-unsigned-policy \
+  "$TMP/tpm2-pcr-public-key.pem" "$TMP/tpm2-pcr-signature-unsigned.json" \
+  "an unsigned sealed-generation policy entry was accepted"
+assert_policy_medium_refused inspector-malformed-policy \
+  "$TMP/tpm2-pcr-public-key.pem" \
+  "$TMP/tpm2-pcr-signature-malformed-entry.json" \
+  "a malformed policy entry before a valid signed entry was accepted"
+assert_policy_medium_refused inspector-malformed-policy-signature \
+  "$TMP/tpm2-pcr-public-key.pem" "$TMP/tpm2-pcr-signature-malformed-sig.json" \
+  "a malformed sealed-generation policy signature was accepted"
+
+# Hash binding alone is insufficient: a signer can accidentally cut a medium
+# whose staged JSON is valid but covers only another machine. Seal the hash of
+# that internally consistent wrong document and require the inspector to catch
+# the missing PolicyPCR digest before the medium leaves the build plane.
+python3 - "$TMP/tpm2-pcr-signature.json" \
+  "$TMP/tpm2-pcr-signature-uncovered.json" "$other_tpm_policy_sha" <<'PYEOF'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="ascii"))
+document["sha256"] = [
+    entry for entry in document["sha256"] if entry["pol"] == sys.argv[3]
+]
+json.dump(document, open(sys.argv[2], "w", encoding="ascii"), separators=(",", ":"))
+PYEOF
+uncovered_signature_sha="$(sha256sum "$TMP/tpm2-pcr-signature-uncovered.json" | awk '{print $1}')"
+build_uki installer-tpm-policy-uncovered \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.pcr_policy=${tpm_policy_sha} neuralice.pcr_policy_key=${tpm_key_sha} neuralice.pcr_policy_signature=${uncovered_signature_sha} neuralice.pcr_policy_seq=7" \
+  >/dev/null || fail "the uncovered-policy mutation UKI failed to build"
+make_esp "$SEALED/installer-tpm-policy-uncovered.efi" \
+  "$SEALED/installer-tpm-policy-uncovered.efi.manifest" installer-install.efi.manifest \
+  "::/ice-coreos/tpm2-pcr-public-key.pem=$TMP/tpm2-pcr-public-key.pem" \
+  "::/ice-coreos/tpm2-pcr-signature.json=$TMP/tpm2-pcr-signature-uncovered.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium whose hash-bound TPM policy JSON omits its sealed PolicyPCR digest was accepted"
 
 printf '%s\n' 'substituted TPM PCR public key' > "$TMP/tpm2-pcr-public-key-swapped.pem"
 make_esp "$SEALED/installer-tpm-policy.efi" \
@@ -110,10 +211,16 @@ assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null 2>&1 \
   && fail "TPM public policy files not pinned by the signed UKI were accepted"
 
+OMIT_DEFAULT_PCR_POLICY=1 make_esp \
+  "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "an Install medium without mandatory TPM policy files was accepted"
 make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest
 assemble "$ESP" "$SEALED/payload.img"
-inspect >/dev/null || fail "the restored medium without optional TPM policy files was refused"
+inspect >/dev/null || fail "the restored Install medium with mandatory TPM policy files was refused"
 
 # --------------------------------------------------------------------------- #
 # 5) THE REFUSALS. Each mutation is one way a medium can be wrong.
@@ -261,7 +368,7 @@ registry_mirror_ca_sha="$(sha256sum "$TMP/mirror-ca.crt" | awk '{print $1}')"
 registry_relauth="neuralice.relauth_sha256=${registry_relauth_sha} neuralice.relauth_sig_sha256=${registry_relauth_sig_sha}"
 registry_mirror_pin="neuralice.mirror_ca_sha256=${registry_mirror_ca_sha} neuralice.mirror_ready=$(printf 'd%.0s' {1..64}) neuralice.mirror_manifest=$(printf 'e%.0s' {1..64}) neuralice.mirror_generation=7"
 build_uki installer-registry \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest} ${registry_relauth} neuralice.mirror=bench.example.test:5000 ${registry_mirror_pin}" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest} ${registry_relauth} neuralice.mirror=bench.example.test:5000 ${registry_mirror_pin}" \
   >/dev/null || fail "the registry-install UKI failed to build"
 registry_esp_files=(
   "::/ice-coreos/release-authorization.json=$TMP/relauth.json"
@@ -312,13 +419,13 @@ grep -q "neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${r
 grep -q 'neuralice.mirror=bench.example.test:5000' "$TMP/inspect-registry.out" \
   || fail "the inspector did not surface the sealed mirror transport"
 build_uki installer-registry-tag \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable" \
   >/dev/null || fail "the mutable-tag registry mutation UKI failed to build"
 build_uki installer-registry-orphan-mirror \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.mirror=bench.example.test" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.mirror=bench.example.test" \
   >/dev/null || fail "the orphan-mirror mutation UKI failed to build"
 build_uki installer-registry-no-image \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.source=registry" \
   >/dev/null || fail "the imageless-registry mutation UKI failed to build"
 for mutation in registry-tag registry-orphan-mirror registry-no-image; do
   make_esp "$SEALED/installer-$mutation.efi" "$SEALED/installer-$mutation.efi.manifest" \
@@ -351,7 +458,7 @@ env NI_UKI_TESTING=1 NI_UKI_TEST_TOOLS="$TOOLS" \
   TRUST_POLICY_ID="$POLICY_ID" TRUST_POLICY_ROOT="$POLICY_ROOT" \
   RELEASE_AUTH_PUBKEY="$IN/relauth.pub" \
   UKI_OUT="$SEALED/unsigned.efi" \
-  EXTRA_KARGS="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1" \
+  EXTRA_KARGS="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS" \
   bash "$ROOT/image/build-installer-uki.sh" >/dev/null || fail "the unsigned build failed"
 make_esp "$SEALED/unsigned.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest
@@ -493,7 +600,7 @@ import hashlib, sys
 print(hashlib.sha256(open(sys.argv[1], "rb").read(4096).rstrip(b"\x00")).hexdigest())
 ' "$TMP/lying-payload.img")"
 build_uki installer-lying \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS" \
   PAYLOAD_DIGEST="$LYING_DIGEST" \
   >/dev/null || fail "the UKI sealing the forged header failed to build"
 make_esp "$SEALED/installer-lying.efi" "$SEALED/installer-lying.efi.manifest" \

@@ -63,9 +63,12 @@ readonly DRY_RUN
 # Neither the installer nor anything it read can widen this.
 # --------------------------------------------------------------------------- #
 readonly EVIDENCE_SCHEMA=neural-ice-installer-failure-evidence-v1
-readonly -a EVIDENCE_KEYS=(schema code phase phase_total stage detail)
+readonly -a EVIDENCE_KEYS=(
+  schema code phase phase_total stage detail
+  pcr7 pcr7_policy pcr7_verified pcr7_verified_count
+)
 readonly VALUE_SHAPE='^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$'
-readonly EVIDENCE_MAX_BYTES=1024
+readonly EVIDENCE_MAX_BYTES=2048
 
 declare -A EVIDENCE=()
 
@@ -75,6 +78,23 @@ evidence_key_is_known() { # $1=key
     [ "$key" = "$1" ] && return 0
   done
   return 1
+}
+
+evidence_value_is_valid() { # $1=key $2=value
+  case "$1" in
+    pcr7|pcr7_policy)
+      [[ "$2" == unavailable || "$2" =~ ^[0-9a-f]{64}$ ]]
+      ;;
+    pcr7_verified)
+      [[ "$2" == none || "$2" =~ ^[0-9a-f]{64}(,[0-9a-f]{64}){0,3}$ ]]
+      ;;
+    pcr7_verified_count)
+      [[ "$2" =~ ^[0-9]{1,4}$ ]]
+      ;;
+    *)
+      [[ "$2" =~ $VALUE_SHAPE ]]
+      ;;
+  esac
 }
 
 # The evidence file lives on a tmpfs the installer's own unit created with
@@ -88,7 +108,7 @@ read_evidence() {
     case "$line" in *=*) ;; *) continue ;; esac
     key="${line%%=*}"; value="${line#*=}"
     evidence_key_is_known "$key" || continue
-    [[ "$value" =~ $VALUE_SHAPE ]] || continue
+    evidence_value_is_valid "$key" "$value" || continue
     [ -z "${EVIDENCE[$key]:-}" ] || continue   # first occurrence wins; no last-writer
     EVIDENCE["$key"]="$value"
   done < <(head -c "$EVIDENCE_MAX_BYTES" -- "$EVIDENCE_FILE" 2>/dev/null | tr -d '\000')
@@ -102,9 +122,10 @@ value() { # $1=key
 
 persist_efi_evidence() {
   local payload
-  printf -v payload 'schema=%s\ncode=%s\nphase=%s\nphase_total=%s\nstage=%s\ndetail=%s\n' \
+  printf -v payload 'schema=%s\ncode=%s\nphase=%s\nphase_total=%s\nstage=%s\ndetail=%s\npcr7=%s\npcr7_policy=%s\npcr7_verified=%s\npcr7_verified_count=%s\n' \
     "$EVIDENCE_SCHEMA" "$(value code)" "$(value phase)" "$(value phase_total)" \
-    "$(value stage)" "$(value detail)"
+    "$(value stage)" "$(value detail)" "$(value pcr7)" "$(value pcr7_policy)" \
+    "$(value pcr7_verified)" "$(value pcr7_verified_count)"
   if [[ -d "${EFI_EVIDENCE_FILE%/*}" && ! -L "$EFI_EVIDENCE_FILE" ]]; then
     printf '\x07\x00\x00\x00%s' "$payload" > "$EFI_EVIDENCE_FILE" 2>/dev/null || true
   fi
@@ -158,6 +179,15 @@ printf '  %-18s %s\n' 'failure code'   "$(value code)"
 printf '  %-18s %s / %s\n' 'stage'     "$(value phase)" "$(value phase_total)"
 printf '  %-18s %s\n' 'stage name'     "$(value stage)"
 printf '  %-18s %s\n' 'evidence'       "$(value detail)"
+printf '  %-18s %s\n' 'live PCR7'      "$(value pcr7)"
+printf '  %-18s %s\n' 'computed policy' "$(value pcr7_policy)"
+printf '  %-18s %s\n' 'verified count' "$(value pcr7_verified_count)"
+if [[ "$(value pcr7_verified)" != none && "$(value pcr7_verified)" != unclassified ]]; then
+  IFS=, read -r -a verified_policies <<<"$(value pcr7_verified)"
+  for policy in "${verified_policies[@]}"; do
+    printf '  %-18s %s\n' 'verified policy' "$policy"
+  done
+fi
 printf '  %-18s %s\n' 'schema'         "$EVIDENCE_SCHEMA"
 printf '\n'
 printf '  The full diagnostic is in this boot'"'"'s journal on the medium only. It\n'

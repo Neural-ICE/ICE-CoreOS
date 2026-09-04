@@ -87,6 +87,11 @@ RUN bash -euxo pipefail -c '\
 
 # Auto-install service (gated by the neuralice.autoinstall kernel argument).
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
+# The installer must derive PolicyPCR from the live PCR with the same
+# repository-authoritative TPM encoding used to author signed policies. Keeping
+# the complete helper in immutable /usr avoids a second cryptographic
+# implementation on the destructive path.
+COPY ota/neural-ice-tpm-policy.py /usr/lib/neural-ice/tpm-policy.py
 # Keep the destructive pre-activation token readback on the same checkout as
 # the installer. A stale helper inherited from BASE_IMAGE can invert the
 # PolicyAuthorize contract and reject a correctly enrolled target.
@@ -160,6 +165,7 @@ COPY ota/neural-ice-device-root-installer-only.conf \
      /etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
+      /usr/lib/neural-ice/tpm-policy.py \
       /usr/local/libexec/neural-ice-lab-baseline-handoff \
       /usr/libexec/neural-ice-luks-token-evidence \
       /usr/libexec/neural-ice-device-root \
@@ -173,7 +179,12 @@ RUN set -euxo pipefail; \
     bash -n /usr/libexec/neural-ice-installer-failure; \
     python3 -c 'import ast,sys; [ast.parse(open(path).read()) for path in sys.argv[1:]]' \
       /usr/lib/neural-ice/registry-authorisation.py \
+      /usr/lib/neural-ice/tpm-policy.py \
       /usr/libexec/neural-ice-luks-token-evidence; \
+    /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
+      | grep -Fq -- '--signature-json'; \
+    /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
+      | grep -Fq -- '--public-key'; \
     # 🔴 THE MARKER THAT MAKES THE INSTALLER'S TEST SEAM IMPOSSIBLE HERE.
     # ota/neural-ice-autoinstall.sh consults an environment override for its
     # command-line file, sealed grammar, library directory, verity mount points,
