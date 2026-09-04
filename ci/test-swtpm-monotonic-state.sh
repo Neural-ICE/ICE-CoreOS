@@ -245,7 +245,11 @@ EOF
 cat > "$FB_TOOLS/systemd-analyze" <<'EOF'
 #!/bin/sh
 [ "$1" = srk ] || exit 2
-tpm2_readpublic -Q -c 0x81000001 -f tpmt -o /dev/stdout
+# The real systemd-analyze srk emits the marshalled TPM2B_PUBLIC (size-prefixed),
+# which is what the installer persists as srk-v1.tpm2b_public and what the
+# LUKS token's Esys serialization embeds. tpm2_readpublic -f tpmt lacks the size.
+tpm2_readpublic -Q -c 0x81000001 -f tpmt -o /dev/stdout \
+  | python3 -c 'import struct,sys; b=sys.stdin.buffer.read(); sys.stdout.buffer.write(struct.pack(">H", len(b)) + b)'
 EOF
 cat > "$FB_TOOLS/profile-anchor" <<'EOF'
 #!/bin/sh
@@ -265,7 +269,7 @@ prepare_firstboot_fixture() {
   rm -rf -- "$FB_STATE"
   mkdir -m 0700 "$FB_STATE"
   tpm2_readpublic -Q -c 0x81010005 -f tpmt -o "$FB_STATE/device-root-v1.json"
-  tpm2_readpublic -Q -c 0x81000001 -f tpmt -o "$FB_STATE/srk-v1.tpm2b_public"
+  "$FB_TOOLS/systemd-analyze" srk > "$FB_STATE/srk-v1.tpm2b_public"
   printf 'access_profile=%s\nhardware_target=%s\nsigned_boot_trust_policy_id=%s\ninitial_issuance_seq=0\n' \
     "$PROFILE" "$TARGET" "$POLICY" > "$FB_STATE/owner-ceremony-intent-v1"
   printf '{"install_source":"medium","installed_at":"1970-01-01T00:00:00Z","installer_sealed_identity_sha256":"%064d","release_identity_sha256":"%064d","schema":"neural-ice-owner-ceremony-install-identity-v1"}\n' \
@@ -277,11 +281,19 @@ prepare_firstboot_fixture() {
     cryptsetup luksFormat --type luks2 --batch-mode --key-file "$FB_RUN/luks.key" "$luks" >/dev/null
   done
   python3 - "$FB_STATE/srk-v1.tpm2b_public" "$FB_RUN/system-token.json" "$FB_RUN/data-token.json" <<'PY'
-import base64, json, sys
-srk = base64.b64encode(open(sys.argv[1], "rb").read()).decode("ascii")
+import base64, hashlib, json, struct, sys
+# tpm2_srk is systemd's Esys_TR_Serialize() record of the SRK:
+# handle || TPM2B_NAME(sha256) || has-resource=1 || TPM2B_PUBLIC.
+tpm2b = open(sys.argv[1], "rb").read()
+name = b"\x00\x0b" + hashlib.sha256(tpm2b[2:]).digest()
+srk = base64.b64encode(struct.pack(">I", 0x81000001) + struct.pack(">H", len(name)) + name + struct.pack(">I", 1) + tpm2b).decode("ascii")
+# The shape the installer enrols (ota/neural-ice-autoinstall.sh, systemd-cryptenroll
+# --tpm2-pcrs= --tpm2-public-key=... --tpm2-public-key-pcrs=7): a SIGNED PCR7
+# policy, no literal PCR list. neural-ice-luks-token-evidence refuses anything else.
 for path,label,byte in ((sys.argv[2],"system",b"S"),(sys.argv[3],"data",b"D")):
     token={"keyslots":["0"],"tpm2-blob":base64.b64encode(byte*64).decode(),
-           "tpm2-pcr-bank":"sha256","tpm2-pcrs":[7],"tpm2-policy-hash":byte.hex()*32,
+           "tpm2-pcr-bank":"sha256","tpm2-pcrs":[],"tpm2-policy-hash":byte.hex()*32,
+           "tpm2_pubkey":base64.b64encode(b"P"*91).decode(),"tpm2_pubkey_pcrs":[7],
            "tpm2_srk":srk,"type":"systemd-tpm2"}
     open(path,"w").write(json.dumps(token,sort_keys=True,separators=(",",":"))+"\n")
 PY
