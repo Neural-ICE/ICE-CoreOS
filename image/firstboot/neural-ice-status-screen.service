@@ -1,0 +1,94 @@
+[Unit]
+Description=Neural ICE boot status screen on tty1 (non-interactive)
+Documentation=https://github.com/Neural-ICE/ICE-CoreOS/blob/main/image/firstboot/status-error-codes.md
+# Runs on EVERY boot: the customer only ever sees reboots, and a sealed
+# appliance (`quiet`, getty/sshd masked, network held until the TPM ceremony)
+# shows nothing else for minutes. This unit displays phases and counters only;
+# it reads no input and prints no secret (see the script header).
+#
+# ORDERING, DELIBERATELY MINIMAL. DefaultDependencies would After=basic.target,
+# i.e. AFTER sysinit and after the ceremony's consumers -- the screen would
+# appear exactly when there is nothing left to watch. No After=/Before= on
+# systemd-tmpfiles-setup.service or sysinit.target either (the ceremony test
+# proves those edges cycle with sysext/sshd.socket). local-fs is enough: /var is
+# where the image inventory and the containers store live, and the script copes
+# with every path that is not there yet.
+DefaultDependencies=no
+After=local-fs.target systemd-vconsole-setup.service
+# DefaultDependencies=no also drops the implicit shutdown edge; restore exactly
+# that one so the unit is stopped (TimeoutStopSec applies) on poweroff/reboot.
+Conflicts=shutdown.target
+Before=shutdown.target
+# NOT gated by the ceremony: this is the one unit that must run WHILE the
+# ceremony runs. No Requires=/After= on neural-ice-firstboot-tpm-ceremony.service,
+# and no 50-neural-ice-tpm-ceremony.conf drop-in may ever target this unit
+# (image/test-status-screen.sh).
+# On ceremony failure OnFailure=emergency.target isolates; without this the
+# failure block would be torn down at the very moment it is needed.
+IgnoreOnIsolate=yes
+# No Conflicts=getty@tty1.service on purpose: getty@tty1 and this unit are both
+# pulled into the same boot transaction, and a Conflicts= between two jobs of one
+# transaction makes systemd DROP one of them -- possibly the login prompt. The
+# script instead polls the tty1 owners (getty@tty1, neural-ice-tui) and exits
+# the moment one is active; getty and the TUI both clear the screen.
+Before=getty@tty1.service neural-ice-tui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/neural-ice-status-screen.sh
+# Seconds the TPM owner ceremony may stay `activating` before NI-E02 is shown.
+Environment=NI_STATUS_CEREMONY_TIMEOUT=1800
+# Seconds READY stays on screen before the unit exits when no tty1 owner exists.
+Environment=NI_STATUS_READY_LINGER=10
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=no
+TTYVTDisallocate=no
+# The screen is informational: a crash must never hold the boot or be retried
+# into a loop on top of the TUI.
+Restart=no
+TimeoutStopSec=5
+
+# === Sandbox (read-only observer) ===
+UMask=0077
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# `disconnected`, not `yes`: PrivateTmp=yes silently adds
+# After=systemd-tmpfiles-setup.service (verified on systemd 257, see the
+# ceremony unit). This unit needs no /tmp at all.
+PrivateTmp=disconnected
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+# /sys is read-only under ProtectKernelTunables; the script only reads
+# /sys/class/net and /sys/class/dmi/id, which stay readable.
+ProtectKernelTunables=yes
+# NOT PrivateNetwork / PrivateDevices: the receive counters come from the real
+# NICs in /sys/class/net and the screen is /dev/tty1. The device cgroup is
+# closed instead: tty1 plus the two UARTs the script may select as the kernel
+# console (GB10 image: ttyS0; QEMU aarch64 virt: ttyAMA0), nothing else. A
+# UART node absent on this hardware is skipped by the manager with a warning.
+DevicePolicy=closed
+DeviceAllow=/dev/tty1 rw
+DeviceAllow=/dev/ttyS0 rw
+DeviceAllow=/dev/ttyAMA0 rw
+# AF_UNIX for systemctl (private manager socket), AF_NETLINK for `ip -4 addr`.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
