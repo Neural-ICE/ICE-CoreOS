@@ -2151,41 +2151,50 @@ for search_root in usr/lib/systemd/system etc/systemd/system etc/systemd/system.
   for dropin_dir in "$ceremony_unit_name.d" "${ceremony_prefix_dirs[@]}" service.d; do
     [[ -d "$dep/$search_root/$dropin_dir" ]] || continue
     for dropin in "$dep/$search_root/$dropin_dir"/*.conf; do
-      [[ -e "$dropin" ]] || continue
-      [[ -f "$dropin" ]] || die "the first-boot ceremony drop-in $dropin is not a regular file"
+      [[ -e "$dropin" || -L "$dropin" ]] || continue
+      # A symlink is judged HERE against the installer's root but read at boot
+      # inside the deployment: an absolute target points at two different files.
+      # Refuse the indirection rather than reason about it.
+      [[ ! -L "$dropin" && -f "$dropin" ]] \
+        || die "the first-boot ceremony drop-in $dropin is not a regular file (symlink or special file); re-pin the medium"
       ceremony_sources+=("$dropin")
     done
   done
 done
-# One `Key=value` line per effective assignment, systemd.syntax(7) applied:
-# comments dropped (also inside a continuation), backslash joins the next
-# non-comment line, whitespace around `=` and at both ends trimmed.
+# One `Section.Key=value` line per effective assignment, systemd.syntax(7)
+# applied: comments dropped (also inside a continuation), backslash joins the
+# next non-comment line, whitespace around `=` and at both ends trimmed. The
+# section is carried because systemd IGNORES a key filed under the wrong one:
+# `DefaultDependencies=no` under [Service] leaves the unit with its defaults.
+# Each file restarts outside any section, so a drop-in's keys count only
+# under a header of its own.
 ceremony_effective="$(
   for src in "${ceremony_sources[@]}"; do
-    printf '\n'; cat -- "$src"; printf '\n'
+    printf '\n[]\n'; cat -- "$src"; printf '\n'
   done | awk '
     { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
     line ~ /^[#;]/ { next }
     pending != "" { line = pending " " line; pending = "" }
     line ~ /\\$/ { pending = substr(line, 1, length(line) - 1); next }
     line == "" { next }
+    line ~ /^\[.*\]$/ { section = substr(line, 2, length(line) - 2); next }
     { key = line; sub(/[ \t]*=.*$/, "", key); val = line; sub(/^[^=]*=[ \t]*/, "", val)
-      if (index(line, "=")) print key "=" val; else print line }
-    END { if (pending != "") print pending }'
+      if (index(line, "=")) print section "." key "=" val; else print section "." line }
+    END { if (pending != "") print section "." pending }'
 )"
 ceremony_values() { printf '%s\n' "$ceremony_effective" | grep -E "^$1=" | cut -d= -f2- | sort -u; }
-[[ "$(ceremony_values DefaultDependencies)" == no ]] \
+[[ "$(ceremony_values 'Unit\.DefaultDependencies')" == no ]] \
   || die "the pinned appliance's first-boot ceremony unit keeps default dependencies (ordering cycle with sysext/confext); re-pin the medium to a fixed appliance digest"
-! printf '%s\n' "$ceremony_effective" | grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\.service' \
+! printf '%s\n' "$ceremony_effective" | grep -Eq '^Unit\.(After|Before)=.*systemd-tmpfiles-setup\.service' \
   || die "the pinned appliance's first-boot ceremony unit orders against tmpfiles-setup (ordering cycle with sysext/confext); re-pin the medium"
-! printf '%s\n' "$ceremony_effective" | grep -Eq '^(After|Before)=.*sysinit\.target' \
+! printf '%s\n' "$ceremony_effective" | grep -Eq '^Unit\.(After|Before)=.*sysinit\.target' \
   || die "the pinned appliance's first-boot ceremony unit orders against sysinit.target (cycle with sshd.socket); re-pin the medium"
 while IFS= read -r private_tmp; do
   case "$private_tmp" in
     no|false|off|0|disconnected) ;;
     *) die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=$private_tmp, which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium" ;;
   esac
-done < <(ceremony_values PrivateTmp)
+done < <(ceremony_values 'Service\.PrivateTmp')
 unset -f ceremony_values
 log "first-boot ceremony unit verified on the pinned appliance (effective config over ${#ceremony_sources[@]} file(s): DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges, no /etc override)"
 
