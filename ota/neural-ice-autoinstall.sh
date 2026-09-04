@@ -2115,56 +2115,79 @@ ceremony_unit="$dep/usr/lib/systemd/system/$ceremony_unit_name"
 [[ -f "$ceremony_unit" && ! -L "$ceremony_unit" ]] \
   || die "the pinned appliance image ships no first-boot TPM ceremony unit"
 # What systemd will run is the EFFECTIVE configuration: the fragment merged
-# with every *.conf drop-in from each unit search path, where a later
-# assignment overrides an earlier one, `Key = value` is legal and a trailing
-# backslash continues the line. Checking the raw fragment alone would approve a
-# unit whose drop-in re-adds the cycle. Normalise the whole set into one
-# stream of `Key=value` lines and judge that. The deployment carries no
-# /etc or /run override for this unit at all: the appliance ships none, and
-# the retired bridge staged exactly such an override from the medium.
-for override in \
-  "$dep/etc/systemd/system/$ceremony_unit_name" \
-  "$dep/etc/systemd/system/$ceremony_unit_name.d" \
-  "$dep/etc/systemd/system.control/$ceremony_unit_name" \
-  "$dep/etc/systemd/system.control/$ceremony_unit_name.d" \
-  "$dep/usr/local/lib/systemd/system/$ceremony_unit_name" \
-  "$dep/usr/local/lib/systemd/system/$ceremony_unit_name.d" \
-  "$dep/etc/systemd/system-generators/neural-ice-firstboot-ceremony" \
-  "$dep/etc/neural-ice/firstboot-tpm-ceremony.service"; do
-  [[ ! -e "$override" && ! -L "$override" ]] \
-    || die "the deployment overrides the pinned appliance's first-boot ceremony unit at $override (retired medium bridge, or a foreign drop-in); re-pin the medium"
+# with every *.conf drop-in that applies to the unit -- <unit>.d, each
+# dash-prefix directory (neural-.service.d, neural-ice-.service.d, ...) and the
+# type-wide service.d -- from every unit search path. `Key = value` is legal,
+# a trailing backslash continues onto the next non-comment line. Checking the
+# raw fragment alone would approve a unit whose drop-in re-adds the cycle.
+#
+# Two fail-closed rules keep this independent of systemd's precedence order:
+#   1. The deployment carries NO override of this unit outside /usr/lib: no
+#      unit file, <unit>.d or prefix .d under /etc, system.control or
+#      /usr/local. The appliance ships none there; the retired bridge staged
+#      exactly such an override from the medium.
+#   2. Every assignment of a judged directive, in the fragment and in any
+#      applicable drop-in, must be the safe value. A disagreement between two
+#      files is refused rather than resolved -- so "which one wins" never
+#      needs answering.
+ceremony_prefix_dirs=()
+ceremony_stem="${ceremony_unit_name%.service}"
+while [[ "$ceremony_stem" == *-* ]]; do
+  ceremony_stem="${ceremony_stem%-*}"
+  ceremony_prefix_dirs+=("${ceremony_stem}-.service.d")
 done
-ceremony_effective="$(
-  {
-    cat -- "$ceremony_unit"
-    for dropin_dir in "$dep/usr/lib/systemd/system/$ceremony_unit_name.d" \
-                      "$dep/usr/lib/systemd/system/service.d" \
-                      "$dep/etc/systemd/system/service.d"; do
-      [[ -d "$dropin_dir" ]] || continue
-      for dropin in "$dropin_dir"/*.conf; do
-        [[ -f "$dropin" ]] || continue
-        printf '\n'; cat -- "$dropin"
-      done
+for search_root in etc/systemd/system etc/systemd/system.control usr/local/lib/systemd/system; do
+  for override in "$ceremony_unit_name" "$ceremony_unit_name.d" "${ceremony_prefix_dirs[@]}"; do
+    [[ ! -e "$dep/$search_root/$override" && ! -L "$dep/$search_root/$override" ]] \
+      || die "the deployment overrides the pinned appliance's first-boot ceremony unit at /$search_root/$override (retired medium bridge, or a foreign drop-in); re-pin the medium"
+  done
+done
+for override in etc/systemd/system-generators/neural-ice-firstboot-ceremony etc/neural-ice/firstboot-tpm-ceremony.service; do
+  [[ ! -e "$dep/$override" && ! -L "$dep/$override" ]] \
+    || die "the deployment carries the retired first-boot ceremony medium bridge at /$override; re-pin the medium"
+done
+ceremony_sources=("$ceremony_unit")
+for search_root in usr/lib/systemd/system etc/systemd/system etc/systemd/system.control usr/local/lib/systemd/system; do
+  for dropin_dir in "$ceremony_unit_name.d" "${ceremony_prefix_dirs[@]}" service.d; do
+    [[ -d "$dep/$search_root/$dropin_dir" ]] || continue
+    for dropin in "$dep/$search_root/$dropin_dir"/*.conf; do
+      [[ -e "$dropin" ]] || continue
+      [[ -f "$dropin" ]] || die "the first-boot ceremony drop-in $dropin is not a regular file"
+      ceremony_sources+=("$dropin")
     done
-  } | sed -e ':a' -e '/\\$/N; s/\\\n//; ta' \
-    | sed -E -e 's/^[[:space:]]+//; s/[[:space:]]+$//' -e '/^[#;]/d' \
-             -e 's/^([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*/\1=/'
+  done
+done
+# One `Key=value` line per effective assignment, systemd.syntax(7) applied:
+# comments dropped (also inside a continuation), backslash joins the next
+# non-comment line, whitespace around `=` and at both ends trimmed.
+ceremony_effective="$(
+  for src in "${ceremony_sources[@]}"; do
+    printf '\n'; cat -- "$src"; printf '\n'
+  done | awk '
+    { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^[#;]/ { next }
+    pending != "" { line = pending " " line; pending = "" }
+    line ~ /\\$/ { pending = substr(line, 1, length(line) - 1); next }
+    line == "" { next }
+    { key = line; sub(/[ \t]*=.*$/, "", key); val = line; sub(/^[^=]*=[ \t]*/, "", val)
+      if (index(line, "=")) print key "=" val; else print line }
+    END { if (pending != "") print pending }'
 )"
-ceremony_effective_last() { # last assignment of a directive wins in systemd
-  printf '%s\n' "$ceremony_effective" | grep -E "^$1=" | tail -n1 | cut -d= -f2-
-}
-[[ "$(ceremony_effective_last DefaultDependencies)" == no ]] \
+ceremony_values() { printf '%s\n' "$ceremony_effective" | grep -E "^$1=" | cut -d= -f2- | sort -u; }
+[[ "$(ceremony_values DefaultDependencies)" == no ]] \
   || die "the pinned appliance's first-boot ceremony unit keeps default dependencies (ordering cycle with sysext/confext); re-pin the medium to a fixed appliance digest"
 ! printf '%s\n' "$ceremony_effective" | grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\.service' \
   || die "the pinned appliance's first-boot ceremony unit orders against tmpfiles-setup (ordering cycle with sysext/confext); re-pin the medium"
 ! printf '%s\n' "$ceremony_effective" | grep -Eq '^(After|Before)=.*sysinit\.target' \
   || die "the pinned appliance's first-boot ceremony unit orders against sysinit.target (cycle with sshd.socket); re-pin the medium"
-case "$(ceremony_effective_last PrivateTmp)" in
-  ''|no|false|off|0|disconnected) ;;
-  *) die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=$(ceremony_effective_last PrivateTmp), which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium" ;;
-esac
-unset -f ceremony_effective_last
-log "first-boot ceremony unit verified on the pinned appliance (effective config: DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges, no /etc override)"
+while IFS= read -r private_tmp; do
+  case "$private_tmp" in
+    no|false|off|0|disconnected) ;;
+    *) die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=$private_tmp, which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium" ;;
+  esac
+done < <(ceremony_values PrivateTmp)
+unset -f ceremony_values
+log "first-boot ceremony unit verified on the pinned appliance (effective config over ${#ceremony_sources[@]} file(s): DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges, no /etc override)"
 
 # The medium runs with a permissive container-signature policy so bootc can read
 # its own local image through whatever transport it picks -- containers-storage
