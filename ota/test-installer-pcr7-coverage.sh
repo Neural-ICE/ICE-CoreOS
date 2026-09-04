@@ -2,7 +2,7 @@
 # Exercise the installer's live-PCR7 fail-closed gate without touching a TPM or
 # a disk. The fake implements only the documented `tpm2_pcrread sha256:7`
 # stdout contract; all PolicyPCR arithmetic comes from the production helper.
-# shellcheck disable=SC2016,SC2034,SC2329
+# shellcheck disable=SC2016,SC2034,SC2317,SC2329
 # Literal source-contract assertions and functions/variables consumed after
 # sourcing extracted production functions.
 set -euo pipefail
