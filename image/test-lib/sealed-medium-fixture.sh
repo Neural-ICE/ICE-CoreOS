@@ -225,7 +225,7 @@ export MTOOLS_SKIP_CHECK=1
 #
 # Extra files are given as `::/path=<source>` pairs after the manifest name.
 make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=source
-  local uki=$1
+  local manifest_name=$3
   rm -f "$ESP"; truncate -s 64M "$ESP"
   mkfs.vfat -F 32 -n EFI-SYSTEM "$ESP" >/dev/null
   mmd -i "$ESP" ::/EFI ::/EFI/BOOT ::/EFI/neural-ice
@@ -238,7 +238,7 @@ make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=
     [[ "${pair%%=*}" != ::/ice-coreos/tpm2-pcr-public-key.pem ]] || has_policy_key=1
     [[ "${pair%%=*}" != ::/ice-coreos/tpm2-pcr-signature.json ]] || has_policy_json=1
   done
-  if [[ "${uki##*/}" == installer-install.efi \
+  if [[ "$manifest_name" == installer-install.efi.manifest \
      && "${OMIT_DEFAULT_PCR_POLICY:-0}" != 1 ]]; then
     (( has_policy_key == 1 )) || pairs+=(
       "::/ice-coreos/tpm2-pcr-public-key.pem=$FIXTURE_PCR_POLICY_KEY_FILE"

@@ -289,7 +289,7 @@ registry_mirror_ca_sha="$(sha256sum "$TMP/mirror-ca.crt" | awk '{print $1}')"
 registry_relauth="neuralice.relauth_sha256=${registry_relauth_sha} neuralice.relauth_sig_sha256=${registry_relauth_sig_sha}"
 registry_mirror_pin="neuralice.mirror_ca_sha256=${registry_mirror_ca_sha} neuralice.mirror_ready=$(printf 'd%.0s' {1..64}) neuralice.mirror_manifest=$(printf 'e%.0s' {1..64}) neuralice.mirror_generation=7"
 build_uki installer-registry \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest} ${registry_relauth} neuralice.mirror=bench.example.test:5000 ${registry_mirror_pin}" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest} ${registry_relauth} neuralice.mirror=bench.example.test:5000 ${registry_mirror_pin}" \
   >/dev/null || fail "the registry-install UKI failed to build"
 registry_esp_files=(
   "::/ice-coreos/release-authorization.json=$TMP/relauth.json"
@@ -340,13 +340,13 @@ grep -q "neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${r
 grep -q 'neuralice.mirror=bench.example.test:5000' "$TMP/inspect-registry.out" \
   || fail "the inspector did not surface the sealed mirror transport"
 build_uki installer-registry-tag \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable" \
   >/dev/null || fail "the mutable-tag registry mutation UKI failed to build"
 build_uki installer-registry-orphan-mirror \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.mirror=bench.example.test" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.mirror=bench.example.test" \
   >/dev/null || fail "the orphan-mirror mutation UKI failed to build"
 build_uki installer-registry-no-image \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.source=registry" \
   >/dev/null || fail "the imageless-registry mutation UKI failed to build"
 for mutation in registry-tag registry-orphan-mirror registry-no-image; do
   make_esp "$SEALED/installer-$mutation.efi" "$SEALED/installer-$mutation.efi.manifest" \
@@ -379,7 +379,7 @@ env NI_UKI_TESTING=1 NI_UKI_TEST_TOOLS="$TOOLS" \
   TRUST_POLICY_ID="$POLICY_ID" TRUST_POLICY_ROOT="$POLICY_ROOT" \
   RELEASE_AUTH_PUBKEY="$IN/relauth.pub" \
   UKI_OUT="$SEALED/unsigned.efi" \
-  EXTRA_KARGS="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1" \
+  EXTRA_KARGS="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS" \
   bash "$ROOT/image/build-installer-uki.sh" >/dev/null || fail "the unsigned build failed"
 make_esp "$SEALED/unsigned.efi" "$SEALED/installer-install.efi.manifest" \
   installer-install.efi.manifest
@@ -521,7 +521,7 @@ import hashlib, sys
 print(hashlib.sha256(open(sys.argv[1], "rb").read(4096).rstrip(b"\x00")).hexdigest())
 ' "$TMP/lying-payload.img")"
 build_uki installer-lying \
-  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1" \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS" \
   PAYLOAD_DIGEST="$LYING_DIGEST" \
   >/dev/null || fail "the UKI sealing the forged header failed to build"
 make_esp "$SEALED/installer-lying.efi" "$SEALED/installer-lying.efi.manifest" \
