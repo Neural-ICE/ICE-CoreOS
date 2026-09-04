@@ -1874,9 +1874,9 @@ fi
 # otherwise bootc resolves localhost/bootc against the future appliance seed
 # path rather than the dm-verity store on the installation medium.
 # No systemd.mask= karg for sysext/confext here: the ceremony/tmpfiles cycle
-# is broken at its source (PrivateTmp=disconnected in the generated unit
-# below), and a mask would have been a permanent karg disabling the very
-# root-capable-extension gate the image installs.
+# is broken at its source (PrivateTmp=disconnected in the appliance's own
+# unit, verified after finalize below), and a mask would have been a permanent
+# karg disabling the very root-capable-extension gate the image installs.
 heartbeat_start "bootc install to-filesystem"
 podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
   --net=host --log-driver=passthrough-tty --pid=host \
@@ -2110,25 +2110,61 @@ rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")"
 # and a generator used to bridge that from the medium; the bridge was retired
 # at the re-pin. The installer now REFUSES such an image instead of patching
 # it: a medium must not silently repair the appliance it deploys.
-ceremony_unit="$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+ceremony_unit_name=neural-ice-firstboot-tpm-ceremony.service
+ceremony_unit="$dep/usr/lib/systemd/system/$ceremony_unit_name"
 [[ -f "$ceremony_unit" && ! -L "$ceremony_unit" ]] \
   || die "the pinned appliance image ships no first-boot TPM ceremony unit"
-grep -qx 'DefaultDependencies=no' "$ceremony_unit" \
-  || die "the pinned appliance's first-boot ceremony unit keeps default dependencies (ordering cycle with sysext/confext); re-pin the medium to a fixed appliance digest"
-! grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\.service' "$ceremony_unit" \
-  || die "the pinned appliance's first-boot ceremony unit orders against tmpfiles-setup (ordering cycle with sysext/confext); re-pin the medium"
-! grep -Eq '^(After|Before)=.*sysinit\.target' "$ceremony_unit" \
-  || die "the pinned appliance's first-boot ceremony unit orders against sysinit.target (cycle with sshd.socket); re-pin the medium"
-! grep -Eq '^PrivateTmp=(yes|true|on|1)[[:space:]]*$' "$ceremony_unit" \
-  || die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=yes, which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium"
-for bridge in \
-  "$dep/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service" \
+# What systemd will run is the EFFECTIVE configuration: the fragment merged
+# with every *.conf drop-in from each unit search path, where a later
+# assignment overrides an earlier one, `Key = value` is legal and a trailing
+# backslash continues the line. Checking the raw fragment alone would approve a
+# unit whose drop-in re-adds the cycle. Normalise the whole set into one
+# stream of `Key=value` lines and judge that. The deployment carries no
+# /etc or /run override for this unit at all: the appliance ships none, and
+# the retired bridge staged exactly such an override from the medium.
+for override in \
+  "$dep/etc/systemd/system/$ceremony_unit_name" \
+  "$dep/etc/systemd/system/$ceremony_unit_name.d" \
+  "$dep/etc/systemd/system.control/$ceremony_unit_name" \
+  "$dep/etc/systemd/system.control/$ceremony_unit_name.d" \
+  "$dep/usr/local/lib/systemd/system/$ceremony_unit_name" \
+  "$dep/usr/local/lib/systemd/system/$ceremony_unit_name.d" \
   "$dep/etc/systemd/system-generators/neural-ice-firstboot-ceremony" \
   "$dep/etc/neural-ice/firstboot-tpm-ceremony.service"; do
-  [[ ! -e "$bridge" && ! -L "$bridge" ]] \
-    || die "the deployment carries a retired first-boot ceremony bridge at $bridge"
+  [[ ! -e "$override" && ! -L "$override" ]] \
+    || die "the deployment overrides the pinned appliance's first-boot ceremony unit at $override (retired medium bridge, or a foreign drop-in); re-pin the medium"
 done
-log "first-boot ceremony unit verified on the pinned appliance (DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges)"
+ceremony_effective="$(
+  {
+    cat -- "$ceremony_unit"
+    for dropin_dir in "$dep/usr/lib/systemd/system/$ceremony_unit_name.d" \
+                      "$dep/usr/lib/systemd/system/service.d" \
+                      "$dep/etc/systemd/system/service.d"; do
+      [[ -d "$dropin_dir" ]] || continue
+      for dropin in "$dropin_dir"/*.conf; do
+        [[ -f "$dropin" ]] || continue
+        printf '\n'; cat -- "$dropin"
+      done
+    done
+  } | sed -e ':a' -e '/\\$/N; s/\\\n//; ta' \
+    | sed -E -e 's/^[[:space:]]+//; s/[[:space:]]+$//' -e '/^[#;]/d' \
+             -e 's/^([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*/\1=/'
+)"
+ceremony_effective_last() { # last assignment of a directive wins in systemd
+  printf '%s\n' "$ceremony_effective" | grep -E "^$1=" | tail -n1 | cut -d= -f2-
+}
+[[ "$(ceremony_effective_last DefaultDependencies)" == no ]] \
+  || die "the pinned appliance's first-boot ceremony unit keeps default dependencies (ordering cycle with sysext/confext); re-pin the medium to a fixed appliance digest"
+! printf '%s\n' "$ceremony_effective" | grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\.service' \
+  || die "the pinned appliance's first-boot ceremony unit orders against tmpfiles-setup (ordering cycle with sysext/confext); re-pin the medium"
+! printf '%s\n' "$ceremony_effective" | grep -Eq '^(After|Before)=.*sysinit\.target' \
+  || die "the pinned appliance's first-boot ceremony unit orders against sysinit.target (cycle with sshd.socket); re-pin the medium"
+case "$(ceremony_effective_last PrivateTmp)" in
+  ''|no|false|off|0|disconnected) ;;
+  *) die "the pinned appliance's first-boot ceremony unit uses PrivateTmp=$(ceremony_effective_last PrivateTmp), which re-adds After=tmpfiles-setup (ordering cycle); re-pin the medium" ;;
+esac
+unset -f ceremony_effective_last
+log "first-boot ceremony unit verified on the pinned appliance (effective config: DefaultDependencies=no, PrivateTmp=disconnected-compatible, no tmpfiles/sysinit edges, no /etc override)"
 
 # The medium runs with a permissive container-signature policy so bootc can read
 # its own local image through whatever transport it picks -- containers-storage

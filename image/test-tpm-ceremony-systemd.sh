@@ -59,18 +59,65 @@ for bridge in image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf \
   [[ ! -e "$ROOT/$bridge" ]] || fail "retired first-boot ceremony bridge is back in the tree: $bridge"
 done
 AUTOINSTALL="$ROOT/ota/neural-ice-autoinstall.sh"
-# Literal source fragments, hence -F: the installer checks the appliance's OWN
-# /usr/lib unit and refuses PrivateTmp=yes and any tmpfiles-setup edge.
-# shellcheck disable=SC2016 # exact installer source assertion
-grep -Fq 'ceremony_unit="$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"' "$AUTOINSTALL" \
-  || fail "the installer does not verify the pinned appliance's own first-boot ceremony unit"
-grep -Fq "grep -Eq '^PrivateTmp=(yes|true|on|1)[[:space:]]*\$' \"\$ceremony_unit\"" "$AUTOINSTALL" \
-  || fail "the installer does not refuse an appliance whose ceremony unit uses PrivateTmp=yes (re-adds After=tmpfiles-setup)"
-grep -Fq "grep -Eq '^(After|Before)=.*systemd-tmpfiles-setup\\.service' \"\$ceremony_unit\"" "$AUTOINSTALL" \
-  || fail "the installer does not refuse an appliance whose ceremony unit orders against tmpfiles-setup"
 ! grep -Fq 'etc/systemd/system-generators/neural-ice-firstboot-ceremony"' "$AUTOINSTALL" \
-  || { grep -Fq 'retired first-boot ceremony bridge' "$AUTOINSTALL" \
+  || { grep -Fq 'retired medium bridge' "$AUTOINSTALL" \
        || fail "the installer still stages the retired first-boot ceremony generator"; }
+
+# Run the installer's verification block itself against crafted deployments.
+# It must judge the EFFECTIVE unit (fragment + drop-ins, `Key = value`, line
+# continuations, last assignment wins), not the raw fragment text: a drop-in
+# that re-adds the cycle must be refused exactly like a cycling fragment.
+verify_start="$(grep -n '^ceremony_unit_name=neural-ice-firstboot-tpm-ceremony\.service$' "$AUTOINSTALL" | cut -d: -f1)"
+verify_end="$(grep -n '^log "first-boot ceremony unit verified on the pinned appliance' "$AUTOINSTALL" | cut -d: -f1)"
+[[ -n "$verify_start" && -n "$verify_end" && "$verify_start" -lt "$verify_end" ]] \
+  || fail "the installer's first-boot ceremony verification block is not where the test expects it"
+verify_tmp="$TMP/verify"
+mkdir -p "$verify_tmp"
+{
+  # shellcheck disable=SC2016 # shell source emitted verbatim into the harness
+  printf 'die() { printf "REFUSED: %%s\\n" "$*"; exit 3; }\nlog() { printf "OK: %%s\\n" "$*"; }\ndep="$1"\n'
+  sed -n "${verify_start},${verify_end}p" "$AUTOINSTALL"
+} > "$verify_tmp/verify.sh"
+verify_dep() { # <name> -> path of a deployment carrying the shipped unit
+  local d="$verify_tmp/$1"
+  mkdir -p "$d/usr/lib/systemd/system"
+  cp -- "$UNIT" "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+  printf '%s\n' "$d"
+}
+verify_expect() { # <accept|refuse> <dep> <message fragment>
+  local out
+  out="$(bash "$verify_tmp/verify.sh" "$2" 2>&1)" || true
+  case "$1" in
+    accept) [[ "$out" == OK:* ]] || fail "installer refused the shipped ceremony unit ($3): $out" ;;
+    refuse) [[ "$out" == REFUSED:*"$3"* ]] || fail "installer must refuse a deployment whose effective ceremony unit $3; got: $out" ;;
+  esac
+}
+d="$(verify_dep shipped)"
+verify_expect accept "$d" "as shipped"
+d="$(verify_dep dropin-tmpfiles)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+printf '[Unit]\nAfter = local-fs.target \\\n    systemd-tmpfiles-setup.service\n' \
+  > "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect refuse "$d" "orders against tmpfiles-setup"
+d="$(verify_dep dropin-privatetmp)"
+mkdir -p "$d/usr/lib/systemd/system/service.d"
+printf '[Service]\nPrivateTmp = yes\n' > "$d/usr/lib/systemd/system/service.d/90-test.conf"
+verify_expect refuse "$d" "PrivateTmp=yes"
+d="$(verify_dep dropin-defaultdeps)"
+mkdir -p "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+printf '[Unit]\nDefaultDependencies=yes\n' \
+  > "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d/90-test.conf"
+verify_expect refuse "$d" "keeps default dependencies"
+d="$(verify_dep etc-override)"
+mkdir -p "$d/etc/systemd/system/neural-ice-firstboot-tpm-ceremony.service.d"
+verify_expect refuse "$d" "overrides the pinned appliance's first-boot ceremony unit"
+d="$(verify_dep etc-bridge)"
+mkdir -p "$d/etc/systemd/system-generators"
+: > "$d/etc/systemd/system-generators/neural-ice-firstboot-ceremony"
+verify_expect refuse "$d" "overrides the pinned appliance's first-boot ceremony unit"
+d="$(verify_dep no-unit)"
+rm -f -- "$d/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"
+verify_expect refuse "$d" "ships no first-boot TPM ceremony unit"
 
 dropin_units=(
   sshd.service sshd.socket getty@.service serial-getty@.service autovt@.service

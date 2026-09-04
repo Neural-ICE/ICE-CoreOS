@@ -465,10 +465,10 @@ grep -Fq 'COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luk
   || fail "the installer still stages the retired first-boot ceremony generator"
 ! grep -Fq 'chcon -t systemd_generic_generator_exec_t' "$ROOT/ota/neural-ice-autoinstall.sh" \
   || fail "the installer still relabels a first-boot ceremony generator overlay"
-grep -Fq 'ceremony_unit="$dep/usr/lib/systemd/system/neural-ice-firstboot-tpm-ceremony.service"' \
+grep -Fq 'ceremony_unit="$dep/usr/lib/systemd/system/$ceremony_unit_name"' \
   "$ROOT/ota/neural-ice-autoinstall.sh" \
   || fail "the installer does not verify the pinned appliance's own first-boot ceremony unit"
-grep -Fq 'retired first-boot ceremony bridge' "$ROOT/ota/neural-ice-autoinstall.sh" \
+grep -Fq 'retired medium bridge' "$ROOT/ota/neural-ice-autoinstall.sh" \
   || fail "the installer does not refuse a deployment that still carries the retired ceremony bridge"
 # The ceremony/tmpfiles cycle is broken at its source (PrivateTmp=disconnected
 # in the ceremony unit). A systemd.mask= karg on sysext/confext would persist
