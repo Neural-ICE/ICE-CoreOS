@@ -44,6 +44,13 @@ grep -Fq '/run/cryptsetup' "$UNIT" \
   || fail "ceremony Before=sysinit cycles with sshd.socket After=sysinit"
 ! grep -E '^(After|Before)=.*sockets\.target' "$UNIT" \
   || fail "ceremony Before=sockets is not required and widens the sysinit cycle"
+# PrivateTmp=yes implicitly adds After=systemd-tmpfiles-setup.service (verified
+# on systemd 255 and 257 with `systemctl show -p After`); sysext/confext are
+# Requires=+After= this gate and Before= tmpfiles-setup, so `yes` is the cycle
+# that made systemd 257 skip sysext/confext on QEMU first boot. `disconnected`
+# keeps the private /tmp and adds no tmpfiles edge.
+grep -qx 'PrivateTmp=disconnected' "$UNIT" \
+  || fail "ceremony must use PrivateTmp=disconnected: PrivateTmp=yes re-adds After=tmpfiles-setup and cycles with sysext"
 SYSINIT_DROPIN="$ROOT/image/firstboot/10-neural-ice-firstboot-ceremony-sysinit.conf"
 GENERATOR="$ROOT/image/firstboot/neural-ice-firstboot-ceremony-generator"
 grep -qx 'DefaultDependencies=no' "$SYSINIT_DROPIN" \
@@ -58,6 +65,8 @@ grep -qx 'After=' "$SYSINIT_DROPIN" \
   || fail "the first-boot ceremony generator is missing"
 grep -Fq '/etc/neural-ice/firstboot-tpm-ceremony.service' "$GENERATOR" \
   || fail "the generator does not install the staged ceremony unit"
+grep -Eq '^! grep -Eq .\^PrivateTmp=\(yes\|true\|on\|1\)' "$GENERATOR" \
+  || fail "the generator does not refuse a staged unit with PrivateTmp=yes (re-adds After=tmpfiles-setup)"
 
 dropin_units=(
   sshd.service sshd.socket getty@.service serial-getty@.service autovt@.service

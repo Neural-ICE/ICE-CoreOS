@@ -479,12 +479,12 @@ grep -Fq 'chcon -t systemd_unit_file_t' \
 grep -Fq 'chcon -t systemd_generic_generator_exec_t' \
   "$ROOT/ota/neural-ice-autoinstall.sh" \
   || fail "the installer does not relabel the first-boot ceremony generator after setfiles"
-grep -Fq -- '--karg "systemd.mask=systemd-sysext.service"' \
+# The ceremony/tmpfiles cycle is broken at its source (PrivateTmp=disconnected
+# in the ceremony unit). A systemd.mask= karg on sysext/confext would persist
+# across every bootc upgrade and disable the root-capable-extension gate.
+! grep -Eq -- '--karg "systemd\.mask=systemd-(sysext|confext)\.service"' \
   "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not mask systemd-sysext to break the first-boot ceremony/tmpfiles cycle"
-grep -Fq -- '--karg "systemd.mask=systemd-confext.service"' \
-  "$ROOT/ota/neural-ice-autoinstall.sh" \
-  || fail "the installer does not mask systemd-confext to break the first-boot ceremony/tmpfiles cycle"
+  || fail "the installer masks systemd-sysext/confext by karg instead of fixing the ceremony ordering"
 grep -Fq 'COPY image/initramfs/91neural-ice-tpm-policy/neural-ice-tpm-policy.sh' \
   "$INSTALLER_CONTAINERFILE" \
   || fail "the installed deployment silently inherits a stale TPM initramfs hook from its base image"

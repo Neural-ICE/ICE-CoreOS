@@ -1873,12 +1873,10 @@ fi
 # drop-in directory with an immutable empty directory for this one container;
 # otherwise bootc resolves localhost/bootc against the future appliance seed
 # path rather than the dm-verity store on the installation medium.
-# Pinned image ceremony After=tmpfiles-setup; sysext/confext Require it and
-# are Before=tmpfiles-setup. That is a cycle (first boot skips tmpfiles,
-# ceremony fails, emergency). /etc overlays did not replace the vendor
-# fragment at first boot. Masking these two units drops that edge; sshd,
-# network-pre and multi-user still Require the ceremony. First boot has no
-# sysext/confext images.
+# No systemd.mask= karg for sysext/confext here: the ceremony/tmpfiles cycle
+# is broken at its source (PrivateTmp=disconnected in the generated unit
+# below), and a mask would have been a permanent karg disabling the very
+# root-capable-extension gate the image installs.
 heartbeat_start "bootc install to-filesystem"
 podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
   --net=host --log-driver=passthrough-tty --pid=host \
@@ -1900,8 +1898,6 @@ podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
     --karg "rd.luks.uuid=luks-$SYS_LUKS_UUID" \
     --karg "rd.luks.options=$SYS_LUKS_UUID=tpm2-device=auto" \
     --karg "systemd.mount-extra=/dev/mapper/data:$DATA_MOUNT:xfs:nofail" \
-    --karg "systemd.mask=systemd-sysext.service" \
-    --karg "systemd.mask=systemd-confext.service" \
     --karg "neuralice.pcr_policy=$PCR_POLICY_DIGEST" \
     --karg "neuralice.pcr_policy_key=$PCR_POLICY_KEY_SHA256" \
     --karg "neuralice.pcr_policy_signature=$PCR_POLICY_SIGNATURE_SHA256" \

@@ -276,8 +276,8 @@ unit_value() { awk -v k="$1" -v f="$2" 'index($0, k "=") == 1 { print substr($0,
   || fail "the failure unit may reach the network"
 [ "$(unit_value ProtectSystem "$FAILURE_UNIT")" = strict ] \
   || fail "the failure unit can write to the machine it is reporting a failure on"
-[ "$(unit_value ReadWritePaths "$FAILURE_UNIT")" = /sys/firmware/efi/efivars ] \
-  || fail "the failure unit can write somewhere other than the one efivarfs directory"
+[ "$(unit_value ReadWritePaths "$FAILURE_UNIT")" = -/sys/firmware/efi/efivars ] \
+  || fail "the failure unit can write somewhere other than the one efivarfs directory, or fails to start when efivarfs is absent (missing '-' prefix)"
 [ "$(unit_value CapabilityBoundingSet "$FAILURE_UNIT")" = CAP_SYS_BOOT ] \
   || fail "the failure unit keeps capabilities beyond the power-off it exists to perform"
 grep -Eq '^PrivateTmp=' "$FAILURE_UNIT" \

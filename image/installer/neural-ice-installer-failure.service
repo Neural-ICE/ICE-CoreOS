@@ -51,7 +51,9 @@ RestrictAddressFamilies=AF_UNIX
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/sys/firmware/efi/efivars
+# `-`: a missing efivarfs must not stop the failure surface from starting;
+# the script already treats the EFI evidence as best-effort.
+ReadWritePaths=-/sys/firmware/efi/efivars
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
