@@ -216,6 +216,7 @@ import sys
 TPM_ALG_ECDSA = 0x0018
 TPM_ALG_SHA256 = 0x000B
 CURVE_BYTES = 32
+CURVE_ORDER = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
 
 
 def refuse(reason: str) -> None:
@@ -243,6 +244,13 @@ r, offset = parameter(4)
 s, offset = parameter(offset)
 if offset != len(tss):
     refuse("trailing bytes")
+
+# TPM ECDSA may return either equivalent s value. Persist the low-S form
+# required by the Rust verifier, without changing the signed message.
+r_value, s_value = int.from_bytes(r, "big"), int.from_bytes(s, "big")
+if not (0 < r_value < CURVE_ORDER and 0 < s_value < CURVE_ORDER):
+    refuse("scalar is outside the P-256 group order")
+s = min(s_value, CURVE_ORDER - s_value).to_bytes(CURVE_BYTES, "big")
 
 
 def integer(value: bytes) -> bytes:
@@ -379,8 +387,9 @@ verify() {
   local rebuilt
   rebuilt="$(anchor_json "$profile" "$target" "$policy_id" "$seq" "$name" "$spki_hash" \
     "$(json_field "$json" enrolled_at)")"
-  [[ "$rebuilt" == "$json" ]] && cmp -s -- "$ANCHOR_JSON" <(printf '%s' "$rebuilt") \
-    || die_reinstall "the anchor is not in its canonical form"
+  if [[ "$rebuilt" != "$json" ]] || ! cmp -s -- "$ANCHOR_JSON" <(printf '%s' "$rebuilt"); then
+    die_reinstall "the anchor is not in its canonical form"
+  fi
   signing_payload "$json" "$WORK/payload"
   "$(tool openssl)" dgst -sha256 -verify <("$(tool openssl)" pkey -pubin -inform DER -in "$WORK/spki.der") \
     -signature "$WORK/signature.der" "$WORK/payload" >/dev/null 2>&1 \

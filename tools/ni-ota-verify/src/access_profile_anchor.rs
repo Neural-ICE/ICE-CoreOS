@@ -845,7 +845,12 @@ pub(crate) fn enrolled_access_profile(
     };
 
     let pem = spki_pem(&spki_der);
-    if let Err(reason) = verify_signature(&pem, ANCHOR_DOMAIN, &anchor_bytes, &signature, store)? {
+    // The delegated verifier removes one mandatory transport LF before adding
+    // the signature domain. Anchor files have no transport LF, so adapt only
+    // this in-memory input; the signed message stays DOMAIN || anchor_bytes.
+    let mut delegated_payload = anchor_bytes.clone();
+    delegated_payload.push(b'\n');
+    if let Err(reason) = verify_signature(&pem, ANCHOR_DOMAIN, &delegated_payload, &signature, store)? {
         return Ok(Err(reinstall_required(&format!(
             "the access-profile anchor is not signed by this machine's device root ({reason})"
         ))));
@@ -990,6 +995,35 @@ mod tests {
 
     #[cfg(feature = "test-path-overrides")]
     static LIFECYCLE_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn shell_tpm_signature_encoder_satisfies_the_rust_low_s_contract() {
+        let source = include_str!("../../../ota/neural-ice-access-profile-anchor.sh");
+        let body = source.split_once("tss_to_der() {").unwrap().1;
+        let body = body.split_once("\n}").unwrap().0;
+        let script = [
+            "set -euo pipefail\ntool() { command -v \"$1\"; }\ntss_to_der() {",
+            body,
+            "\n}\n",
+            r#"tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+python3 - "$tmp/input" <<'PY'
+import sys
+order = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+tss = bytes.fromhex("0018000b0020") + (1).to_bytes(32, "big")
+tss += bytes.fromhex("0020") + (order - 1).to_bytes(32, "big")
+open(sys.argv[1], "wb").write(tss)
+PY
+tss_to_der "$tmp/input" "$tmp/output"
+cat "$tmp/output"
+"#,
+        ]
+        .concat();
+        let output = Command::new("bash").args(["-c", &script]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, [0x30, 6, 2, 1, 1, 2, 1, 1]);
+        assert!(crate::delegated::contract::validate_der_signature(&output.stdout).is_ok());
+    }
 
     #[test]
     fn canonical_bytes_match_the_shell_enrollers_persisted_bytes() {

@@ -279,7 +279,7 @@ impl Fixture {
 \"device_root_handle\":\"0x81010005\",\"device_root_name\":\"{name}\",\
 \"device_root_spki_sha256\":\"{spki_sha256}\",\"enrolled_at\":\"2026-07-01T00:00:00Z\",\
 \"hardware_target\":\"nvidia-gb10-arm64\",\"schema\":\"neural-ice-access-profile-anchor-v1\",\
-\"signed_boot_trust_policy_id\":\"neural-ice-secureboot-lab-v1\"}}\n"
+\"signed_boot_trust_policy_id\":\"neural-ice-secureboot-lab-v1\"}}"
             )
         } else {
             format!(
@@ -287,16 +287,16 @@ impl Fixture {
 \"device_root_handle\":\"0x81010005\",\"device_root_name\":\"{name}\",\
 \"device_root_spki_sha256\":\"{spki_sha256}\",\"enrolled_at\":\"2026-07-01T00:00:00Z\",\
 \"hardware_target\":\"nvidia-gb10-arm64\",\"schema\":\"neural-ice-access-profile-anchor-v1\",\
-\"signed_boot_trust_policy_id\":\"neural-ice-secureboot-lab-v1\"}}\n"
+\"signed_boot_trust_policy_id\":\"neural-ice-secureboot-lab-v1\"}}"
             )
         };
         fs::write(dir.join("access-profile-v1.json"), &json).unwrap();
 
         // The exact bytes the verifier reconstructs: domain, a NUL, then the
-        // canonical JSON WITHOUT its trailing LF. Signing anything else here
+        // canonical JSON with no trailing LF. Signing anything else here
         // would hide a domain-separation defect rather than expose it.
         let mut payload = b"neural-ice:ota:access-profile-anchor:v1\0".to_vec();
-        payload.extend_from_slice(json.trim_end_matches('\n').as_bytes());
+        payload.extend_from_slice(json.as_bytes());
         let payload_path = self.path("anchor-payload.bin");
         fs::write(&payload_path, &payload).unwrap();
         let sig_der = self.path("anchor-signature.der");
