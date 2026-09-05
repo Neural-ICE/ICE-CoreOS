@@ -6,6 +6,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER="$ROOT/ota/neural-ice-ota-tpm-state.sh"
+CEREMONY_UNIT="$ROOT/image/firstboot/neural-ice-firstboot-tpm-ceremony.service"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ni-owner-ota-state.XXXXXX")"
 trap 'rm -rf -- "$TMP"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -129,6 +130,19 @@ ota() { bash "$HELPER" "$@"; }
 clear_mutations() { : >"$STATE/mutations"; }
 assert_no_mutations() { [[ ! -s "$STATE/mutations" ]] || fail "$1"; }
 
+# The helper creates this private workspace itself in every production mode.
+# ProtectSystem=strict makes /run read-only unless the ceremony unit grants the
+# exact RuntimeDirectory/ReadWritePaths exception.  Keep both declarations
+# coupled to the helper rather than widening the unit to all of /run.
+runtime_directories="$(sed -n 's/^RuntimeDirectory=//p' "$CEREMONY_UNIT")"
+read_write_paths="$(sed -n 's/^ReadWritePaths=//p' "$CEREMONY_UNIT")"
+[[ " $runtime_directories " == *" neural-ice-ota-tpm-state "* ]] \
+  || fail "ceremony unit does not create the owner OTA TPM helper runtime directory"
+[[ " $read_write_paths " == *" /run/neural-ice-ota-tpm-state "* ]] \
+  || fail "ceremony unit does not grant the owner OTA TPM helper its exact writable runtime path"
+[[ " $read_write_paths " != *" /run "* && " $read_write_paths " != *" /run/ "* ]] \
+  || fail "ceremony unit grants an over-broad writable /run path"
+
 clear_mutations
 expect_refusal "zero floor accepted" ota prepare 0
 expect_refusal "negative floor accepted" ota prepare -1
@@ -156,6 +170,21 @@ assert json.loads(sys.argv[1]) == {
  "anchor_sha256":None,"anchor_state":"pristine","baseline_floor":42,
  "clear_protected":False,"owner_sealed":False,"profile":"owner-sealed-ota-state-v1",
  "schema":"neural-ice-owner-ota-state-inspection-v1"}
+PY
+inspection_v2="$(ota inspect-v2)"
+python3 - "$inspection_v2" <<'PY'
+import json,sys
+assert json.loads(sys.argv[1]) == {
+ "anchor_attributes":"0x2060048","anchor_index":"0x01500002",
+ "anchor_name":"000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+ "anchor_policy_sha256":"b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7",
+ "anchor_sha256":None,"anchor_size":32,"anchor_state":"pristine",
+ "baseline_floor":42,"clear_protected":False,"floor_attributes":"0x62008",
+ "floor_index":"0x01500001",
+ "floor_name":"000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4",
+ "floor_policy_sha256":"f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230",
+ "floor_size":8,"owner_sealed":False,"profile":"owner-sealed-ota-state-v1",
+ "schema":"neural-ice-owner-ota-state-inspection-v2"}
 PY
 
 clear_mutations
@@ -190,6 +219,14 @@ first="$(ota extend "$(printf '11%.0s' {1..32})")"
 second="$(ota extend "$(printf '22%.0s' {1..32})")"
 [[ "$second" == 78830000e1197790a7e1884139a65721210d642ad112e6c9899a05cb214027a5 ]] \
   || fail "second anchor extension returned $second"
+inspection_v2="$(ota inspect-v2)"
+python3 - "$inspection_v2" "$second" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1])
+assert d["anchor_name"] == "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56"
+assert d["anchor_sha256"] == sys.argv[2] and d["anchor_state"] == "written"
+assert d["clear_protected"] is True and d["owner_sealed"] is True
+PY
 
 printf 0 >"$STATE/disableClear"
 clear_mutations

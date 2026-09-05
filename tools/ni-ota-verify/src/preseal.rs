@@ -138,7 +138,38 @@ struct PresealReceipt {
     variant: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedPreseal {
+    pub(crate) bundle_seq: u64,
+    pub(crate) receipt_sha256: String,
+    pub(crate) set_sha256: String,
+}
+
+enum VerificationMode<'a> {
+    Initial {
+        sealed_set_sha256: &'a str,
+        sealed_installer_sha256: &'a str,
+        sealed_installer_signature_sha256: &'a str,
+        current_os_ref: &'a str,
+        current_os_manifest_digest: &'a str,
+        current_seed_ref: &'a str,
+        candidate_root: &'a Path,
+    },
+    Retained {
+        expected_set_sha256: &'a str,
+        expected_receipt_sha256: &'a str,
+    },
+}
+
 pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
+    run_command(args, false)
+}
+
+pub(crate) fn run_retained(args: &[String]) -> Result<u8, InternalError> {
+    run_command(args, true)
+}
+
+fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
     let flags = parse_flags(
         args,
         &[
@@ -158,42 +189,120 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "current-seed-ref",
             "candidate-root",
             "receipt-out",
+            "receipt",
+            "expected-set-sha256",
+            "expected-receipt-sha256",
+            "scratch-dir",
             "config",
         ],
     )?;
+    let command = if retained {
+        "verify-retained-preseal-baseline"
+    } else {
+        "verify-preseal-baseline"
+    };
     let required = |name: &str| {
         flags
             .get(name)
-            .ok_or_else(|| InternalError(format!("verify-preseal-baseline: --{name} is required")))
+            .ok_or_else(|| InternalError(format!("{command}: --{name} is required")))
     };
     let config = Config::load(Path::new(
         flags.get("config").map_or(DEFAULT_CONFIG, String::as_str),
     ))?;
     let state_dir = config
         .state_dir
-        .ok_or_else(|| InternalError("verify-preseal-baseline requires state_dir".into()))?;
+        .ok_or_else(|| InternalError(format!("{command} requires state_dir")))?;
     let expected_receipt = state_dir.join("preseal/receipt.json");
-    let receipt_path = PathBuf::from(required("receipt-out")?);
+    let receipt_path = PathBuf::from(required(if retained { "receipt" } else { "receipt-out" })?);
     if receipt_path != expected_receipt {
         return refusal(format!(
             "receipt path must be exactly {}",
             expected_receipt.display()
         ));
     }
+    let forbidden = if retained {
+        [
+            "sealed-set-sha256",
+            "sealed-installer-authorization-sha256",
+            "sealed-installer-authorization-signature-sha256",
+            "current-os-ref",
+            "current-os-manifest-digest",
+            "current-seed-ref",
+            "candidate-root",
+            "receipt-out",
+        ]
+        .as_slice()
+    } else {
+        [
+            "receipt",
+            "expected-set-sha256",
+            "expected-receipt-sha256",
+            "scratch-dir",
+        ]
+        .as_slice()
+    };
+    if forbidden.iter().any(|name| flags.contains_key(*name)) {
+        return refusal(format!(
+            "{command} received a flag for the other verification mode"
+        ));
+    }
+
+    let mode = if retained {
+        VerificationMode::Retained {
+            expected_set_sha256: required("expected-set-sha256")?,
+            expected_receipt_sha256: required("expected-receipt-sha256")?,
+        }
+    } else {
+        VerificationMode::Initial {
+            sealed_set_sha256: required("sealed-set-sha256")?,
+            sealed_installer_sha256: required("sealed-installer-authorization-sha256")?,
+            sealed_installer_signature_sha256: required(
+                "sealed-installer-authorization-signature-sha256",
+            )?,
+            current_os_ref: required("current-os-ref")?,
+            current_os_manifest_digest: required("current-os-manifest-digest")?,
+            current_seed_ref: required("current-seed-ref")?,
+            candidate_root: Path::new(required("candidate-root")?),
+        }
+    };
+
     let receipt_store = FileStateStore {
         path: receipt_path.clone(),
     };
     if let Err(reason) = receipt_store.validate_bootstrap_parent() {
         return refusal(reason);
     }
-    let _lock = match receipt_store.lock_bootstrap() {
+    let scratch_store = if retained {
+        let scratch = PathBuf::from(required("scratch-dir")?);
+        if !scratch.is_absolute()
+            || scratch.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return refusal("retained preseal scratch path is not canonical absolute".into());
+        }
+        #[cfg(not(feature = "test-path-overrides"))]
+        if !scratch.starts_with("/run") {
+            return refusal("retained preseal scratch must be beneath /run".into());
+        }
+        Some(FileStateStore {
+            path: scratch.join("preseal-retained-operation"),
+        })
+    } else {
+        None
+    };
+    let operation_store = scratch_store.as_ref().unwrap_or(&receipt_store);
+    let _lock = match operation_store.lock_bootstrap() {
         Ok(lock) => lock,
         Err(reason) => return refusal(reason),
     };
 
     macro_rules! snap {
         ($flag:literal, $label:literal, $max:expr) => {{
-            match snapshot(&receipt_store, Path::new(required($flag)?), $label, $max)? {
+            match snapshot(operation_store, Path::new(required($flag)?), $label, $max)? {
                 Ok(value) => value,
                 Err(reason) => return refusal(reason),
             }
@@ -227,7 +336,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         Some(path) => path,
         None => return refusal("root_pubkey is required".into()),
     };
-    let root_file = match snapshot(&receipt_store, root_path, "root public key", MAX_SMALL)? {
+    let root_file = match snapshot(operation_store, root_path, "root public key", MAX_SMALL)? {
         Ok(value) => value,
         Err(reason) => return refusal(reason),
     };
@@ -238,8 +347,16 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         Err(reason) => return refusal(reason),
     };
     let set_hash = runner::sha256_bytes(&set_bytes)?;
-    let sealed_set_hash = required("sealed-set-sha256")?;
-    if !sha256(sealed_set_hash) || sealed_set_hash != &set_hash {
+    let expected_set_hash = match &mode {
+        VerificationMode::Initial {
+            sealed_set_sha256, ..
+        } => *sealed_set_sha256,
+        VerificationMode::Retained {
+            expected_set_sha256,
+            ..
+        } => *expected_set_sha256,
+    };
+    if !sha256(expected_set_hash) || expected_set_hash != set_hash {
         return refusal("preseal set differs from the signed UKI hash".into());
     }
     if let Err(reason) = validate_set_shape(&set) {
@@ -253,7 +370,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         &snapshot_bytes,
         &snapshot_sig_bytes,
         &root_bytes,
-        &receipt_store,
+        operation_store,
     ) {
         Ok(value) => value,
         Err(ContractError::Refusal(reason)) => return refusal(reason),
@@ -291,7 +408,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         RELEASE_DOMAIN,
         &release_bytes,
         &release_sig_bytes,
-        &receipt_store,
+        operation_store,
     )? {
         return refusal(reason);
     }
@@ -333,28 +450,39 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     if set.installer_authorization_sha256 != runner::sha256_bytes(&installer_bytes)?
         || set.installer_authorization_signature_sha256
             != runner::sha256_bytes(&installer_sig_bytes)?
-        || set.installer_authorization_sha256 != *required("sealed-installer-authorization-sha256")?
-        || set.installer_authorization_signature_sha256
-            != *required("sealed-installer-authorization-signature-sha256")?
     {
-        return refusal("installer authorization differs from the signed UKI hashes".into());
+        return refusal("installer authorization hash binding is invalid".into());
     }
-    if let Err(reason) = validate_installer(
-        &installer,
-        &set,
-        required("current-os-ref")?,
-        required("current-os-manifest-digest")?,
-        &release_pem,
-        authority,
-        key,
-    ) {
+    if let VerificationMode::Initial {
+        sealed_installer_sha256,
+        sealed_installer_signature_sha256,
+        ..
+    } = &mode
+    {
+        if set.installer_authorization_sha256 != **sealed_installer_sha256
+            || set.installer_authorization_signature_sha256 != **sealed_installer_signature_sha256
+        {
+            return refusal("installer authorization differs from the signed UKI hashes".into());
+        }
+    }
+    let observed_os = match &mode {
+        VerificationMode::Initial {
+            current_os_ref,
+            current_os_manifest_digest,
+            ..
+        } => Some((*current_os_ref, *current_os_manifest_digest)),
+        VerificationMode::Retained { .. } => None,
+    };
+    if let Err(reason) =
+        validate_installer(&installer, &set, observed_os, &release_pem, authority, key)
+    {
         return refusal(reason);
     }
     if let Err(reason) = verify_installer_signature(
         &release_pem,
         &installer_bytes,
         &installer_sig_bytes,
-        &receipt_store,
+        operation_store,
     )? {
         return refusal(reason);
     }
@@ -369,17 +497,21 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
             "preseal compatibility range differs from immutable device configuration".into(),
         );
     }
-    let current_seed = required("current-seed-ref")?;
-    if current_seed != &set.seed_ref {
-        return refusal("current seed differs from the signed preseal selection".into());
-    }
     if let Err(reason) = validate_bom(&bom, &set) {
         return refusal(reason);
     }
-    if let Err(reason) =
-        validate_candidate(Path::new(required("candidate-root")?), &set, current_seed)
+    if let VerificationMode::Initial {
+        current_seed_ref,
+        candidate_root,
+        ..
+    } = &mode
     {
-        return refusal(reason);
+        if *current_seed_ref != set.seed_ref {
+            return refusal("current seed differs from the signed preseal selection".into());
+        }
+        if let Err(reason) = validate_candidate(candidate_root, &set, current_seed_ref) {
+            return refusal(reason);
+        }
     }
 
     let receipt = PresealReceipt {
@@ -422,15 +554,40 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         .map_err(|error| InternalError(format!("cannot serialize preseal receipt: {error}")))?;
     receipt_bytes.push(b'\n');
     let receipt_hash = runner::sha256_bytes(&receipt_bytes)?;
-    let created = match publish_receipt(&receipt_store, &receipt_bytes)? {
-        Ok(value) => value,
-        Err(reason) => return refusal(reason),
+    let verified = VerifiedPreseal {
+        bundle_seq: receipt.bundle_seq,
+        receipt_sha256: receipt_hash.clone(),
+        set_sha256: receipt.preseal_set_sha256.clone(),
+    };
+    let created = match &mode {
+        VerificationMode::Initial { .. } => {
+            match publish_receipt(&receipt_store, &receipt_bytes)? {
+                Ok(value) => value,
+                Err(reason) => return refusal(reason),
+            }
+        }
+        VerificationMode::Retained {
+            expected_receipt_sha256,
+            ..
+        } => {
+            if !sha256(expected_receipt_sha256)
+                || **expected_receipt_sha256 != verified.receipt_sha256
+            {
+                return refusal(
+                    "preseal receipt differs from authenticated completion evidence".into(),
+                );
+            }
+            match compare_retained_receipt(operation_store, &receipt_path, &receipt_bytes)? {
+                Ok(()) => false,
+                Err(reason) => return refusal(reason),
+            }
+        }
     };
     println!(
         "{{\"bundle_seq\":{},\"idempotent\":{},\"preseal_receipt_sha256\":\"{}\",\"verdict\":\"pass\"}}",
-        receipt.bundle_seq,
+        verified.bundle_seq,
         if created { "false" } else { "true" },
-        receipt_hash
+        verified.receipt_sha256
     );
     Ok(EXIT_PASS)
 }
@@ -556,8 +713,7 @@ fn validate_release<'a>(
 fn validate_installer(
     value: &InstallerAuthorization,
     set: &PresealSet,
-    current_os_ref: &str,
-    current_manifest: &str,
+    observed_os: Option<(&str, &str)>,
     release_pem: &[u8],
     snapshot: &crate::delegated::contract::Snapshot,
     key: &crate::delegated::contract::DelegatedKey,
@@ -568,6 +724,11 @@ fn validate_installer(
         .target_os_ref
         .rsplit_once("@sha256:")
         .ok_or("target OS reference is malformed")?;
+    let observed_os_invalid = observed_os.is_some_and(|(current_os_ref, current_manifest)| {
+        value.image_manifest_digest != current_manifest
+            || current_os_ref != set.target_os_ref
+            || !digest_value(current_manifest)
+    });
     if value.schema != INSTALLER_SCHEMA
         || value.access_profile != set.access_profile
         || value.hardware_target != set.hardware_target
@@ -578,9 +739,8 @@ fn validate_installer(
         )
         || value.image_repository != repository
         || value.image_index_digest != format!("sha256:{digest}")
-        || value.image_manifest_digest != current_manifest
-        || current_os_ref != set.target_os_ref
-        || !digest_value(current_manifest)
+        || !digest_value(&value.image_manifest_digest)
+        || observed_os_invalid
         || !installer_id(&value.issuance_id)
         || issuance_seq.is_none_or(|seq| !safe_uint(seq))
         || value.issuance_seq.len() > 16
@@ -862,12 +1022,42 @@ fn compare_receipt(
     if let Err(reason) = store.validate_bootstrap_state() {
         return Ok(Err(reason));
     }
-    let file = File::open(&store.path)
-        .map_err(|error| InternalError(format!("cannot read preseal receipt: {error}")))?;
+    let file = match File::open(&store.path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Err("preseal receipt is missing".into()))
+        }
+        Err(error) => {
+            return Err(InternalError(format!(
+                "cannot read preseal receipt: {error}"
+            )))
+        }
+    };
     let mut actual = Vec::new();
     file.take(MAX_RECEIPT + 1)
         .read_to_end(&mut actual)
         .map_err(|error| InternalError(format!("cannot read preseal receipt: {error}")))?;
+    if actual != expected {
+        return Ok(Err(
+            "existing preseal receipt differs from authenticated selection".into(),
+        ));
+    }
+    match parse_canonical::<PresealReceipt>(&actual, "preseal receipt") {
+        Ok(_) => Ok(Ok(())),
+        Err(reason) => Ok(Err(reason)),
+    }
+}
+
+fn compare_retained_receipt(
+    scratch_store: &FileStateStore,
+    receipt_path: &Path,
+    expected: &[u8],
+) -> Result<Result<(), String>, InternalError> {
+    let receipt = match snapshot(scratch_store, receipt_path, "preseal receipt", MAX_RECEIPT)? {
+        Ok(receipt) => receipt,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let actual = receipt.read()?;
     if actual != expected {
         return Ok(Err(
             "existing preseal receipt differs from authenticated selection".into(),

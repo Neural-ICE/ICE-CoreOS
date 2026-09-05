@@ -84,7 +84,7 @@ use std::process::Command;
 
 use p256::elliptic_curve::ff::PrimeField;
 use p256::Scalar;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::delegated::{contract::validate_der_signature, verify_signature};
@@ -108,7 +108,19 @@ const ANCHOR_JSON: &str = "access-profile-v1.json";
 const ANCHOR_SIG: &str = "access-profile-v1.sig";
 const ANCHOR_SPKI: &str = "access-profile-v1.spki";
 const DEVICE_ROOT_IDENTITY: &str = "device-root-v1.json";
-const OWNER_CEREMONY_EVIDENCE: &str = "owner-ceremony-evidence-v1.json";
+const OWNER_CEREMONY_EVIDENCE_V1: &str = "owner-ceremony-evidence-v1.json";
+const OWNER_CEREMONY_EVIDENCE_V2: &str = "owner-ceremony-evidence-v2.json";
+const COMPLETION_V2_DOMAIN: &[u8] = b"neural-ice:tpm:owner-ceremony-completion:v2\0";
+const OWNER_STATE_PROFILE: &str = "owner-sealed-ota-state-v1";
+const OWNER_FLOOR_NAME: &str =
+    "000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4";
+const OWNER_ANCHOR_PRISTINE_NAME: &str =
+    "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d";
+const OWNER_ANCHOR_WRITTEN_NAME: &str =
+    "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56";
+const OWNER_FLOOR_POLICY: &str = "f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230";
+const OWNER_ANCHOR_POLICY: &str =
+    "b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7";
 
 /// Bounds exist so a hostile or corrupted `/var` cannot make the verifier read
 /// an unbounded file before it has decided anything.
@@ -140,7 +152,7 @@ struct DeviceRootIdentity {
     spki_sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CeremonyAnchorEvidence {
     json_sha256: String,
@@ -152,6 +164,72 @@ struct CeremonyAnchorEvidence {
 struct OwnerCeremonyEvidence {
     access_profile_anchor: CeremonyAnchorEvidence,
     schema: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionInspection {
+    completion_version: u64,
+    evidence_digest_sha256: String,
+    schema: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerPresealEvidence {
+    receipt_schema: String,
+    receipt_sha256: String,
+    set_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerOtaStateEvidence {
+    anchor_attributes: String,
+    anchor_index: String,
+    anchor_name_at_completion: String,
+    anchor_policy_sha256: String,
+    anchor_pristine_name: String,
+    anchor_size: u64,
+    anchor_state_at_completion: String,
+    anchor_written_name: String,
+    baseline_floor: u64,
+    clear_protected_at_completion: bool,
+    floor_attributes: String,
+    floor_index: String,
+    floor_name: String,
+    floor_policy_sha256: String,
+    floor_size: u64,
+    profile: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerCeremonyEvidenceV2 {
+    access_profile_anchor: CeremonyAnchorEvidence,
+    data_luks: serde_json::Value,
+    device_root_name: String,
+    install_identity: serde_json::Value,
+    ota_preseal: OwnerPresealEvidence,
+    ota_state: OwnerOtaStateEvidence,
+    schema: String,
+    srk_name: String,
+    system_luks: serde_json::Value,
+    tpm_state: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedOwnerCompletion {
+    pub(crate) completion_version: u64,
+    pub(crate) evidence_digest_sha256: String,
+    pub(crate) preseal_receipt_sha256: Option<String>,
+    pub(crate) preseal_set_sha256: Option<String>,
+    pub(crate) baseline_floor: Option<u64>,
+}
+
+struct AuthenticatedCompletion {
+    verified: VerifiedOwnerCompletion,
+    anchor: CeremonyAnchorEvidence,
 }
 
 /// The one refusal string the OTA caller and the operator both key on.
@@ -222,6 +300,15 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn closed_object(value: &serde_json::Value, fields: &[&str], schema: &str) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == fields.len()
+        && fields.iter().all(|field| object.contains_key(*field))
+        && object.get("schema").and_then(serde_json::Value::as_str) == Some(schema)
 }
 
 fn known_profile(value: &str) -> bool {
@@ -399,11 +486,12 @@ fn assert_full_tpm_lifecycle() -> Result<Result<(), String>, InternalError> {
     }
 }
 
-/// Read the digest from the immutable TPM-state helper's read-only
-/// `completion-status` command. That helper validates ownerAuthSet and the
-/// completion NV index's exact public shape, policy, written/write-locked state,
-/// magic and reserved bytes before emitting this digest.
-fn authenticated_completion_digest() -> Result<Result<String, String>, InternalError> {
+/// Authenticate the versioned completion record, then bind its digest to the
+/// exact canonical evidence file selected by the TPM magic. There is no
+/// fallback between versions after the helper has selected one.
+fn authenticated_completion(
+    state_dir: &Path,
+) -> Result<Result<AuthenticatedCompletion, String>, InternalError> {
     #[cfg(feature = "test-path-overrides")]
     let executable = match std::env::var_os("NI_OTA_TPM_STATE_HELPER") {
         Some(path) => PathBuf::from(path),
@@ -416,36 +504,234 @@ fn authenticated_completion_digest() -> Result<Result<String, String>, InternalE
     #[cfg(not(feature = "test-path-overrides"))]
     let executable = PathBuf::from(TPM_STATE_HELPER);
 
-    let output = match Command::new(executable).arg("completion-status").output() {
+    let output = match Command::new(executable).arg("completion-inspect").output() {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             let detail = String::from_utf8_lossy(&output.stderr);
             return Ok(Err(reinstall_required(&format!(
-                "the TPM ceremony-completion digest cannot be authenticated ({})",
+                "the TPM ceremony-completion record cannot be authenticated ({})",
                 detail.trim()
             ))));
         }
         Err(error) => {
             return Ok(Err(reinstall_required(&format!(
-                "the TPM ceremony-completion digest cannot be read ({error})"
+                "the TPM ceremony-completion record cannot be read ({error})"
             ))));
         }
     };
-    let digest = match std::str::from_utf8(&output.stdout) {
-        Ok(text) => text.strip_suffix('\n').unwrap_or(text),
-        Err(_) => {
-            return Ok(Err(reinstall_required(
-                "the TPM ceremony-completion digest is not ASCII",
-            )))
+    let inspection: CompletionInspection = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Err(reinstall_required(&format!(
+                "the TPM ceremony-completion inspection is malformed ({error})"
+            ))))
         }
     };
-    if !is_lower_hex(digest, 64) || output.stdout.iter().filter(|byte| **byte == b'\n').count() > 1
+    let mut canonical = serde_json::to_vec(&inspection).map_err(|error| {
+        InternalError(format!("cannot serialize completion inspection: {error}"))
+    })?;
+    canonical.push(b'\n');
+    if output.stdout != canonical
+        || inspection.schema != "neural-ice-owner-ceremony-completion-inspection-v1"
+        || !matches!(inspection.completion_version, 1 | 2)
+        || !is_lower_hex(&inspection.evidence_digest_sha256, 64)
     {
         return Ok(Err(reinstall_required(
-            "the TPM ceremony-completion digest is malformed",
+            "the TPM ceremony-completion inspection violates its closed contract",
         )));
     }
-    Ok(Ok(digest.to_owned()))
+
+    let evidence_path = state_dir.join(match inspection.completion_version {
+        1 => OWNER_CEREMONY_EVIDENCE_V1,
+        2 => OWNER_CEREMONY_EVIDENCE_V2,
+        _ => unreachable!(),
+    });
+    let evidence_bytes = match read_bounded(
+        &evidence_path,
+        MAX_OWNER_CEREMONY_EVIDENCE_BYTES,
+        "owner-ceremony evidence",
+    ) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let observed_digest = if inspection.completion_version == 1 {
+        hex_sha256(&evidence_bytes)
+    } else {
+        let mut message = Vec::with_capacity(COMPLETION_V2_DOMAIN.len() + evidence_bytes.len());
+        message.extend_from_slice(COMPLETION_V2_DOMAIN);
+        message.extend_from_slice(&evidence_bytes);
+        hex_sha256(&message)
+    };
+    if observed_digest != inspection.evidence_digest_sha256 {
+        return Ok(Err(reinstall_required(
+            "the owner-ceremony evidence bytes do not match the write-locked TPM completion record",
+        )));
+    }
+
+    if inspection.completion_version == 1 {
+        let evidence: OwnerCeremonyEvidence = match serde_json::from_slice(&evidence_bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Err(reinstall_required(&format!(
+                    "the authenticated owner-ceremony evidence is malformed ({error})"
+                ))))
+            }
+        };
+        if evidence.schema != "neural-ice-owner-ceremony-evidence-v1" {
+            return Ok(Err(reinstall_required(
+                "the authenticated owner-ceremony evidence has the wrong schema",
+            )));
+        }
+        return Ok(Ok(AuthenticatedCompletion {
+            verified: VerifiedOwnerCompletion {
+                completion_version: 1,
+                evidence_digest_sha256: inspection.evidence_digest_sha256,
+                preseal_receipt_sha256: None,
+                preseal_set_sha256: None,
+                baseline_floor: None,
+            },
+            anchor: evidence.access_profile_anchor,
+        }));
+    }
+
+    let generic: serde_json::Value = match serde_json::from_slice(&evidence_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Err(reinstall_required(&format!(
+                "the authenticated owner-ceremony evidence is malformed ({error})"
+            ))))
+        }
+    };
+    let mut canonical_evidence = serde_json::to_vec(&generic).map_err(|error| {
+        InternalError(format!("cannot serialize owner-ceremony evidence: {error}"))
+    })?;
+    canonical_evidence.push(b'\n');
+    if canonical_evidence != evidence_bytes {
+        return Ok(Err(reinstall_required(
+            "the authenticated owner-ceremony evidence is not canonical JSON plus LF",
+        )));
+    }
+    let evidence: OwnerCeremonyEvidenceV2 = match serde_json::from_slice(&evidence_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Err(reinstall_required(&format!(
+                "the authenticated owner-ceremony evidence is malformed ({error})"
+            ))))
+        }
+    };
+    let ota = &evidence.ota_state;
+    if evidence.schema != "neural-ice-owner-ceremony-evidence-v2"
+        || !closed_object(
+            &evidence.install_identity,
+            &[
+                "install_source",
+                "installed_at",
+                "installer_sealed_identity_sha256",
+                "release_identity_sha256",
+                "schema",
+            ],
+            "neural-ice-owner-ceremony-install-identity-v1",
+        )
+        || !closed_object(
+            &evidence.tpm_state,
+            &[
+                "freshness_counter",
+                "freshness_public_sha256",
+                "install_counter",
+                "install_public_sha256",
+                "profile_binding",
+                "schema",
+            ],
+            "neural-ice-tpm-state-snapshot-v1",
+        )
+        || ![&evidence.system_luks, &evidence.data_luks]
+            .into_iter()
+            .all(|value| {
+                closed_object(
+                    value,
+                    &[
+                        "keyslot",
+                        "pcr_bank",
+                        "pcrs",
+                        "policy_hash",
+                        "policy_public_key_sha256",
+                        "schema",
+                        "sealed_object_sha256",
+                        "srk_sha256",
+                        "token_sha256",
+                    ],
+                    "neural-ice-luks-token-evidence-v1",
+                )
+            })
+        || evidence.ota_preseal.receipt_schema != "neural-ice-ota-preseal-receipt-v1"
+        || !is_lower_hex(&evidence.ota_preseal.receipt_sha256, 64)
+        || !is_lower_hex(&evidence.ota_preseal.set_sha256, 64)
+        || ota.profile != OWNER_STATE_PROFILE
+        || ota.floor_index != "0x01500001"
+        || ota.floor_attributes != "0x62008"
+        || ota.floor_policy_sha256 != OWNER_FLOOR_POLICY
+        || ota.floor_size != 8
+        || ota.floor_name != OWNER_FLOOR_NAME
+        || ota.anchor_index != "0x01500002"
+        || ota.anchor_attributes != "0x2060048"
+        || ota.anchor_policy_sha256 != OWNER_ANCHOR_POLICY
+        || ota.anchor_size != 32
+        || ota.anchor_pristine_name != OWNER_ANCHOR_PRISTINE_NAME
+        || ota.anchor_written_name != OWNER_ANCHOR_WRITTEN_NAME
+        || ota.anchor_state_at_completion != "pristine"
+        || ota.anchor_name_at_completion != OWNER_ANCHOR_PRISTINE_NAME
+        || !ota.clear_protected_at_completion
+        || ota.baseline_floor == 0
+        || ota.baseline_floor > 9_007_199_254_740_991
+        || !is_lower_hex(&evidence.device_root_name, 68)
+        || !is_lower_hex(&evidence.srk_name, 68)
+    {
+        return Ok(Err(reinstall_required(
+            "the authenticated owner-profile completion evidence violates its closed contract",
+        )));
+    }
+    Ok(Ok(AuthenticatedCompletion {
+        verified: VerifiedOwnerCompletion {
+            completion_version: 2,
+            evidence_digest_sha256: inspection.evidence_digest_sha256,
+            preseal_receipt_sha256: Some(evidence.ota_preseal.receipt_sha256),
+            preseal_set_sha256: Some(evidence.ota_preseal.set_sha256),
+            baseline_floor: Some(ota.baseline_floor),
+        },
+        anchor: evidence.access_profile_anchor,
+    }))
+}
+
+#[allow(dead_code)] // Frozen Slice-C API consumed by the subsequent R1 reader.
+pub(crate) fn verified_owner_completion(
+    state_dir: &Path,
+) -> Result<Result<VerifiedOwnerCompletion, String>, InternalError> {
+    Ok(authenticated_completion(state_dir)?.map(|value| value.verified))
+}
+
+#[cfg(feature = "test-path-overrides")]
+pub(crate) fn run_owner_completion_test(args: &[String]) -> Result<u8, InternalError> {
+    let flags = crate::parse_flags(args, &["state-dir"])?;
+    let state_dir = flags.get("state-dir").ok_or_else(|| {
+        InternalError("test-inspect-owner-completion: --state-dir is required".into())
+    })?;
+    match verified_owner_completion(Path::new(state_dir))? {
+        Ok(value) => {
+            println!(
+                "{{\"baseline_floor\":{},\"completion_version\":{},\"evidence_digest_sha256\":\"{}\",\"preseal_receipt_sha256\":{},\"preseal_set_sha256\":{}}}",
+                value.baseline_floor.map_or("null".into(), |v| v.to_string()),
+                value.completion_version,
+                value.evidence_digest_sha256,
+                value.preseal_receipt_sha256.map_or("null".into(), |v| format!("\"{v}\"")),
+                value.preseal_set_sha256.map_or("null".into(), |v| format!("\"{v}\"")),
+            );
+            Ok(crate::EXIT_PASS)
+        }
+        Err(reason) => {
+            eprintln!("ni-ota-verify: owner completion REFUSED: {reason}");
+            Ok(crate::EXIT_REFUSE)
+        }
+    }
 }
 
 fn strict_der_integers(signature: &[u8]) -> (&[u8], &[u8]) {
@@ -517,37 +803,12 @@ fn ceremony_bound_signature(
     spki_encoded: &[u8],
     signature: &[u8],
 ) -> Result<Result<Vec<u8>, String>, InternalError> {
-    let evidence_bytes = match read_bounded(
-        &state_dir.join(OWNER_CEREMONY_EVIDENCE),
-        MAX_OWNER_CEREMONY_EVIDENCE_BYTES,
-        "owner-ceremony evidence",
-    ) {
-        Ok(bytes) => bytes,
+    let completion = match authenticated_completion(state_dir)? {
+        Ok(value) => value,
         Err(reason) => return Ok(Err(reason)),
     };
-    let completion_digest = match authenticated_completion_digest()? {
-        Ok(digest) => digest,
-        Err(reason) => return Ok(Err(reason)),
-    };
-    if hex_sha256(&evidence_bytes) != completion_digest {
-        return Ok(Err(reinstall_required(
-            "the owner-ceremony evidence bytes do not match the write-locked TPM completion record",
-        )));
-    }
-    let evidence: OwnerCeremonyEvidence = match serde_json::from_slice(&evidence_bytes) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            return Ok(Err(reinstall_required(&format!(
-                "the authenticated owner-ceremony evidence is malformed ({error})"
-            ))))
-        }
-    };
-    if evidence.schema != "neural-ice-owner-ceremony-evidence-v1" {
-        return Ok(Err(reinstall_required(
-            "the authenticated owner-ceremony evidence has the wrong schema",
-        )));
-    }
-    let hashes = evidence.access_profile_anchor;
+    let _authenticated_completion_version = completion.verified.completion_version;
+    let hashes = completion.anchor;
     if !is_lower_hex(&hashes.json_sha256, 64)
         || !is_lower_hex(&hashes.signature_sha256, 64)
         || !is_lower_hex(&hashes.spki_sha256, 64)

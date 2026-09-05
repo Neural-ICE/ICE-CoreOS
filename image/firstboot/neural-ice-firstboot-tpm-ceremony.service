@@ -21,7 +21,7 @@ UMask=0077
 # ProtectSystem=strict remounts /run read-only except RuntimeDirectory and
 # ReadWritePaths. The ceremony execs device-root, tpm-state, access-profile
 # anchor and cryptsetup, each of which install(1)s its own /run directory.
-RuntimeDirectory=neural-ice-owner-ceremony neural-ice-device-root neural-ice-tpm-state neural-ice-access-profile-anchor
+RuntimeDirectory=neural-ice-owner-ceremony neural-ice-device-root neural-ice-tpm-state neural-ice-ota-tpm-state neural-ice-access-profile-anchor
 RuntimeDirectoryMode=0700
 # `disconnected`, NOT `yes`. PrivateTmp=yes silently adds
 # After=systemd-tmpfiles-setup.service; systemd-sysext/confext carry
@@ -33,7 +33,7 @@ RuntimeDirectoryMode=0700
 # uses /tmp anyway; every mktemp lives under its RuntimeDirectory.
 PrivateTmp=disconnected
 ProtectSystem=strict
-ReadWritePaths=/var/lib/neural-ice/ota /run/neural-ice-owner-ceremony /run/neural-ice-device-root /run/neural-ice-tpm-state /run/neural-ice-access-profile-anchor /run/cryptsetup
+ReadWritePaths=/var/lib/neural-ice/ota /run/neural-ice-owner-ceremony /run/neural-ice-device-root /run/neural-ice-tpm-state /run/neural-ice-ota-tpm-state /run/neural-ice-access-profile-anchor /run/cryptsetup
 StandardOutput=journal+console
 StandardError=journal+console
 

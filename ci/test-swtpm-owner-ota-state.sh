@@ -161,6 +161,17 @@ assert value["anchor_sha256"] is None
 assert value["anchor_state"] == "pristine"
 assert value["owner_sealed"] is False and value["clear_protected"] is False
 PY
+inspection_v2="$(ota inspect-v2)"
+python3 - "$inspection_v2" <<'PY'
+import json,sys
+value=json.loads(sys.argv[1])
+assert list(value)==sorted(value)
+assert value["schema"] == "neural-ice-owner-ota-state-inspection-v2"
+assert value["baseline_floor"] == 42
+assert value["anchor_name"] == "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d"
+assert value["anchor_sha256"] is None and value["anchor_state"] == "pristine"
+assert value["owner_sealed"] is False and value["clear_protected"] is False
+PY
 tpm2_nvread 0x01500001 -C 0x01500001 -s 8 -o "$TMP/floor.bin" >/dev/null
 python3 - "$TMP/floor.bin" <<'PY'
 import struct,sys
@@ -196,6 +207,14 @@ PY
 first="$(ota extend "$(printf '11%.0s' {1..32})")"
 [[ "$first" == 8878b15a7d6a3a4f464e8f9f42591dbc0cf4bedea0ec309003d2b2ee53655ef8 ]] \
   || fail "first real anchor extension mismatched"
+written_inspection="$(ota inspect-v2)"
+python3 - "$written_inspection" "$first" <<'PY'
+import json,sys
+value=json.loads(sys.argv[1])
+assert value["anchor_name"] == "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56"
+assert value["anchor_sha256"] == sys.argv[2] and value["anchor_state"] == "written"
+assert value["owner_sealed"] is True and value["clear_protected"] is True
+PY
 
 snapshot_nv "$TMP/sealed.before"
 policy_floor_write

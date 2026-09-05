@@ -633,7 +633,7 @@ printf 'TPM2_PT_PERMANENT:\n  ownerAuthSet:              %s\n' "${NI_TEST_OWNER_
         fs::write(
             &tpm_state,
             format!(
-                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = completion-status ] || exit 2\ncat '{}'\n",
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = completion-inspect ] || exit 2\ndigest=$(cat '{}')\nprintf '{{\"completion_version\":1,\"evidence_digest_sha256\":\"%s\",\"schema\":\"neural-ice-owner-ceremony-completion-inspection-v1\"}}\\n' \"$digest\"\n",
                 self.path("completion-evidence-digest").display(),
             ),
         )
