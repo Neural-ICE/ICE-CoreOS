@@ -308,6 +308,8 @@ tamper_case() { # $1=label  $2=mutation command over a fresh copy in $D
   return 0
 }
 
+# Command substitution must not hide noncanonical trailing bytes from verify.
+tamper_case final-newline 'printf "\n" >> "$D/access-profile-v1.json"'
 # The single most valuable edit an attacker can make.
 tamper_case profile-flip \
   'sed -i "s/customer-locked/lab-managed   /" "$D/access-profile-v1.json"'
@@ -337,7 +339,7 @@ tamper_case corrupt-signature 'printf "not-base64!!\n" > "$D/access-profile-v1.s
 # — re-attested against the live TPM on every boot — still records it.
 tamper_case foreign-signer '
   sed -i "s/customer-locked/lab-managed   /" "$D/access-profile-v1.json"
-  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; head -c -1 "$D/access-profile-v1.json"; } > "$D/payload"
+  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; cat "$D/access-profile-v1.json"; } > "$D/payload"
   openssl dgst -sha256 -sign "'"$TMP"'/other-machine.key" -out "$D/sig.der" "$D/payload"
   base64 -w0 < "$D/sig.der" > "$D/access-profile-v1.sig"
   cp "'"$TMP"'/other-machine.der" "$D/spki.der"
@@ -348,7 +350,7 @@ tamper_case foreign-signer-consistent '
   other_hash="$(sha256sum "'"$TMP"'/other-machine.der" | awk "{print \$1}")"
   sed -i "s/customer-locked/lab-managed   /; s/\"device_root_spki_sha256\":\"'"$SPKI_SHA256"'\"/\"device_root_spki_sha256\":\"$other_hash\"/" \
     "$D/access-profile-v1.json"
-  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; head -c -1 "$D/access-profile-v1.json"; } > "$D/payload"
+  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; cat "$D/access-profile-v1.json"; } > "$D/payload"
   openssl dgst -sha256 -sign "'"$TMP"'/other-machine.key" -out "$D/sig.der" "$D/payload"
   base64 -w0 < "$D/sig.der" > "$D/access-profile-v1.sig"
   base64 -w0 < "'"$TMP"'/other-machine.der" > "$D/access-profile-v1.spki"'
