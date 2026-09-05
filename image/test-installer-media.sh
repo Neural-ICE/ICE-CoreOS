@@ -36,7 +36,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # choose which entry the inspector reads. This pure check runs even when the
 # host lacks the real media toolchain used below.
 python3 - "$ROOT/image/inspect-installer-media.py" <<'PYEOF'
-import importlib.util, pathlib, sys
+import importlib.util, os, pathlib, stat, sys, tempfile
 spec = importlib.util.spec_from_file_location("media_inspector", pathlib.Path(sys.argv[1]))
 module = importlib.util.module_from_spec(spec)
 assert spec.loader
@@ -65,6 +65,68 @@ except module.InspectionError:
     pass
 else:
     raise SystemExit("case-insensitive FAT aliases were accepted")
+
+# The create-new publisher's retry proves the retained inode and fsyncs that
+# file before its directory. This pure transaction check stays active on hosts
+# that lack the real media toolchain used by the rest of the suite.
+with tempfile.TemporaryDirectory(prefix="ni-measurements-") as scratch_name:
+    scratch = pathlib.Path(scratch_name)
+    os.chmod(scratch, 0o700)
+    raw_path = scratch / "raw"
+    raw_path.write_bytes(b"raw")
+    output = scratch / "measurements.json"
+    document = module.measurements_document(
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        "neuralice.source=registry",
+        {"neuralice.rootverity": "4" * 64, "neuralice.relauth_keyid": "5" * 64},
+    )
+    with module.PinnedRaw(raw_path) as pinned:
+        module.publish_measurements(output, document, pinned)
+    fsynced_types = []
+    real_fsync = module.os.fsync
+    def recording_fsync(descriptor):
+        fsynced_types.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+        return real_fsync(descriptor)
+    module.os.fsync = recording_fsync
+    with module.PinnedRaw(raw_path) as pinned:
+        module.publish_measurements(output, document, pinned)
+    module.os.fsync = real_fsync
+    assert fsynced_types == [stat.S_IFREG, stat.S_IFDIR, stat.S_IFREG]
+
+    inherited = os.open(raw_path, os.O_RDONLY)
+    try:
+        with module.PinnedRaw(pathlib.Path(f"/proc/self/fd/{inherited}")) as pinned:
+            assert pinned.sha256() == module.hashlib.sha256(b"raw").hexdigest()
+    finally:
+        os.close(inherited)
+    try:
+        module.PinnedRaw(pathlib.Path("/proc/self/fd/999999"))
+    except OSError:
+        pass
+    else:
+        raise SystemExit("an absent inherited raw descriptor was accepted")
+    raw_link = scratch / "raw-link"
+    raw_link.symlink_to(raw_path.name)
+    try:
+        module.PinnedRaw(raw_link)
+    except OSError:
+        pass
+    else:
+        raise SystemExit("an arbitrary raw symlink was accepted")
+    raw_fifo = scratch / "raw-fifo"
+    os.mkfifo(raw_fifo)
+    fifo_fd = os.open(raw_fifo, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        try:
+            module.PinnedRaw(pathlib.Path(f"/proc/self/fd/{fifo_fd}"))
+        except module.InspectionError:
+            pass
+        else:
+            raise SystemExit("a non-regular inherited raw descriptor was accepted")
+    finally:
+        os.close(fifo_fd)
 PYEOF
 
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
@@ -103,6 +165,11 @@ grep -q 'neuralice.relauth_schema=neural-ice-installer-release-authorization-v2'
   || fail "the inspector did not surface the exact v2 authorization contract sealed by the UKI"
 grep -q 'recomputed from the medium' "$TMP/inspect.out" \
   || fail "the inspector did not recompute the verity root hashes off the medium"
+NONREGISTRY_MEASUREMENTS="$TMP/nonregistry-measurements.json"
+inspect --measurements-output "$NONREGISTRY_MEASUREMENTS" >/dev/null 2>&1 \
+  && fail "a non-registry medium emitted final registry measurements"
+[[ ! -e "$NONREGISTRY_MEASUREMENTS" ]] \
+  || fail "a refused non-registry measurement left an output behind"
 
 # Public TPM policy material may travel on the mutable ESP only when the signed
 # UKI command line pins each file's digest, and the policy JSON must contain the
@@ -432,8 +499,11 @@ make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manife
   "::/ice-coreos/release-authorization.sig=$TMP/relauth.sig" \
   "::/ice-coreos/mirror-ca.crt=$TMP/mirror-ca.crt"
 assemble "$ESP" "$SEALED/payload.img"
-inspect >/dev/null 2>&1 \
+TAMPERED_MEASUREMENTS="$TMP/tampered-measurements.json"
+inspect --measurements-output "$TAMPERED_MEASUREMENTS" >/dev/null 2>&1 \
   && fail "a medium whose ESP release authorization was swapped after the cut was accepted"
+[[ ! -e "$TAMPERED_MEASUREMENTS" ]] \
+  || fail "a tampered medium left a measurement output behind"
 
 # ...and an artefact the signature pins but the ESP does not carry is a medium
 # that would refuse itself at install time. It is refused here instead.
@@ -458,6 +528,145 @@ grep -q "neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${r
   || fail "the inspector did not surface the sealed digest-pinned appliance image"
 grep -q 'neuralice.mirror=bench.example.test:5000' "$TMP/inspect-registry.out" \
   || fail "the inspector did not surface the sealed mirror transport"
+
+# FINAL MEASUREMENTS ARE FROM THE ACCEPTED BYTES, NOT THE BUILD INPUTS. Ask the
+# real inspector to publish them, then independently parse the PE section table
+# and stream the complete raw to derive every expected value.
+MEASUREMENTS_DIR="$TMP/measurements"
+mkdir -m 0700 "$MEASUREMENTS_DIR"
+MEASUREMENTS="$MEASUREMENTS_DIR/medium.json"
+inspect --measurements-output "$MEASUREMENTS" >/dev/null \
+  || fail "the accepted registry medium did not produce final measurements"
+python3 - "$RAW" "$SEALED/installer-registry.efi" \
+  "$SEALED/installer-registry.efi.manifest" "$ROOT_HASH" "$MEASUREMENTS" <<'PYEOF'
+import hashlib, json, pathlib, stat, struct, sys
+
+raw, uki, manifest, root_hash, output = map(pathlib.Path, sys.argv[1:])
+expected_root = str(root_hash)
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+pe = uki.read_bytes()
+pe_offset = struct.unpack_from("<I", pe, 0x3C)[0]
+coff = pe_offset + 4
+count = struct.unpack_from("<H", pe, coff + 2)[0]
+optional_size = struct.unpack_from("<H", pe, coff + 16)[0]
+table = coff + 20 + optional_size
+cmdline = None
+for index in range(count):
+    entry = table + index * 40
+    name = pe[entry:entry + 8].rstrip(b"\0")
+    if name == b".cmdline":
+        raw_size = struct.unpack_from("<I", pe, entry + 16)[0]
+        raw_pointer = struct.unpack_from("<I", pe, entry + 20)[0]
+        cmdline = pe[raw_pointer:raw_pointer + raw_size]
+        break
+assert cmdline is not None
+manifest_values = dict(
+    line.split("=", 1)
+    for line in manifest.read_text(encoding="ascii").splitlines()
+    if "=" in line
+)
+expected = {
+    "medium_raw_sha256": sha256_file(raw),
+    "relauth_key_sha256": manifest_values["relauth_keyid"],
+    "rootfs_verity_hash_algorithm": "sha256",
+    "rootfs_verity_root_hash": expected_root,
+    "schema": "neural-ice-installer-medium-measurements-v1",
+    "uki_cmdline_sha256": hashlib.sha256(cmdline).hexdigest(),
+    "uki_pe_sha256": hashlib.sha256(pe).hexdigest(),
+}
+encoded = output.read_bytes()
+assert encoded == (json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+assert stat.S_IMODE(output.stat().st_mode) == 0o644
+assert set(json.loads(encoded)) == set(expected)
+PYEOF
+
+# A byte-identical retry is the only accepted reuse of an output name.
+before_measurements="$(sha256sum "$MEASUREMENTS")"
+inspect --measurements-output "$MEASUREMENTS" >/dev/null \
+  || fail "a byte-identical measurement retry was refused"
+[[ "$(sha256sum "$MEASUREMENTS")" == "$before_measurements" ]] \
+  || fail "a byte-identical retry rewrote the measurement document"
+
+printf '{}\n' > "$MEASUREMENTS_DIR/conflict.json"
+chmod 0644 "$MEASUREMENTS_DIR/conflict.json"
+inspect --measurements-output "$MEASUREMENTS_DIR/conflict.json" >/dev/null 2>&1 \
+  && fail "an existing different measurement document was replaced"
+ln -s medium.json "$MEASUREMENTS_DIR/symlink.json"
+inspect --measurements-output "$MEASUREMENTS_DIR/symlink.json" >/dev/null 2>&1 \
+  && fail "a symlink measurement output was followed"
+mkfifo "$MEASUREMENTS_DIR/fifo.json"
+inspect --measurements-output "$MEASUREMENTS_DIR/fifo.json" >/dev/null 2>&1 \
+  && fail "a FIFO measurement output was accepted"
+python3 - "$MEASUREMENTS_DIR/oversize.json" <<'PYEOF'
+import os, sys
+with open(sys.argv[1], "wb") as handle:
+    handle.truncate(2049)
+os.chmod(sys.argv[1], 0o644)
+PYEOF
+inspect --measurements-output "$MEASUREMENTS_DIR/oversize.json" >/dev/null 2>&1 \
+  && fail "an oversized existing measurement output was read or accepted"
+
+# The pinned descriptor cannot be switched underneath the parser or hasher.
+# Drive main() over this same real medium while injecting each race at a stable
+# seam; neither attempt may publish a result.
+python3 - "$ROOT/image/inspect-installer-media.py" "$RAW" "$MEASUREMENTS_DIR" \
+  "$ROOT_HASH" "$PAYLOAD_DIGEST" "$POLICY_ID" <<'PYEOF'
+import importlib.util, os, pathlib, shutil, sys
+
+module_path, source_name, output_name = map(pathlib.Path, sys.argv[1:4])
+root_hash, payload_digest, policy_id = sys.argv[4:]
+spec = importlib.util.spec_from_file_location("media_inspector_race", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader
+spec.loader.exec_module(module)
+
+def arguments(raw, output):
+    return [
+        str(module_path), "--raw", str(raw),
+        "--expect-verity-root-hash", root_hash,
+        "--expect-payload-digest", payload_digest,
+        "--expect-mode", "install",
+        "--expect-access-profile", "lab-managed",
+        "--expect-hardware-target", "nvidia-gb10-arm64",
+        "--expect-trust-policy-id", policy_id,
+        "--measurements-output", str(output),
+    ]
+
+mutated = output_name / "mutated.raw"
+shutil.copyfile(source_name, mutated)
+mutation_output = output_name / "mutation.json"
+original_sha256 = module.PinnedRaw.sha256
+def mutate_then_hash(pinned):
+    os.utime(pinned.path, None)
+    return original_sha256(pinned)
+module.PinnedRaw.sha256 = mutate_then_hash
+sys.argv = arguments(mutated, mutation_output)
+assert module.main() == 1
+assert not mutation_output.exists()
+
+module.PinnedRaw.sha256 = original_sha256
+replaced = output_name / "replaced.raw"
+replacement = output_name / "replacement.raw"
+shutil.copyfile(source_name, replaced)
+shutil.copyfile(source_name, replacement)
+replacement_output = output_name / "replacement.json"
+original_check_payload = module.check_payload
+def replace_after_inspection(*args, **kwargs):
+    result = original_check_payload(*args, **kwargs)
+    os.replace(replacement, replaced)
+    return result
+module.check_payload = replace_after_inspection
+sys.argv = arguments(replaced, replacement_output)
+assert module.main() == 1
+assert not replacement_output.exists()
+PYEOF
 
 # A LAB LIGHT medium binds one closed six-file pre-seal set to the signed UKI.
 PRESEAL_DIR="$TMP/preseal"
@@ -798,6 +1007,8 @@ grep -Fq 'image/build-installer-payload.sh' "$USB" \
   || fail "the media producer does not assemble the sealed payload"
 grep -Fq 'image/inspect-installer-media.py' "$USB" \
   || fail "the media producer does not inspect the medium it produced"
+grep -Fq 'INSPECT_ARGS+=(--measurements-output "$SEALED_DIR/final-medium-measurements.json")' "$USB" \
+  || fail "the registry Install producer does not request measurements in its caller-owned directory"
 grep -Fq 'EFI/BOOT/BOOTAA64.EFI' "$USB" \
   || fail "the media producer does not install the signed UKI as the removable-media default path"
 grep -Fq 'ni-installer-payload' "$USB" \

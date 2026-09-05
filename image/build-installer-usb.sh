@@ -1058,8 +1058,19 @@ INSPECT_ARGS=(
   --expect-hardware-target "$HARDWARE_TARGET"
 )
 if [[ -z "$UKI_SIGNING_KEY" ]]; then INSPECT_ARGS+=(--allow-unsigned); fi
+# Only the registry Install path has the signed release authorization needed by
+# the final Fabric reprojection. Keep the measurement beside the exact raw the
+# inspector reads. SEALED_DIR is caller-owned while BIB's image directory is
+# root-owned; callers consume both before any USB write, and no later builder
+# step mutates that raw.
+if [[ "$MEDIA_MODE" == install && "$INSTALL_SOURCE" == registry ]]; then
+  INSPECT_ARGS+=(--measurements-output "$SEALED_DIR/final-medium-measurements.json")
+fi
 python3 "$REPO_ROOT/image/inspect-installer-media.py" "${INSPECT_ARGS[@]}" \
   || { echo "ERROR: the produced medium does not contain the artefacts this build staged" >&2; exit 1; }
+if [[ "$MEDIA_MODE" == install && "$INSTALL_SOURCE" == registry ]]; then
+  echo "    final measurements: $SEALED_DIR/final-medium-measurements.json"
+fi
 
 if [[ -n "$OUT_NAME" ]]; then
   cp "$RAW" "${REPO_ROOT}/${OUT_NAME}.img"
