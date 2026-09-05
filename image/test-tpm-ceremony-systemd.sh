@@ -17,6 +17,7 @@ CF="$ROOT/image/Containerfile.bootc"
 DROPIN="$ROOT/image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf"
 UNIT="$ROOT/image/firstboot/neural-ice-firstboot-tpm-ceremony.service"
 CEREMONY="$ROOT/ota/neural-ice-firstboot-tpm-ceremony.sh"
+OTA_STATE_HELPER="$ROOT/ota/neural-ice-ota-tpm-state.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ni-tpm-ceremony-systemd.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -189,6 +190,56 @@ done
 # shellcheck disable=SC2016 # exact Containerfile source assertion
 grep -Fq 'test "$(stat -c '\''%u:%g:%a'\'' "$marker")" = 0:0:444' <<<"$mode_block" \
   || fail "the image build does not prove the installed immutable marker ownership and mode"
+
+# Package the reviewed owner-sealed helper as a dormant capability. The marker
+# says which state profile this OS knows how to consume; it is not evidence that
+# the device TPM was provisioned under that profile. Runtime selection must keep
+# using authenticated completion/TPM evidence rather than this build marker.
+bash -n "$OTA_STATE_HELPER" || fail "the owner-sealed OTA TPM helper is not valid shell"
+ota_state_package_contract() { # $1=Containerfile candidate
+  local containerfile=$1 block
+  grep -Fqx 'COPY ota/neural-ice-ota-tpm-state.sh /usr/libexec/neural-ice-ota-tpm-state' \
+    "$containerfile" || return 1
+  block="$(sed -n '/^COPY ota\/neural-ice-ota-tpm-state\.sh /,/systemctl enable neural-ice-device-root\.service/p' \
+    "$containerfile")"
+  grep -Fq 'chmod 0755 /usr/libexec/neural-ice-ota-tpm-state;' <<<"$block" || return 1
+  grep -Fq 'bash -n /usr/libexec/neural-ice-ota-tpm-state;' <<<"$block" || return 1
+  # shellcheck disable=SC2016 # exact Containerfile source assertion
+  grep -Fq 'test "$(stat -c '\''%u:%g:%a'\'' /usr/libexec/neural-ice-ota-tpm-state)" = 0:0:755;' \
+    <<<"$block" || return 1
+  grep -Fq "printf '%s\\n' owner-sealed-ota-state-v1 > /usr/lib/neural-ice/ota-state-profile;" \
+    <<<"$block" || return 1
+  grep -Fq 'chmod 0444 /usr/lib/neural-ice/ota-state-profile;' <<<"$block" || return 1
+  grep -Fq "printf '%s\\n' owner-sealed-ota-state-v1 | cmp - /usr/lib/neural-ice/ota-state-profile;" \
+    <<<"$block" || return 1
+  # shellcheck disable=SC2016 # exact Containerfile source assertion
+  grep -Fq 'test "$(stat -c '\''%u:%g:%a'\'' /usr/lib/neural-ice/ota-state-profile)" = 0:0:444;' \
+    <<<"$block" || return 1
+}
+ota_state_package_contract "$CF" \
+  || fail "the image does not package and read back the owner-sealed OTA state capability exactly"
+
+# Mutation oracles keep the three independent packaging properties visible.
+# A future COPY/mode/marker drift must fail this native composition test.
+for mutation in missing-helper non-executable-helper wrong-marker writable-marker; do
+  candidate="$TMP/Containerfile-$mutation"
+  cp -- "$CF" "$candidate"
+  case "$mutation" in
+    missing-helper)
+      sed -i '/^COPY ota\/neural-ice-ota-tpm-state\.sh /d' "$candidate" ;;
+    non-executable-helper)
+      sed -i 's/chmod 0755 \/usr\/libexec\/neural-ice-ota-tpm-state;/chmod 0644 \/usr\/libexec\/neural-ice-ota-tpm-state;/' \
+        "$candidate" ;;
+    wrong-marker)
+      sed -i 's/owner-sealed-ota-state-v1/unsupported-ota-state-profile/g' "$candidate" ;;
+    writable-marker)
+      sed -i 's/chmod 0444 \/usr\/lib\/neural-ice\/ota-state-profile;/chmod 0644 \/usr\/lib\/neural-ice\/ota-state-profile;/' \
+        "$candidate" ;;
+  esac
+  if ota_state_package_contract "$candidate"; then
+    fail "the $mutation OTA state packaging mutation was accepted"
+  fi
+done
 
 # Execute the real firstboot wrapper through its unprivileged test seam. The
 # stubs model a complete legitimate boot but do not reimplement either file
