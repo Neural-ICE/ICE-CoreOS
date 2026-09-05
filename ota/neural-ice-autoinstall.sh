@@ -392,6 +392,11 @@ DEVICE_CHANNEL="$(karg_once neuralice.device_channel)"
 readonly DEVICE_CHANNEL
 [[ "$DEVICE_CHANNEL" =~ ^(lab|beta|stable)$ ]] \
   || die "this install medium seals no valid lab/beta/stable device channel"
+PRESEAL_SET_SHA256="$(karg_once neuralice.preseal)"
+readonly PRESEAL_SET_SHA256
+if [[ -n "$PRESEAL_SET_SHA256" && ! "$PRESEAL_SET_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  die "this install medium carries a malformed signed preseal-set digest"
+fi
 NEURALICE_BAKED_IMGREF="$(ni_path NEURALICE_BAKED_IMGREF /usr/lib/neural-ice/ota-imgref)"
 readonly NEURALICE_BAKED_IMGREF
 
@@ -631,6 +636,12 @@ readonly DATA_MOUNT="/var/lib/neural-ice/data"
 # before replaying, so neither can live on the disk being wiped.
 TPM_STATE="$(ni_path TPM_STATE /usr/libexec/neural-ice-tpm-state)"
 readonly TPM_STATE
+OTA_TPM_STATE="$(ni_path OTA_TPM_STATE /usr/libexec/neural-ice-ota-tpm-state)"
+readonly OTA_TPM_STATE
+PRESEAL_HANDOFF="$(ni_path PRESEAL_HANDOFF /usr/libexec/neural-ice-preseal-handoff)"
+readonly PRESEAL_HANDOFF
+OTA_VERIFY="$(ni_path OTA_VERIFY /usr/bin/ni-ota-verify)"
+readonly OTA_VERIFY
 
 # The ONE signature-policy reader, and the file it reads. Both are fixed
 # production paths: the reader lives in the dm-verity-protected /usr the UKI
@@ -859,6 +870,32 @@ mounted_at() { # $1=device -> first mountpoint, or nothing
     | awk 'NR == 1 { first=$0 } END { if (first != "") print first }'
 }
 
+candidate_ota_state_profile() { # $1=mounted candidate root -> closed profile token
+  local marker="$1/usr/lib/neural-ice/ota-state-profile"
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    printf '%s\n' legacy-unmarked
+    return 0
+  fi
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  if cmp -s "$marker" <(printf '%s\n' owner-sealed-ota-state-v1); then
+    printf '%s\n' owner-sealed-ota-state-v1
+    return 0
+  fi
+  return 1
+}
+
+require_medium_source_profile() { # $1=closed candidate profile token
+  case "$1" in
+    legacy-unmarked) return 0 ;;
+    owner-sealed-ota-state-v1)
+      die "the sealed medium contains an owner-sealed appliance but carries no authenticated preseal transport; use the signed registry preseal source"
+      ;;
+    *)
+      die "the sealed medium appliance declares an unsupported OTA-state profile"
+      ;;
+  esac
+}
+
 # --------------------------------------------------------------------------- #
 # 🔴 WHAT THIS REPLACES (review 2026-09-01, P0 #1). This phase used to run
 # `bootc image copy-to-storage`, which duplicated the BOOTED ostree deployment
@@ -964,11 +1001,22 @@ _medium_mount="$(podman --cgroup-manager=cgroupfs --events-backend=file \
     podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_medium_probe" >/dev/null 2>&1 || true
     die "the verified image store produced no no-exec merged filesystem before the target wipe"
   }
+_medium_ota_profile=legacy-unmarked
+_medium_ota_profile_valid=1
+if [[ "$INSTALL_SOURCE" == medium ]]; then
+  _medium_ota_profile="$(candidate_ota_state_profile "$_medium_mount")" \
+    || _medium_ota_profile_valid=0
+fi
 if ! podman --cgroup-manager=cgroupfs --events-backend=file \
     unmount "$_medium_probe" >/dev/null \
   || ! podman --cgroup-manager=cgroupfs --events-backend=file \
     rm "$_medium_probe" >/dev/null; then
   die "the verified image store's no-exec pre-wipe mount cannot be released"
+fi
+(( _medium_ota_profile_valid == 1 )) \
+  || die "the sealed medium appliance carries a malformed OTA-state profile marker"
+if [[ "$INSTALL_SOURCE" == medium ]]; then
+  require_medium_source_profile "$_medium_ota_profile"
 fi
 log "Sealed image store registered read-only at $STORE_MOUNT; ${STORE_IMAGE_NAME} = ${MEDIUM_IMAGE_DIGEST} (no copy, dm-verity enforced)"
 
@@ -1276,6 +1324,129 @@ esp_staged_file() { # $1=basename $2=expected sha256 $3=destination -> stages it
   return 0
 }
 
+snapshot_preseal_from_esp() { # $1=destination
+  local destination=$1 esp mountpoint mounted=0 rc=0
+  esp="$(media_vfat_partition || true)"
+  [[ -n "${esp:-}" ]] || return 1
+  mountpoint="$(mounted_at "/dev/$esp" || true)"
+  if [[ -z "$mountpoint" ]]; then
+    mountpoint=/run/neural-ice-installer/esp
+    install -d -m 0700 "$mountpoint"
+    mount -o ro,nodev,nosuid,noexec "/dev/$esp" "$mountpoint" || return 1
+    mounted=1
+  fi
+  "$PRESEAL_HANDOFF" snapshot-persistent \
+    "$mountpoint/ice-coreos/preseal" "$PRESEAL_SET_SHA256" \
+    "$_auth_scratch/release-authorization.json" \
+    "$_auth_scratch/release-authorization.sig" "$destination" || rc=$?
+  if (( mounted == 1 )); then
+    umount "$mountpoint" || return 1
+  fi
+  return "$rc"
+}
+
+write_preseal_verifier_config() { # $1=state dir $2=destination
+  local state_dir=$1 destination=$2 source root_key
+  source="$VERITY_ROOT_MOUNT/etc/neural-ice/ota.conf"
+  root_key="$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub"
+  [[ -f "$source" && ! -L "$source" && "$(wc -c < "$source")" -le 65536 ]] \
+    || die "the verified installer root carries no bounded OTA verifier configuration"
+  [[ -f "$root_key" && ! -L "$root_key" ]] \
+    || die "the verified installer root carries no OTA root public key"
+  install -m 0600 /dev/null "$destination"
+  python3 - "$source" "$destination" "$state_dir" "$root_key" <<'PRESEAL_CONFIG_PY' \
+    || die "cannot create the bounded preseal verifier configuration"
+import pathlib
+import sys
+
+source, destination, state_dir, root_key = map(pathlib.Path, sys.argv[1:])
+lines = source.read_text(encoding="utf-8").splitlines()
+counts = {"root_pubkey": 0, "state_dir": 0,
+          "device_compat_min": 0, "device_compat_max": 0}
+result = []
+for line in lines:
+    stripped = line.strip()
+    key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else None
+    if key in counts:
+        counts[key] += 1
+    if key == "root_pubkey":
+        line = f"root_pubkey={root_key}"
+    elif key == "state_dir":
+        line = f"state_dir={state_dir}"
+    result.append(line)
+if counts != {"root_pubkey": 1, "state_dir": 1,
+              "device_compat_min": 1, "device_compat_max": 1}:
+    raise SystemExit("required OTA verifier configuration keys are absent or duplicated")
+destination.write_text("\n".join(result) + "\n", encoding="utf-8")
+PRESEAL_CONFIG_PY
+  chmod 0600 "$destination"
+  sync -f "$destination" || die "cannot fsync the preseal verifier configuration"
+}
+
+verify_preseal_candidate() { # $1=input root $2=candidate root $3=current seed $4=config $5=receipt
+  local input_root=$1 candidate_root=$2 current_seed=$3 config=$4 receipt=$5 verdict
+  verdict="$(
+    "$OTA_VERIFY" verify-preseal-baseline \
+      --set "$input_root/preseal-set.json" \
+      --snapshot "$input_root/delegation-snapshot.json" \
+      --snapshot-sig "$input_root/delegation-snapshot.sig" \
+      --release "$input_root/ota-release-authorization.json" \
+      --release-sig "$input_root/ota-release-authorization.sig" \
+      --bom "$input_root/bom.json" \
+      --installer-authorization "$input_root/installer-release-authorization-v2.json" \
+      --installer-authorization-sig "$input_root/installer-release-authorization-v2.sig" \
+      --sealed-set-sha256 "$PRESEAL_SET_SHA256" \
+      --sealed-installer-authorization-sha256 "$RELEASE_AUTH_DOC_SHA256" \
+      --sealed-installer-authorization-signature-sha256 "$RELEASE_AUTH_SIG_SHA256" \
+      --current-os-ref "$OS_IMAGE" \
+      --current-os-manifest-digest "$got_manifest" \
+      --current-seed-ref "$current_seed" \
+      --candidate-root "$candidate_root" \
+      --receipt-out "$receipt" --config "$config"
+  )" || return 1
+  python3 - "$verdict" "$receipt" <<'PRESEAL_VERDICT_PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+def closed_pairs(items):
+    result = {}
+    for key, item in items:
+        if key in result:
+            raise ValueError(f"duplicate field: {key}")
+        result[key] = item
+    return result
+
+value = json.loads(sys.argv[1], object_pairs_hook=closed_pairs)
+if (not isinstance(value, dict)
+    or set(value) != {"bundle_seq", "idempotent", "preseal_receipt_sha256", "verdict"}
+    or value.get("verdict") != "pass"
+    or not isinstance(value.get("idempotent"), bool)
+    or isinstance(value.get("bundle_seq"), bool)
+    or not isinstance(value.get("bundle_seq"), int)
+    or not 0 < value["bundle_seq"] <= 9007199254740991
+    or not isinstance(value.get("preseal_receipt_sha256"), str)
+    or not re.fullmatch(r"[0-9a-f]{64}", value["preseal_receipt_sha256"])):
+    raise SystemExit(1)
+receipt = pathlib.Path(sys.argv[2]).read_bytes()
+if len(receipt) == 0 or len(receipt) > 16 * 1024:
+    raise SystemExit(1)
+if hashlib.sha256(receipt).hexdigest() != value["preseal_receipt_sha256"]:
+    raise SystemExit(1)
+print(value["bundle_seq"])
+PRESEAL_VERDICT_PY
+}
+
+verify_installed_preseal_candidate() { # $1=input root $2=current seed $3=config $4=receipt
+  # bootc's target mount is an OSTree sysroot. The candidate root consumed by
+  # ni-ota-verify is the resolved deployment below it, where usr/lib markers
+  # actually live; passing the sysroot makes every valid install fail post-wipe.
+  [[ -n "${dep:-}" && -d "$dep/usr" ]] || return 1
+  verify_preseal_candidate "$1" "$dep" "$2" "$3" "$4"
+}
+
 # The TPM slot is authorised by an offline policy key, never by whatever PCR 7
 # happens to contain while this installer is running. All four values are in the
 # signed UKI command line; the release authorization independently repeats them
@@ -1409,6 +1580,12 @@ fi
 
 RELEASE_AUTH_VERIFIED_REF=""
 source_imgref="containers-storage:$STORE_IMAGE_NAME"
+readonly PRESEAL_SNAPSHOT=/run/neural-ice-installer/preseal-input-v1
+readonly PRESEAL_PREFLIGHT_STATE=/run/neural-ice-installer/preseal-verifier-state
+readonly PRESEAL_PREFLIGHT_CONFIG=/run/neural-ice-installer/preseal-verifier.conf
+readonly PRESEAL_PREFLIGHT_RECEIPT="$PRESEAL_PREFLIGHT_STATE/preseal/receipt.json"
+PRESEAL_ACTIVE=0
+PRESEAL_BUNDLE_SEQ=""
 if [ "$INSTALL_SOURCE" = registry ]; then
   _relauth_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
   [[ -f "$_relauth_key" && ! -L "$_relauth_key" ]] \
@@ -1447,6 +1624,18 @@ if [ "$INSTALL_SOURCE" = registry ]; then
     "$_auth_scratch/release-authorization.json"
   esp_staged_file release-authorization.sig "$RELEASE_AUTH_SIG_SHA256" \
     "$_auth_scratch/release-authorization.sig"
+
+  if [[ -n "$PRESEAL_SET_SHA256" ]]; then
+    [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
+      || die "a signed preseal set is only valid for a lab-managed installer"
+    [[ -x "$PRESEAL_HANDOFF" && -x "$OTA_VERIFY" && -x "$OTA_TPM_STATE" ]] \
+      || die "this medium lacks the immutable preseal handoff, verifier, or owner OTA-state helper"
+    snapshot_preseal_from_esp "$PRESEAL_SNAPSHOT" \
+      || die "cannot snapshot the complete UKI-bound eight-file preseal set"
+    "$PRESEAL_HANDOFF" verify-persistent "$PRESEAL_SNAPSHOT" "$PRESEAL_SET_SHA256" \
+      || die "the protected eight-file preseal snapshot failed exact readback"
+    PRESEAL_ACTIVE=1
+  fi
 
   release_auth_verify_signature "$_auth_scratch/release-authorization.json" \
     "$_auth_scratch/release-authorization.sig" "$_relauth_key" \
@@ -1596,7 +1785,8 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   img_profile="$(_img_read usr/lib/neural-ice/access-policy)"
   img_variant="$(_img_read usr/lib/neural-ice/appliance-variant)"
   img_target="$(_img_read usr/lib/neural-ice/hardware-target)"
-  podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+  img_ota_state_profile="$(_img_read usr/lib/neural-ice/ota-state-profile)"
+  img_seed_ref="$(_img_read usr/lib/neural-ice/product-payload/PAYLOAD_ID)"
   img_policy="$(podman image inspect "$OS_IMAGE" \
     --format '{{index .Labels "ch.neural-ice.signed-boot-trust-policy-id"}}' 2>/dev/null || true)"
   # The platform the OBJECT reports, from its own config rather than from the
@@ -1604,12 +1794,46 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   # architecture's child fails here.
   img_platform="$(podman image inspect "$OS_IMAGE" \
     --format '{{.Os}}/{{.Architecture}}{{with .Variant}}/{{.}}{{end}}' 2>/dev/null || true)"
-  release_auth_gate_pulled "$RELEASE_AUTH" "$SEALED_ANCHOR" \
-    "$got_index" "$got_manifest" "$img_profile" "$img_variant" "$img_target" "$img_policy" \
-    "$img_platform" \
-    || die "the pulled image does not match its release authorization or this medium's sealed profile"
-  [[ "$img_platform" == "$INSTALL_PLATFORM" ]] \
-    || die "the pulled image is for platform '$img_platform' but this machine installs '$INSTALL_PLATFORM'"
+  if ! release_auth_gate_pulled "$RELEASE_AUTH" "$SEALED_ANCHOR" \
+      "$got_index" "$got_manifest" "$img_profile" "$img_variant" "$img_target" "$img_policy" \
+      "$img_platform"; then
+    podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+    die "the pulled image does not match its release authorization or this medium's sealed profile"
+  fi
+  if [[ "$img_platform" != "$INSTALL_PLATFORM" ]]; then
+    podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+    die "the pulled image is for platform '$img_platform' but this machine installs '$INSTALL_PLATFORM'"
+  fi
+
+  case "$img_ota_state_profile" in
+    owner-sealed-ota-state-v1)
+      (( PRESEAL_ACTIVE == 1 )) \
+        || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the selected owner-sealed appliance has no UKI-bound preseal inputs"; }
+      ;;
+    "")
+      (( PRESEAL_ACTIVE == 0 )) \
+        || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the selected legacy appliance cannot consume this medium's owner-profile preseal inputs"; }
+      ;;
+    *)
+      podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+      die "the selected appliance declares an unsupported OTA-state profile"
+      ;;
+  esac
+  if (( PRESEAL_ACTIVE == 1 )); then
+    [[ "$img_seed_ref" =~ ^[0-9a-f]{40}$ ]] \
+      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the selected owner-sealed appliance carries no bounded PAYLOAD_ID"; }
+    install -d -m 0700 "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_STATE/preseal"
+    write_preseal_verifier_config "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_CONFIG"
+    PRESEAL_BUNDLE_SEQ="$(verify_preseal_candidate "$PRESEAL_SNAPSHOT" \
+      "$_img_root" "$img_seed_ref" "$PRESEAL_PREFLIGHT_CONFIG" "$PRESEAL_PREFLIGHT_RECEIPT")" \
+      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation"; }
+    sync -f "$PRESEAL_PREFLIGHT_RECEIPT" \
+      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "cannot fsync the authenticated pre-wipe preseal receipt"; }
+    sync -f "$PRESEAL_PREFLIGHT_STATE/preseal" \
+      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "cannot fsync the authenticated pre-wipe preseal receipt directory"; }
+  fi
+  podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 \
+    || die "cannot release the authenticated candidate image mount before disk mutation"
 
   # From here the object in local storage is the ONLY thing that may be
   # installed. Nothing is re-resolved between this proof and the install.
@@ -1623,6 +1847,7 @@ else
   RELEASE_AUTH_VERIFIED_REF="$source_imgref"
 fi
 readonly RELEASE_AUTH_VERIFIED_REF
+readonly PRESEAL_ACTIVE PRESEAL_BUNDLE_SEQ
 
 # --------------------------------------------------------------------------- #
 # 2c) 🔴 THE OFFLINE SEED, VERIFIED IN FULL BEFORE THE FIRST DISK MUTATION
@@ -2340,6 +2565,86 @@ fi
   || die "the installed image's access profile '$_enrolled_profile' is not the one this medium seals ('$SEALED_ACCESS_PROFILE'); refusing to anchor a posture nothing signed"
 ota_state="$stateroot/var/lib/neural-ice/ota"
 install -d -m 0700 "$ota_state"
+
+if (( PRESEAL_ACTIVE == 1 )); then
+  readonly PRESEAL_INSTALLED_CONFIG=/run/neural-ice-installer/preseal-installed-verifier.conf
+  readonly PRESEAL_INSTALLED_INPUTS="$ota_state/preseal-input-v1"
+  readonly PRESEAL_INSTALLED_RECEIPT="$ota_state/preseal/receipt.json"
+  "$PRESEAL_HANDOFF" install-persistent \
+    "$PRESEAL_SNAPSHOT" "$PRESEAL_SET_SHA256" "$PRESEAL_INSTALLED_INPUTS" \
+    || die "cannot atomically publish the authenticated eight-file preseal handoff"
+  "$PRESEAL_HANDOFF" verify-persistent \
+    "$PRESEAL_INSTALLED_INPUTS" "$PRESEAL_SET_SHA256" \
+    || die "the installed eight-file preseal handoff failed exact readback"
+  install -d -m 0700 "$ota_state/preseal"
+  write_preseal_verifier_config "$ota_state" "$PRESEAL_INSTALLED_CONFIG"
+  _installed_preseal_floor="$(verify_installed_preseal_candidate "$PRESEAL_INSTALLED_INPUTS" \
+    "$img_seed_ref" "$PRESEAL_INSTALLED_CONFIG" "$PRESEAL_INSTALLED_RECEIPT")" \
+    || die "the installed candidate and persistent preseal inputs failed reauthentication"
+  [[ "$_installed_preseal_floor" == "$PRESEAL_BUNDLE_SEQ" ]] \
+    || die "the installed preseal verifier changed the authenticated baseline floor"
+  cmp -- "$PRESEAL_PREFLIGHT_RECEIPT" "$PRESEAL_INSTALLED_RECEIPT" \
+    || die "the installed preseal receipt differs from the authenticated pre-wipe receipt"
+  sync -f "$PRESEAL_INSTALLED_RECEIPT" \
+    || die "cannot fsync the installed preseal receipt"
+  sync -f "$ota_state/preseal" \
+    || die "cannot fsync the installed preseal receipt directory"
+
+  [[ "$("$OTA_TPM_STATE" prepare "$PRESEAL_BUNDLE_SEQ")" == prepared ]] \
+    || die "cannot prepare the owner-sealed OTA baseline state"
+  _owner_ota_inspection="$("$OTA_TPM_STATE" inspect-v2)" \
+    || die "cannot inspect the prepared owner-sealed OTA baseline state"
+  python3 - "$_owner_ota_inspection" "$PRESEAL_BUNDLE_SEQ" <<'OWNER_OTA_INSPECTION_PY' \
+    || die "the prepared owner-sealed OTA baseline state differs from its closed public contract"
+import json
+import sys
+
+def closed_pairs(items):
+    result = {}
+    for key, item in items:
+        if key in result:
+            raise ValueError(f"duplicate field: {key}")
+        result[key] = item
+    return result
+
+value = json.loads(sys.argv[1], object_pairs_hook=closed_pairs)
+expected = {
+    "anchor_attributes": "0x2060048",
+    "anchor_index": "0x01500002",
+    "anchor_name": "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+    "anchor_policy_sha256": "b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7",
+    "anchor_sha256": None,
+    "anchor_size": 32,
+    "anchor_state": "pristine",
+    "baseline_floor": int(sys.argv[2]),
+    "clear_protected": False,
+    "floor_attributes": "0x62008",
+    "floor_index": "0x01500001",
+    "floor_name": "000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4",
+    "floor_policy_sha256": "f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230",
+    "floor_size": 8,
+    "owner_sealed": False,
+    "profile": "owner-sealed-ota-state-v1",
+    "schema": "neural-ice-owner-ota-state-inspection-v2",
+}
+if value != expected:
+    raise SystemExit(1)
+OWNER_OTA_INSPECTION_PY
+  [[ "$("$TPM_STATE" provisioning-status)" == preseal-prepared ]] \
+    || die "the complete TPM state is not the exact preseal-prepared lifecycle checkpoint"
+  for _preseal_file in "$PRESEAL_INSTALLED_INPUTS"/* "$PRESEAL_INSTALLED_RECEIPT"; do
+    [[ -f "$_preseal_file" && ! -L "$_preseal_file" ]] \
+      || die "an installed preseal input is no longer a regular file"
+    sync -f "$_preseal_file" || die "cannot fsync an installed preseal input"
+  done
+  sync -f "$PRESEAL_INSTALLED_INPUTS" \
+    || die "cannot fsync the installed preseal input directory"
+  sync -f "$ota_state/preseal" \
+    || die "cannot fsync the installed preseal receipt directory"
+  sync -f "$ota_state" \
+    || die "cannot fsync the complete installed preseal state"
+  log "Owner-sealed OTA baseline authenticated before the wipe, reverified after deployment, and prepared for first boot."
+fi
 
 # Publish each installer-created ceremony input atomically.  A power loss may
 # leave the temporary file, but can never leave a partial final input that the

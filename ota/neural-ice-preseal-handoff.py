@@ -24,6 +24,13 @@ FILES = {
     "ota-release-authorization.sig": 1024,
     "bom.json": 128 * 1024,
 }
+INSTALLER_AUTH_NAME = "installer-release-authorization-v2.json"
+INSTALLER_SIG_NAME = "installer-release-authorization-v2.sig"
+PERSISTENT_FILES = {
+    **FILES,
+    INSTALLER_AUTH_NAME: 1024,
+    INSTALLER_SIG_NAME: 4 * 1024,
+}
 FIELDS = {
     "access_policy_sha256",
     "access_profile",
@@ -246,6 +253,51 @@ def load(
     return files
 
 
+def load_persistent_source(
+    root: Path, expected: str, auth_path: Path, sig_path: Path
+) -> dict[str, bytes]:
+    require_real_directory_path(root, "preseal evidence root")
+    names = {entry.name for entry in os.scandir(root)}
+    if names != set(FILES):
+        raise Refusal("preseal evidence root must contain exactly the six fixed files")
+    files = {name: read_regular(root / name, limit) for name, limit in FILES.items()}
+    auth = read_regular(auth_path, PERSISTENT_FILES[INSTALLER_AUTH_NAME])
+    sig = read_regular(sig_path, PERSISTENT_FILES[INSTALLER_SIG_NAME])
+    parse_set(files[SET_NAME], files, auth, sig, expected)
+    return {
+        **files,
+        INSTALLER_AUTH_NAME: auth,
+        INSTALLER_SIG_NAME: sig,
+    }
+
+
+def load_persistent(root: Path, expected: str) -> dict[str, bytes]:
+    require_real_directory_path(root, "persistent preseal evidence root")
+    names = {entry.name for entry in os.scandir(root)}
+    if names != set(PERSISTENT_FILES):
+        raise Refusal(
+            "persistent preseal evidence root must contain exactly the eight fixed files"
+        )
+    # These bytes have crossed the wipe boundary and now live beside the TPM
+    # state they will authorize. Reading the right bytes from a public source
+    # is still unsafe: another local principal could replace them between
+    # installer phases. Enforce the published private layout on every read,
+    # including verify and the source side of an install retry.
+    require_private_layout(root, PERSISTENT_FILES)
+    files = {
+        name: read_regular(root / name, limit)
+        for name, limit in PERSISTENT_FILES.items()
+    }
+    parse_set(
+        files[SET_NAME],
+        files,
+        files[INSTALLER_AUTH_NAME],
+        files[INSTALLER_SIG_NAME],
+        expected,
+    )
+    return files
+
+
 def fsync_path(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -275,18 +327,24 @@ def rename_noreplace(source: Path, destination: Path) -> None:
         raise Refusal(f"cannot publish preseal destination: {os.strerror(error)}")
 
 
-def require_private_layout(directory: Path) -> None:
+def require_private_layout(directory: Path, bounds: dict[str, int]) -> None:
     info = directory.stat()
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise Refusal("private preseal directory has unsafe ownership or mode")
-    for name in FILES:
-        info = (directory / name).stat()
+    for name in bounds:
+        info = (directory / name).lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise Refusal(f"private {name} is not a regular file")
         if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
             raise Refusal(f"private {name} has unsafe ownership or mode")
 
 
 def publish(
-    files: dict[str, bytes], destination: Path, directory_mode: int, file_mode: int
+    files: dict[str, bytes],
+    bounds: dict[str, int],
+    destination: Path,
+    directory_mode: int,
+    file_mode: int,
 ) -> None:
     parent = destination.parent
     require_real_directory_path(parent, "destination parent")
@@ -299,16 +357,20 @@ def publish(
         existing = (
             {
                 name: read_regular(destination / name, limit)
-                for name, limit in FILES.items()
+                for name, limit in bounds.items()
             }
             if destination.is_dir()
             and not destination.is_symlink()
-            and {e.name for e in os.scandir(destination)} == set(FILES)
+            and {e.name for e in os.scandir(destination)} == set(bounds)
             else None
         )
         if existing == files:
             if file_mode == 0o600:
-                require_private_layout(destination)
+                require_private_layout(destination, bounds)
+            for name in bounds:
+                fsync_path(destination / name)
+            fsync_path(destination)
+            fsync_path(parent)
             return
         raise Refusal("refusing to replace a conflicting or unsafe preseal destination")
     old_umask = os.umask(0o077)
@@ -333,16 +395,16 @@ def publish(
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            if read_regular(path, FILES[name]) != data:
+            if read_regular(path, bounds[name]) != data:
                 raise Refusal(f"staged {name} failed readback")
         fsync_path(stage)
         rename_noreplace(stage, destination)
         fsync_path(parent)
         for name, data in files.items():
-            if read_regular(destination / name, FILES[name]) != data:
+            if read_regular(destination / name, bounds[name]) != data:
                 raise Refusal(f"published {name} failed readback")
         if file_mode == 0o600:
-            require_private_layout(destination)
+            require_private_layout(destination, bounds)
     finally:
         os.umask(old_umask)
         if stage.exists():
@@ -350,6 +412,26 @@ def publish(
 
 
 def command(args: argparse.Namespace) -> None:
+    if args.operation in ("verify-persistent", "install-persistent"):
+        files = load_persistent(Path(args.source), args.set_sha256)
+        if args.operation == "verify-persistent":
+            return
+        if os.geteuid() != 0:
+            raise Refusal("persistent install must run as root")
+        publish(files, PERSISTENT_FILES, Path(args.destination), 0o700, 0o600)
+        return
+
+    if args.operation == "snapshot-persistent":
+        persistent = load_persistent_source(
+            Path(args.source),
+            args.set_sha256,
+            Path(args.authorization),
+            Path(args.authorization_signature),
+        )
+        publish(
+            persistent, PERSISTENT_FILES, Path(args.destination), 0o700, 0o600
+        )
+        return
     source = Path(args.source)
     auth = Path(args.authorization)
     sig = Path(args.authorization_signature)
@@ -357,19 +439,19 @@ def command(args: argparse.Namespace) -> None:
     if args.operation == "verify":
         return
     if args.operation == "snapshot":
-        publish(files, Path(args.destination), 0o700, 0o600)
+        publish(files, FILES, Path(args.destination), 0o700, 0o600)
     elif args.mode == "media":
-        publish(files, Path(args.destination), 0o755, 0o444)
+        publish(files, FILES, Path(args.destination), 0o755, 0o444)
     else:
         if os.geteuid() != 0:
             raise Refusal("private install must run as root")
-        publish(files, Path(args.destination), 0o700, 0o600)
+        publish(files, FILES, Path(args.destination), 0o700, 0o600)
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     subs = result.add_subparsers(dest="operation", required=True)
-    for name in ("snapshot", "verify", "install"):
+    for name in ("snapshot", "verify", "install", "snapshot-persistent"):
         sub = subs.add_parser(name)
         sub.add_argument("source")
         sub.add_argument("set_sha256")
@@ -379,6 +461,12 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("destination")
         if name == "install":
             sub.add_argument("--mode", choices=("media", "private"), default="private")
+    for name in ("verify-persistent", "install-persistent"):
+        sub = subs.add_parser(name)
+        sub.add_argument("source")
+        sub.add_argument("set_sha256")
+        if name == "install-persistent":
+            sub.add_argument("destination")
     return result
 
 

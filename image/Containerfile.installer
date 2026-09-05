@@ -97,6 +97,7 @@ COPY ota/neural-ice-tpm-policy.py /usr/lib/neural-ice/tpm-policy.py
 # PolicyAuthorize contract and reject a correctly enrolled target.
 COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luks-token-evidence
 COPY ota/neural-ice-lab-baseline-handoff.sh /usr/local/libexec/neural-ice-lab-baseline-handoff
+COPY ota/neural-ice-preseal-handoff.py /usr/libexec/neural-ice-preseal-handoff
 COPY ota/neural-ice-autoinstall.service /usr/lib/systemd/system/neural-ice-autoinstall.service
 COPY image/installer/neural-ice-installer.target \
      /usr/lib/systemd/system/neural-ice-installer.target
@@ -158,6 +159,10 @@ COPY ota/neural-ice-device-root-tpm.sh /usr/libexec/neural-ice-device-root
 # image ships this helper too; copying it here keeps the medium's copy the same
 # bytes as the appliance's, so the two readers of one record cannot drift.
 COPY ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state
+# Keep the owner-profile writer on the same reviewed checkout as its installer
+# caller. The target image carries its own copy for first boot; this one is the
+# signed live installer's bounded prepare/inspect implementation.
+COPY ota/neural-ice-ota-tpm-state.sh /usr/libexec/neural-ice-ota-tpm-state
 COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service \
      /usr/lib/systemd/system/neural-ice-device-root.service
 RUN install -d -m 0755 /etc/systemd/system/neural-ice-device-root.service.d
@@ -167,9 +172,11 @@ RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
       /usr/lib/neural-ice/tpm-policy.py \
       /usr/local/libexec/neural-ice-lab-baseline-handoff \
+      /usr/libexec/neural-ice-preseal-handoff \
       /usr/libexec/neural-ice-luks-token-evidence \
       /usr/libexec/neural-ice-device-root \
       /usr/libexec/neural-ice-tpm-state \
+      /usr/libexec/neural-ice-ota-tpm-state \
       /usr/libexec/neural-ice-live-diagnostics \
       /usr/libexec/neural-ice-installer-failure \
       /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator; \
@@ -180,7 +187,21 @@ RUN set -euxo pipefail; \
     python3 -c 'import ast,sys; [ast.parse(open(path).read()) for path in sys.argv[1:]]' \
       /usr/lib/neural-ice/registry-authorisation.py \
       /usr/lib/neural-ice/tpm-policy.py \
-      /usr/libexec/neural-ice-luks-token-evidence; \
+      /usr/libexec/neural-ice-luks-token-evidence \
+      /usr/libexec/neural-ice-preseal-handoff; \
+    bash -n /usr/libexec/neural-ice-ota-tpm-state; \
+    test -r /usr/lib/neural-ice/lib/tpm2-nv-public.sh; \
+    test -x /usr/bin/ni-ota-verify; \
+    if _ota_usage=$(/usr/bin/ni-ota-verify 2>&1); then \
+      echo 'ni-ota-verify unexpectedly accepted an empty invocation' >&2; exit 1; \
+    else \
+      test "$?" -eq 2; \
+    fi; \
+    grep -Fq 'ni-ota-verify verify-preseal-baseline --set <path>' <<<"$_ota_usage"; \
+    printf '%s\n' owner-sealed-ota-state-v1 \
+      | cmp - /usr/lib/neural-ice/ota-state-profile; \
+    /usr/libexec/neural-ice-preseal-handoff --help \
+      | grep -Fq 'snapshot-persistent'; \
     /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
       | grep -Fq -- '--signature-json'; \
     /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
