@@ -29,6 +29,7 @@ mod commit;
 mod config;
 mod delegated;
 mod device_policy;
+mod preseal;
 mod record;
 mod release_manifest;
 mod runner;
@@ -93,6 +94,18 @@ const USAGE: &str = "usage:
                        --current-os-ref <image@sha256:digest> --current-seed-ref <40hex>
                        --trusted-now <UTC-seconds> --candidate-root <path>
                        [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify verify-preseal-baseline --set <path>
+                       --snapshot <path> --snapshot-sig <path>
+                       --release <path> --release-sig <path> --bom <path>
+                       --installer-authorization <path>
+                       --installer-authorization-sig <path>
+                       --sealed-set-sha256 <64hex>
+                       --sealed-installer-authorization-sha256 <64hex>
+                       --sealed-installer-authorization-signature-sha256 <64hex>
+                       --current-os-ref <image@sha256:digest>
+                       --current-os-manifest-digest <sha256:digest>
+                       --current-seed-ref <40hex> --candidate-root <path>
+                       --receipt-out <path> [--config /etc/neural-ice/ota.conf]
   ni-ota-verify release-plan --current <path> --candidate <path>
                        --registry-host <canonical OCI authority>
                        --hardware-target <id> --reader-version <n>
@@ -134,6 +147,7 @@ fn run() -> u8 {
         Some("verify-delegation-snapshot") => delegated::run(&args[1..]),
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
+        Some("verify-preseal-baseline") => preseal::run(&args[1..]),
         Some("release-plan") => release_plan(&args[1..]),
         Some("verify-seed-closure") => seed_closure::run(&args[1..]),
         Some("device-policy") => device_policy::run(&args[1..]),
