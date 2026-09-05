@@ -19,6 +19,7 @@ trap cleanup EXIT
 for tool in swtpm tpm2_getcap tpm2_nvdefine tpm2_nvincrement tpm2_nvundefine \
   tpm2_nvread tpm2_nvwrite tpm2_nvwritelock tpm2_nvreadpublic \
   tpm2_startauthsession tpm2_policycommandcode tpm2_policyor tpm2_flushcontext \
+  tpm2_clearcontrol tpm2_nvextend \
   tpm2_changeauth tpm2_clear tpm2_createprimary tpm2_evictcontrol \
   tpm2_readpublic cryptsetup truncate python3 flock sha256sum od head wc awk cmp; do
   command -v "$tool" >/dev/null 2>&1 \
@@ -57,6 +58,9 @@ mkdir -p "$TOOLS"
 for tool in python3 flock sha256sum od head wc awk tpm2_getcap tpm2_nvdefine \
   tpm2_nvincrement tpm2_nvread tpm2_nvwrite tpm2_nvwritelock tpm2_nvreadpublic \
   tpm2_startauthsession tpm2_policycommandcode tpm2_policyor tpm2_flushcontext; do
+  ln -sf "$(command -v "$tool")" "$TOOLS/$tool"
+done
+for tool in tpm2_clearcontrol tpm2_nvextend; do
   ln -sf "$(command -v "$tool")" "$TOOLS/$tool"
 done
 REAL_CHANGEAUTH="$(command -v tpm2_changeauth)"
@@ -316,6 +320,13 @@ firstboot() {
     NI_FIRSTBOOT_TPM_TEST_LUKS_EVIDENCE="$ROOT/ota/neural-ice-luks-token-evidence.py" \
     NI_FIRSTBOOT_TPM_TEST_TPM2_READPUBLIC="$(command -v tpm2_readpublic)" \
     NI_FIRSTBOOT_TPM_TEST_RUN_ROOT="$FB_RUN" \
+    NI_FIRSTBOOT_TPM_TEST_OTA_STATE="${FB_OTA_STATE:-}" \
+    NI_FIRSTBOOT_TPM_TEST_OTA_VERIFY="${FB_OTA_VERIFY:-}" \
+    NI_FIRSTBOOT_TPM_TEST_OTA_CONFIG="${FB_OTA_CONFIG:-}" \
+    NI_FIRSTBOOT_TPM_TEST_OTA_PROFILE="${FB_OTA_PROFILE:-}" \
+    NI_FIRSTBOOT_TPM_TEST_CANDIDATE_ROOT="${FB_CANDIDATE_ROOT:-}" \
+    NI_FIRSTBOOT_TPM_TEST_BOOTC="${FB_BOOTC:-}" \
+    NI_TPM_STATE_TEST_OTA_HELPER="${FB_OTA_STATE:-}" \
     bash "$FIRSTBOOT" "$@"
 }
 runtime_complete() {
@@ -480,5 +491,115 @@ clear_tpm
 [[ "$(hw provisioning-status)" == virgin ]] || fail "TPM clear did not restore virgin hardware state"
 expect_refusal "runtime became ready immediately after TPM clear" runtime_complete
 expect_refusal "mutable evidence made TPM clear look complete" firstboot status
+
+# Fresh owner-profile ceremony: real SWTPM exercises the exact preseal-prepared
+# classification, ClearControl-before-NV06 ordering, NI-DONE2 domain binding,
+# OwnerAuth destruction, orderly restart, and read-only retained validation.
+# Delegated signature verification is covered with real OpenSSL keys by the
+# Rust preseal integration suite; this orchestration seam uses an explicit mock.
+# TPM Clear does not reset the TPM-wide counter allocator. Select a safely
+# bounded sequence above every counter this fixture has allocated so the added
+# fresh install remains a valid signed-policy candidate.
+PCR_POLICY_CANDIDATE=$((PCR_POLICY_CANDIDATE + 32))
+persist_prerequisites
+FB_OTA_STATE="$FB_TOOLS/ota-state"
+FB_OTA_VERIFY="$FB_TOOLS/ota-verify"
+FB_OTA_CONFIG="$TMP/ota.conf"
+FB_OTA_PROFILE="$TMP/ota-state-profile"
+FB_CANDIDATE_ROOT="$TMP/candidate"
+FB_BOOTC="$FB_TOOLS/bootc"
+cat > "$FB_OTA_STATE" <<EOF
+#!/bin/sh
+exec env NI_OTA_TPM_STATE_TESTING=1 NI_OTA_TPM_STATE_TEST_TOOLS="$TOOLS" \
+  NI_OTA_TPM_STATE_TEST_RUN_DIR="$TMP/owner-ota-run" \
+  bash "$ROOT/ota/neural-ice-ota-tpm-state.sh" "\$@"
+EOF
+cat > "$FB_OTA_VERIFY" <<EOF
+#!/bin/sh
+case "\$1" in
+  verify-preseal-baseline|verify-retained-preseal-baseline)
+    printf '%s\n' "\$1" >> "$TMP/preseal-calls"
+    if [ "\$1" = verify-retained-preseal-baseline ] && [ -e "$TMP/swap-completion-evidence" ]; then
+      mv "$TMP/replacement-completion-evidence.json" "$FB_STATE/owner-ceremony-evidence-v2.json" || exit 98
+      rm -f "$TMP/swap-completion-evidence"
+    fi
+    exit 0
+    ;;
+  *) exit 97 ;;
+esac
+EOF
+cat > "$FB_BOOTC" <<EOF
+#!/bin/sh
+[ "\$#" -eq 2 ] && [ "\$1" = status ] && [ "\$2" = --json ] || exit 97
+digit=0; [ ! -e "$TMP/bootc-mismatch" ] || digit=1
+printf '{"spec":{"image":{"image":"release.example.test/neural-ice/neural-ice-appliance@sha256:%064d"}},"status":{"booted":{"image":{"image":{"image":"release.example.test/neural-ice/neural-ice-appliance@sha256:%064d"},"imageDigest":"sha256:%064d"}}}}\n' 0 0 "\$digit"
+EOF
+chmod +x "$FB_OTA_STATE" "$FB_OTA_VERIFY" "$FB_BOOTC"
+printf 'owner-sealed-ota-state-v1\n' > "$FB_OTA_PROFILE"
+prepare_firstboot_fixture
+mkdir -p "$FB_CANDIDATE_ROOT" "$FB_STATE/preseal-input-v1" "$FB_STATE/preseal"
+printf 'enforce=1\nstate_dir=%s\n' "$FB_STATE" > "$FB_OTA_CONFIG"
+for name in delegation-snapshot.json delegation-snapshot.sig \
+  ota-release-authorization.json ota-release-authorization.sig bom.json \
+  installer-release-authorization-v2.sig; do printf '{}\n' > "$FB_STATE/preseal-input-v1/$name"; done
+printf '{"image_manifest_digest":"sha256:%064d"}\n' 0 \
+  > "$FB_STATE/preseal-input-v1/installer-release-authorization-v2.json"
+printf '{"bundle_seq":42,"installer_authorization_sha256":"%064d","installer_authorization_signature_sha256":"%064d","schema":"neural-ice-installer-preseal-set-v1","seed_ref":"%040d","target_os_ref":"release.example.test/neural-ice/neural-ice-appliance@sha256:%064d"}\n' \
+  0 0 0 0 > "$FB_STATE/preseal-input-v1/preseal-set.json"
+set_hash="$(sha256sum "$FB_STATE/preseal-input-v1/preseal-set.json" | awk '{print $1}')"
+printf '{"bundle_seq":42,"installer_authorization_sha256":"%064d","preseal_set_sha256":"%s","schema":"neural-ice-ota-preseal-receipt-v1"}\n' \
+  0 "$set_hash" > "$FB_STATE/preseal/receipt.json"
+chmod 0600 "$FB_STATE/preseal-input-v1"/* "$FB_STATE/preseal/receipt.json"
+"$FB_OTA_STATE" prepare 42 >/dev/null
+[[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+  || fail "real owner preseal state was not classified exactly"
+printf 'owner-sealed-ota-state-v1\n\n' > "$FB_OTA_PROFILE"
+expect_refusal "owner ceremony accepted a noncanonical immutable profile marker" firstboot
+[[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+  || fail "noncanonical profile marker mutated owner TPM state"
+printf 'owner-sealed-ota-state-v1\n' > "$FB_OTA_PROFILE"
+mv "$FB_STATE/preseal-input-v1/bom.json" "$TMP/bom.absent"
+expect_refusal "owner ceremony accepted an incomplete retained preseal set" firstboot
+[[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+  || fail "missing preseal input mutated owner TPM state"
+mv "$TMP/bom.absent" "$FB_STATE/preseal-input-v1/bom.json"
+touch "$TMP/bootc-mismatch"
+expect_refusal "owner ceremony accepted a different booted manifest" firstboot
+[[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+  || fail "booted-image mismatch mutated owner TPM state"
+rm -f "$TMP/bootc-mismatch"
+firstboot >/dev/null || fail "owner-profile firstboot ceremony did not complete"
+mapfile -t preseal_calls < "$TMP/preseal-calls"
+[[ "${preseal_calls[*]}" == "verify-preseal-baseline verify-preseal-baseline" ]] \
+  || fail "owner ceremony did not authenticate the installed candidate before and after finalization"
+[[ "$(firstboot status)" == complete ]] || fail "owner-profile completion did not validate"
+mapfile -t preseal_calls < "$TMP/preseal-calls"
+[[ "${preseal_calls[*]}" == "verify-preseal-baseline verify-preseal-baseline verify-retained-preseal-baseline" ]] \
+  || fail "later owner status did not use the retained nonpublishing verifier"
+cp "$FB_STATE/owner-ceremony-evidence-v2.json" "$TMP/authenticated-owner-evidence-v2.json"
+printf '{"attacker":"pathname replacement"}\n' > "$TMP/replacement-completion-evidence.json"
+: > "$TMP/swap-completion-evidence"
+[[ "$(firstboot status)" == complete ]] \
+  || fail "a pathname replacement after the evidence snapshot changed the current validation decision"
+grep -Fq 'pathname replacement' "$FB_STATE/owner-ceremony-evidence-v2.json" \
+  || fail "the deterministic pathname-swap fixture did not execute"
+cp "$TMP/authenticated-owner-evidence-v2.json" "$FB_STATE/owner-ceremony-evidence-v2.json"
+mv "$FB_OTA_PROFILE" "$TMP/ota-state-profile.absent"
+expect_refusal "owner completion was selected without immutable reader support" firstboot status
+mv "$TMP/ota-state-profile.absent" "$FB_OTA_PROFILE"
+grep -q '^NI-DONE2' < <(tpm2_nvread 0x01500006 -C 0x01500006 -s 8 2>/dev/null) \
+  || fail "owner-profile ceremony did not persist NI-DONE2"
+stop_swtpm
+start_swtpm
+[[ "$(firstboot status)" == complete ]] \
+  || fail "owner-profile retained validation failed after orderly SWTPM restart"
+read -r v2_digest v2_install v2_freshness < <(python3 - "$FB_STATE/owner-ceremony-evidence-v2.json" <<'PY'
+import hashlib,json,sys
+raw=open(sys.argv[1],"rb").read(); state=json.loads(raw)["tpm_state"]
+print(hashlib.sha256(b"neural-ice:tpm:owner-ceremony-completion:v2\0"+raw).hexdigest(),state["install_counter"],state["freshness_counter"])
+PY
+)
+expect_refusal "v1 runtime reader accepted NI-DONE2" \
+  hw runtime-status "$PROFILE" "$TARGET" "$POLICY" "$v2_digest" "$v2_install" "$v2_freshness"
 
 echo "SWTPM_TPM_STATE_TEST_OK (real TPM 2.0 + real cryptsetup LUKS2 headers; anchor signer fixture is explicitly synthetic; signed physical recovery and GB10 gates remain)"

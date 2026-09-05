@@ -341,6 +341,32 @@ export PATH="$TOOLS:$PATH"
 export NI_TPM_STATE_TESTING=1
 export NI_TPM_STATE_TEST_TOOLS="$TOOLS"
 export NI_TPM_STATE_TEST_RUN_DIR="$TMP/run"
+OWNER_OTA_FLOOR="$TMP/owner-ota-floor"
+OWNER_OTA_CLEAR="$TMP/owner-ota-clear"
+cat > "$TOOLS/owner-ota-helper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "\${1:-}" == inspect-v2 && \$# == 1 ]]
+python3 - "$OWNER_OTA_FLOOR" "$OWNER_OTA_CLEAR" "$OWNER_AUTH_MARK" <<'PY'
+import json,pathlib,sys
+floor=int(pathlib.Path(sys.argv[1]).read_text())
+clear=pathlib.Path(sys.argv[2]).read_text().strip()=="1"
+owner=pathlib.Path(sys.argv[3]).exists()
+print(json.dumps({
+ "anchor_attributes":"0x2060048","anchor_index":"0x01500002",
+ "anchor_name":"000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+ "anchor_policy_sha256":"b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7",
+ "anchor_sha256":None,"anchor_size":32,"anchor_state":"pristine",
+ "baseline_floor":floor,"clear_protected":clear,"floor_attributes":"0x62008",
+ "floor_index":"0x01500001",
+ "floor_name":"000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4",
+ "floor_policy_sha256":"f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230",
+ "floor_size":8,"owner_sealed":owner,"profile":"owner-sealed-ota-state-v1",
+ "schema":"neural-ice-owner-ota-state-inspection-v2"},sort_keys=True,separators=(",",":")))
+PY
+EOF
+chmod 0700 "$TOOLS/owner-ota-helper"
+export NI_TPM_STATE_TEST_OTA_HELPER="$TOOLS/owner-ota-helper"
 st() { bash "$SCRIPT" "$@"; }
 activate_pcr_policy() {
   [ "$(st pcr-policy-check 1)" = 0 ] || fail "virgin PCR policy high-water check failed"
@@ -497,11 +523,97 @@ st profile-bind customer-locked "$TARGET" "$POLICY" >/dev/null 2>&1 \
   && fail "profile-bind completed an interrupted record"
 : > "$NV/01500005/locked"
 
+# Owner-profile completion uses an exact preseal-prepared discriminator and a
+# separately versioned completion record. It must neither weaken nor reinterpret
+# the retained v1 commands above.
+rm -rf "${NV:?}"/*; rm -f "$OWNER_AUTH_MARK"
+activate_pcr_policy
+printf '42\n' > "$OWNER_OTA_FLOOR"
+printf '0\n' > "$OWNER_OTA_CLEAR"
+mkdir "$NV/01500001"
+st provisioning-status >/dev/null 2>&1 \
+  && fail "a partial owner floor was classified as preseal-prepared"
+mkdir "$NV/01500002"
+rm -f "$PERSIST/81000001"
+st provisioning-status >/dev/null 2>&1 \
+  && fail "owner preseal state without the persistent SRK was classified as prepared"
+: > "$PERSIST/81000001"
+rm -f "$PERSIST/81010005"
+st provisioning-status >/dev/null 2>&1 \
+  && fail "owner preseal state without the device root was classified as prepared"
+: > "$PERSIST/81010005"
+[ "$(st provisioning-status)" = preseal-prepared ] \
+  || fail "the exact owner preseal state was not classified"
+result="$(st ceremony-prepare-v2 customer-locked "$TARGET" "$POLICY" 4 42)"
+read -r install_at freshness_at _ <<<"$result"
+printf '1\n' > "$OWNER_OTA_CLEAR"
+NI_TEST_CHANGEAUTH_FAIL=1 st ceremony-finalize-v2 customer-locked "$TARGET" "$POLICY" \
+  cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  "$install_at" "$freshness_at" 42 >/dev/null 2>&1 \
+  && fail "v2 finalize reported success when OwnerAuth destruction failed"
+st completion-inspect >/dev/null 2>&1 \
+  && fail "write-locked NI-DONE2 without OwnerAuth destruction became completion"
+st provisioning-status >/dev/null 2>&1 \
+  && fail "partial v2 finalize was reclassified as a resumable preseal state"
+
+# A partial post-NV03 ceremony is recovery-only. Reset this filesystem mock to
+# model the separately approved physical reinstall before the successful case.
+rm -rf "${NV:?}"/*; rm -f "$OWNER_AUTH_MARK"
+activate_pcr_policy
+printf '42\n' > "$OWNER_OTA_FLOOR"
+printf '0\n' > "$OWNER_OTA_CLEAR"
+mkdir "$NV/01500001" "$NV/01500002"
+result="$(st ceremony-prepare-v2 customer-locked "$TARGET" "$POLICY" 4 42)"
+read -r install_at freshness_at _ <<<"$result"
+printf '1\n' > "$OWNER_OTA_CLEAR"
+st ceremony-finalize-v2 customer-locked "$TARGET" "$POLICY" \
+  cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  "$install_at" "$freshness_at" 42 >/dev/null
+inspection="$(st completion-inspect)"
+python3 - "$inspection" <<'PY' || fail "v2 completion inspection is not exact"
+import json,sys
+assert json.loads(sys.argv[1]) == {
+ "completion_version":2,
+ "evidence_digest_sha256":"c"*64,
+ "schema":"neural-ice-owner-ceremony-completion-inspection-v1"}
+PY
+cp "$NV/01500006/data" "$TMP/completion-v2.data"
+python3 - "$NV/01500006/data" <<'PY'
+import sys
+p=sys.argv[1]; value=bytearray(open(p,"rb").read()); value[0]^=1; open(p,"wb").write(value)
+PY
+st completion-inspect >/dev/null 2>&1 && fail "v2 completion accepted foreign magic"
+cp "$TMP/completion-v2.data" "$NV/01500006/data"
+python3 - "$NV/01500006/data" <<'PY'
+import sys
+p=sys.argv[1]; value=bytearray(open(p,"rb").read()); value[-1]=1; open(p,"wb").write(value)
+PY
+st completion-inspect >/dev/null 2>&1 && fail "v2 completion accepted nonzero reserved bytes"
+cp "$TMP/completion-v2.data" "$NV/01500006/data"
+rm "$NV/01500006/locked"
+st completion-inspect >/dev/null 2>&1 && fail "v2 completion accepted an unlocked public area"
+: > "$NV/01500006/locked"
+printf 63 > "$NV/01500006/size"
+st completion-inspect >/dev/null 2>&1 && fail "v2 completion accepted a foreign public size"
+printf 64 > "$NV/01500006/size"
+cp "$NV/01500006/policy" "$TMP/completion-v2.policy"
+printf '\0' > "$NV/01500006/policy"
+st completion-inspect >/dev/null 2>&1 && fail "v2 completion accepted a foreign public policy"
+cp "$TMP/completion-v2.policy" "$NV/01500006/policy"
+[ "$(st runtime-status-v2 customer-locked "$TARGET" "$POLICY" \
+  cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  "$install_at" "$freshness_at" 42)" = complete ] \
+  || fail "v2 completion did not pass its exact runtime status"
+st runtime-status customer-locked "$TARGET" "$POLICY" \
+  cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  "$install_at" "$freshness_at" >/dev/null 2>&1 \
+  && fail "the retained v1 status accepted NI-DONE2"
+
 grep -Fq 'os.urandom(32)' "$SCRIPT" || fail "owner auth is not 32-byte CSPRNG output"
 find "$NI_TPM_STATE_TEST_RUN_DIR" -name 'owner-auth*' -print 2>/dev/null | grep -q . \
   && fail "owner authorization survived ceremony"
-grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -Eq 'baseline|current[[:space:]]*-' \
-  && fail "baseline arithmetic remains executable"
+grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -Eq 'current[[:space:]]*-' \
+  && fail "legacy relative-counter arithmetic remains executable"
 grep -Fq 'tpm2_nvundefine' "$SCRIPT" && fail "runtime helper can undefine state"
 grep -Fq 'ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state' \
   "$ROOT/image/Containerfile.bootc" || fail "image does not ship TPM helper"

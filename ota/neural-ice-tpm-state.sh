@@ -107,9 +107,12 @@ readonly FRESHNESS_INDEX="0x01500004"
 readonly RECORD_INDEX="0x01500005"
 readonly COMPLETION_INDEX="0x01500006"
 readonly PCR_POLICY_INDEX="0x01500007"
+readonly OTA_FLOOR_INDEX="0x01500001"
+readonly OTA_ANCHOR_INDEX="0x01500002"
 readonly RECORD_BYTES=64
 readonly RECORD_MAGIC="NI-TPM02"
 readonly COMPLETION_MAGIC="NI-DONE1"
+readonly COMPLETION_MAGIC_V2="NI-DONE2"
 # Domain separation: the same three words must never hash to a value some other
 # statement in this tree also produces.
 readonly PROFILE_BINDING_DOMAIN="neural-ice:tpm:access-profile-binding:v1"
@@ -167,10 +170,12 @@ if [[ -n "${NI_TPM_STATE_TEST_TOOLS:-}" ]]; then
     || die "test tool override is forbidden in a release image"
   readonly TOOL_DIR="$NI_TPM_STATE_TEST_TOOLS"
   readonly RUN_DIR="${NI_TPM_STATE_TEST_RUN_DIR:?test run directory is required}"
+  readonly OTA_STATE_HELPER="${NI_TPM_STATE_TEST_OTA_HELPER:-}"
 else
   [[ "$EUID" -eq 0 ]] || die "must run as root"
   readonly TOOL_DIR="/usr/bin"
   readonly RUN_DIR="/run/neural-ice-tpm-state"
+  readonly OTA_STATE_HELPER="/usr/libexec/neural-ice-ota-tpm-state"
 fi
 
 # The tpm2_nvreadpublic parser is shared with the initramfs high-water hook
@@ -681,7 +686,7 @@ open(sys.argv[4], "wb").write(blob.ljust(size, b"\x00"))
   [[ "$(record_read)" == "$1" ]] || die "the sealed record did not read back exactly"
 }
 
-completion_read() {
+completion_read_versioned() {
   index_present "$COMPLETION_INDEX" || return 2
   assert_index_shape "$COMPLETION_INDEX" "$RECORD_ATTRIBUTES" "$POLICY_RECORD" \
     "$RECORD_BYTES" "$RECORD_SEALED_BITS"
@@ -690,18 +695,30 @@ completion_read() {
     || die "the ceremony completion record exists but cannot be read"
   local magic digest reserved
   magic="$(head -c 8 "$WORK/completion.bin")"
-  [[ "$magic" == "$COMPLETION_MAGIC" ]] \
-    || die "the completion record is not this appliance's ceremony evidence"
+  local version
+  case "$magic" in
+    "$COMPLETION_MAGIC") version=1 ;;
+    "$COMPLETION_MAGIC_V2") version=2 ;;
+    *) die "the completion record is not this appliance's ceremony evidence" ;;
+  esac
   digest="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[8:40].hex())' "$WORK/completion.bin")"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "the completion record carries no evidence digest"
   reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[40:].hex())' "$WORK/completion.bin")"
   [[ "$reserved" == "$(printf '00%.0s' {1..24})" ]] \
     || die "the completion record carries bytes outside its closed contract"
+  printf '%s %s\n' "$version" "$digest"
+}
+
+completion_read() {
+  local version digest
+  read -r version digest < <(completion_read_versioned) || return $?
   printf '%s\n' "$digest"
 }
 
-write_completion() { # $1=canonical evidence digest
-  [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "completion evidence digest is malformed"
+write_completion() { # $1=magic $2=canonical evidence digest
+  [[ "$1" == "$COMPLETION_MAGIC" || "$1" == "$COMPLETION_MAGIC_V2" ]] \
+    || die "completion evidence version is unsupported"
+  [[ "$2" =~ ^[0-9a-f]{64}$ ]] || die "completion evidence digest is malformed"
   "$(tool tpm2_nvdefine)" "$COMPLETION_INDEX" -C o -s "$RECORD_BYTES" \
     -a "policywrite|authread|ownerread|writedefine" -L "$WORK/policy-record" \
     >/dev/null 2>&1 || die "cannot provision the ceremony completion record"
@@ -709,7 +726,7 @@ write_completion() { # $1=canonical evidence digest
 import sys
 blob = sys.argv[1].encode("ascii") + bytes.fromhex(sys.argv[2])
 open(sys.argv[3], "wb").write(blob.ljust(64, b"\x00"))
-' "$COMPLETION_MAGIC" "$1" "$WORK/completion-new.bin"
+' "$1" "$2" "$WORK/completion-new.bin"
   session_for TPM2_CC_NV_Write or
   "$(tool tpm2_nvwrite)" "$COMPLETION_INDEX" -C "$COMPLETION_INDEX" \
     -P "session:$SESSION" -i "$WORK/completion-new.bin" >/dev/null 2>&1 \
@@ -720,7 +737,11 @@ open(sys.argv[3], "wb").write(blob.ljust(64, b"\x00"))
     -P "session:$SESSION" >/dev/null 2>&1 \
     || die "the TPM refused to write-lock ceremony completion evidence"
   session_close
-  [[ "$(completion_read)" == "$1" ]] || die "completion evidence did not read back exactly"
+  local version digest expected_version
+  read -r version digest < <(completion_read_versioned)
+  [[ "$1" == "$COMPLETION_MAGIC_V2" ]] && expected_version=2 || expected_version=1
+  [[ "$version" == "$expected_version" && "$digest" == "$2" ]] \
+    || die "completion evidence did not read back exactly"
 }
 
 # --------------------------------------------------------------------------- #
@@ -838,8 +859,24 @@ print(json.dumps(obj, sort_keys=True, separators=(",", ":")))
 PY
 }
 
-runtime_status() { # profile target policy evidence-digest install-at-ceremony freshness-at-ceremony
+runtime_status() { # retained v1
   (( $# == 6 )) || die "runtime-status requires profile, target, policy, evidence digest and ceremony counter values"
+  runtime_status_impl 1 "$@"
+  printf 'complete\n'
+}
+
+runtime_status_v2() { # owner profile
+  (( $# == 7 )) || die "runtime-status-v2 requires profile, target, policy, evidence digest, counter values and baseline floor"
+  [[ "$7" =~ ^[1-9][0-9]{0,15}$ ]] || die "owner baseline floor is malformed"
+  (( 10#$7 <= MAX_SAFE_INTEGER )) || die "owner baseline floor exceeds the JSON safe-integer range"
+  runtime_status_impl 2 "${@:1:6}"
+  owner_ota_inspection "$7" 1 1 any
+  printf 'complete\n'
+}
+
+runtime_status_impl() { # completion version then profile target policy digest counters
+  local expected_version=$1; shift
+  (( $# == 6 )) || die "internal runtime-status argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   [[ "$4" =~ ^[0-9a-f]{64}$ ]] || die "runtime completion evidence digest is malformed"
   [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^[1-9][0-9]{0,15}$ ]] \
@@ -850,10 +887,10 @@ runtime_status() { # profile target policy evidence-digest install-at-ceremony f
   [[ "$(owner_auth_set)" == 1 ]] \
     || die "the mandatory owner ceremony is not complete; runtime readiness is forbidden"
   assert_fixed_state "$wanted"
-  local completion install_value freshness_value
-  completion="$(completion_read)" \
+  local completion_version completion install_value freshness_value
+  read -r completion_version completion < <(completion_read_versioned) \
     || die "authenticated TPM completion evidence is absent or partial; signed physical recovery is required"
-  [[ "$completion" == "$4" ]] \
+  [[ "$completion_version" == "$expected_version" && "$completion" == "$4" ]] \
     || die "authenticated TPM completion evidence does not match the canonical lifecycle evidence"
   install_value="$(counter_value "$COUNTER_INDEX")"
   freshness_value="$(counter_value "$FRESHNESS_INDEX")"
@@ -861,7 +898,6 @@ runtime_status() { # profile target policy evidence-digest install-at-ceremony f
     || die "the live install counter no longer equals its authenticated ceremony value"
   (( freshness_value >= 10#$expected_freshness )) \
     || die "the live freshness high-water regressed below its authenticated ceremony value"
-  printf 'complete\n'
 }
 
 completion_status() {
@@ -873,16 +909,98 @@ completion_status() {
     || die "the TPM has no authenticated write-locked ceremony completion record"
 }
 
+completion_inspect() {
+  (( $# == 0 )) || die "completion-inspect takes no arguments"
+  with_workspace; compute_policies
+  [[ "$(owner_auth_set)" == 1 ]] \
+    || die "ownerAuthSet is not set; there is no authenticated completed ceremony"
+  local version digest
+  read -r version digest < <(completion_read_versioned) \
+    || die "the TPM has no authenticated write-locked ceremony completion record"
+  "$(tool python3)" - "$version" "$digest" <<'PY'
+import json,sys
+print(json.dumps({"completion_version":int(sys.argv[1]),
+ "evidence_digest_sha256":sys.argv[2],
+ "schema":"neural-ice-owner-ceremony-completion-inspection-v1"},
+ sort_keys=True,separators=(",",":")))
+PY
+}
+
+owner_ota_inspection() { # expected floor, owner sealed, clear protected, pristine|any
+  (( $# == 4 )) || die "internal owner OTA inspection contract misuse"
+  [[ "$1" =~ ^[1-9][0-9]{0,15}$ && "$2" =~ ^[01]$ && "$3" =~ ^[01]$ && "$4" =~ ^(pristine|any)$ ]] \
+    || die "internal owner OTA inspection expectation is malformed"
+  [[ -n "$OTA_STATE_HELPER" && -x "$OTA_STATE_HELPER" ]] \
+    || die "owner-sealed OTA state helper is unavailable"
+  local inspection
+  inspection="$($OTA_STATE_HELPER inspect-v2)" \
+    || die "owner-sealed OTA NV state does not satisfy its exact public contract"
+  "$(tool python3)" - "$inspection" "$1" "$2" "$3" "$4" <<'PY'
+import json,re,sys
+def pairs(items):
+    out={}
+    for key,value in items:
+        if key in out: raise SystemExit("duplicate owner OTA inspection field")
+        out[key]=value
+    return out
+try: value=json.loads(sys.argv[1],object_pairs_hook=pairs)
+except Exception as error: raise SystemExit(f"malformed owner OTA inspection: {error}")
+expected={
+ "anchor_attributes":"0x2060048","anchor_index":"0x01500002",
+ "anchor_policy_sha256":"b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7",
+ "anchor_size":32,
+ "baseline_floor":int(sys.argv[2]),"clear_protected":sys.argv[4]=="1",
+ "floor_attributes":"0x62008","floor_index":"0x01500001",
+ "floor_name":"000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4",
+ "floor_policy_sha256":"f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230",
+ "floor_size":8,"owner_sealed":sys.argv[3]=="1",
+ "profile":"owner-sealed-ota-state-v1",
+ "schema":"neural-ice-owner-ota-state-inspection-v2"}
+state=value.get("anchor_state")
+if state == "pristine":
+    expected.update(anchor_name="000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",anchor_sha256=None,anchor_state="pristine")
+elif sys.argv[5] == "any" and state == "written":
+    anchor=value.get("anchor_sha256")
+    if not isinstance(anchor,str) or not re.fullmatch(r"[0-9a-f]{64}",anchor): raise SystemExit("written owner anchor is malformed")
+    expected.update(anchor_name="000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56",anchor_sha256=anchor,anchor_state="written")
+else: raise SystemExit("owner OTA anchor is not in an allowed state")
+if value != expected: raise SystemExit("owner OTA inspection differs from the closed profile")
+PY
+}
+
 provisioning_status() {
   (( $# == 0 )) || die "provisioning-status takes no arguments"
   with_workspace
   [[ "$(owner_auth_set)" == 0 ]] \
     || die "ownerAuthSet=1 before provisioning; signed physical recovery is required"
-  local index
+  local index owner_floor=0 owner_anchor=0 floor
   for index in "$COUNTER_INDEX" "$FRESHNESS_INDEX" "$RECORD_INDEX" "$COMPLETION_INDEX"; do
     ! index_present "$index" \
       || die "TPM state already exists at $index; encrypted-volume reset is not a fresh install — TPM clear with physical presence and signed reinstall are required"
   done
+  index_present "$OTA_FLOOR_INDEX" && owner_floor=1
+  index_present "$OTA_ANCHOR_INDEX" && owner_anchor=1
+  if (( owner_floor || owner_anchor )); then
+    (( owner_floor && owner_anchor )) \
+      || die "owner-sealed OTA NV state is partial; signed physical recovery is required"
+    handle_present "$PERSISTENT_SRK_HANDLE" \
+      || die "owner-sealed OTA state exists without the intended persistent SRK; signed physical recovery is required"
+    handle_present "$DEVICE_ROOT_HANDLE" \
+      || die "owner-sealed OTA state exists without the persisted device root; signed physical recovery is required"
+    pcr_policy_current >/dev/null
+    [[ -n "$OTA_STATE_HELPER" && -x "$OTA_STATE_HELPER" ]] \
+      || die "owner-sealed OTA state helper is unavailable"
+    floor="$($OTA_STATE_HELPER inspect-v2 | "$(tool python3)" -c '
+import json,sys
+d=json.load(sys.stdin)
+v=d.get("baseline_floor")
+if isinstance(v,bool) or not isinstance(v,int) or not 0 < v <= 9007199254740991: raise SystemExit(1)
+print(v)
+')" || die "owner-sealed OTA NV state cannot be classified"
+    owner_ota_inspection "$floor" 0 0 pristine
+    printf 'preseal-prepared\n'
+    return
+  fi
   if index_present "$PCR_POLICY_INDEX"; then
     pcr_policy_current >/dev/null
     printf 'pcr-policy-activated\n'
@@ -891,8 +1009,21 @@ provisioning_status() {
   fi
 }
 
-ceremony_prepare() { # profile target policy initial consumed absolute issuance seq
+ceremony_prepare() { # retained v1: profile target policy initial issuance seq
   (( $# == 4 )) || die "ceremony-prepare requires a profile, target, policy and initial issuance sequence"
+  ceremony_prepare_impl "" "$@"
+}
+
+ceremony_prepare_v2() { # profile target policy initial issuance seq baseline floor
+  (( $# == 5 )) || die "ceremony-prepare-v2 requires profile, target, policy, initial issuance sequence and baseline floor"
+  [[ "$5" =~ ^[1-9][0-9]{0,15}$ ]] || die "owner baseline floor is malformed"
+  (( 10#$5 <= MAX_SAFE_INTEGER )) || die "owner baseline floor exceeds the JSON safe-integer range"
+  ceremony_prepare_impl "$5" "${@:1:4}"
+}
+
+ceremony_prepare_impl() { # optional owner floor, profile, target, policy, initial issuance seq
+  local owner_floor=$1; shift
+  (( $# == 4 )) || die "internal ceremony-prepare argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   local requested="$4" wanted index current step
   if ! [[ "$requested" =~ ^[0-9]{1,16}$ ]] || (( requested > MAX_SAFE_INTEGER )); then
@@ -915,6 +1046,11 @@ ceremony_prepare() { # profile target policy initial consumed absolute issuance 
       || die "TPM provisioning already began ($index exists); ceremony is one-time and partial state requires signed physical recovery"
   done
   pcr_policy_current >/dev/null
+  if [[ -n "$owner_floor" ]]; then
+    owner_ota_inspection "$owner_floor" 0 0 pristine
+  elif index_present "$OTA_FLOOR_INDEX" || index_present "$OTA_ANCHOR_INDEX"; then
+    die "owner-sealed OTA state is present on the retained v1 ceremony path"
+  fi
 
   # EVERYTHING THE OWNER HIERARCHY IS STILL NEEDED FOR MUST ALREADY BE DONE.
   # These are refusals: sealing first and discovering the consequence at the next
@@ -942,8 +1078,21 @@ ceremony_prepare() { # profile target policy initial consumed absolute issuance 
     "$(counter_value "$FRESHNESS_INDEX")" "$wanted"
 }
 
-ceremony_finalize() { # profile target policy evidence-digest install-at-ceremony freshness-at-ceremony
+ceremony_finalize() { # retained v1
   (( $# == 6 )) || die "ceremony-finalize requires profile, target, policy, evidence digest and ceremony counter values"
+  ceremony_finalize_impl "$COMPLETION_MAGIC" "" "$@"
+}
+
+ceremony_finalize_v2() { # profile target policy completion-digest install freshness baseline-floor
+  (( $# == 7 )) || die "ceremony-finalize-v2 requires profile, target, policy, evidence digest, counter values and baseline floor"
+  [[ "$7" =~ ^[1-9][0-9]{0,15}$ ]] || die "owner baseline floor is malformed"
+  (( 10#$7 <= MAX_SAFE_INTEGER )) || die "owner baseline floor exceeds the JSON safe-integer range"
+  ceremony_finalize_impl "$COMPLETION_MAGIC_V2" "$7" "${@:1:6}"
+}
+
+ceremony_finalize_impl() { # magic, optional owner floor, profile target policy digest counters
+  local completion_magic=$1 owner_floor=$2; shift 2
+  (( $# == 6 )) || die "internal ceremony-finalize argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   [[ "$4" =~ ^[0-9a-f]{64}$ ]] || die "completion evidence digest is malformed"
   [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^[1-9][0-9]{0,15}$ ]] \
@@ -954,13 +1103,18 @@ ceremony_finalize() { # profile target policy evidence-digest install-at-ceremon
   [[ "$(owner_auth_set)" == 0 ]] \
     || die "ownerAuthSet=1 before the trusted one-time finalize path; arbitrary owner authorization is never accepted"
   assert_fixed_state "$wanted"
+  if [[ -n "$owner_floor" ]]; then
+    owner_ota_inspection "$owner_floor" 0 1 pristine
+  elif index_present "$OTA_FLOOR_INDEX" || index_present "$OTA_ANCHOR_INDEX"; then
+    die "owner-sealed OTA state is present on the retained v1 finalize path"
+  fi
   ! index_present "$COMPLETION_INDEX" \
     || die "ceremony completion evidence already exists before finalize; this is not a trusted one-time transition"
   install_value="$(counter_value "$COUNTER_INDEX")"
   freshness_value="$(counter_value "$FRESHNESS_INDEX")"
   (( install_value == 10#$expected_install && freshness_value == 10#$expected_freshness )) \
     || die "live TPM counters changed between ceremony preparation and authenticated finalization"
-  write_completion "$4"
+  write_completion "$completion_magic" "$4"
 
   # 32 BYTES FROM THE KERNEL CSPRNG, PASSED BY FILE AND NEVER BY ARGUMENT. An
   # authorization value on a command line is in /proc for every process on the
@@ -998,7 +1152,13 @@ os.unlink(path)
   [[ "$(owner_auth_set)" == 1 ]] \
     || die "the TPM still reports an empty owner authorization after it was changed"
   assert_fixed_state "$wanted"
-  [[ "$(completion_read)" == "$4" ]] \
+  if [[ -n "$owner_floor" ]]; then
+    owner_ota_inspection "$owner_floor" 1 1 any
+  fi
+  local completion_version completion_digest expected_version
+  read -r completion_version completion_digest < <(completion_read_versioned)
+  [[ "$completion_magic" == "$COMPLETION_MAGIC_V2" ]] && expected_version=2 || expected_version=1
+  [[ "$completion_version" == "$expected_version" && "$completion_digest" == "$4" ]] \
     || die "the authenticated completion record changed after owner authorization sealing"
   printf 'complete\n'
 }
@@ -1022,11 +1182,15 @@ usage:
   neural-ice-tpm-state profile-bind PROFILE HARDWARE_TARGET TRUST_POLICY_ID
   neural-ice-tpm-state profile-digest PROFILE HARDWARE_TARGET TRUST_POLICY_ID
   neural-ice-tpm-state ceremony-prepare PROFILE HARDWARE_TARGET TRUST_POLICY_ID INITIAL_ISSUANCE_SEQ
+  neural-ice-tpm-state ceremony-prepare-v2 PROFILE HARDWARE_TARGET TRUST_POLICY_ID INITIAL_ISSUANCE_SEQ BASELINE_FLOOR
   neural-ice-tpm-state ceremony-finalize PROFILE HARDWARE_TARGET TRUST_POLICY_ID EVIDENCE_SHA256 INSTALL_COUNTER FRESHNESS_COUNTER
+  neural-ice-tpm-state ceremony-finalize-v2 PROFILE HARDWARE_TARGET TRUST_POLICY_ID COMPLETION_DIGEST INSTALL_COUNTER FRESHNESS_COUNTER BASELINE_FLOOR
   neural-ice-tpm-state provisioning-status
   neural-ice-tpm-state completion-status
+  neural-ice-tpm-state completion-inspect
   neural-ice-tpm-state state-snapshot PROFILE HARDWARE_TARGET TRUST_POLICY_ID
   neural-ice-tpm-state runtime-status PROFILE HARDWARE_TARGET TRUST_POLICY_ID EVIDENCE_SHA256 INSTALL_COUNTER FRESHNESS_COUNTER
+  neural-ice-tpm-state runtime-status-v2 PROFILE HARDWARE_TARGET TRUST_POLICY_ID COMPLETION_DIGEST INSTALL_COUNTER FRESHNESS_COUNTER BASELINE_FLOOR
 EOF
   exit 2
 }
@@ -1044,10 +1208,14 @@ case "$command_name" in
   profile-bind) profile_bind "$@" ;;
   profile-digest) profile_digest_command "$@" ;;
   ceremony-prepare) ceremony_prepare "$@" ;;
+  ceremony-prepare-v2) ceremony_prepare_v2 "$@" ;;
   ceremony-finalize) ceremony_finalize "$@" ;;
+  ceremony-finalize-v2) ceremony_finalize_v2 "$@" ;;
   provisioning-status) provisioning_status "$@" ;;
   completion-status) completion_status "$@" ;;
+  completion-inspect) completion_inspect "$@" ;;
   state-snapshot) state_snapshot "$@" ;;
   runtime-status) runtime_status "$@" ;;
+  runtime-status-v2) runtime_status_v2 "$@" ;;
   *) usage ;;
 esac

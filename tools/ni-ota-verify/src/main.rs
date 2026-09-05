@@ -106,6 +106,15 @@ const USAGE: &str = "usage:
                        --current-os-manifest-digest <sha256:digest>
                        --current-seed-ref <40hex> --candidate-root <path>
                        --receipt-out <path> [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify verify-retained-preseal-baseline --set <path>
+                       --snapshot <path> --snapshot-sig <path>
+                       --release <path> --release-sig <path> --bom <path>
+                       --installer-authorization <path>
+                       --installer-authorization-sig <path>
+                       --expected-set-sha256 <64hex>
+                       --expected-receipt-sha256 <64hex>
+                       --receipt <path> --scratch-dir </run/private-work>
+                       [--config /etc/neural-ice/ota.conf]
   ni-ota-verify release-plan --current <path> --candidate <path>
                        --registry-host <canonical OCI authority>
                        --hardware-target <id> --reader-version <n>
@@ -148,6 +157,11 @@ fn run() -> u8 {
         Some("verify-delegated-beta") => delegated::run_beta(&args[1..]),
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
         Some("verify-preseal-baseline") => preseal::run(&args[1..]),
+        Some("verify-retained-preseal-baseline") => preseal::run_retained(&args[1..]),
+        #[cfg(feature = "test-path-overrides")]
+        Some("test-inspect-owner-completion") => {
+            access_profile_anchor::run_owner_completion_test(&args[1..])
+        }
         Some("release-plan") => release_plan(&args[1..]),
         Some("verify-seed-closure") => seed_closure::run(&args[1..]),
         Some("device-policy") => device_policy::run(&args[1..]),

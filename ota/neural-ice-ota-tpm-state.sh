@@ -300,6 +300,43 @@ print(json.dumps({"anchor_sha256": None if anchor == "-" else anchor, "anchor_st
 PY
 }
 
+inspect_v2() {
+  (( $# == 0 )) || die "inspect-v2 takes no arguments"
+  with_workspace; compute_policies
+  if ! index_present "$FLOOR_INDEX" || ! index_present "$ANCHOR_INDEX"; then
+    die "OTA NV state is absent or partial"
+  fi
+  assert_floor
+  local floor anchor state owner protected anchor_name
+  floor="$(floor_value)"; state="$(anchor_state)"
+  if [[ "$state" == written ]]; then
+    anchor="$(anchor_value)"; anchor_name="$ANCHOR_WRITTEN_NAME"
+  else
+    anchor=-; anchor_name="$ANCHOR_PRISTINE_NAME"
+  fi
+  owner="$(permanent_property ownerAuthSet)"
+  protected="$(permanent_property disableClear)"
+  "$(tool python3)" - "$floor" "$anchor" "$state" "$anchor_name" "$owner" "$protected" \
+    "$FLOOR_INDEX" "$FLOOR_ATTRIBUTES" "$FLOOR_NAME" "$POLICY_FLOOR" \
+    "$ANCHOR_INDEX" "$ANCHOR_ATTRIBUTES" "$POLICY_EXTEND" <<'PY'
+import json, sys
+(floor, anchor, state, anchor_name, owner, protected, floor_index,
+ floor_attributes, floor_name, floor_policy, anchor_index,
+ anchor_attributes, anchor_policy) = sys.argv[1:]
+print(json.dumps({
+ "anchor_attributes":anchor_attributes,"anchor_index":anchor_index,
+ "anchor_name":anchor_name,"anchor_policy_sha256":anchor_policy,
+ "anchor_sha256":None if anchor == "-" else anchor,"anchor_size":32,
+ "anchor_state":state,"baseline_floor":int(floor),
+ "clear_protected":protected == "1","floor_attributes":floor_attributes,
+ "floor_index":floor_index,"floor_name":floor_name,
+ "floor_policy_sha256":floor_policy,"floor_size":8,
+ "owner_sealed":owner == "1","profile":"owner-sealed-ota-state-v1",
+ "schema":"neural-ice-owner-ota-state-inspection-v2"},
+ sort_keys=True,separators=(",",":")))
+PY
+}
+
 clear_protection() {
   (( $# == 0 )) || die "clear-protection takes no arguments"
   with_workspace; compute_policies
@@ -370,6 +407,7 @@ usage() {
 usage:
   neural-ice-ota-tpm-state prepare BASELINE_FLOOR
   neural-ice-ota-tpm-state inspect
+  neural-ice-ota-tpm-state inspect-v2
   neural-ice-ota-tpm-state clear-protection
   neural-ice-ota-tpm-state extend SHA256
 EOF
@@ -381,6 +419,7 @@ shift || true
 case "$command_name" in
   prepare) prepare "$@" ;;
   inspect) inspect "$@" ;;
+  inspect-v2) inspect_v2 "$@" ;;
   clear-protection) clear_protection "$@" ;;
   extend) extend_anchor "$@" ;;
   *) usage ;;

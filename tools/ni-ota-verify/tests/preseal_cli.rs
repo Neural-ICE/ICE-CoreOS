@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +31,7 @@ struct Fixture {
     installer_sig: PathBuf,
     candidate: PathBuf,
     receipt: PathBuf,
+    scratch: PathBuf,
     sealed_set: String,
     sealed_installer: String,
     sealed_installer_sig: String,
@@ -58,6 +59,8 @@ impl Fixture {
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
+        fs::create_dir(root.join("scratch")).unwrap();
+        fs::set_permissions(root.join("scratch"), fs::Permissions::from_mode(0o700)).unwrap();
 
         let root_key = root.join("root.key");
         let root_pub = root.join("root.pub");
@@ -242,6 +245,7 @@ impl Fixture {
             installer_sig: root.join("installer.sig"),
             candidate: root.join("candidate"),
             receipt: root.join("state/preseal/receipt.json"),
+            scratch: root.join("scratch"),
             sealed_set: hash(&set_bytes),
             sealed_installer: hash(&installer_bytes),
             sealed_installer_sig: hash(&installer_sig_bytes),
@@ -314,6 +318,58 @@ impl Fixture {
     fn run(&self) -> Output {
         self.command().output().unwrap()
     }
+
+    fn retained_command(&self, receipt_sha256: &str) -> Command {
+        self.retained_command_with(&self.sealed_set, receipt_sha256)
+    }
+
+    fn retained_command_with(&self, set_sha256: &str, receipt_sha256: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ni-ota-verify"));
+        command
+            .args(["verify-retained-preseal-baseline", "--set"])
+            .arg(&self.set)
+            .arg("--snapshot")
+            .arg(&self.snapshot)
+            .arg("--snapshot-sig")
+            .arg(&self.snapshot_sig)
+            .arg("--release")
+            .arg(&self.release)
+            .arg("--release-sig")
+            .arg(&self.release_sig)
+            .arg("--bom")
+            .arg(&self.bom)
+            .arg("--installer-authorization")
+            .arg(&self.installer)
+            .arg("--installer-authorization-sig")
+            .arg(&self.installer_sig)
+            .args(["--expected-set-sha256", set_sha256])
+            .args(["--expected-receipt-sha256", receipt_sha256])
+            .arg("--receipt")
+            .arg(&self.receipt)
+            .arg("--scratch-dir")
+            .arg(&self.scratch)
+            .arg("--config")
+            .arg(&self.config)
+            .env("NI_OTA_COSIGN", self.root.join("cosign"))
+            .env("NI_TEST_FORBIDDEN_TEMP_ROOT", self.root.join("state"))
+            .env(
+                "NI_OTA_HARDWARE_TARGET_FILE",
+                self.root.join("hardware-target"),
+            )
+            .env(
+                "NI_OTA_APPLIANCE_VARIANT_FILE",
+                self.root.join("appliance-variant"),
+            )
+            .env(
+                "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+                self.root.join("min-delegation-seq"),
+            )
+            .env(
+                "NI_OTA_BOOTSTRAP_DELEGATION_SHA256_FILE",
+                self.root.join("bootstrap-delegation-sha256"),
+            );
+        command
+    }
 }
 
 impl Drop for Fixture {
@@ -371,6 +427,102 @@ fn authentic_preseal_is_exactly_idempotent_and_writes_no_runtime_state() {
     );
     assert!(String::from_utf8_lossy(&second.stdout).contains("\"idempotent\":true"));
     assert_eq!(fs::read(&fixture.receipt).unwrap(), receipt);
+}
+
+#[test]
+fn retained_preseal_reauthenticates_baseline_without_rebinding_running_candidate() {
+    let fixture = Fixture::new("retained", |_| {});
+    assert_eq!(fixture.run().status.code(), Some(0));
+    let receipt_bytes = fs::read(&fixture.receipt).unwrap();
+    let receipt_sha256 = hash(&receipt_bytes);
+
+    // A later accepted OS may have different running markers. Retained mode
+    // authenticates the historical floor and never reads those markers.
+    fs::write(
+        fixture
+            .candidate
+            .join("usr/lib/neural-ice/product-payload/PAYLOAD_ID"),
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n",
+    )
+    .unwrap();
+    let persistent_before = tree_snapshot(&fixture.root.join("state"));
+    let output = fixture.retained_command(&receipt_sha256).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"idempotent\":true"));
+    let repeated = fixture.retained_command(&receipt_sha256).output().unwrap();
+    assert_eq!(repeated.status.code(), Some(0));
+    assert_eq!(
+        tree_snapshot(&fixture.root.join("state")),
+        persistent_before,
+        "retained verification changed the persistent OTA tree"
+    );
+
+    fs::set_permissions(&fixture.scratch, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        fixture
+            .retained_command(&receipt_sha256)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+    fs::set_permissions(&fixture.scratch, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let wrong_set = fixture
+        .retained_command_with(&"e".repeat(64), &receipt_sha256)
+        .output()
+        .unwrap();
+    assert_eq!(wrong_set.status.code(), Some(1));
+
+    let wrong_receipt = fixture.retained_command(&"e".repeat(64)).output().unwrap();
+    assert_eq!(wrong_receipt.status.code(), Some(1));
+
+    fs::remove_file(&fixture.receipt).unwrap();
+    let missing = fixture.retained_command(&receipt_sha256).output().unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        !fixture.receipt.exists(),
+        "retained verification recreated receipt"
+    );
+
+    let tampered = Fixture::new("retained-tampered", |_| {});
+    assert_eq!(tampered.run().status.code(), Some(0));
+    let receipt_sha256 = hash(&fs::read(&tampered.receipt).unwrap());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&tampered.release)
+        .unwrap()
+        .write_all(b" ")
+        .unwrap();
+    assert_eq!(
+        tampered
+            .retained_command(&receipt_sha256)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+
+    let wrong_mode = Fixture::new("retained-wrong-mode", |_| {});
+    assert_eq!(wrong_mode.run().status.code(), Some(0));
+    let receipt_sha256 = hash(&fs::read(&wrong_mode.receipt).unwrap());
+    assert_eq!(
+        wrong_mode
+            .retained_command(&receipt_sha256)
+            .args(["--current-os-ref", "ignored.example.test/value"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -810,10 +962,51 @@ fn hash(bytes: &[u8]) -> String {
         .to_owned()
 }
 
+type TreeEntry = (PathBuf, u32, i64, i64, i64, i64, Vec<u8>);
+
+fn tree_snapshot(root: &Path) -> Vec<TreeEntry> {
+    fn visit(root: &Path, path: &Path, out: &mut Vec<TreeEntry>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let metadata = fs::symlink_metadata(&entry).unwrap();
+            let relative = entry.strip_prefix(root).unwrap().to_path_buf();
+            let record = |bytes| {
+                (
+                    relative.clone(),
+                    metadata.permissions().mode() & 0o7777,
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                    bytes,
+                )
+            };
+            if metadata.is_dir() {
+                out.push(record(Vec::new()));
+                visit(root, &entry, out);
+            } else {
+                out.push(record(fs::read(&entry).unwrap()));
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
 const COSIGN: &str = r#"#!/bin/sh
 set -eu
 [ "$1" = verify-blob ]
 shift
+if [ -n "${NI_TEST_FORBIDDEN_TEMP_ROOT:-}" ]; then
+  for argument in "$@"; do
+    case "$argument" in "$NI_TEST_FORBIDDEN_TEMP_ROOT"/*) exit 89 ;; esac
+  done
+fi
 key= signature=
 while [ "$#" -gt 1 ]; do
   case "$1" in

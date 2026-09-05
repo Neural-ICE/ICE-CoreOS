@@ -24,8 +24,13 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # The installer is a top-to-bottom script that wipes disks; it cannot be sourced.
 # Extract exactly the two functions under test, verbatim, so the suite runs the
 # SAME code the appliance runs rather than a paraphrase of it.
-awk '/^karg_count\(\) \{/,/^}$/' "$AUTOINSTALL" > "$TMP/reader.sh"
-awk '/^karg_once\(\) \{/,/^}$/'  "$AUTOINSTALL" >> "$TMP/reader.sh"
+{
+  awk '/^karg_count\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^karg_once\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^candidate_ota_state_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^require_medium_source_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^verify_installed_preseal_candidate\(\) \{/,/^}$/' "$AUTOINSTALL"
+} > "$TMP/reader.sh"
 grep -q '^karg_count()' "$TMP/reader.sh" || fail "cannot extract karg_count from the installer"
 grep -q '^karg_once()'  "$TMP/reader.sh" || fail "cannot extract karg_once from the installer"
 
@@ -38,6 +43,50 @@ NEURALICE_CMDLINE_FILE="$CMDLINE"
 source "$TMP/reader.sh"
 
 set_cmdline() { printf '%s\n' "$*" > "$CMDLINE"; }
+
+# The medium source has no authenticated eight-file transport. Its historical
+# unmarked image remains supported, while an owner-profile or malformed marker
+# refuses before the first destructive call. Exercise the production helpers;
+# the marker is read from the real usr/lib layout of a mounted candidate.
+medium_root="$TMP/medium-root"
+mkdir -p "$medium_root/usr/lib/neural-ice"
+destructive="$TMP/destructive-called"
+medium_attempt() (
+  profile="$(candidate_ota_state_profile "$medium_root")" || exit 1
+  require_medium_source_profile "$profile"
+  : > "$destructive"
+)
+medium_attempt || fail "the historical unmarked medium source was refused"
+[[ -e "$destructive" ]] || fail "the admitted legacy medium did not reach the synthetic destructive boundary"
+rm -f "$destructive"
+printf '%s\n' owner-sealed-ota-state-v1 > "$medium_root/usr/lib/neural-ice/ota-state-profile"
+medium_attempt >/dev/null 2>&1 && fail "an owner-profile medium without preseal transport was admitted"
+[[ ! -e "$destructive" ]] || fail "an owner-profile medium reached the destructive boundary"
+printf '%s\n' owner-sealed-ota-state-v1 malformed > "$medium_root/usr/lib/neural-ice/ota-state-profile"
+medium_attempt >/dev/null 2>&1 && fail "a malformed medium OTA-state profile was admitted"
+[[ ! -e "$destructive" ]] || fail "a malformed medium profile reached the destructive boundary"
+
+# The post-bootc verifier consumes the resolved deployment root, not the
+# /var/tmp/nitarget OSTree sysroot. Make the distinction executable with the
+# actual directory shape and marker locations the Rust verifier reads.
+TGT="$TMP/nitarget"
+dep="$TGT/ostree/deploy/neuralice/deploy/0123456789abcdef.0"
+mkdir -p "$dep/usr/lib/neural-ice/product-payload"
+printf '%s\n' owner-sealed-ota-state-v1 > "$dep/usr/lib/neural-ice/ota-state-profile"
+printf '%040d\n' 6 > "$dep/usr/lib/neural-ice/product-payload/PAYLOAD_ID"
+verify_preseal_candidate() {
+  [[ "$1" == "$TMP/installed-inputs" \
+     && "$2" == "$dep" \
+     && "$(cat "$2/usr/lib/neural-ice/ota-state-profile")" == owner-sealed-ota-state-v1 \
+     && "$(cat "$2/usr/lib/neural-ice/product-payload/PAYLOAD_ID")" == "$(printf '%040d' 6)" \
+     && "$3" == "$(printf '%040d' 6)" \
+     && "$4" == "$TMP/installed.conf" \
+     && "$5" == "$TMP/receipt.json" ]] || return 1
+  printf '%s\n' 7
+}
+[[ "$(verify_installed_preseal_candidate "$TMP/installed-inputs" \
+  "$(printf '%040d' 6)" "$TMP/installed.conf" "$TMP/receipt.json")" == 7 ]] \
+  || fail "the installed preseal verifier did not receive the resolved OSTree deployment root"
 
 # --------------------------------------------------------------------------- #
 # 1) ABSENT is empty, PRESENT ONCE is the value, PRESENT TWICE is a refusal.
@@ -60,7 +109,7 @@ set_cmdline "neuralice.target=/dev/sda quiet neuralice.target=/dev/nvme0n1"
 # Every security-relevant argument, both orders. A list is only a control if it
 # is complete, so each one is exercised rather than assumed to share code.
 for key in neuralice.target neuralice.imgref neuralice.osimage neuralice.mirror \
-  neuralice.source neuralice.systemsize neuralice.sshkey; do
+  neuralice.source neuralice.systemsize neuralice.sshkey neuralice.preseal; do
   set_cmdline "quiet ${key}=first ${key}=second"
   ( karg_once "$key" ) >/dev/null 2>&1 \
     && fail "a duplicated $key was resolved instead of refused"
@@ -68,6 +117,52 @@ for key in neuralice.target neuralice.imgref neuralice.osimage neuralice.mirror 
   set_cmdline "quiet ${key}=only"
   [ "$(karg_once "$key")" = only ] || fail "$key was not read when present exactly once"
 done
+
+# Owner-profile installs carry eight authenticated inputs across the wipe. The
+# snapshot and the complete cryptographic candidate proof must both precede the
+# first destructive command; post-bootc only the same protected bytes may be
+# published and reverified before TPM NV preparation.
+line_of() { grep -nF -- "$1" "$AUTOINSTALL" | head -1 | cut -d: -f1 || true; }
+preseal_snapshot_line="$(line_of 'snapshot_preseal_from_esp "$PRESEAL_SNAPSHOT"')"
+preseal_preflight_line="$(line_of 'PRESEAL_BUNDLE_SEQ="$(verify_preseal_candidate "$PRESEAL_SNAPSHOT"')"
+medium_profile_gate_line="$(line_of 'require_medium_source_profile "$_medium_ota_profile"')"
+wipe_line="$(grep -nE '^[[:space:]]*wipefs -a "\$target"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+bootc_line="$(awk '$1 == "bootc" && $2 == "install" && $3 == "to-filesystem" { print NR; exit }' "$AUTOINSTALL")"
+handoff_line="$(line_of '"$PRESEAL_HANDOFF" install-persistent')"
+installed_verify_line="$(line_of '_installed_preseal_floor="$(verify_installed_preseal_candidate "$PRESEAL_INSTALLED_INPUTS"')"
+prepare_line="$(line_of '"$OTA_TPM_STATE" prepare "$PRESEAL_BUNDLE_SEQ"')"
+inspect_line="$(line_of '"$OTA_TPM_STATE" inspect-v2')"
+status_line="$(line_of '"$TPM_STATE" provisioning-status)" == preseal-prepared')"
+[[ -n "$preseal_snapshot_line" && -n "$preseal_preflight_line" \
+   && -n "$medium_profile_gate_line" && -n "$wipe_line" \
+   && -n "$bootc_line" && -n "$handoff_line" && -n "$installed_verify_line" \
+   && -n "$prepare_line" && -n "$inspect_line" && -n "$status_line" \
+   && "$preseal_snapshot_line" -lt "$preseal_preflight_line" \
+   && "$preseal_preflight_line" -lt "$wipe_line" \
+   && "$medium_profile_gate_line" -lt "$wipe_line" \
+   && "$wipe_line" -lt "$bootc_line" && "$bootc_line" -lt "$handoff_line" \
+   && "$handoff_line" -lt "$installed_verify_line" \
+   && "$installed_verify_line" -lt "$prepare_line" \
+   && "$prepare_line" -lt "$inspect_line" && "$inspect_line" -lt "$status_line" ]] \
+  || fail "the authenticated eight-input preseal handoff is not ordered around the wipe and bootc install"
+
+for required in \
+  'the selected owner-sealed appliance has no UKI-bound preseal inputs' \
+  'the selected legacy appliance cannot consume this medium' \
+  'the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation' \
+  '--current-os-ref "$OS_IMAGE"' \
+  '--current-os-manifest-digest "$got_manifest"' \
+  '--current-seed-ref "$current_seed"' \
+  '--candidate-root "$candidate_root"' \
+  '"$PRESEAL_HANDOFF" verify-persistent' \
+  'cmp -- "$PRESEAL_PREFLIGHT_RECEIPT" "$PRESEAL_INSTALLED_RECEIPT"' \
+  'sync -f "$PRESEAL_INSTALLED_INPUTS"' \
+  'sync -f "$ota_state"' \
+  'the complete TPM state is not the exact preseal-prepared lifecycle checkpoint'; do
+  grep -Fq -- "$required" "$AUTOINSTALL" \
+    || fail "the owner-profile preseal contract is incomplete: $required"
+done
+unset -f line_of
 
 # A key that merely CONTAINS another key's name must not be counted as it: a
 # substring match would make `neuralice.targetfoo=` shadow `neuralice.target=`.

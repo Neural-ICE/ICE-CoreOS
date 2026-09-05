@@ -531,6 +531,16 @@ for source in neural-ice-installer.target neural-ice-live.target \
   grep -Fq "image/installer/$source" "$INSTALLER_CF" \
     || fail "the installer image does not contain $source"
 done
+for packaged in \
+  'COPY ota/neural-ice-preseal-handoff.py /usr/libexec/neural-ice-preseal-handoff' \
+  'COPY ota/neural-ice-ota-tpm-state.sh /usr/libexec/neural-ice-ota-tpm-state' \
+  '/usr/libexec/neural-ice-preseal-handoff --help' \
+  'ni-ota-verify verify-preseal-baseline --set <path>' \
+  'printf '\''%s\n'\'' owner-sealed-ota-state-v1' \
+  '| cmp - /usr/lib/neural-ice/ota-state-profile'; do
+  grep -Fq -- "$packaged" "$INSTALLER_CF" \
+    || fail "the installer image does not package and attest its preseal prerequisite: $packaged"
+done
 grep -Fq 'systemctl enable neural-ice-autoinstall.service' "$INSTALLER_CF" \
   || fail "the installer image does not attach autoinstall to its dedicated target"
 grep -Eq 'systemctl (mask|disable).*neural-ice-firstboot-tpm-ceremony' "$INSTALLER_CF" \
