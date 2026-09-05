@@ -4,12 +4,16 @@
 //! chain reproduces the observed TPM anchor. The public capability remains
 //! gated until the complete guard/commit command set lands.
 
-use std::ffi::OsString;
+use std::collections::BTreeMap;
+use std::ffi::{CString, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +47,26 @@ const STATE_NV_NAME_UNWRITTEN: &str =
     "000b8ae052b814918370b191fe38782bb500041130d0665b1e7b2a368edcaf81eb62";
 const STATE_NV_NAME_WRITTEN: &str =
     "000b571132a9688f4088f3696fa9bf5d5793be7483202cee08ceb2261f2bbe89b440";
+const OWNER_STATE_NV_ATTRIBUTES: &str = "authread|no_da|nt=0x1|ownerread|policywrite";
+const OWNER_STATE_NV_POLICY: &str =
+    "b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7";
+const OWNER_STATE_NV_NAME_PRISTINE: &str =
+    "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d";
+const OWNER_STATE_NV_NAME_WRITTEN: &str =
+    "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56";
+const OWNER_FLOOR_NV_NAME: &str =
+    "000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4";
+const OWNER_FLOOR_NV_POLICY: &str =
+    "f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230";
+const OWNER_STATE_PROFILE: &str = "owner-sealed-ota-state-v1";
+const OWNER_PROFILE_MARKER: &str = "/usr/lib/neural-ice/ota-state-profile";
+const PAYLOAD_ID_MARKER: &str = "/usr/lib/neural-ice/product-payload/PAYLOAD_ID";
+#[cfg(not(feature = "test-path-overrides"))]
+const OWNER_HELPER: &str = "/usr/libexec/neural-ice-ota-tpm-state";
+const STATUS_SCRATCH_ROOT: &str = "/run/neural-ice-ota-status";
+const STATUS_MAX_FILES: usize = 256;
+const STATUS_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const STATUS_MAX_DEPTH: usize = 5;
 const ZERO_ANCHOR: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const GENERATION_ARTIFACTS: &[&str] = &[
     "applied.json",
@@ -126,6 +150,85 @@ struct LoadedGeneration {
     manifest_sha256: String,
     nv_anchor: String,
     trusted: TrustedTimeState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NvPublicArea {
+    name: String,
+    algorithm: String,
+    attributes: String,
+    size: u64,
+    authorization_policy: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateProfile {
+    RetainedPlatformV1,
+    OwnerSealedV1 { written: bool },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct OwnerStateInspection {
+    anchor_attributes: String,
+    anchor_index: String,
+    anchor_name: String,
+    anchor_policy_sha256: String,
+    anchor_sha256: Option<String>,
+    anchor_size: u64,
+    anchor_state: String,
+    baseline_floor: u64,
+    clear_protected: bool,
+    floor_attributes: String,
+    floor_index: String,
+    floor_name: String,
+    floor_policy_sha256: String,
+    floor_size: u64,
+    owner_sealed: bool,
+    profile: String,
+    schema: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootcStatus {
+    spec: BootcSpec,
+    status: BootcState,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootcSpec {
+    image: BootcSpecImage,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootcSpecImage {
+    image: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootcState {
+    booted: BootcBooted,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootcBooted {
+    image: BootcBootedImage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootcBootedImage {
+    image: BootcSpecImage,
+    image_digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthenticatedOtaStatus {
+    committed_generation: Option<u64>,
+    completion_version: u64,
+    enforce_ready_verified: bool,
+    profile: String,
+    schema: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -272,6 +375,99 @@ pub(crate) trait NvAnchor {
 pub(crate) struct CommandTpm {
     pub(crate) index: u32,
     pub(crate) scratch: FileStateStore,
+}
+
+/// Read-only TPM adapter for the public status command. Keeping it separate
+/// from `CommandTpm` makes it structurally impossible for status inspection to
+/// reach the provision and extend methods used by the transactional writer.
+struct StatusCommandTpm {
+    index: u32,
+    scratch: FileStateStore,
+}
+
+trait StatusNvAnchor {
+    fn read_anchor(&self) -> Result<[u8; 32], InternalError>;
+    fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError>;
+}
+
+impl StatusNvAnchor for StatusCommandTpm {
+    fn read_anchor(&self) -> Result<[u8; 32], InternalError> {
+        let output = self.scratch.secure_temp_bytes("nv-read", &[])?;
+        let mut command = Command::new(tool("tpm2_nvread"));
+        command
+            .args([
+                format!("0x{:08x}", self.index),
+                "-C".into(),
+                format!("0x{:08x}", self.index),
+                "-s".into(),
+                "32".into(),
+                "-o".into(),
+            ])
+            .arg(output.path());
+        let result = run_status_helper(&mut command, "tpm2_nvread")?;
+        if result.timed_out {
+            return Err(InternalError("tpm2_nvread timed out".into()));
+        }
+        if result.overflowed {
+            return Err(InternalError(
+                "tpm2_nvread exceeded its output bound".into(),
+            ));
+        }
+        if !result.status.success() {
+            return Err(InternalError(format!(
+                "tpm2_nvread failed for initialized 0x{:08x}",
+                self.index
+            )));
+        }
+        output.read()?.try_into().map_err(|_| {
+            InternalError(format!(
+                "TPM NV 0x{:08x} did not return exactly 32 bytes",
+                self.index
+            ))
+        })
+    }
+
+    fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+        let output = self.scratch.secure_temp_bytes("legacy-nv-read", &[])?;
+        let mut command = Command::new(tool("tpm2_nvread"));
+        command
+            .args([
+                format!("0x{LEGACY_NV_INDEX:08x}"),
+                "-C".into(),
+                format!("0x{LEGACY_NV_INDEX:08x}"),
+                "-s".into(),
+                "8".into(),
+                "-o".into(),
+            ])
+            .arg(output.path());
+        let read = run_status_helper(&mut command, "legacy tpm2_nvread")?;
+        if read.timed_out || read.overflowed {
+            return Err(InternalError(
+                "legacy TPM floor read exceeded its process bound".into(),
+            ));
+        }
+        if !read.status.success() {
+            let mut command = Command::new(tool("tpm2_getcap"));
+            command.arg("handles-nv-index");
+            let handles = run_status_helper(&mut command, "tpm2_getcap")?;
+            if handles.timed_out || handles.overflowed || !handles.status.success() {
+                return Err(InternalError("cannot enumerate TPM NV handles".into()));
+            }
+            let handles = String::from_utf8(handles.stdout)
+                .map_err(|_| InternalError("TPM NV handle list is not UTF-8".into()))?;
+            if contains_nv_handle(&handles, LEGACY_NV_INDEX) {
+                return Err(InternalError(
+                    "legacy TPM floor exists but cannot be read exactly".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let bytes: [u8; 8] = output
+            .read()?
+            .try_into()
+            .map_err(|_| InternalError("legacy TPM floor is not exactly 8 bytes".into()))?;
+        Ok(Some(u64::from_be_bytes(bytes)))
+    }
 }
 
 impl NvAnchor for CommandTpm {
@@ -1320,6 +1516,78 @@ impl Store {
         }
     }
 
+    fn read_current_status(
+        &self,
+        nv: &impl StatusNvAnchor,
+    ) -> Result<Option<(LoadedGeneration, bool)>, InternalError> {
+        let observed = hex(nv.read_anchor()?);
+        if !secure_optional_dir(&self.root)? {
+            return if observed == ZERO_ANCHOR {
+                Ok(None)
+            } else {
+                Err(InternalError(
+                    "TPM NV anchor exists while state-v1 root is absent".into(),
+                ))
+            };
+        }
+        let pointer =
+            read_optional_regular(&self.root.join("current"), 0o600)?.ok_or_else(|| {
+                InternalError("state-v1 CURRENT is absent; status never repairs it".into())
+            })?;
+        let generation = parse_pointer(&pointer)?;
+        let scan = self.scan_generations()?;
+        let loaded = self.load_generations(&scan.numbers)?;
+        let matches: Vec<_> = loaded
+            .iter()
+            .filter(|value| value.nv_anchor == observed)
+            .collect();
+        let current = match matches.as_slice() {
+            [value] if value.manifest.generation == generation => (*value).clone(),
+            _ => {
+                return Err(InternalError(
+                    "state-v1 CURRENT does not identify one unique anchored generation".into(),
+                ))
+            }
+        };
+        let legacy_floor = nv
+            .legacy_bundle_floor()?
+            .ok_or_else(|| InternalError("legacy TPM floor is absent".into()))?;
+        if current.manifest.legacy_bundle_floor != Some(legacy_floor) {
+            return Err(InternalError(
+                "legacy floor differs from TPM-anchored state-v1 manifest".into(),
+            ));
+        }
+        let ready = match read_optional_regular(&self.root.join("enforce-ready.json"), 0o600)? {
+            None => false,
+            Some(bytes) => {
+                let value: EnforceReady =
+                    parse_canonical(&bytes, "state-v1 enforce-ready").map_err(InternalError)?;
+                let expected = EnforceReady {
+                    manifest_sha256: current.manifest_sha256.clone(),
+                    nv_anchor: current.nv_anchor.clone(),
+                    schema: "neural-ice-ota-enforce-ready-v1".into(),
+                };
+                if value != expected {
+                    return Err(InternalError(
+                        "state-v1 enforce marker differs from the authenticated generation".into(),
+                    ));
+                }
+                true
+            }
+        };
+        if hex(nv.read_anchor()?) != observed {
+            return Err(InternalError(
+                "TPM NV anchor changed during read-only status verification".into(),
+            ));
+        }
+        if nv.legacy_bundle_floor()? != Some(legacy_floor) {
+            return Err(InternalError(
+                "legacy TPM floor changed during read-only status verification".into(),
+            ));
+        }
+        Ok(Some((current, ready)))
+    }
+
     fn accept_current(
         &self,
         nv: &dyn NvAnchor,
@@ -2184,6 +2452,877 @@ fn read_regular(path: &Path, mode: u32) -> Result<Vec<u8>, InternalError> {
     Ok(bytes)
 }
 
+pub(crate) fn run_authenticated_ota_status(args: &[String]) -> Result<u8, InternalError> {
+    // The host gate has a 15-second outer timeout. Start the complete reader
+    // budget at command entry and reserve three seconds for normal error
+    // propagation and volatile cleanup before that supervisor deadline.
+    #[cfg(not(feature = "test-path-overrides"))]
+    let operation_timeout = std::time::Duration::from_secs(12);
+    #[cfg(feature = "test-path-overrides")]
+    let operation_timeout = std::time::Duration::from_secs(3);
+    crate::runner::with_operation_deadline(operation_timeout, || {
+        run_authenticated_ota_status_bounded(args)
+    })
+}
+
+fn run_authenticated_ota_status_bounded(args: &[String]) -> Result<u8, InternalError> {
+    crate::runner::check_operation_deadline("argument validation")?;
+    if !args.is_empty() {
+        return Err(InternalError(
+            "authenticated-ota-status takes no arguments".into(),
+        ));
+    }
+    #[cfg(feature = "test-path-overrides")]
+    let config_path = std::env::var_os("NI_OTA_AUTH_STATUS_CONFIG")
+        .map_or_else(|| PathBuf::from(crate::DEFAULT_CONFIG), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let config_path = PathBuf::from(crate::DEFAULT_CONFIG);
+    let config = crate::config::Config::load(&config_path)?;
+    crate::runner::check_operation_deadline("persistent-state configuration")?;
+    let state_dir = config
+        .state_dir
+        .as_deref()
+        .ok_or_else(|| InternalError("authenticated OTA status requires state_dir".into()))?;
+
+    #[cfg(feature = "test-path-overrides")]
+    let scratch_root = std::env::var_os("NI_OTA_AUTH_STATUS_SCRATCH_ROOT")
+        .map_or_else(|| PathBuf::from(STATUS_SCRATCH_ROOT), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let scratch_root = PathBuf::from(STATUS_SCRATCH_ROOT);
+    crate::runner::check_operation_deadline("volatile operation allocation")?;
+    ensure_secure_state_directory(&scratch_root)?;
+    let operation = StatusOperation::create(&scratch_root)?;
+    let snapshot_root = operation.path.join("persistent-state");
+    crate::runner::check_operation_deadline("initial persistent-state capture")?;
+    let before = match capture_persistent_tree(state_dir, Some(&snapshot_root))? {
+        Ok(value) => value,
+        Err(reason) => return status_refusal(reason),
+    };
+    crate::runner::check_operation_deadline("snapshot configuration")?;
+    let snapshot_config = operation.path.join("ota.conf");
+    write_snapshot_config(&snapshot_config, &config, &snapshot_root)?;
+    crate::runner::check_operation_deadline("authenticated status checks")?;
+    let authenticated = authenticate_status(&snapshot_root, &snapshot_config, &operation.path);
+    crate::runner::check_operation_deadline("final persistent-state capture")?;
+    let after = match capture_persistent_tree(state_dir, None)? {
+        Ok(value) => value,
+        Err(reason) => return status_refusal(reason),
+    };
+    if before != after {
+        return status_refusal(
+            "persistent OTA state changed during authenticated read-only status".into(),
+        );
+    }
+    crate::runner::check_operation_deadline("status result validation")?;
+    let status = match authenticated? {
+        Ok(value) => value,
+        Err(reason) => return status_refusal(reason),
+    };
+    let mut bytes = serde_json::to_vec(&status).map_err(|error| {
+        InternalError(format!(
+            "cannot serialize authenticated OTA status: {error}"
+        ))
+    })?;
+    bytes.push(b'\n');
+    crate::runner::check_operation_deadline("status success output")?;
+    print!(
+        "{}",
+        String::from_utf8(bytes).expect("status JSON is UTF-8")
+    );
+    Ok(crate::EXIT_PASS)
+}
+
+fn status_refusal(reason: String) -> Result<u8, InternalError> {
+    eprintln!("ni-ota-verify: authenticated OTA status REFUSED: {reason}");
+    Ok(crate::EXIT_REFUSE)
+}
+
+fn authenticate_status(
+    state_dir: &Path,
+    config_path: &Path,
+    operation: &Path,
+) -> Result<Result<AuthenticatedOtaStatus, String>, InternalError> {
+    let first_public = match read_state_public()? {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let profile = match select_state_profile(&first_public) {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let completion = match crate::access_profile_anchor::verified_owner_completion(state_dir)? {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let scratch_store = FileStateStore {
+        path: operation.join("access-profile-operation"),
+    };
+    let enrolled =
+        match crate::access_profile_anchor::enrolled_access_profile(state_dir, &scratch_store)? {
+            Ok(value) => value,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    if enrolled.is_empty() {
+        return Ok(Err("authenticated access profile is empty".into()));
+    }
+
+    let mut initial_owner_inspection = None;
+    let outcome = match profile {
+        StateProfile::RetainedPlatformV1 => {
+            if completion.completion_version != 1
+                || state_dir.join("owner-ceremony-evidence-v2.json").exists()
+                || state_dir.join("preseal-input-v1").exists()
+                || state_dir.join("preseal").exists()
+            {
+                return Ok(Err(
+                    "historical TPM backend is mixed with owner-profile evidence".into(),
+                ));
+            }
+            let tpm = StatusCommandTpm {
+                index: STATE_NV_INDEX,
+                scratch: FileStateStore {
+                    path: operation.join("historical-tpm-operation"),
+                },
+            };
+            let current = match (Store {
+                root: state_dir.join("state-v1"),
+            })
+            .read_current_status(&tpm)
+            {
+                Ok(Some(value)) => value,
+                Ok(None) => return Ok(Err("historical OTA state is unprovisioned".into())),
+                Err(error) => return Ok(Err(error.0)),
+            };
+            Ok(AuthenticatedOtaStatus {
+                committed_generation: Some(current.0.manifest.generation),
+                completion_version: 1,
+                enforce_ready_verified: current.1,
+                profile: "retained-platform-state-v1".into(),
+                schema: "neural-ice-authenticated-ota-status-v1".into(),
+            })
+        }
+        StateProfile::OwnerSealedV1 { written } => {
+            if let Err(reason) = require_owner_profile_marker() {
+                return Ok(Err(reason));
+            }
+            if completion.completion_version != 2
+                || completion.baseline_floor.is_none()
+                || completion.preseal_receipt_sha256.is_none()
+                || completion.preseal_set_sha256.is_none()
+                || state_dir.join("owner-ceremony-evidence-v1.json").exists()
+            {
+                return Ok(Err(
+                    "owner TPM backend lacks one exact version-2 completion binding".into(),
+                ));
+            }
+            let inspection = match inspect_owner_state()? {
+                Ok(value) => value,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if let Err(reason) = validate_owner_inspection(&inspection, &first_public, &completion)
+            {
+                return Ok(Err(reason));
+            }
+            initial_owner_inspection = Some(inspection.clone());
+            let input = state_dir.join("preseal-input-v1");
+            let receipt = state_dir.join("preseal/receipt.json");
+            let verified =
+                match crate::preseal::verify_retained(&crate::preseal::RetainedPresealPaths {
+                    set: &input.join("preseal-set.json"),
+                    snapshot: &input.join("delegation-snapshot.json"),
+                    snapshot_signature: &input.join("delegation-snapshot.sig"),
+                    release: &input.join("ota-release-authorization.json"),
+                    release_signature: &input.join("ota-release-authorization.sig"),
+                    bom: &input.join("bom.json"),
+                    installer_authorization: &input.join("installer-release-authorization-v2.json"),
+                    installer_authorization_signature: &input
+                        .join("installer-release-authorization-v2.sig"),
+                    receipt: &receipt,
+                    expected_set_sha256: completion.preseal_set_sha256.as_deref().expect("checked"),
+                    expected_receipt_sha256: completion
+                        .preseal_receipt_sha256
+                        .as_deref()
+                        .expect("checked"),
+                    scratch_dir: operation,
+                    config: config_path,
+                })? {
+                    Ok(value) => value,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+            if completion.baseline_floor != Some(verified.bundle_seq)
+                || inspection.baseline_floor != verified.bundle_seq
+            {
+                return Ok(Err(
+                    "owner baseline floor differs from authenticated preseal evidence".into(),
+                ));
+            }
+            if written {
+                Err(
+                    "owner-written OTA state requires the pending typed licensing/time R2 verifier"
+                        .into(),
+                )
+            } else if state_dir.join("state-v1").exists() {
+                Err("pristine owner anchor is mixed with generation state".into())
+            } else if let Err(reason) = verify_running_baseline(&verified) {
+                Err(reason)
+            } else {
+                Ok(AuthenticatedOtaStatus {
+                    committed_generation: None,
+                    completion_version: 2,
+                    enforce_ready_verified: false,
+                    profile: OWNER_STATE_PROFILE.into(),
+                    schema: "neural-ice-authenticated-ota-status-v1".into(),
+                })
+            }
+        }
+    };
+
+    let final_public = match read_state_public()? {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if final_public != first_public {
+        return Ok(Err(
+            "TPM NV02 public state changed during status verification".into(),
+        ));
+    }
+    if let Some(initial_inspection) = initial_owner_inspection {
+        let final_inspection = match inspect_owner_state()? {
+            Ok(value) => value,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if final_inspection != initial_inspection {
+            return Ok(Err(
+                "TPM owner state changed during status verification".into()
+            ));
+        }
+        if let Err(reason) =
+            validate_owner_inspection(&final_inspection, &final_public, &completion)
+        {
+            return Ok(Err(reason));
+        }
+    }
+    Ok(outcome)
+}
+
+fn read_state_public() -> Result<Result<NvPublicArea, String>, InternalError> {
+    let mut command = Command::new(tool("tpm2_nvreadpublic"));
+    command.arg(format!("0x{STATE_NV_INDEX:08x}"));
+    let output = run_status_helper(&mut command, "tpm2_nvreadpublic")?;
+    if output.timed_out {
+        return Err(InternalError("TPM NV02 public inspection timed out".into()));
+    }
+    if output.overflowed {
+        return Ok(Err(
+            "TPM NV02 public inspection exceeds its output bound".into()
+        ));
+    }
+    if !output.status.success() {
+        return Ok(Err("TPM NV02 public state is absent or unreadable".into()));
+    }
+    let text = match String::from_utf8(output.stdout) {
+        Ok(value) => value,
+        Err(_) => return Ok(Err("TPM NV02 public inspection is not UTF-8".into())),
+    };
+    match parse_state_index_public(&text, STATE_NV_INDEX) {
+        Ok(value) => Ok(Ok(value)),
+        Err(error) => Ok(Err(error.0)),
+    }
+}
+
+fn select_state_profile(public: &NvPublicArea) -> Result<StateProfile, String> {
+    let historical_written = format!("{STATE_NV_ATTRIBUTES}|written");
+    if public.algorithm == "sha256"
+        && public.size == 32
+        && public.authorization_policy == STATE_NV_DELETE_AUTH_POLICY
+        && public.attributes == STATE_NV_ATTRIBUTES
+        && public.name == STATE_NV_NAME_UNWRITTEN
+    {
+        return Ok(StateProfile::RetainedPlatformV1);
+    }
+    if public.algorithm == "sha256"
+        && public.size == 32
+        && public.authorization_policy == STATE_NV_DELETE_AUTH_POLICY
+        && public.attributes == historical_written
+        && public.name == STATE_NV_NAME_WRITTEN
+    {
+        return Ok(StateProfile::RetainedPlatformV1);
+    }
+    let owner_written = format!("{OWNER_STATE_NV_ATTRIBUTES}|written");
+    if public.algorithm == "sha256"
+        && public.size == 32
+        && public.authorization_policy == OWNER_STATE_NV_POLICY
+    {
+        if public.attributes == OWNER_STATE_NV_ATTRIBUTES
+            && public.name == OWNER_STATE_NV_NAME_PRISTINE
+        {
+            return Ok(StateProfile::OwnerSealedV1 { written: false });
+        }
+        if public.attributes == owner_written && public.name == OWNER_STATE_NV_NAME_WRITTEN {
+            return Ok(StateProfile::OwnerSealedV1 { written: true });
+        }
+    }
+    Err("TPM NV02 does not match either exact supported backend".into())
+}
+
+fn inspect_owner_state() -> Result<Result<OwnerStateInspection, String>, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let helper = match std::env::var_os("NI_OTA_OWNER_STATE_HELPER") {
+        Some(path) => PathBuf::from(path),
+        None => return Ok(Err("test owner-state helper was not configured".into())),
+    };
+    #[cfg(not(feature = "test-path-overrides"))]
+    let helper = PathBuf::from(OWNER_HELPER);
+    let mut command = Command::new(helper);
+    command.arg("inspect-v2");
+    let output = run_status_helper(&mut command, "owner-state inspection")?;
+    if output.timed_out {
+        return Err(InternalError("owner-state inspection timed out".into()));
+    }
+    if output.overflowed {
+        return Ok(Err("owner-state inspection exceeds its output bound".into()));
+    }
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Ok(Err(
+            "owner-state inspection refused or emitted diagnostics".into()
+        ));
+    }
+    let value: OwnerStateInspection =
+        match parse_canonical(&output.stdout, "owner-state inspection") {
+            Ok(value) => value,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    Ok(Ok(value))
+}
+
+fn validate_owner_inspection(
+    value: &OwnerStateInspection,
+    public: &NvPublicArea,
+    completion: &crate::access_profile_anchor::VerifiedOwnerCompletion,
+) -> Result<(), String> {
+    let written = public.name == OWNER_STATE_NV_NAME_WRITTEN;
+    if value.schema != "neural-ice-owner-ota-state-inspection-v2"
+        || value.profile != OWNER_STATE_PROFILE
+        || value.anchor_index != "0x01500002"
+        || value.anchor_attributes != "0x2060048"
+        || value.anchor_policy_sha256 != OWNER_STATE_NV_POLICY
+        || value.anchor_size != 32
+        || value.anchor_name != public.name
+        || value.floor_index != "0x01500001"
+        || value.floor_attributes != "0x62008"
+        || value.floor_name != OWNER_FLOOR_NV_NAME
+        || value.floor_policy_sha256 != OWNER_FLOOR_NV_POLICY
+        || value.floor_size != 8
+        || !safe_uint(value.baseline_floor)
+        || completion.baseline_floor != Some(value.baseline_floor)
+        || !value.owner_sealed
+        || !value.clear_protected
+        || (written
+            && (value.anchor_state != "written"
+                || value
+                    .anchor_sha256
+                    .as_deref()
+                    .is_none_or(|hash| !sha256(hash))))
+        || (!written && (value.anchor_state != "pristine" || value.anchor_sha256.is_some()))
+    {
+        return Err("owner-state inspection does not match the selected TPM backend".into());
+    }
+    Ok(())
+}
+
+fn verify_running_baseline(value: &crate::preseal::VerifiedPreseal) -> Result<(), String> {
+    #[cfg(feature = "test-path-overrides")]
+    let bootc = std::env::var_os("NI_OTA_AUTH_STATUS_BOOTC")
+        .map_or_else(|| PathBuf::from("/usr/bin/bootc"), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let bootc = PathBuf::from("/usr/bin/bootc");
+    #[cfg(feature = "test-path-overrides")]
+    let payload = std::env::var_os("NI_OTA_AUTH_STATUS_PAYLOAD_ID")
+        .map_or_else(|| PathBuf::from(PAYLOAD_ID_MARKER), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let payload = PathBuf::from(PAYLOAD_ID_MARKER);
+    verify_running_baseline_at(value, &bootc, &payload)
+}
+
+fn verify_running_baseline_at(
+    value: &crate::preseal::VerifiedPreseal,
+    bootc: &Path,
+    payload: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new(bootc);
+    command.args(["status", "--json"]);
+    let output =
+        run_status_helper(&mut command, "booted deployment inspection").map_err(|error| error.0)?;
+    if output.timed_out || output.overflowed || !output.status.success() {
+        return Err("booted deployment inspection failed or exceeded its bound".into());
+    }
+    let status: BootcStatus = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("bootc status is malformed: {error}"))?;
+    if status.spec.image.image != status.status.booted.image.image.image
+        || status.spec.image.image != value.target_os_ref
+        || status.status.booted.image.image_digest != value.target_os_manifest_digest
+        || !status
+            .status
+            .booted
+            .image
+            .image_digest
+            .strip_prefix("sha256:")
+            .is_some_and(sha256)
+    {
+        return Err("booted deployment differs from authenticated preseal baseline".into());
+    }
+    let bytes = read_noatime_regular(payload, 0o644, 256)
+        .map_err(|error| format!("cannot authenticate running PAYLOAD_ID: {}", error.0))?;
+    if bytes != format!("{}\n", value.seed_ref).as_bytes() {
+        return Err("running PAYLOAD_ID differs from authenticated preseal baseline".into());
+    }
+    Ok(())
+}
+
+pub(crate) type StatusHelperOutput = runner::BoundedOutput;
+
+pub(crate) fn run_status_helper(
+    command: &mut Command,
+    label: &str,
+) -> Result<StatusHelperOutput, InternalError> {
+    runner::bounded_output(command, None, label)
+}
+
+fn require_owner_profile_marker() -> Result<(), String> {
+    #[cfg(feature = "test-path-overrides")]
+    let marker = std::env::var_os("NI_OTA_AUTH_STATUS_PROFILE_MARKER")
+        .map_or_else(|| PathBuf::from(OWNER_PROFILE_MARKER), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let marker = PathBuf::from(OWNER_PROFILE_MARKER);
+    let bytes = read_noatime_regular(&marker, 0o644, 128).map_err(|error| {
+        format!(
+            "cannot authenticate immutable OTA profile marker: {}",
+            error.0
+        )
+    })?;
+    if bytes != b"owner-sealed-ota-state-v1\n" {
+        return Err("immutable OTA profile marker is not the owner-sealed contract".into());
+    }
+    Ok(())
+}
+
+fn write_snapshot_config(
+    path: &Path,
+    config: &crate::config::Config,
+    state_dir: &Path,
+) -> Result<(), InternalError> {
+    let root = config
+        .root_pubkey
+        .as_deref()
+        .ok_or_else(|| InternalError("authenticated OTA status requires root_pubkey".into()))?;
+    let compat = config.device_compat.ok_or_else(|| {
+        InternalError(
+            "authenticated OTA status requires the closed device compatibility range".into(),
+        )
+    })?;
+    let text = format!(
+        "enforce=1\nroot_pubkey={}\nstate_dir={}\ndevice_compat_min={}\ndevice_compat_max={}\n",
+        root.display(),
+        state_dir.display(),
+        compat.0,
+        compat.1
+    );
+    // This is operation-local state under /run. Exclusive creation and a
+    // complete write are required before helper handoff; persistence across a
+    // crash is neither useful nor part of this volatile scratch contract.
+    let mut file = new_file(path).map_err(|error| {
+        InternalError(format!(
+            "cannot create volatile snapshot config {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(text.as_bytes()).map_err(|error| {
+        InternalError(format!(
+            "cannot write volatile snapshot config {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TreeEntry {
+    bytes: Option<Vec<u8>>,
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    size: u64,
+    atime: i64,
+    atime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+struct StatusOperation {
+    path: PathBuf,
+}
+
+impl StatusOperation {
+    fn create(root: &Path) -> Result<Self, InternalError> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..128 {
+            let path = root.join(format!(
+                "operation-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(InternalError(format!(
+                        "cannot create volatile authenticated-status operation: {error}"
+                    )))
+                }
+            }
+        }
+        Err(InternalError(
+            "cannot allocate a unique volatile authenticated-status operation".into(),
+        ))
+    }
+}
+
+impl Drop for StatusOperation {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn capture_persistent_tree(
+    source: &Path,
+    destination: Option<&Path>,
+) -> Result<Result<BTreeMap<PathBuf, TreeEntry>, String>, InternalError> {
+    crate::runner::check_operation_deadline("persistent-state tree capture")?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, destination);
+        return Err(InternalError(
+            "authenticated OTA status persistent snapshots require Linux O_NOATIME".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let root = match open_status_directory(source) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Err(format!(
+                    "cannot open persistent OTA state without metadata writes: {error}"
+                )))
+            }
+        };
+        if let Some(destination) = destination {
+            crate::runner::check_operation_deadline("volatile snapshot directory creation")?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(destination)
+                .map_err(|error| {
+                    InternalError(format!("cannot create volatile state snapshot: {error}"))
+                })?;
+        }
+        let mut entries = BTreeMap::new();
+        let mut total = 0_usize;
+        match capture_directory(
+            &root,
+            Path::new(""),
+            destination,
+            0,
+            &mut total,
+            &mut entries,
+        ) {
+            Ok(()) => Ok(Ok(entries)),
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_directory(
+    directory: &File,
+    relative: &Path,
+    destination_root: Option<&Path>,
+    depth: usize,
+    total: &mut usize,
+    entries: &mut BTreeMap<PathBuf, TreeEntry>,
+) -> Result<(), String> {
+    crate::runner::check_operation_deadline("persistent-state directory traversal")
+        .map_err(|error| error.0)?;
+    if depth > STATUS_MAX_DEPTH || entries.len() >= STATUS_MAX_FILES {
+        return Err("persistent OTA state exceeds its inventory bound".into());
+    }
+    let before = directory.metadata().map_err(|error| error.to_string())?;
+    validate_status_metadata(&before, true)?;
+    let names = list_status_directory(directory).map_err(|error| error.to_string())?;
+    for name in names {
+        crate::runner::check_operation_deadline("persistent-state entry capture")
+            .map_err(|error| error.0)?;
+        if entries.len() >= STATUS_MAX_FILES {
+            return Err("persistent OTA state exceeds its file-count bound".into());
+        }
+        let path = relative.join(&name);
+        match open_status_directory_at(directory, &name) {
+            Ok(child) => {
+                if let Some(root) = destination_root {
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(root.join(&path))
+                        .map_err(|error| error.to_string())?;
+                }
+                capture_directory(&child, &path, destination_root, depth + 1, total, entries)?;
+            }
+            Err(error) if error.raw_os_error() == Some(20) => {
+                let (record, bytes) = read_status_regular_at(directory, &name, 1024 * 1024)?;
+                *total = total
+                    .checked_add(bytes.len())
+                    .ok_or("persistent OTA state size overflow")?;
+                if *total > STATUS_MAX_TOTAL_BYTES {
+                    return Err("persistent OTA state exceeds its total byte bound".into());
+                }
+                if let Some(root) = destination_root {
+                    let target = root.join(&path);
+                    let mut output = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&target)
+                        .map_err(|error| error.to_string())?;
+                    output
+                        .write_all(&bytes)
+                        .map_err(|error| error.to_string())?;
+                }
+                entries.insert(
+                    path,
+                    TreeEntry {
+                        bytes: Some(bytes),
+                        ..record
+                    },
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "unsafe persistent OTA state entry {:?}: {error}",
+                    name
+                ))
+            }
+        }
+    }
+    crate::runner::check_operation_deadline("persistent-state directory reattestation")
+        .map_err(|error| error.0)?;
+    let after = directory.metadata().map_err(|error| error.to_string())?;
+    validate_status_metadata(&after, true)?;
+    let record = tree_entry(&after, None);
+    if tree_entry(&before, None) != record {
+        return Err("persistent OTA state directory metadata changed during snapshot".into());
+    }
+    entries.insert(relative.to_path_buf(), record);
+    Ok(())
+}
+
+fn validate_status_metadata(metadata: &std::fs::Metadata, directory: bool) -> Result<(), String> {
+    let expected_mode = if directory { 0o700 } else { 0o600 };
+    if (directory && !metadata.file_type().is_dir())
+        || (!directory && !metadata.file_type().is_file())
+        || metadata.mode() & 0o7777 != expected_mode
+        || metadata.nlink() == 0
+        || (!directory && metadata.nlink() != 1)
+        || (unsafe { geteuid() } == 0 && metadata.uid() != 0)
+    {
+        return Err(format!("persistent OTA state has unsafe mode/owner/type metadata; expected {expected_mode:04o}"));
+    }
+    Ok(())
+}
+
+fn tree_entry(metadata: &std::fs::Metadata, bytes: Option<Vec<u8>>) -> TreeEntry {
+    TreeEntry {
+        bytes,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        nlink: metadata.nlink(),
+        size: metadata.size(),
+        atime: metadata.atime(),
+        atime_nsec: metadata.atime_nsec(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+fn read_noatime_regular(path: &Path, mode: u32, maximum: usize) -> Result<Vec<u8>, InternalError> {
+    #[cfg(target_os = "linux")]
+    const NOATIME: i32 = 0o1000000;
+    #[cfg(not(target_os = "linux"))]
+    const NOATIME: i32 = 0;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | NOATIME)
+        .open(path)
+        .map_err(|error| {
+            InternalError(format!(
+                "cannot open {} without atime mutation: {error}",
+                path.display()
+            ))
+        })?;
+    let before = file
+        .metadata()
+        .map_err(|error| InternalError(error.to_string()))?;
+    if !before.file_type().is_file() || before.mode() & 0o7777 != mode || before.nlink() != 1 {
+        return Err(InternalError(format!(
+            "{} has unsafe metadata",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| InternalError(error.to_string()))?;
+    if bytes.len() > maximum {
+        return Err(InternalError(format!(
+            "{} exceeds its read bound",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn open_status_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(status_o_directory() | O_NOFOLLOW | 0o1000000)
+        .open(path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_status_directory_at(parent: &File, name: &std::ffi::OsStr) -> std::io::Result<File> {
+    status_openat(parent, name, status_o_directory() | O_NOFOLLOW | 0o1000000)
+}
+
+#[cfg(target_os = "linux")]
+fn read_status_regular_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    maximum: usize,
+) -> Result<(TreeEntry, Vec<u8>), String> {
+    let file = status_openat(parent, name, O_NOFOLLOW | 0o1000000 | 0o4000)
+        .map_err(|error| error.to_string())?;
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    validate_status_metadata(&before, false)?;
+    let mut bytes = Vec::new();
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > maximum {
+        return Err("persistent OTA state file exceeds its per-file bound".into());
+    }
+    let after = status_openat(parent, name, O_NOFOLLOW | 0o1000000 | 0o4000)
+        .and_then(|file| file.metadata())
+        .map_err(|error| error.to_string())?;
+    if tree_entry(&before, None) != tree_entry(&after, None) {
+        return Err("persistent OTA state file metadata changed during snapshot".into());
+    }
+    Ok((tree_entry(&after, None), bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn status_openat(parent: &File, name: &std::ffi::OsStr, flags: i32) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags | 0o2000000, 0_u32) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn list_status_directory(directory: &File) -> std::io::Result<Vec<OsString>> {
+    let scan = status_openat(
+        directory,
+        std::ffi::OsStr::new("."),
+        status_o_directory() | O_NOFOLLOW | 0o1000000,
+    )?;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut names = Vec::new();
+    loop {
+        let count = unsafe {
+            syscall(
+                status_getdents64_syscall(),
+                scan.as_raw_fd(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count == 0 {
+            break;
+        }
+        let mut offset = 0_usize;
+        while offset < count as usize {
+            if offset + 19 > count as usize {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            let record = &buffer[offset..count as usize];
+            let reclen = u16::from_ne_bytes([record[16], record[17]]) as usize;
+            if reclen < 20 || offset + reclen > count as usize {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            let raw = &record[19..reclen];
+            let end = raw
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let name = &raw[..end];
+            if name != b"." && name != b".." {
+                if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                names.push(std::os::unix::ffi::OsStringExt::from_vec(name.to_vec()));
+            }
+            offset += reclen;
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn status_o_directory() -> i32 {
+    0o200000
+}
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const fn status_o_directory() -> i32 {
+    0o40000
+}
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn status_getdents64_syscall() -> std::os::raw::c_long {
+    217
+}
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const fn status_getdents64_syscall() -> std::os::raw::c_long {
+    61
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn openat(dirfd: i32, pathname: *const std::os::raw::c_char, flags: i32, ...) -> i32;
+    fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
+}
+
 fn sync_dir(path: &Path) -> Result<(), InternalError> {
     File::open(path)
         .and_then(|file| file.sync_all())
@@ -2260,6 +3399,29 @@ fn nonce_from(source: &Path) -> Result<String, InternalError> {
 }
 
 fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> {
+    let public = parse_state_index_public(output, index)?;
+    let expected_written = format!("{STATE_NV_ATTRIBUTES}|written");
+    let written = public.attributes == expected_written;
+    let expected_name = if written {
+        STATE_NV_NAME_WRITTEN
+    } else {
+        STATE_NV_NAME_UNWRITTEN
+    };
+    if public.algorithm != "sha256"
+        || (!written && public.attributes != STATE_NV_ATTRIBUTES)
+        || public.size != 32
+        || public.name != expected_name
+        || public.authorization_policy != STATE_NV_DELETE_AUTH_POLICY
+    {
+        return Err(invalid_index(
+            index,
+            "public area, name, or root-authorized deletion policy mismatch",
+        ));
+    }
+    Ok(written)
+}
+
+fn parse_state_index_public(output: &str, index: u32) -> Result<NvPublicArea, InternalError> {
     #[derive(Clone, Copy)]
     enum Section {
         HashAlgorithm,
@@ -2267,6 +3429,7 @@ fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> 
     }
 
     let mut in_index = false;
+    let mut matching_sections = 0_u8;
     let mut section = None;
     let mut name = None;
     let mut algorithm = None;
@@ -2275,16 +3438,31 @@ fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> 
     let mut authorization_policy = None;
     for line in output.lines() {
         let trimmed = line.trim();
-        if parse_index_header(trimmed) == Some(index) {
-            in_index = true;
-            section = None;
-            continue;
+        if let Some(observed_index) = parse_index_header(trimmed) {
+            if observed_index == index {
+                matching_sections = matching_sections.saturating_add(1);
+                if matching_sections != 1 {
+                    return Err(invalid_index(index, "duplicate public-area section"));
+                }
+                in_index = true;
+                section = None;
+                continue;
+            }
+            if in_index {
+                return Err(invalid_index(
+                    index,
+                    "unexpected second public-area section",
+                ));
+            }
         }
         if !in_index {
             continue;
         }
         if !line.chars().next().is_some_and(char::is_whitespace) && trimmed.ends_with(':') {
-            break;
+            return Err(invalid_index(
+                index,
+                "unexpected trailing public-area section",
+            ));
         }
         if let Some(value) = trimmed.strip_prefix("name:") {
             name = parse_unique_hex(name, value, 34, "name", index)?;
@@ -2326,6 +3504,11 @@ fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> 
                 }
                 None => return Err(invalid_index(index, "friendly value outside a section")),
             }
+        } else if trimmed.strip_prefix("value:").is_some() {
+            if section.is_none() {
+                return Err(invalid_index(index, "value outside a public-area section"));
+            }
+            section = None;
         } else if let Some(value) = trimmed.strip_prefix("size:") {
             if size.is_some() {
                 return Err(invalid_index(index, "duplicate size"));
@@ -2341,27 +3524,23 @@ fn inspect_state_index(output: &str, index: u32) -> Result<bool, InternalError> 
                 index,
             )?;
             section = None;
+        } else if !trimmed.is_empty() {
+            return Err(invalid_index(index, "unknown public-area field"));
         }
     }
-    let expected_written = format!("{STATE_NV_ATTRIBUTES}|written");
-    let written = attributes.as_deref() == Some(expected_written.as_str());
-    let expected_name = if written {
-        STATE_NV_NAME_WRITTEN
-    } else {
-        STATE_NV_NAME_UNWRITTEN
-    };
-    if algorithm != Some("sha256")
-        || (!written && attributes.as_deref() != Some(STATE_NV_ATTRIBUTES))
-        || size != Some(32)
-        || name.as_deref() != Some(expected_name)
-        || authorization_policy.as_deref() != Some(STATE_NV_DELETE_AUTH_POLICY)
-    {
-        return Err(invalid_index(
-            index,
-            "public area, name, or root-authorized deletion policy mismatch",
-        ));
+    if matching_sections != 1 {
+        return Err(invalid_index(index, "public-area section is absent"));
     }
-    Ok(written)
+    Ok(NvPublicArea {
+        name: name.ok_or_else(|| invalid_index(index, "name is absent"))?,
+        algorithm: algorithm
+            .ok_or_else(|| invalid_index(index, "hash algorithm is absent"))?
+            .to_owned(),
+        attributes: attributes.ok_or_else(|| invalid_index(index, "attributes are absent"))?,
+        size: size.ok_or_else(|| invalid_index(index, "size is absent"))?,
+        authorization_policy: authorization_policy
+            .ok_or_else(|| invalid_index(index, "authorization policy is absent"))?,
+    })
 }
 
 fn parse_unique_text<'a>(
@@ -2442,14 +3621,15 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[cfg(feature = "test-path-overrides")]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn hex_bytes(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);
-        value
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
             .collect()
     }
 
@@ -2552,6 +3732,33 @@ mod tests {
 
         fn extend(&self, _digest: [u8; 32]) -> Result<(), InternalError> {
             Err(InternalError("test anchor cannot be extended".into()))
+        }
+    }
+
+    impl StatusNvAnchor for TestAnchor {
+        fn read_anchor(&self) -> Result<[u8; 32], InternalError> {
+            self.read()
+        }
+
+        fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+            NvAnchor::legacy_bundle_floor(self)
+        }
+    }
+
+    struct ChangingStatusFloor {
+        anchor: [u8; 32],
+        floor_reads: Cell<u8>,
+    }
+
+    impl StatusNvAnchor for ChangingStatusFloor {
+        fn read_anchor(&self) -> Result<[u8; 32], InternalError> {
+            Ok(self.anchor)
+        }
+
+        fn legacy_bundle_floor(&self) -> Result<Option<u64>, InternalError> {
+            let reads = self.floor_reads.get();
+            self.floor_reads.set(reads.saturating_add(1));
+            Ok(Some(if reads == 0 { 1 } else { 2 }))
         }
     }
 
@@ -3106,6 +4313,131 @@ mod tests {
         );
         assert!(store.verify_enforce_ready(&nv).is_ok());
         assert!(store.root.join("enforce-ready.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_status_reads_exact_current_and_ready_without_repair() {
+        let (store, root) = test_store();
+        let (manifest_sha256, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        write_file(
+            &store.root.join("current"),
+            b"generation-0000000000000001\n",
+        );
+        write_file(
+            &store.root.join("enforce-ready.json"),
+            &canonical(&EnforceReady {
+                manifest_sha256,
+                nv_anchor: anchor.clone(),
+                schema: "neural-ice-ota-enforce-ready-v1".into(),
+            })
+            .unwrap(),
+        );
+        let nv = TestAnchor {
+            anchor: decode_hash(&anchor).unwrap(),
+            initialized: true,
+            readable: true,
+            legacy_floor: Some(1),
+            safe_clock: true,
+        };
+        let (loaded, ready) = store.read_current_status(&nv).unwrap().unwrap();
+        assert_eq!(loaded.manifest.generation, 1);
+        assert!(ready);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_status_refuses_a_changed_legacy_floor_before_return() {
+        let (store, root) = test_store();
+        let (_, anchor) = write_generation(
+            &store,
+            GenerationSpec {
+                generation: 1,
+                bundle: 1,
+                delegation: 1,
+                time_seq: 1,
+                trusted_time: "2026-07-21T12:00:00Z",
+                legacy: Some(1),
+                previous_manifest: None,
+                previous_anchor: ZERO_ANCHOR.into(),
+            },
+        );
+        write_file(
+            &store.root.join("current"),
+            b"generation-0000000000000001\n",
+        );
+        let nv = ChangingStatusFloor {
+            anchor: decode_hash(&anchor).unwrap(),
+            floor_reads: Cell::new(0),
+        };
+        let error = store.read_current_status(&nv).unwrap_err();
+        assert!(error.0.contains("legacy TPM floor changed"), "{}", error.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn expired_operation_deadline_refuses_before_persistent_tree_capture() {
+        let root = std::env::temp_dir().join(format!(
+            "ni-owner-reader-expired-capture-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = crate::runner::with_operation_deadline(std::time::Duration::ZERO, || {
+            capture_persistent_tree(&root, None)
+        })
+        .unwrap_err();
+        assert!(error.0.contains("deadline exceeded"), "{}", error.0);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn expired_operation_deadline_refuses_final_capture_and_cleans_volatile_operation() {
+        let root = std::env::temp_dir().join(format!(
+            "ni-owner-reader-expired-final-{}",
+            std::process::id()
+        ));
+        let state = root.join("state");
+        let scratch = root.join("run");
+        for directory in [&root, &state, &scratch] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write_file(&state.join("stable"), b"stable\n");
+        let error = crate::runner::with_operation_deadline(
+            std::time::Duration::from_millis(20),
+            || -> Result<(), InternalError> {
+                let operation = StatusOperation::create(&scratch)?;
+                let snapshot = operation.path.join("persistent-state");
+                capture_persistent_tree(&state, Some(&snapshot))?.map_err(InternalError)?;
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                crate::runner::check_operation_deadline("final persistent-state capture")?;
+                let _ = capture_persistent_tree(&state, None)?.map_err(InternalError)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.0.contains("final persistent-state capture"),
+            "{}",
+            error.0
+        );
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(std::fs::read(state.join("stable")).unwrap(), b"stable\n");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4120,5 +5452,169 @@ mod tests {
         assert!(monotonic(&manifest, &baseline.trusted, &jump).is_err());
         jump.trusted.trusted_time = "2026-07-22T00:10:02Z".into();
         assert!(monotonic(&manifest, &baseline.trusted, &jump).is_ok());
+    }
+
+    #[test]
+    fn backend_selector_uses_the_full_public_area_and_never_falls_through() {
+        let historical = NvPublicArea {
+            name: STATE_NV_NAME_WRITTEN.into(),
+            algorithm: "sha256".into(),
+            attributes: format!("{STATE_NV_ATTRIBUTES}|written"),
+            size: 32,
+            authorization_policy: STATE_NV_DELETE_AUTH_POLICY.into(),
+        };
+        assert_eq!(
+            select_state_profile(&historical),
+            Ok(StateProfile::RetainedPlatformV1)
+        );
+        let owner = NvPublicArea {
+            name: OWNER_STATE_NV_NAME_PRISTINE.into(),
+            algorithm: "sha256".into(),
+            attributes: OWNER_STATE_NV_ATTRIBUTES.into(),
+            size: 32,
+            authorization_policy: OWNER_STATE_NV_POLICY.into(),
+        };
+        assert_eq!(
+            select_state_profile(&owner),
+            Ok(StateProfile::OwnerSealedV1 { written: false })
+        );
+        for mut hostile in [
+            {
+                let mut value = owner.clone();
+                value.name = STATE_NV_NAME_UNWRITTEN.into();
+                value
+            },
+            {
+                let mut value = owner.clone();
+                value.authorization_policy = STATE_NV_DELETE_AUTH_POLICY.into();
+                value
+            },
+            {
+                let mut value = owner.clone();
+                value.attributes.push_str("|ownerwrite");
+                value
+            },
+        ] {
+            assert!(select_state_profile(&hostile).is_err());
+            hostile.name = OWNER_STATE_NV_NAME_WRITTEN.into();
+            assert!(select_state_profile(&hostile).is_err());
+        }
+    }
+
+    #[test]
+    fn owner_inspection_is_closed_and_bound_to_completion_floor() {
+        let public = NvPublicArea {
+            name: OWNER_STATE_NV_NAME_PRISTINE.into(),
+            algorithm: "sha256".into(),
+            attributes: OWNER_STATE_NV_ATTRIBUTES.into(),
+            size: 32,
+            authorization_policy: OWNER_STATE_NV_POLICY.into(),
+        };
+        let mut completion = crate::access_profile_anchor::VerifiedOwnerCompletion {
+            completion_version: 2,
+            evidence_digest_sha256: "a".repeat(64),
+            preseal_receipt_sha256: Some("b".repeat(64)),
+            preseal_set_sha256: Some("c".repeat(64)),
+            baseline_floor: Some(5),
+        };
+        let mut inspection = OwnerStateInspection {
+            anchor_attributes: "0x2060048".into(),
+            anchor_index: "0x01500002".into(),
+            anchor_name: OWNER_STATE_NV_NAME_PRISTINE.into(),
+            anchor_policy_sha256: OWNER_STATE_NV_POLICY.into(),
+            anchor_sha256: None,
+            anchor_size: 32,
+            anchor_state: "pristine".into(),
+            baseline_floor: 5,
+            clear_protected: true,
+            floor_attributes: "0x62008".into(),
+            floor_index: "0x01500001".into(),
+            floor_name: OWNER_FLOOR_NV_NAME.into(),
+            floor_policy_sha256: OWNER_FLOOR_NV_POLICY.into(),
+            floor_size: 8,
+            owner_sealed: true,
+            profile: OWNER_STATE_PROFILE.into(),
+            schema: "neural-ice-owner-ota-state-inspection-v2".into(),
+        };
+        assert!(validate_owner_inspection(&inspection, &public, &completion).is_ok());
+        inspection.baseline_floor = 6;
+        assert!(validate_owner_inspection(&inspection, &public, &completion).is_err());
+        inspection.baseline_floor = 5;
+        inspection.anchor_sha256 = Some("d".repeat(64));
+        assert!(validate_owner_inspection(&inspection, &public, &completion).is_err());
+        inspection.anchor_sha256 = None;
+        completion.baseline_floor = Some(6);
+        assert!(validate_owner_inspection(&inspection, &public, &completion).is_err());
+    }
+
+    #[test]
+    fn public_parser_rejects_duplicate_selected_sections() {
+        let one = format!(
+            "0x01500002:\n  name: {OWNER_STATE_NV_NAME_PRISTINE}\n  hash algorithm:\n    friendly: sha256\n  attributes:\n    friendly: policywrite|authread|ownerread|no_da|nt=extend\n  size: 32\n  authorization policy: {OWNER_STATE_NV_POLICY}\n"
+        );
+        let error = parse_state_index_public(&format!("{one}{one}"), STATE_NV_INDEX).unwrap_err();
+        assert!(error.0.contains("duplicate public-area section"));
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn pristine_baseline_binds_booted_reference_child_digest_and_payload() {
+        static NEXT_BASELINE: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ni-owner-baseline-{}-{}",
+            std::process::id(),
+            NEXT_BASELINE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let image = "registry.example.test/neural-ice/appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let bootc = root.join("bootc");
+        let bootc_status = serde_json::to_string(&serde_json::json!({
+            "spec":{"image":{"image":image}},
+            "status":{"booted":{"image":{"image":{"image":image},"imageDigest":digest}}}
+        }))
+        .unwrap();
+        std::fs::write(
+            &bootc,
+            format!("#!/bin/sh\nprintf '%s\\n' '{bootc_status}'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bootc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let payload = root.join("PAYLOAD_ID");
+        std::fs::write(&payload, b"fabric-seed-revision\n").unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut verified = crate::preseal::VerifiedPreseal {
+            bundle_seq: 13,
+            receipt_sha256: "c".repeat(64),
+            set_sha256: "d".repeat(64),
+            target_os_ref: image.into(),
+            target_os_manifest_digest: digest.into(),
+            seed_ref: "fabric-seed-revision".into(),
+        };
+        assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_ok());
+        verified.target_os_manifest_digest = format!("sha256:{}", "e".repeat(64));
+        assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_err());
+        verified.target_os_manifest_digest = digest.into();
+        std::fs::write(&payload, b"different-seed\n").unwrap();
+        assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_pristine_status_has_the_exact_null_false_contract() {
+        let status = AuthenticatedOtaStatus {
+            committed_generation: None,
+            completion_version: 2,
+            enforce_ready_verified: false,
+            profile: OWNER_STATE_PROFILE.into(),
+            schema: "neural-ice-authenticated-ota-status-v1".into(),
+        };
+        let mut bytes = serde_json::to_vec(&status).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            bytes,
+            b"{\"committed_generation\":null,\"completion_version\":2,\"enforce_ready_verified\":false,\"profile\":\"owner-sealed-ota-state-v1\",\"schema\":\"neural-ice-authenticated-ota-status-v1\"}\n"
+        );
     }
 }

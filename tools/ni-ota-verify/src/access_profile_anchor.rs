@@ -452,6 +452,18 @@ fn tool(name: &str) -> PathBuf {
     PathBuf::from(format!("/usr/bin/{name}"))
 }
 
+fn bounded_helper(
+    command: &mut Command,
+    label: &str,
+) -> Result<Result<crate::state_v1::StatusHelperOutput, String>, InternalError> {
+    match crate::state_v1::run_status_helper(command, label) {
+        Ok(output) if output.timed_out => Ok(Err(format!("{label} timed out"))),
+        Ok(output) if output.overflowed => Ok(Err(format!("{label} exceeded its output bound"))),
+        Ok(output) => Ok(Ok(output)),
+        Err(error) => Ok(Err(error.0)),
+    }
+}
+
 /// Require the exact same read-only lifecycle proof that gates boot readiness.
 ///
 /// This is deliberately shared with the shell implementation instead of
@@ -471,7 +483,9 @@ fn assert_full_tpm_lifecycle() -> Result<Result<(), String>, InternalError> {
     #[cfg(not(feature = "test-path-overrides"))]
     let executable = PathBuf::from(TPM_LIFECYCLE_STATUS);
 
-    match Command::new(executable).arg("status").output() {
+    let mut command = Command::new(executable);
+    command.arg("status");
+    match bounded_helper(&mut command, "authenticated TPM owner lifecycle")? {
         Ok(output) if output.status.success() => Ok(Ok(())),
         Ok(output) => {
             let detail = String::from_utf8_lossy(&output.stderr);
@@ -480,8 +494,8 @@ fn assert_full_tpm_lifecycle() -> Result<Result<(), String>, InternalError> {
                 detail.trim()
             ))))
         }
-        Err(error) => Ok(Err(reinstall_required(&format!(
-            "the authenticated TPM owner lifecycle cannot be checked ({error})"
+        Err(reason) => Ok(Err(reinstall_required(&format!(
+            "the authenticated TPM owner lifecycle cannot be checked ({reason})"
         )))),
     }
 }
@@ -504,7 +518,9 @@ fn authenticated_completion(
     #[cfg(not(feature = "test-path-overrides"))]
     let executable = PathBuf::from(TPM_STATE_HELPER);
 
-    let output = match Command::new(executable).arg("completion-inspect").output() {
+    let mut command = Command::new(executable);
+    command.arg("completion-inspect");
+    let output = match bounded_helper(&mut command, "TPM ceremony-completion inspection")? {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             let detail = String::from_utf8_lossy(&output.stderr);
@@ -513,9 +529,9 @@ fn authenticated_completion(
                 detail.trim()
             ))));
         }
-        Err(error) => {
+        Err(reason) => {
             return Ok(Err(reinstall_required(&format!(
-                "the TPM ceremony-completion record cannot be read ({error})"
+                "the TPM ceremony-completion record cannot be read ({reason})"
             ))));
         }
     };
@@ -936,20 +952,20 @@ fn verify_der_over_bytes(
 /// installation of the same machine.
 fn tpm_install_counter(store: &FileStateStore) -> Result<Result<u64, String>, InternalError> {
     let output = store.secure_temp_bytes("install-counter", &[])?;
-    let status = Command::new(tool("tpm2_nvread"))
+    let mut command = Command::new(tool("tpm2_nvread"));
+    command
         .arg(format!("0x{INSTALL_COUNTER_NV_INDEX:08x}"))
         .arg("-C")
         .arg(format!("0x{INSTALL_COUNTER_NV_INDEX:08x}"))
         .arg("-s")
         .arg("8")
         .arg("-o")
-        .arg(output.path())
-        .output();
-    let status = match status {
+        .arg(output.path());
+    let status = match bounded_helper(&mut command, "TPM install-counter read")? {
         Ok(value) => value,
-        Err(error) => {
+        Err(reason) => {
             return Ok(Err(reinstall_required(&format!(
-                "this appliance's TPM cannot be queried for its install counter ({error})"
+                "this appliance's TPM cannot be queried for its install counter ({reason})"
             ))))
         }
     };
@@ -995,10 +1011,9 @@ fn profile_binding_digest(profile: &str, target: &str, policy_id: &str) -> Strin
 /// (empty) owner authorization. Reading its CONTENT without checking its SHAPE
 /// would hand that attacker exactly the authority this record exists to remove.
 fn assert_profile_record_shape() -> Result<Result<(), String>, InternalError> {
-    let output = Command::new(tool("tpm2_nvreadpublic"))
-        .arg(format!("0x{PROFILE_RECORD_NV_INDEX:08x}"))
-        .output();
-    let output = match output {
+    let mut command = Command::new(tool("tpm2_nvreadpublic"));
+    command.arg(format!("0x{PROFILE_RECORD_NV_INDEX:08x}"));
+    let output = match bounded_helper(&mut command, "TPM access-profile public read")? {
         Ok(value) if value.status.success() => value,
         _ => {
             return Ok(Err(reinstall_required(&format!(
@@ -1056,20 +1071,20 @@ fn tpm_profile_binding(store: &FileStateStore) -> Result<Result<String, String>,
         return Ok(Err(reason));
     }
     let output = store.secure_temp_bytes("access-profile-record", &[])?;
-    let status = Command::new(tool("tpm2_nvread"))
+    let mut command = Command::new(tool("tpm2_nvread"));
+    command
         .arg(format!("0x{PROFILE_RECORD_NV_INDEX:08x}"))
         .arg("-C")
         .arg(format!("0x{PROFILE_RECORD_NV_INDEX:08x}"))
         .arg("-s")
         .arg(PROFILE_RECORD_BYTES.to_string())
         .arg("-o")
-        .arg(output.path())
-        .output();
-    let status = match status {
+        .arg(output.path());
+    let status = match bounded_helper(&mut command, "TPM access-profile record read")? {
         Ok(value) => value,
-        Err(error) => {
+        Err(reason) => {
             return Ok(Err(reinstall_required(&format!(
-                "this appliance's TPM cannot be queried for its access-profile record ({error})"
+                "this appliance's TPM cannot be queried for its access-profile record ({reason})"
             ))))
         }
     };
@@ -1099,10 +1114,9 @@ fn tpm_profile_binding(store: &FileStateStore) -> Result<Result<String, String>,
 }
 
 fn assert_owner_ceremony_complete() -> Result<Result<(), String>, InternalError> {
-    let output = Command::new(tool("tpm2_getcap"))
-        .arg("properties-variable")
-        .output();
-    let output = match output {
+    let mut command = Command::new(tool("tpm2_getcap"));
+    command.arg("properties-variable");
+    let output = match bounded_helper(&mut command, "TPM owner property read")? {
         Ok(value) if value.status.success() => value,
         _ => {
             return Ok(Err(reinstall_required(
@@ -1139,20 +1153,20 @@ fn attest_live_device_root(
     store: &FileStateStore,
 ) -> Result<Result<(), String>, InternalError> {
     let spki = store.secure_temp_bytes("device-root-spki", &[])?;
-    let readpublic = Command::new(tool("tpm2_readpublic"))
+    let mut command = Command::new(tool("tpm2_readpublic"));
+    command
         .arg("-Q")
         .arg("-c")
         .arg(DEVICE_ROOT_HANDLE)
         .arg("-f")
         .arg("der")
         .arg("-o")
-        .arg(spki.path())
-        .output();
-    let readpublic = match readpublic {
+        .arg(spki.path());
+    let readpublic = match bounded_helper(&mut command, "TPM device-root public read")? {
         Ok(value) => value,
-        Err(error) => {
+        Err(reason) => {
             return Ok(Err(reinstall_required(&format!(
-                "this appliance's TPM cannot be queried for its device root ({error})"
+                "this appliance's TPM cannot be queried for its device root ({reason})"
             ))))
         }
     };
@@ -1169,14 +1183,14 @@ fn attest_live_device_root(
     }
 
     let name = store.secure_temp_bytes("device-root-name", &[])?;
-    let name_output = Command::new(tool("tpm2_readpublic"))
+    let mut command = Command::new(tool("tpm2_readpublic"));
+    command
         .arg("-Q")
         .arg("-c")
         .arg(DEVICE_ROOT_HANDLE)
         .arg("-n")
-        .arg(name.path())
-        .output();
-    match name_output {
+        .arg(name.path());
+    match bounded_helper(&mut command, "TPM device-root Name read")? {
         Ok(value) if value.status.success() => {
             if hex_encode(&name.read()?) != anchor.device_root_name {
                 return Ok(Err(reinstall_required(
@@ -1204,7 +1218,8 @@ fn attest_live_device_root(
     }
     let challenge_file = store.secure_temp_bytes("device-root-nonce", &challenge)?;
     let signature = store.secure_temp_bytes("device-root-nonce-sig", &[])?;
-    let signed = Command::new(tool("tpm2_sign"))
+    let mut command = Command::new(tool("tpm2_sign"));
+    command
         .arg("-Q")
         .arg("-c")
         .arg(DEVICE_ROOT_HANDLE)
@@ -1216,9 +1231,8 @@ fn attest_live_device_root(
         .arg("tss")
         .arg("-o")
         .arg(signature.path())
-        .arg(challenge_file.path())
-        .output();
-    match signed {
+        .arg(challenge_file.path());
+    match bounded_helper(&mut command, "TPM device-root liveness signature")? {
         Ok(value) if value.status.success() => {}
         _ => {
             return Ok(Err(reinstall_required(
@@ -1529,6 +1543,28 @@ mod tests {
 
     #[cfg(feature = "test-path-overrides")]
     static LIFECYCLE_ENV: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn bounded_helper_refuses_timeout() {
+        let mut command = Command::new("bash");
+        command.args(["-c", "sleep 2"]);
+        let reason = bounded_helper(&mut command, "test helper")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(reason, "test helper timed out");
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn bounded_helper_refuses_oversized_output() {
+        let mut command = Command::new("python3");
+        command.args(["-c", "import sys; sys.stdout.write('x' * 65537)"]);
+        let reason = bounded_helper(&mut command, "test helper")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(reason, "test helper exceeded its output bound");
+    }
 
     #[test]
     fn shell_tpm_signature_encoder_satisfies_the_rust_low_s_contract() {

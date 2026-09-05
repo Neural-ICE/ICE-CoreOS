@@ -115,6 +115,7 @@ const USAGE: &str = "usage:
                        --expected-receipt-sha256 <64hex>
                        --receipt <path> --scratch-dir </run/private-work>
                        [--config /etc/neural-ice/ota.conf]
+  ni-ota-verify authenticated-ota-status
   ni-ota-verify release-plan --current <path> --candidate <path>
                        --registry-host <canonical OCI authority>
                        --hardware-target <id> --reader-version <n>
@@ -158,6 +159,7 @@ fn run() -> u8 {
         Some("verify-delegated-usb") => delegated::run_usb(&args[1..]),
         Some("verify-preseal-baseline") => preseal::run(&args[1..]),
         Some("verify-retained-preseal-baseline") => preseal::run_retained(&args[1..]),
+        Some("authenticated-ota-status") => state_v1::run_authenticated_ota_status(&args[1..]),
         #[cfg(feature = "test-path-overrides")]
         Some("test-inspect-owner-completion") => {
             access_profile_anchor::run_owner_completion_test(&args[1..])
