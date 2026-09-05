@@ -29,6 +29,11 @@
 # BUMP: retag + re-pin together:  skopeo inspect --format '{{.Digest}}' \
 #   docker://docker.io/library/rust:<ver>-bookworm
 # --------------------------------------------------------------------------- #
+FROM quay.io/centos-bootc/centos-bootc@sha256:2b7e3b1abf8db094d1efb083721dc0f72e6feeef2355fc16ea010d0266b2bb95 AS systemd-srk-build
+RUN dnf -y install dnf-plugins-core rpm-build rpmdevtools git python3 curl
+COPY image/systemd-srk/build-rpms.sh image/systemd-srk/0001-creds-pin-srk.patch /build/input/
+RUN bash /build/input/build-rpms.sh
+
 FROM docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS ni-ota-verify-build
 WORKDIR /build
 COPY tools/ni-ota-verify/ /build/
@@ -61,7 +66,15 @@ RUN set -eux; \
         | grep -Eq 'statically linked|not a dynamic executable'; \
     /out/ni-ota-verify --version
 
-FROM quay.io/centos-bootc/centos-bootc:stream10
+FROM quay.io/centos-bootc/centos-bootc@sha256:2b7e3b1abf8db094d1efb083721dc0f72e6feeef2355fc16ea010d0266b2bb95
+
+# Writer, PID1 reader/shared library and companion packages are one transaction.
+# RPMs are locally rebuilt from the pinned source; the resulting bootc image is
+# admitted through the existing signed image/release chain.
+RUN --mount=type=bind,from=systemd-srk-build,source=/out,target=/run/ni-systemd-rpms \
+    dnf -y install /run/ni-systemd-rpms/*.rpm && \
+    dnf clean all && \
+    install -D -m 0644 /run/ni-systemd-rpms/provenance.txt /usr/lib/neural-ice/systemd-srk-provenance.txt
 
 ARG NVIDIA_DRIVER_VERSION=580.159.03
 

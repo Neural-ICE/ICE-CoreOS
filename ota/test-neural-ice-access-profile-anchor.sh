@@ -101,10 +101,16 @@ assert der[0] == 0x30
 body = der[2:] if der[1] < 0x80 else der[2 + (der[1] & 0x7F):]
 out = (0x0018).to_bytes(2, "big") + (0x000B).to_bytes(2, "big")
 index = 0
-for _ in range(2):
+for component in range(2):
     assert body[index] == 0x02
     length = body[index + 1]
     value = body[index + 2 : index + 2 + length].lstrip(b"\x00")
+    if component == 1:
+        # Exercise a valid high-S TPM result deterministically on every real
+        # signature; the producer must normalize it for the Rust verifier.
+        order = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+        scalar = int.from_bytes(value, "big")
+        value = max(scalar, order - scalar).to_bytes(32, "big")
     out += (32).to_bytes(2, "big") + value.rjust(32, b"\x00")
     index += 2 + length
 open(sys.argv[2], "wb").write(out)
@@ -308,6 +314,8 @@ tamper_case() { # $1=label  $2=mutation command over a fresh copy in $D
   return 0
 }
 
+# Command substitution must not hide noncanonical trailing bytes from verify.
+tamper_case final-newline 'printf "\n" >> "$D/access-profile-v1.json"'
 # The single most valuable edit an attacker can make.
 tamper_case profile-flip \
   'sed -i "s/customer-locked/lab-managed   /" "$D/access-profile-v1.json"'
@@ -337,7 +345,7 @@ tamper_case corrupt-signature 'printf "not-base64!!\n" > "$D/access-profile-v1.s
 # — re-attested against the live TPM on every boot — still records it.
 tamper_case foreign-signer '
   sed -i "s/customer-locked/lab-managed   /" "$D/access-profile-v1.json"
-  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; head -c -1 "$D/access-profile-v1.json"; } > "$D/payload"
+  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; cat "$D/access-profile-v1.json"; } > "$D/payload"
   openssl dgst -sha256 -sign "'"$TMP"'/other-machine.key" -out "$D/sig.der" "$D/payload"
   base64 -w0 < "$D/sig.der" > "$D/access-profile-v1.sig"
   cp "'"$TMP"'/other-machine.der" "$D/spki.der"
@@ -348,7 +356,7 @@ tamper_case foreign-signer-consistent '
   other_hash="$(sha256sum "'"$TMP"'/other-machine.der" | awk "{print \$1}")"
   sed -i "s/customer-locked/lab-managed   /; s/\"device_root_spki_sha256\":\"'"$SPKI_SHA256"'\"/\"device_root_spki_sha256\":\"$other_hash\"/" \
     "$D/access-profile-v1.json"
-  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; head -c -1 "$D/access-profile-v1.json"; } > "$D/payload"
+  { printf "%s\0" "neural-ice:ota:access-profile-anchor:v1"; cat "$D/access-profile-v1.json"; } > "$D/payload"
   openssl dgst -sha256 -sign "'"$TMP"'/other-machine.key" -out "$D/sig.der" "$D/payload"
   base64 -w0 < "$D/sig.der" > "$D/access-profile-v1.sig"
   base64 -w0 < "'"$TMP"'/other-machine.der" > "$D/access-profile-v1.spki"'
@@ -441,8 +449,8 @@ head -c 60 "$MOCK_STATE/sign-tss-override" > "$MOCK_STATE/truncated" \
 
 # The DER encoder, in isolation: a high-bit scalar gets a 0x00 pad (33-byte
 # INTEGER), leading zeros are stripped (never a non-minimal INTEGER), and an
-# all-zero scalar encodes as the single byte 0x00. openssl asn1parse is the
-# independent oracle, and the encoded r/s must round-trip byte for byte.
+# out-of-range scalar is refused. openssl asn1parse is the independent oracle,
+# and already-low-S values must round-trip byte for byte.
 tss_to_der_direct() { # $1=tss  $2=der — the helper's function, its python3 resolved to PATH
   bash -c 'tool() { command -v "$1"; }; eval "$(sed -n "/^tss_to_der() {/,/^}/p" "$0")"; tss_to_der "$1" "$2"' \
     "$SCRIPT" "$1" "$2"
@@ -458,9 +466,14 @@ der_ints="$(openssl asn1parse -inform DER -in "$TMP/der-out.der" | awk -F'[: ]+'
 [ "$(xxd -p "$TMP/der-out.der" | tr -d '\n' | cut -c1-8)" = "30430221" ] \
   || fail "high-bit r must be a 33-byte padded INTEGER and leading-zero s a 30-byte one (SEQUENCE 0x43)"
 tss_vector "$TMP/der-zero.tss" 0018 000b "$(printf '00%.0s' $(seq 32))" "$S32"
-tss_to_der_direct "$TMP/der-zero.tss" "$TMP/der-zero.der" || fail "the DER encoder refused an all-zero scalar"
-[ "$(openssl asn1parse -inform DER -in "$TMP/der-zero.der" | grep -c 'INTEGER *:00$')" = 1 ] \
-  || fail "an all-zero scalar must encode as INTEGER 00"
+if tss_to_der_direct "$TMP/der-zero.tss" "$TMP/der-zero.der" 2>/dev/null; then
+  fail "the DER encoder accepted an all-zero scalar"
+fi
+ORDER=ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+tss_vector "$TMP/der-order.tss" 0018 000b "$R32" "$ORDER"
+if tss_to_der_direct "$TMP/der-order.tss" "$TMP/der-order.der" 2>/dev/null; then
+  fail "the DER encoder accepted a scalar equal to the group order"
+fi
 
 # --------------------------------------------------------------------------- #
 # 6) THE TEST OVERRIDE MUST NOT BE A PRODUCTION BYPASS.

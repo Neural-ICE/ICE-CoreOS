@@ -132,9 +132,9 @@ with_workspace() {
 }
 
 # --------------------------------------------------------------------------- #
-# Canonical bytes. ONE serialisation, sorted keys, no optional whitespace, LF
-# terminated -- because the signature is over these bytes and a second way to
-# write the same document is a second document.
+# Canonical persisted bytes: sorted keys, no optional whitespace or final LF.
+# anchor_json emits a display LF; enroll command substitution removes it before
+# signing and atomic_write. Rust must match these already-issued bytes exactly.
 # --------------------------------------------------------------------------- #
 anchor_json() { # profile target policy_id seq name spki_sha256 enrolled_at
   printf '{"access_profile":"%s","anchor_seq":%s,"device_root_handle":"%s","device_root_name":"%s","device_root_spki_sha256":"%s","enrolled_at":"%s","hardware_target":"%s","schema":"%s","signed_boot_trust_policy_id":"%s"}\n' \
@@ -198,7 +198,7 @@ device_root_fields() { # $1=identity path -> sets DR_NAME, DR_SPKI_SHA256
 
 # The exact bytes that are signed: domain, a NUL, then the JSON WITHOUT its
 # trailing LF. Identical construction on both sides of the wire.
-signing_payload() { # $1=json (LF-terminated)  $2=output path
+signing_payload() { # $1=json (canonical bytes, no LF)  $2=output path
   { printf '%s\0' "$ANCHOR_DOMAIN"; printf '%s' "${1%$'\n'}"; } > "$2"
 }
 
@@ -216,6 +216,7 @@ import sys
 TPM_ALG_ECDSA = 0x0018
 TPM_ALG_SHA256 = 0x000B
 CURVE_BYTES = 32
+CURVE_ORDER = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
 
 
 def refuse(reason: str) -> None:
@@ -243,6 +244,13 @@ r, offset = parameter(4)
 s, offset = parameter(offset)
 if offset != len(tss):
     refuse("trailing bytes")
+
+# TPM ECDSA may return either equivalent s value. Persist the low-S form
+# required by the Rust verifier, without changing the signed message.
+r_value, s_value = int.from_bytes(r, "big"), int.from_bytes(s, "big")
+if not (0 < r_value < CURVE_ORDER and 0 < s_value < CURVE_ORDER):
+    refuse("scalar is outside the P-256 group order")
+s = min(s_value, CURVE_ORDER - s_value).to_bytes(CURVE_BYTES, "big")
 
 
 def integer(value: bytes) -> bytes:
@@ -379,8 +387,9 @@ verify() {
   local rebuilt
   rebuilt="$(anchor_json "$profile" "$target" "$policy_id" "$seq" "$name" "$spki_hash" \
     "$(json_field "$json" enrolled_at)")"
-  [[ "$rebuilt" == "$json" ]] \
-    || die_reinstall "the anchor is not in its canonical form"
+  if [[ "$rebuilt" != "$json" ]] || ! cmp -s -- "$ANCHOR_JSON" <(printf '%s' "$rebuilt"); then
+    die_reinstall "the anchor is not in its canonical form"
+  fi
   signing_payload "$json" "$WORK/payload"
   "$(tool openssl)" dgst -sha256 -verify <("$(tool openssl)" pkey -pubin -inform DER -in "$WORK/spki.der") \
     -signature "$WORK/signature.der" "$WORK/payload" >/dev/null 2>&1 \

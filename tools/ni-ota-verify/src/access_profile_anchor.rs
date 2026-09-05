@@ -179,7 +179,9 @@ fn known_profile(value: &str) -> bool {
     )
 }
 
-/// Re-serialise the parsed anchor in the ONE canonical form the enroller emits.
+/// Re-serialise the parsed anchor in the ONE canonical form the enroller persists.
+/// Shell command substitution strips the formatter LF before signing and storage.
+/// Preserve those already-issued bytes; never normalise a signed file on disk.
 ///
 /// The signature is verified over THIS, not over the file's bytes. Verifying the
 /// file would accept whatever the file happened to contain -- including bytes no
@@ -191,7 +193,7 @@ fn canonical_bytes(anchor: &Anchor) -> Vec<u8> {
     format!(
         "{{\"access_profile\":\"{}\",\"anchor_seq\":{},\"device_root_handle\":\"{}\",\
 \"device_root_name\":\"{}\",\"device_root_spki_sha256\":\"{}\",\"enrolled_at\":\"{}\",\
-\"hardware_target\":\"{}\",\"schema\":\"{}\",\"signed_boot_trust_policy_id\":\"{}\"}}\n",
+\"hardware_target\":\"{}\",\"schema\":\"{}\",\"signed_boot_trust_policy_id\":\"{}\"}}",
         anchor.access_profile,
         anchor.anchor_seq,
         anchor.device_root_handle,
@@ -843,7 +845,14 @@ pub(crate) fn enrolled_access_profile(
     };
 
     let pem = spki_pem(&spki_der);
-    if let Err(reason) = verify_signature(&pem, ANCHOR_DOMAIN, &anchor_bytes, &signature, store)? {
+    // The delegated verifier removes one mandatory transport LF before adding
+    // the signature domain. Anchor files have no transport LF, so adapt only
+    // this in-memory input; the signed message stays DOMAIN || anchor_bytes.
+    let mut delegated_payload = anchor_bytes.clone();
+    delegated_payload.push(b'\n');
+    if let Err(reason) =
+        verify_signature(&pem, ANCHOR_DOMAIN, &delegated_payload, &signature, store)?
+    {
         return Ok(Err(reinstall_required(&format!(
             "the access-profile anchor is not signed by this machine's device root ({reason})"
         ))));
@@ -988,6 +997,74 @@ mod tests {
 
     #[cfg(feature = "test-path-overrides")]
     static LIFECYCLE_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn shell_tpm_signature_encoder_satisfies_the_rust_low_s_contract() {
+        let source = include_str!("../../../ota/neural-ice-access-profile-anchor.sh");
+        let body = source.split_once("tss_to_der() {").unwrap().1;
+        let body = body.split_once("\n}").unwrap().0;
+        let script = [
+            "set -euo pipefail\ntool() { command -v \"$1\"; }\ntss_to_der() {",
+            body,
+            "\n}\n",
+            r#"tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+python3 - "$tmp/input" <<'PY'
+import sys
+order = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+tss = bytes.fromhex("0018000b0020") + (1).to_bytes(32, "big")
+tss += bytes.fromhex("0020") + (order - 1).to_bytes(32, "big")
+open(sys.argv[1], "wb").write(tss)
+PY
+tss_to_der "$tmp/input" "$tmp/output"
+cat "$tmp/output"
+"#,
+        ]
+        .concat();
+        let output = Command::new("bash").args(["-c", &script]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, [0x30, 6, 2, 1, 1, 2, 1, 1]);
+        assert!(crate::delegated::contract::validate_der_signature(&output.stdout).is_ok());
+    }
+
+    #[test]
+    fn canonical_bytes_match_the_shell_enrollers_persisted_bytes() {
+        // Run the actual shell formatter through the command substitution used
+        // by enroll(), rather than duplicating its JSON spelling in a fixture.
+        let source = include_str!("../../../ota/neural-ice-access-profile-anchor.sh");
+        let body = source.split_once("anchor_json() {").unwrap().1;
+        let body = body.split_once("\n}").unwrap().0;
+        let script = format!(
+            "readonly DEVICE_ROOT_HANDLE=0x81010005 ANCHOR_SCHEMA=neural-ice-access-profile-anchor-v1; \
+             anchor_json() {{{body}\n}}; json=\"$(anchor_json \"$@\")\"; printf '%s' \"$json\""
+        );
+        let output = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &script,
+                "anchor-test",
+                "lab-managed",
+                "nvidia-gb10-arm64",
+                "neural-ice-secureboot-lab-v1",
+                "3",
+                &format!("000b{}", "12".repeat(32)),
+                &"34".repeat(32),
+                "2026-09-05T00:00:00Z",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let anchor: Anchor = serde_json::from_slice(&output.stdout).unwrap();
+        let canonical = canonical_bytes(&anchor);
+        assert_eq!(canonical, output.stdout);
+        assert_eq!(canonical.last(), Some(&b'}'));
+        let mut padded = canonical.clone();
+        padded.push(b'\n');
+        assert_ne!(
+            canonical_bytes(&serde_json::from_slice(&padded).unwrap()),
+            padded
+        );
+    }
 
     fn candidate(dir: &Path, marker: &str) {
         let target = dir.join("usr/lib/neural-ice");
