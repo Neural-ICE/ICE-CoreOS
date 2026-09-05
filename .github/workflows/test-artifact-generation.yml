@@ -89,6 +89,7 @@ on:
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
       - "ci/test-swtpm-monotonic-state.sh"
+      - "ci/test-swtpm-owner-ota-state.sh"
       - "ci/test-gb10-console-boot.sh"
       # Le script qui nomme la machine rend AUSSI son profil réseau de secours :
       # sans lui, une appliance sur un lien sans DHCP n'a aucune adresse et
@@ -180,6 +181,7 @@ on:
       - "build/patches/nvidia-open-inline-sign.patch"
       - "ci/test-kernel-packaging-patch.sh"
       - "ci/test-swtpm-monotonic-state.sh"
+      - "ci/test-swtpm-owner-ota-state.sh"
       - "ci/test-gb10-console-boot.sh"
       # Le script qui nomme la machine rend AUSSI son profil réseau de secours :
       # sans lui, une appliance sur un lien sans DHCP n'a aucune adresse et
@@ -230,7 +232,7 @@ jobs:
             ci/test-kernel-packaging-patch.sh ci/test-linklocal-fallback.sh ci/test-no-shim-chained-updater.sh \
             ci/test-oci-signature-policy.sh ci/test-open-core-boundary.sh ci/test-open-core-workflow.sh \
             ci/run-media-validation.sh \
-            ci/test-stage-nvidia-userspace.sh ci/test-suite-collection.sh ci/test-swtpm-monotonic-state.sh \
+            ci/test-stage-nvidia-userspace.sh ci/test-suite-collection.sh ci/test-swtpm-monotonic-state.sh ci/test-swtpm-owner-ota-state.sh \
             ci/verify-build-context.sh image/build-installer-payload.sh image/build-installer-root.sh \
             image/build-installer-uki.sh image/build-installer-usb.sh image/build-preloaded.sh \
             image/build-seed-v2.sh image/firstboot/neural-ice-firstboot-sshkey.sh image/firstboot/neural-ice-seed-import.sh \
@@ -250,10 +252,10 @@ jobs:
             image/test-tpm-policy-initramfs.sh \
             image/test-verify-preloaded-media.sh ota/neural-ice-access-profile-anchor.sh ota/neural-ice-autoinstall.sh \
             ota/neural-ice-device-root-tpm.sh ota/neural-ice-firstboot-tpm-ceremony.sh ota/neural-ice-lab-baseline-handoff.sh \
-            ota/neural-ice-tpm-policy-check.sh ota/neural-ice-tpm-state.sh ota/test-autoinstall-kargs.sh \
+            ota/neural-ice-tpm-policy-check.sh ota/neural-ice-tpm-state.sh ota/neural-ice-ota-tpm-state.sh ota/test-autoinstall-kargs.sh \
             ota/test-installer-pcr7-coverage.sh \
             ota/test-neural-ice-access-profile-anchor.sh ota/test-neural-ice-device-root-tpm.sh ota/test-neural-ice-lab-baseline-handoff.sh \
-            ota/test-neural-ice-tpm-state.sh ota/test-tpm-signed-policy.sh
+            ota/test-neural-ice-tpm-state.sh ota/test-neural-ice-ota-tpm-state.sh ota/test-tpm-signed-policy.sh
           # The initramfs hooks and the payload library are POSIX sh, on purpose:
           # they run in the initramfs /bin/sh AND are sourced by bash on the build
           # host and by the installer. Checking them as `sh` is what catches a
@@ -429,6 +431,7 @@ jobs:
           ./ota/test-autoinstall-kargs.sh
           ./ota/test-installer-pcr7-coverage.sh
           ./ota/test-neural-ice-tpm-state.sh
+          ./ota/test-neural-ice-ota-tpm-state.sh
           ./ota/test-neural-ice-access-profile-anchor.sh
           # 🔴 AND THE THREE HAND-MAINTAINED LISTS ABOVE ARE CHECKED AGAINST THE
           # TREE. A file added with no wiring fails here rather than being
@@ -469,4 +472,6 @@ jobs:
       # docs/ADR-0015, and this step says so out loud rather than implying
       # coverage it does not have.
       - name: Exercise the TPM helpers against a real software TPM
-        run: ./ci/test-swtpm-monotonic-state.sh
+        run: |
+          ./ci/test-swtpm-monotonic-state.sh
+          ./ci/test-swtpm-owner-ota-state.sh
