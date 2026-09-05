@@ -285,8 +285,10 @@ jobs:
               "image/test-seed-tree-manifest.py",
               "image/verify-preloaded-media.py",
               "ota/neural-ice-luks-token-evidence.py",
+              "ota/neural-ice-preseal-handoff.py",
               "ota/neural-ice-tpm-policy.py",
               "ota/test-neural-ice-luks-token-evidence.py",
+              "ota/test-neural-ice-preseal-handoff.py",
           ]
           missing = [f for f in files if not pathlib.Path(f).is_file()]
           if missing:
@@ -432,6 +434,7 @@ jobs:
           ./ota/test-installer-pcr7-coverage.sh
           ./ota/test-neural-ice-tpm-state.sh
           ./ota/test-neural-ice-ota-tpm-state.sh
+          ./ota/test-neural-ice-preseal-handoff.py
           ./ota/test-neural-ice-access-profile-anchor.sh
           # 🔴 AND THE THREE HAND-MAINTAINED LISTS ABOVE ARE CHECKED AGAINST THE
           # TREE. A file added with no wiring fails here rather than being
