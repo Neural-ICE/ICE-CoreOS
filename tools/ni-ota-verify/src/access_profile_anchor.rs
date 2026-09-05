@@ -580,12 +580,42 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// A TPM ECDSA signature is raw `r||s`; every verifier in this tree speaks DER.
-/// Converted here, once, rather than teaching each of them a second encoding --
-/// the same conversion `ota/neural-ice-access-profile-anchor.sh` performs.
-fn raw_signature_to_der(raw: &[u8]) -> Option<Vec<u8>> {
-    if raw.len() != 64 {
+/// Parse the TCG-marshalled `TPMT_SIGNATURE` requested from `tpm2_sign -f tss`.
+///
+/// `plain` is a tool-specific representation and is DER for the shipped
+/// tpm2-tools. The TSS representation is the TPM wire contract: sigAlg,
+/// hashAlg, then two
+/// variable-length TPM2B parameters. Refuse every shape outside this appliance's
+/// ECDSA-P256/SHA-256 profile before converting the integers to DER.
+fn tss_signature_to_der(tss: &[u8]) -> Option<Vec<u8>> {
+    const TPM_ALG_ECDSA: u16 = 0x0018;
+    const TPM_ALG_SHA256: u16 = 0x000b;
+    const CURVE_BYTES: usize = 32;
+    const CURVE_ORDER: [u8; CURVE_BYTES] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+
+    if tss.len() < 4
+        || u16::from_be_bytes(tss[0..2].try_into().ok()?) != TPM_ALG_ECDSA
+        || u16::from_be_bytes(tss[2..4].try_into().ok()?) != TPM_ALG_SHA256
+    {
         return None;
+    }
+    fn parameter(tss: &[u8], offset: &mut usize) -> Option<[u8; CURVE_BYTES]> {
+        let size = usize::from(u16::from_be_bytes(
+            tss.get(*offset..*offset + 2)?.try_into().ok()?,
+        ));
+        *offset += 2;
+        if size == 0 || size > CURVE_BYTES {
+            return None;
+        }
+        let value = tss.get(*offset..*offset + size)?;
+        *offset += size;
+        let mut scalar = [0u8; CURVE_BYTES];
+        scalar[CURVE_BYTES - size..].copy_from_slice(value);
+        (scalar.iter().any(|byte| *byte != 0) && scalar < CURVE_ORDER).then_some(scalar)
     }
     fn integer(value: &[u8]) -> Vec<u8> {
         let trimmed: &[u8] = {
@@ -604,7 +634,13 @@ fn raw_signature_to_der(raw: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(&body);
         out
     }
-    let body = [integer(&raw[..32]), integer(&raw[32..])].concat();
+    let mut offset = 4;
+    let r = parameter(tss, &mut offset)?;
+    let s = parameter(tss, &mut offset)?;
+    if offset != tss.len() {
+        return None;
+    }
+    let body = [integer(&r), integer(&s)].concat();
     if body.len() > 0x7f {
         return None;
     }
@@ -916,7 +952,7 @@ fn attest_live_device_root(
         .arg("-s")
         .arg("ecdsa")
         .arg("-f")
-        .arg("plain")
+        .arg("tss")
         .arg("-o")
         .arg(signature.path())
         .arg(challenge_file.path())
@@ -929,9 +965,9 @@ fn attest_live_device_root(
             )))
         }
     }
-    let Some(der) = raw_signature_to_der(&signature.read()?) else {
+    let Some(der) = tss_signature_to_der(&signature.read()?) else {
         return Ok(Err(reinstall_required(
-            "the device root produced a liveness signature that is not a 64-byte r||s pair",
+            "the device root produced a liveness signature outside the ECDSA-P256/SHA-256 TPMT_SIGNATURE contract",
         )));
     };
     let pem = spki_pem(&spki_der);
@@ -1409,20 +1445,19 @@ cat "$tmp/output"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A TPM emits raw `r||s`; every verifier in this tree speaks DER. The
-    /// conversion is where a silent defect would make the liveness challenge
-    /// verify nothing, so it is checked against the two cases that actually
-    /// differ: a high bit set (needs a leading zero) and a leading zero byte
-    /// (must be stripped, or the integer is over-long and non-canonical).
+    /// The TSS signature is a stable TPM wire structure. Parse its algorithms,
+    /// bounded non-zero P-256 parameters and complete extent before DER encoding.
     #[test]
-    fn raw_signatures_become_canonical_der() {
-        assert!(raw_signature_to_der(&[0u8; 63]).is_none());
-        assert!(raw_signature_to_der(&[0u8; 65]).is_none());
-
-        let mut raw = [0x01u8; 64];
-        raw[0] = 0x80; // r's high bit set
-        raw[32] = 0x00; // s has a leading zero
-        let der = raw_signature_to_der(&raw).expect("a 64-byte pair must encode");
+    fn tss_signatures_become_canonical_der() {
+        let mut tss = vec![0x00, 0x18, 0x00, 0x0b, 0x00, 0x20];
+        let mut r = [0x01u8; 32];
+        r[0] = 0x80; // r's high bit set
+        let mut s = [0x01u8; 32];
+        s[0] = 0x00; // s has a leading zero
+        tss.extend_from_slice(&r);
+        tss.extend_from_slice(&[0x00, 0x20]);
+        tss.extend_from_slice(&s);
+        let der = tss_signature_to_der(&tss).expect("a valid TPMT_SIGNATURE must encode");
         assert_eq!(der[0], 0x30);
         assert_eq!(usize::from(der[1]), der.len() - 2);
         // r: 0x02 <len> 0x00 0x80 ...   (33 bytes of content)
@@ -1435,6 +1470,34 @@ cat "$tmp/output"
         assert_eq!(der[s_tag], 0x02);
         assert_eq!(der[s_tag + 1], 31);
         assert_ne!(der[s_tag + 2], 0x00);
+
+        let short = [0x00, 0x18, 0x00, 0x0b, 0x00, 0x01, 0x01, 0x00, 0x01, 0x01];
+        assert_eq!(
+            tss_signature_to_der(&short).unwrap(),
+            [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]
+        );
+
+        let mut zero_scalar = short;
+        zero_scalar[6] = 0;
+        let mut order_scalar = vec![0x00, 0x18, 0x00, 0x0b, 0x00, 0x20];
+        order_scalar.extend_from_slice(&[
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ]);
+        order_scalar.extend_from_slice(&[0x00, 0x01, 0x01]);
+        for invalid in [
+            [&tss[..], &[0][..]].concat(),
+            [&[0x00, 0x17][..], &tss[2..]].concat(),
+            [&tss[..2], &[0x00, 0x0c][..], &tss[4..]].concat(),
+            vec![0x00, 0x18, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x01, 0x01],
+            vec![0x00, 0x18, 0x00, 0x0b, 0x00, 0x21],
+            zero_scalar.to_vec(),
+            order_scalar,
+            tss[..tss.len() - 1].to_vec(),
+        ] {
+            assert!(tss_signature_to_der(&invalid).is_none());
+        }
     }
 
     /// Differential shell/Rust vector: Rust must surface the exact read-only
