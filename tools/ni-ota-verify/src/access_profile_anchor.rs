@@ -1549,7 +1549,10 @@ mod tests {
     fn bounded_helper_refuses_timeout() {
         let mut command = Command::new("bash");
         command.args(["-c", "sleep 2"]);
-        let reason = bounded_helper(&mut command, "test helper")
+        let reason =
+            crate::runner::with_operation_deadline(std::time::Duration::from_millis(40), || {
+                bounded_helper(&mut command, "test helper")
+            })
             .unwrap()
             .unwrap_err();
         assert_eq!(reason, "test helper timed out");

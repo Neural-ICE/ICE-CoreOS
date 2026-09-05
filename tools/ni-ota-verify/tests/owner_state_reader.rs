@@ -1166,7 +1166,7 @@ fn helper_timeout_and_oversized_output_refuse_without_success_or_residue() {
             "timeout",
             "#!/bin/sh\nsleep 30 & echo $! > \"$0.child\"\nwait\n",
             2,
-            "timed out",
+            "deadline exceeded",
         ),
         (
             "overflow",

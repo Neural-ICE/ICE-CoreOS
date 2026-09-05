@@ -22,10 +22,7 @@ use crate::InternalError;
 /// gate every shell seam in this tree applies.
 const COSIGN_DEFAULT: &str = "/usr/bin/cosign";
 const MAX_HELPER_OUTPUT: usize = 64 * 1024;
-#[cfg(not(feature = "test-path-overrides"))]
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "test-path-overrides")]
-const HELPER_TIMEOUT: Duration = Duration::from_millis(500);
 
 thread_local! {
     /// Optional deadline for one top-level verification operation. Helpers use
@@ -88,9 +85,18 @@ pub(crate) fn bounded_output(
     stdin: Option<Vec<u8>>,
     label: &str,
 ) -> Result<BoundedOutput, InternalError> {
+    bounded_output_with_timeout(command, stdin, label, HELPER_TIMEOUT)
+}
+
+fn bounded_output_with_timeout(
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+    label: &str,
+    helper_timeout: Duration,
+) -> Result<BoundedOutput, InternalError> {
     check_operation_deadline(label)?;
     let started = Instant::now();
-    let helper_deadline = started + HELPER_TIMEOUT;
+    let helper_deadline = started + helper_timeout;
     let deadline = OPERATION_DEADLINE
         .get()
         .map_or(helper_deadline, |operation| operation.min(helper_deadline));
@@ -363,7 +369,7 @@ mod tests {
     #[cfg(feature = "test-path-overrides")]
     use super::seam::select_cosign;
     #[cfg(feature = "test-path-overrides")]
-    use super::{bounded_output, with_operation_deadline};
+    use super::{bounded_output, bounded_output_with_timeout, with_operation_deadline};
     use super::{sha256_file, COSIGN_DEFAULT};
     use std::io::Write;
     use std::path::PathBuf;
@@ -393,7 +399,13 @@ mod tests {
         let started = Instant::now();
         let mut command = Command::new("bash");
         command.args(["-c", "sleep 30 & wait"]);
-        let output = bounded_output(&mut command, None, "timeout fixture").unwrap();
+        let output = bounded_output_with_timeout(
+            &mut command,
+            None,
+            "timeout fixture",
+            Duration::from_millis(100),
+        )
+        .unwrap();
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(3));
     }

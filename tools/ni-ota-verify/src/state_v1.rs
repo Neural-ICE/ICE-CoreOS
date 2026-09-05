@@ -5592,7 +5592,8 @@ mod tests {
             target_os_manifest_digest: digest.into(),
             seed_ref: "fabric-seed-revision".into(),
         };
-        assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_ok());
+        let result = verify_running_baseline_at(&verified, &bootc, &payload);
+        assert!(result.is_ok(), "{result:?}");
         verified.target_os_manifest_digest = format!("sha256:{}", "e".repeat(64));
         assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_err());
         verified.target_os_manifest_digest = digest.into();
