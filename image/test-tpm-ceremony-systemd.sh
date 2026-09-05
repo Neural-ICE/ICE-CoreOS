@@ -249,17 +249,39 @@ RUN="$TMP/run"
 TOOLS="$TMP/tools"
 MARKERS="$TMP/markers"
 TPM_CALLED="$TMP/tpm-called"
+TPM_COMPLETION="$TMP/tpm-completion"
 mkdir -p "$TOOLS"
 
 cat > "$TOOLS/tpm-state" <<'EOF'
 #!/usr/bin/env bash
 : > "$NI_TEST_TPM_CALLED"
+closed_identity() {
+  [[ "$2" == customer-locked && "$3" == nvidia-gb10-arm64 \
+    && "$4" == neural-ice-secureboot-lab-v1 ]]
+}
 case "$1" in
-  completion-status) exit 1 ;;
-  provisioning-status) exit 0 ;;
-  ceremony-prepare) printf '1 1 %064d\n' 0 ;;
-  state-snapshot) printf '{"freshness_counter":1,"install_counter":1,"schema":"neural-ice-tpm-state-snapshot-v1"}\n' ;;
-  ceremony-finalize|runtime-status) exit 0 ;;
+  completion-status)
+    (( $# == 1 )) && [[ -s "$NI_TEST_TPM_COMPLETION" ]] ;;
+  completion-inspect)
+    (( $# == 1 )) && [[ -s "$NI_TEST_TPM_COMPLETION" ]] || exit 1
+    printf '{"completion_version":1,"evidence_digest_sha256":"%s","schema":"neural-ice-owner-ceremony-completion-inspection-v1"}\n' \
+      "$(cat "$NI_TEST_TPM_COMPLETION")" ;;
+  provisioning-status)
+    (( $# == 1 )) && [[ ! -e "$NI_TEST_TPM_COMPLETION" ]] || exit 1
+    printf 'virgin\n' ;;
+  ceremony-prepare)
+    (( $# == 5 )) && closed_identity "$@" && [[ "$5" == 1 ]] || exit 1
+    printf '1 1 0d980453cfc2147ba50e02b979a2a5c70797d8bf305550949accffabf130324b\n' ;;
+  state-snapshot)
+    (( $# == 4 )) && closed_identity "$@" || exit 1
+    printf '%s\n' '{"freshness_counter":1,"freshness_public_sha256":"2222222222222222222222222222222222222222222222222222222222222222","install_counter":1,"install_public_sha256":"1111111111111111111111111111111111111111111111111111111111111111","profile_binding":"0d980453cfc2147ba50e02b979a2a5c70797d8bf305550949accffabf130324b","schema":"neural-ice-tpm-state-snapshot-v1"}' ;;
+  ceremony-finalize)
+    (( $# == 7 )) && closed_identity "$@" \
+      && [[ "$5" =~ ^[0-9a-f]{64}$ && "$6" == 1 && "$7" == 1 ]] || exit 1
+    printf '%s\n' "$5" > "$NI_TEST_TPM_COMPLETION" ;;
+  runtime-status)
+    (( $# == 7 )) && closed_identity "$@" && [[ -s "$NI_TEST_TPM_COMPLETION" ]] \
+      && [[ "$5" == "$(cat "$NI_TEST_TPM_COMPLETION")" && "$6" == 1 && "$7" == 1 ]] ;;
   *) exit 2 ;;
 esac
 EOF
@@ -319,7 +341,7 @@ prepare_fixture() {
   printf 'neural-ice-secureboot-lab-v1\n' > "$MARKERS/signed-boot-trust-policy-id"
   chmod 0444 "$MARKERS"/*
   : > "$TMP/system-luks"; : > "$TMP/data-luks"
-  rm -f "$TPM_CALLED"
+  rm -f "$TPM_CALLED" "$TPM_COMPLETION"
 }
 
 run_ceremony() { # $1=script, optional $2=access-policy path
@@ -341,6 +363,7 @@ run_ceremony() { # $1=script, optional $2=access-policy path
     NI_FIRSTBOOT_TPM_TEST_LUKS_EVIDENCE="$TOOLS/luks-evidence" \
     NI_FIRSTBOOT_TPM_TEST_RUN_ROOT="$RUN" \
     NI_TEST_TPM_CALLED="$TPM_CALLED" \
+    NI_TEST_TPM_COMPLETION="$TPM_COMPLETION" \
     bash "$script" boot
 }
 
@@ -358,6 +381,8 @@ prepare_fixture
 [[ "$(run_ceremony "$CEREMONY")" == complete ]] \
   || fail "an exact 0600-evidence/0444-marker first boot did not complete"
 [[ -e "$TPM_CALLED" ]] || fail "the exact-mode positive boot never reached the TPM lifecycle"
+[[ "$(run_ceremony "$CEREMONY")" == complete ]] \
+  || fail "the completed v1 fixture did not pass the retained boot validation"
 
 prepare_fixture
 chmod 0644 "$MARKERS/access-policy"
