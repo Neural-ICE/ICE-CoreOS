@@ -850,7 +850,9 @@ pub(crate) fn enrolled_access_profile(
     // this in-memory input; the signed message stays DOMAIN || anchor_bytes.
     let mut delegated_payload = anchor_bytes.clone();
     delegated_payload.push(b'\n');
-    if let Err(reason) = verify_signature(&pem, ANCHOR_DOMAIN, &delegated_payload, &signature, store)? {
+    if let Err(reason) =
+        verify_signature(&pem, ANCHOR_DOMAIN, &delegated_payload, &signature, store)?
+    {
         return Ok(Err(reinstall_required(&format!(
             "the access-profile anchor is not signed by this machine's device root ({reason})"
         ))));
