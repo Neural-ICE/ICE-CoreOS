@@ -66,7 +66,10 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import os
 import re
+import secrets
+import stat
 import struct
 import subprocess
 import sys
@@ -78,6 +81,8 @@ GPT_SIGNATURE = b"EFI PART"
 ESP_TYPE_GUID = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 SECTOR_CANDIDATES = (512, 4096)
 MAX_SECTION_BYTES = 1 << 20
+MAX_MEASUREMENTS_BYTES = 2048
+MEASUREMENTS_SCHEMA = "neural-ice-installer-medium-measurements-v1"
 
 PAYLOAD_SCHEMA = "neural-ice-installer-payload-v1"
 PAYLOAD_HEADER_BYTES = 4096
@@ -137,6 +142,244 @@ READ_CHUNK = 8 << 20
 
 class InspectionError(RuntimeError):
     pass
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+class PinnedRaw:
+    """One admitted raw inode, held through inspection and full-file hashing."""
+
+    def __init__(self, path: Path):
+        inherited = re.fullmatch(r"/proc/self/fd/([0-9]+)", os.fspath(path))
+        self.inherited_fd: int | None = None
+        if inherited is not None and str(int(inherited.group(1))) == inherited.group(1):
+            self.path = Path(os.fspath(path))
+            self.inherited_fd = int(inherited.group(1))
+            self.fd = os.dup(self.inherited_fd)
+        else:
+            self.path = path.absolute()
+            self.fd = os.open(
+                self.path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        metadata = os.fstat(self.fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(self.fd)
+            raise InspectionError("the raw input is not a regular file")
+        if metadata.st_size <= 0:
+            os.close(self.fd)
+            raise InspectionError("the raw input is empty")
+        self.identity = _file_identity(metadata)
+        # All existing parsers reopen this path. /proc/self/fd fixes those opens
+        # to the admitted inode even if an attacker exchanges the caller's path.
+        self.reader_path = Path(f"/proc/self/fd/{self.fd}")
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def assert_stable(self) -> None:
+        if _file_identity(os.fstat(self.fd)) != self.identity:
+            raise InspectionError("the raw input changed while it was being inspected")
+        if self.inherited_fd is not None:
+            if _file_identity(os.fstat(self.inherited_fd)) != self.identity:
+                raise InspectionError(
+                    "the inherited raw descriptor changed during inspection"
+                )
+            return
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise InspectionError(
+                "the raw input path disappeared during inspection"
+            ) from error
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or _file_identity(current) != self.identity
+        ):
+            raise InspectionError("the raw input path was replaced during inspection")
+
+    def sha256(self) -> str:
+        digest = hashlib.sha256()
+        offset = 0
+        size = self.identity[2]
+        while offset < size:
+            block = os.pread(self.fd, min(READ_CHUNK, size - offset), offset)
+            if not block:
+                raise InspectionError(
+                    "the raw input became short while it was being hashed"
+                )
+            digest.update(block)
+            offset += len(block)
+        self.assert_stable()
+        return digest.hexdigest()
+
+    def __enter__(self) -> "PinnedRaw":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+def _open_safe_parent(path: Path) -> tuple[int, str, Path]:
+    absolute = path.absolute()
+    if absolute.name in ("", ".", ".."):
+        raise InspectionError("the measurements output has no file name")
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in absolute.parent.parts[1:]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise InspectionError(
+                "the measurements output directory must be caller-owned and not writable by group or other"
+            )
+        return descriptor, absolute.name, absolute.parent
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_existing_output(parent_fd: int, name: str, *, durable: bool = False) -> bytes | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InspectionError("the measurements output is not a regular file")
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o644:
+            raise InspectionError(
+                "the measurements output has unsafe ownership or mode"
+            )
+        if metadata.st_size > MAX_MEASUREMENTS_BYTES:
+            raise InspectionError("the measurements output exceeds its size bound")
+        contents = b""
+        while len(contents) < metadata.st_size:
+            block = os.read(descriptor, metadata.st_size - len(contents))
+            if not block:
+                break
+            contents += block
+        if len(contents) != metadata.st_size:
+            raise InspectionError("the measurements output changed while it was read")
+        if durable:
+            os.fsync(descriptor)
+        final_metadata = os.fstat(descriptor)
+        try:
+            named_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise InspectionError("the measurements output name disappeared while it was read") from error
+        if (
+            _file_identity(final_metadata) != _file_identity(metadata)
+            or _file_identity(named_metadata) != _file_identity(metadata)
+            or not stat.S_ISREG(named_metadata.st_mode)
+        ):
+            raise InspectionError("the measurements output changed while it was read")
+        return contents
+    finally:
+        os.close(descriptor)
+
+
+def publish_measurements(path: Path, contents: bytes, raw: PinnedRaw) -> None:
+    """Durably create a public result; accept only a byte-identical retry."""
+    if len(contents) > MAX_MEASUREMENTS_BYTES:
+        raise InspectionError("the measurements document exceeds its size bound")
+    parent_fd, name, parent_path = _open_safe_parent(path)
+    temporary = f".{name}.tmp.{secrets.token_hex(12)}"
+    temporary_fd = -1
+    try:
+        existing = _read_existing_output(parent_fd, name, durable=True)
+        if existing is not None:
+            if existing != contents:
+                raise InspectionError(
+                    "the measurements output already contains different bytes"
+                )
+            raw.assert_stable()
+            os.fsync(parent_fd)
+            if _read_existing_output(parent_fd, name, durable=True) != contents:
+                raise InspectionError(
+                    "the retained measurements output changed during retry"
+                )
+            return
+
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        written = 0
+        while written < len(contents):
+            count = os.write(temporary_fd, contents[written:])
+            if count <= 0:
+                raise InspectionError("the measurements output became unwritable")
+            written += count
+        os.fchmod(temporary_fd, 0o644)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        staged = _read_existing_output(parent_fd, temporary)
+        if staged != contents:
+            raise InspectionError("the staged measurements output failed read-back")
+        raw.assert_stable()
+        current_parent = os.stat(parent_path, follow_symlinks=False)
+        parent_metadata = os.fstat(parent_fd)
+        if not stat.S_ISDIR(current_parent.st_mode) or (
+            current_parent.st_dev,
+            current_parent.st_ino,
+        ) != (parent_metadata.st_dev, parent_metadata.st_ino):
+            raise InspectionError("the measurements output directory was replaced")
+        # linkat is an atomic create-new publication: it can never replace an
+        # existing result. The first directory fsync commits the public name;
+        # the second commits removal of the private staging name.
+        os.link(
+            temporary,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(parent_fd)
+        os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if _read_existing_output(parent_fd, name, durable=True) != contents:
+            raise InspectionError("the published measurements output failed read-back")
+    except FileExistsError as error:
+        existing = _read_existing_output(parent_fd, name, durable=True)
+        if existing != contents:
+            raise InspectionError(
+                "the measurements output appeared with different bytes"
+            ) from error
+        raw.assert_stable()
+        os.fsync(parent_fd)
+        if _read_existing_output(parent_fd, name, durable=True) != contents:
+            raise InspectionError("the raced measurements output changed during retry")
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -1396,7 +1639,9 @@ def canonical_esp_paths(discovered: list[str]) -> list[str]:
     return result
 
 
-def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, str]]:
+def check_esp(
+    esp: Fat, arguments: argparse.Namespace
+) -> tuple[str, dict[str, str], str, str]:
     paths = canonical_esp_paths(sorted(esp.walk()))
     manifests = [path for path in paths if ESP_MANIFEST_RE.fullmatch(path)]
     if len(manifests) != 1:
@@ -1473,7 +1718,47 @@ def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, s
     check_tpm_policy_document(set(paths), esp.read_file, cmdline)
     if not arguments.allow_unsigned and not pe_has_signature(blob):
         raise InspectionError("BOOTAA64.EFI carries no signature")
-    return cmdline, fields
+    return (
+        cmdline,
+        fields,
+        hashlib.sha256(blob).hexdigest(),
+        hashlib.sha256(sections[".cmdline"]).hexdigest(),
+    )
+
+
+def measurements_document(
+    raw_sha256: str,
+    uki_pe_sha256: str,
+    uki_cmdline_sha256: str,
+    cmdline: str,
+    sealed: dict[str, str],
+) -> bytes:
+    optional = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
+    if optional.get("neuralice.source") != "registry":
+        raise InspectionError(
+            "measurements are available only for a registry Install medium"
+        )
+    digests = {
+        "medium_raw_sha256": raw_sha256,
+        "uki_pe_sha256": uki_pe_sha256,
+        "uki_cmdline_sha256": uki_cmdline_sha256,
+        "rootfs_verity_root_hash": sealed["neuralice.rootverity"],
+        "relauth_key_sha256": sealed["neuralice.relauth_keyid"],
+    }
+    if any(
+        not re.fullmatch(r"(?!0{64})[0-9a-f]{64}", value) for value in digests.values()
+    ):
+        raise InspectionError(
+            "a final medium measurement is not a nonzero lowercase SHA-256"
+        )
+    document = {
+        **digests,
+        "rootfs_verity_hash_algorithm": "sha256",
+        "schema": MEASUREMENTS_SCHEMA,
+    }
+    return (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "ascii"
+    )
 
 
 def main() -> int:
@@ -1506,6 +1791,7 @@ def main() -> int:
     parser.add_argument("--expect-trust-policy-id")
     parser.add_argument("--allow-unsigned", action="store_true")
     parser.add_argument("--payload-partition-name", default=PAYLOAD_PARTITION_NAME)
+    parser.add_argument("--measurements-output", type=Path)
     arguments = parser.parse_args()
 
     for value, label in (
@@ -1517,32 +1803,41 @@ def main() -> int:
             return 2
 
     try:
-        _sector, partitions = read_gpt(arguments.raw)
-        payloads = [p for p in partitions if p.name == arguments.payload_partition_name]
-        if len(payloads) != 1:
-            raise InspectionError(
-                f"expected exactly one partition named {arguments.payload_partition_name!r}, "
-                f"found {len(payloads)} in {[p.name for p in partitions]}"
-            )
-        esp_partitions = [p for p in partitions if p.type_guid == ESP_TYPE_GUID]
-        if len(esp_partitions) != 1:
-            raise InspectionError(
-                f"expected exactly one EFI System Partition, found {len(esp_partitions)}"
-            )
-        with arguments.raw.open("rb") as handle:
-            esp = Fat(handle, esp_partitions[0].offset, esp_partitions[0].length)
-            cmdline, sealed = check_esp(esp, arguments)
-        header = check_payload(arguments.raw, payloads[0], arguments, sealed)
+        with PinnedRaw(arguments.raw) as raw:
+            _sector, partitions = read_gpt(raw.reader_path)
+            payloads = [p for p in partitions if p.name == arguments.payload_partition_name]
+            if len(payloads) != 1:
+                raise InspectionError(
+                    f"expected exactly one partition named {arguments.payload_partition_name!r}, "
+                    f"found {len(payloads)} in {[p.name for p in partitions]}"
+                )
+            esp_partitions = [p for p in partitions if p.type_guid == ESP_TYPE_GUID]
+            if len(esp_partitions) != 1:
+                raise InspectionError(
+                    f"expected exactly one EFI System Partition, found {len(esp_partitions)}"
+                )
+            with raw.reader_path.open("rb") as handle:
+                esp = Fat(handle, esp_partitions[0].offset, esp_partitions[0].length)
+                cmdline, sealed, uki_pe_sha256, uki_cmdline_sha256 = check_esp(
+                    esp, arguments
+                )
+            header = check_payload(raw.reader_path, payloads[0], arguments, sealed)
 
-        # EVERY OTHER PARTITION MUST BE EMPTY. The medium's old boot partition and
-        # its ostree deployment are overwritten, not deleted, and this is where
-        # that is proved: a partition that still carries a kernel, an initramfs
-        # or a BLS entry would be a boot authority nothing signed.
-        known = {payloads[0].index, esp_partitions[0].index}
-        for partition in partitions:
-            if partition.index in known or partition.name == "ni-seed":
-                continue
-            assert_zero(arguments.raw, partition)
+            # EVERY OTHER PARTITION MUST BE EMPTY. The medium's old boot partition and
+            # its ostree deployment are overwritten, not deleted, and this is where
+            # that is proved: a partition that still carries a kernel, an initramfs
+            # or a BLS entry would be a boot authority nothing signed.
+            known = {payloads[0].index, esp_partitions[0].index}
+            for partition in partitions:
+                if partition.index in known or partition.name == "ni-seed":
+                    continue
+                assert_zero(raw.reader_path, partition)
+            raw.assert_stable()
+            if arguments.measurements_output is not None:
+                contents = measurements_document(
+                    raw.sha256(), uki_pe_sha256, uki_cmdline_sha256, cmdline, sealed
+                )
+                publish_measurements(arguments.measurements_output, contents, raw)
     except InspectionError as error:
         print(f"inspect-installer-media: REFUSED: {error}", file=sys.stderr)
         return 1
