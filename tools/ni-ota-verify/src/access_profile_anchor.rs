@@ -77,13 +77,17 @@
 //! unreadable index — all refusals. This module exists to remove the branch
 //! where "there is no evidence" meant "carry on".
 
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use p256::elliptic_curve::ff::PrimeField;
+use p256::Scalar;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::delegated::verify_signature;
+use crate::delegated::{contract::validate_der_signature, verify_signature};
 use crate::state::FileStateStore;
 use crate::{runner, InternalError};
 
@@ -97,11 +101,14 @@ const DEVICE_ROOT_SCHEMA: &str = "neural-ice-device-root-tpm-v1";
 const DEVICE_ROOT_HANDLE: &str = "0x81010005";
 #[cfg(not(feature = "test-path-overrides"))]
 const TPM_LIFECYCLE_STATUS: &str = "/usr/libexec/neural-ice-firstboot-tpm-ceremony";
+#[cfg(not(feature = "test-path-overrides"))]
+const TPM_STATE_HELPER: &str = "/usr/libexec/neural-ice-tpm-state";
 
 const ANCHOR_JSON: &str = "access-profile-v1.json";
 const ANCHOR_SIG: &str = "access-profile-v1.sig";
 const ANCHOR_SPKI: &str = "access-profile-v1.spki";
 const DEVICE_ROOT_IDENTITY: &str = "device-root-v1.json";
+const OWNER_CEREMONY_EVIDENCE: &str = "owner-ceremony-evidence-v1.json";
 
 /// Bounds exist so a hostile or corrupted `/var` cannot make the verifier read
 /// an unbounded file before it has decided anything.
@@ -109,6 +116,7 @@ const MAX_ANCHOR_BYTES: u64 = 1024;
 const MAX_SIGNATURE_BYTES: u64 = 1024;
 const MAX_SPKI_BYTES: u64 = 1024;
 const MAX_IDENTITY_BYTES: u64 = 4096;
+const MAX_OWNER_CEREMONY_EVIDENCE_BYTES: u64 = 16 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,28 +140,72 @@ struct DeviceRootIdentity {
     spki_sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CeremonyAnchorEvidence {
+    json_sha256: String,
+    signature_sha256: String,
+    spki_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct OwnerCeremonyEvidence {
+    access_profile_anchor: CeremonyAnchorEvidence,
+    schema: String,
+}
+
 /// The one refusal string the OTA caller and the operator both key on.
 pub(crate) fn reinstall_required(detail: &str) -> String {
     format!("reinstall required: {detail}")
 }
 
 fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
-    let metadata = std::fs::symlink_metadata(path)
+    let path_metadata = std::fs::symlink_metadata(path)
         .map_err(|_| reinstall_required(&format!("the {label} is absent ({})", path.display())))?;
-    if !metadata.file_type().is_file() {
+    if !path_metadata.file_type().is_file() {
         return Err(reinstall_required(&format!(
             "the {label} is not a regular file ({})",
             path.display()
         )));
     }
-    if metadata.len() == 0 || metadata.len() > maximum {
+    if path_metadata.len() == 0 || path_metadata.len() > maximum {
         return Err(reinstall_required(&format!(
             "the {label} has an implausible size ({} bytes)",
-            metadata.len()
+            path_metadata.len()
         )));
     }
-    std::fs::read(path)
-        .map_err(|_| reinstall_required(&format!("the {label} is unreadable ({})", path.display())))
+    let mut file = std::fs::File::open(path).map_err(|_| {
+        reinstall_required(&format!("the {label} is unreadable ({})", path.display()))
+    })?;
+    let opened_metadata = file.metadata().map_err(|_| {
+        reinstall_required(&format!(
+            "the {label} metadata is unreadable ({})",
+            path.display()
+        ))
+    })?;
+    if !opened_metadata.file_type().is_file()
+        || opened_metadata.dev() != path_metadata.dev()
+        || opened_metadata.ino() != path_metadata.ino()
+    {
+        return Err(reinstall_required(&format!(
+            "the {label} changed while it was opened"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(std::cmp::min(maximum, 16 * 1024) as usize);
+    file.by_ref()
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            reinstall_required(&format!("the {label} is unreadable ({})", path.display()))
+        })?;
+    // Bound the descriptor-held bytes themselves. The path is mutable, but the
+    // caller's snapshot cannot grow after this read or change under later use.
+    if bytes.is_empty() || bytes.len() as u64 > maximum {
+        return Err(reinstall_required(&format!(
+            "the {label} changed to an implausible size while it was read"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -343,6 +395,179 @@ fn assert_full_tpm_lifecycle() -> Result<Result<(), String>, InternalError> {
         }
         Err(error) => Ok(Err(reinstall_required(&format!(
             "the authenticated TPM owner lifecycle cannot be checked ({error})"
+        )))),
+    }
+}
+
+/// Read the digest from the immutable TPM-state helper's read-only
+/// `completion-status` command. That helper validates ownerAuthSet and the
+/// completion NV index's exact public shape, policy, written/write-locked state,
+/// magic and reserved bytes before emitting this digest.
+fn authenticated_completion_digest() -> Result<Result<String, String>, InternalError> {
+    #[cfg(feature = "test-path-overrides")]
+    let executable = match std::env::var_os("NI_OTA_TPM_STATE_HELPER") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            return Ok(Err(reinstall_required(
+                "the test TPM-state helper was not explicitly configured",
+            )))
+        }
+    };
+    #[cfg(not(feature = "test-path-overrides"))]
+    let executable = PathBuf::from(TPM_STATE_HELPER);
+
+    let output = match Command::new(executable).arg("completion-status").output() {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Ok(Err(reinstall_required(&format!(
+                "the TPM ceremony-completion digest cannot be authenticated ({})",
+                detail.trim()
+            ))));
+        }
+        Err(error) => {
+            return Ok(Err(reinstall_required(&format!(
+                "the TPM ceremony-completion digest cannot be read ({error})"
+            ))));
+        }
+    };
+    let digest = match std::str::from_utf8(&output.stdout) {
+        Ok(text) => text.strip_suffix('\n').unwrap_or(text),
+        Err(_) => {
+            return Ok(Err(reinstall_required(
+                "the TPM ceremony-completion digest is not ASCII",
+            )))
+        }
+    };
+    if !is_lower_hex(digest, 64) || output.stdout.iter().filter(|byte| **byte == b'\n').count() > 1
+    {
+        return Ok(Err(reinstall_required(
+            "the TPM ceremony-completion digest is malformed",
+        )));
+    }
+    Ok(Ok(digest.to_owned()))
+}
+
+fn strict_der_integers(signature: &[u8]) -> (&[u8], &[u8]) {
+    // Only called after validate_der_signature() established the complete DER
+    // shape and both scalar ranges. Keep this extractor deliberately dumb so a
+    // second parser cannot silently accept a wider language.
+    let r_len = usize::from(signature[3]);
+    let r = &signature[4..4 + r_len];
+    let s_tag = 4 + r_len;
+    let s_len = usize::from(signature[s_tag + 1]);
+    let s = &signature[s_tag + 2..s_tag + 2 + s_len];
+    (r, s)
+}
+
+fn der_integer_from_scalar(bytes: &[u8; 32]) -> Vec<u8> {
+    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(31);
+    let significant = &bytes[first..];
+    let mut encoded = Vec::with_capacity(35);
+    encoded.push(0x02);
+    encoded.push((significant.len() + usize::from(significant[0] & 0x80 != 0)) as u8);
+    if significant[0] & 0x80 != 0 {
+        encoded.push(0);
+    }
+    encoded.extend_from_slice(significant);
+    encoded
+}
+
+/// Preserve the persisted, NV-authenticated historical bytes. Only the
+/// signature passed to the anchor verifier is canonicalized in memory. The
+/// shared delegated verifier remains unmodified and still rejects every high-S
+/// release signature.
+fn canonicalize_ceremony_bound_signature(signature: &[u8]) -> Result<Vec<u8>, String> {
+    match validate_der_signature(signature) {
+        Ok(()) => return Ok(signature.to_vec()),
+        Err(reason) if reason == "signature is not low-S" => {}
+        Err(reason) => return Err(reason),
+    }
+
+    let (r, s) = strict_der_integers(signature);
+    let significant_s = s.strip_prefix(&[0]).unwrap_or(s);
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes[32 - significant_s.len()..].copy_from_slice(significant_s);
+    let scalar = Option::<Scalar>::from(Scalar::from_repr(scalar_bytes.into()))
+        .ok_or_else(|| "signature integer is outside the P-256 scalar range".to_string())?;
+    let canonical_s: [u8; 32] = (-scalar).to_repr().into();
+
+    let mut body = Vec::with_capacity(70);
+    body.push(0x02);
+    body.push(r.len() as u8);
+    body.extend_from_slice(r);
+    body.extend_from_slice(&der_integer_from_scalar(&canonical_s));
+    let mut canonical = Vec::with_capacity(body.len() + 2);
+    canonical.push(0x30);
+    canonical.push(body.len() as u8);
+    canonical.extend_from_slice(&body);
+    validate_der_signature(&canonical)?;
+    Ok(canonical)
+}
+
+/// Bind the exact in-memory anchor buffers to the write-locked completion NV
+/// record before permitting the one historical high-S compatibility rule.
+/// This closes the A/B path race left by merely running lifecycle status before
+/// reading mutable `/var`: no different bytes can match the authenticated
+/// evidence digest and its three embedded artifact hashes.
+fn ceremony_bound_signature(
+    state_dir: &Path,
+    anchor_bytes: &[u8],
+    signature_encoded: &[u8],
+    spki_encoded: &[u8],
+    signature: &[u8],
+) -> Result<Result<Vec<u8>, String>, InternalError> {
+    let evidence_bytes = match read_bounded(
+        &state_dir.join(OWNER_CEREMONY_EVIDENCE),
+        MAX_OWNER_CEREMONY_EVIDENCE_BYTES,
+        "owner-ceremony evidence",
+    ) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let completion_digest = match authenticated_completion_digest()? {
+        Ok(digest) => digest,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if hex_sha256(&evidence_bytes) != completion_digest {
+        return Ok(Err(reinstall_required(
+            "the owner-ceremony evidence bytes do not match the write-locked TPM completion record",
+        )));
+    }
+    let evidence: OwnerCeremonyEvidence = match serde_json::from_slice(&evidence_bytes) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Ok(Err(reinstall_required(&format!(
+                "the authenticated owner-ceremony evidence is malformed ({error})"
+            ))))
+        }
+    };
+    if evidence.schema != "neural-ice-owner-ceremony-evidence-v1" {
+        return Ok(Err(reinstall_required(
+            "the authenticated owner-ceremony evidence has the wrong schema",
+        )));
+    }
+    let hashes = evidence.access_profile_anchor;
+    if !is_lower_hex(&hashes.json_sha256, 64)
+        || !is_lower_hex(&hashes.signature_sha256, 64)
+        || !is_lower_hex(&hashes.spki_sha256, 64)
+    {
+        return Ok(Err(reinstall_required(
+            "the authenticated owner-ceremony anchor hashes are malformed",
+        )));
+    }
+    if hashes.json_sha256 != hex_sha256(anchor_bytes)
+        || hashes.signature_sha256 != hex_sha256(signature_encoded)
+        || hashes.spki_sha256 != hex_sha256(spki_encoded)
+    {
+        return Ok(Err(reinstall_required(
+            "the access-profile anchor bytes do not match the write-locked owner-ceremony evidence",
+        )));
+    }
+    match canonicalize_ceremony_bound_signature(signature) {
+        Ok(signature) => Ok(Ok(signature)),
+        Err(reason) => Ok(Err(reinstall_required(&format!(
+            "the access-profile anchor signature is invalid ({reason})"
         )))),
     }
 }
@@ -838,9 +1063,19 @@ pub(crate) fn enrolled_access_profile(
         Ok(bytes) => bytes,
         Err(reason) => return Ok(Err(reason)),
     };
-    let signature = match decode_base64_line(&signature_encoded, "access-profile anchor signature")
-    {
-        Ok(bytes) => bytes,
+    let persisted_signature =
+        match decode_base64_line(&signature_encoded, "access-profile anchor signature") {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let signature = match ceremony_bound_signature(
+        state_dir,
+        &anchor_bytes,
+        &signature_encoded,
+        &spki_encoded,
+        &persisted_signature,
+    )? {
+        Ok(signature) => signature,
         Err(reason) => return Ok(Err(reason)),
     };
 
@@ -1025,6 +1260,39 @@ cat "$tmp/output"
         assert!(output.status.success());
         assert_eq!(output.stdout, [0x30, 6, 2, 1, 1, 2, 1, 1]);
         assert!(crate::delegated::contract::validate_der_signature(&output.stdout).is_ok());
+    }
+
+    #[test]
+    fn only_strict_high_s_anchor_der_is_normalized_in_memory() {
+        let low = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        assert_eq!(canonicalize_ceremony_bound_signature(&low).unwrap(), low);
+
+        // (r=1, s=n-1) is strict, in-range DER and the high-S equivalent of
+        // (r=1, s=1). The shared validator must keep refusing the persisted
+        // bytes, while this anchor-local in-memory adapter produces its exact
+        // canonical representative.
+        let mut high = vec![0x30, 0x26, 0x02, 0x01, 0x01, 0x02, 0x21, 0x00];
+        high.extend_from_slice(&[
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x50,
+        ]);
+        assert_eq!(
+            validate_der_signature(&high).unwrap_err(),
+            "signature is not low-S"
+        );
+        assert_eq!(canonicalize_ceremony_bound_signature(&high).unwrap(), low);
+        assert!(validate_der_signature(&low).is_ok());
+
+        let mut out_of_range = high.clone();
+        *out_of_range.last_mut().unwrap() = 0x51; // s=n
+        for invalid in [
+            [&low[..], &[0][..]].concat(),
+            vec![0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01],
+            out_of_range,
+        ] {
+            assert!(canonicalize_ceremony_bound_signature(&invalid).is_err());
+        }
     }
 
     #[test]

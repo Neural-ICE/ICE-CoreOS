@@ -316,14 +316,10 @@ impl Fixture {
         normalise_low_s(&sig_der);
         fs::write(
             dir.join("access-profile-v1.sig"),
-            format!("{}\n", base64_of(&fs::read(&sig_der).unwrap())),
+            base64_of(&fs::read(&sig_der).unwrap()),
         )
         .unwrap();
-        fs::write(
-            dir.join("access-profile-v1.spki"),
-            format!("{}\n", base64_of(&spki)),
-        )
-        .unwrap();
+        fs::write(dir.join("access-profile-v1.spki"), base64_of(&spki)).unwrap();
         // An anchor lifted from ANOTHER appliance is a valid signature over a
         // statement about a different machine; this is how the suite builds one.
         let identity_name = if matches!(defect, AnchorDefect::ForeignDeviceRoot) {
@@ -369,6 +365,40 @@ impl Fixture {
             "neural-ice-secureboot-lab-v1",
         );
         self.write_tpm_mocks(&public_area, seq, &binding);
+        self.write_ceremony_evidence();
+    }
+
+    /// The exact pre-fix producer outcome retained by an already-completed
+    /// appliance: the persisted signature is high-S and its exact encoded bytes
+    /// are part of the evidence digest held by the write-locked TPM record.
+    fn write_historical_high_s_access_profile_anchor(&self, profile: &str, seq: u64) {
+        self.write_access_profile_anchor(profile, seq);
+        let signature_der = self.path("anchor-signature.der");
+        force_high_s(&signature_der);
+        fs::write(
+            self.path("state/access-profile-v1.sig"),
+            base64_of(&fs::read(signature_der).unwrap()),
+        )
+        .unwrap();
+        self.write_ceremony_evidence();
+    }
+
+    fn write_ceremony_evidence(&self) {
+        let state = self.path("state");
+        let evidence = state.join("owner-ceremony-evidence-v1.json");
+        let document = format!(
+            "{{\"access_profile_anchor\":{{\"json_sha256\":\"{}\",\"signature_sha256\":\"{}\",\"spki_sha256\":\"{}\"}},\"schema\":\"neural-ice-owner-ceremony-evidence-v1\"}}\n",
+            sha256_of(&state.join("access-profile-v1.json")),
+            sha256_of(&state.join("access-profile-v1.sig")),
+            sha256_of(&state.join("access-profile-v1.spki")),
+        );
+        fs::write(&evidence, document).unwrap();
+        fs::set_permissions(&evidence, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            self.path("completion-evidence-digest"),
+            format!("{}\n", sha256_of(&evidence)),
+        )
+        .unwrap();
     }
 
     /// The TPM this suite does not have.
@@ -585,6 +615,17 @@ printf 'TPM2_PT_PERMANENT:\n  ownerAuthSet:              %s\n' "${NI_TEST_OWNER_
         )
         .unwrap();
         fs::set_permissions(&getcap, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tpm_state = self.path("tpm-state");
+        fs::write(
+            &tpm_state,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = completion-status ] || exit 2\ncat '{}'\n",
+                self.path("completion-evidence-digest").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tpm_state, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn write_candidate_root(&self, profile: &str) -> PathBuf {
@@ -755,6 +796,44 @@ open(sys.argv[1], "wb").write(b"\x30" + bytes([len(out)]) + out)
     assert!(
         output.status.success(),
         "low-S normalisation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Deterministically select the other valid ECDSA representative. This models
+/// the historical TPM producer without retrying OpenSSL until a coin flip
+/// happens to return high-S.
+fn force_high_s(der: &Path) {
+    let script = r#"
+import sys
+ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+raw = open(sys.argv[1], "rb").read()
+assert raw[0] == 0x30 and raw[1] == len(raw) - 2
+body = raw[2:]
+def take(buf):
+    assert buf[0] == 0x02
+    length = buf[1]
+    return int.from_bytes(buf[2:2 + length], "big"), buf[2 + length:]
+r, rest = take(body)
+s, rest = take(rest)
+assert not rest and 0 < r < ORDER and 0 < s < ORDER
+if s <= ORDER // 2:
+    s = ORDER - s
+def integer(value):
+    encoded = value.to_bytes((value.bit_length() + 8) // 8 or 1, "big")
+    return b"\x02" + bytes([len(encoded)]) + encoded
+out = integer(r) + integer(s)
+open(sys.argv[1], "wb").write(b"\x30" + bytes([len(out)]) + out)
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(der)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "high-S fixture construction failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -2662,6 +2741,7 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
             .env("NI_OTA_TPM2_NVREAD", fx.path("tpm2_nvread"))
             .env("NI_OTA_TPM2_NVREADPUBLIC", fx.path("tpm2_nvreadpublic"))
             .env("NI_OTA_TPM2_GETCAP", fx.path("tpm2_getcap"))
+            .env("NI_OTA_TPM_STATE_HELPER", fx.path("tpm-state"))
             .arg("verify-delegated-beta")
             .args(["--candidate-root".as_ref(), candidate.as_os_str()])
             .args(["--snapshot".as_ref(), snapshot.as_os_str()])
@@ -2908,6 +2988,138 @@ fn delegated_beta_binds_signed_release_receipt_and_immutable_target() {
     fx.write_access_profile_anchor("customer-locked", 1);
     let (code, _, stderr) = command(&cfg);
     assert_eq!(code, 0, "the restored good anchor was refused: {stderr}");
+
+    // (7a) AN AUTHENTICATED HISTORICAL HIGH-S ANCHOR. The old producer could
+    // persist either ECDSA representative. Its exact encoded bytes are retained
+    // in /var and bound by the write-locked ceremony-completion record; only the
+    // verifier's private copy may become low-S.
+    fx.write_historical_high_s_access_profile_anchor("customer-locked", 1);
+    let historical_signature = fs::read(fx.path("state/access-profile-v1.sig")).unwrap();
+    let historical_evidence = fs::read(fx.path("state/owner-ceremony-evidence-v1.json")).unwrap();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(
+        code, 0,
+        "an NV-bound historical high-S anchor was refused: {stderr}"
+    );
+    assert_eq!(
+        fs::read(fx.path("state/access-profile-v1.sig")).unwrap(),
+        historical_signature,
+        "verification rewrote the historical signature"
+    );
+    assert_eq!(
+        fs::read(fx.path("state/owner-ceremony-evidence-v1.json")).unwrap(),
+        historical_evidence,
+        "verification rewrote authenticated ceremony evidence"
+    );
+
+    // Changing only the persisted ECDSA representative is precisely the unsafe
+    // maintenance operation this compatibility reader replaces. Even though the
+    // low-S bytes verify mathematically, they are not the bytes the completion
+    // NV record authenticates.
+    normalise_low_s(&fx.path("anchor-signature.der"));
+    fs::write(
+        fx.path("state/access-profile-v1.sig"),
+        base64_of(&fs::read(fx.path("anchor-signature.der")).unwrap()),
+    )
+    .unwrap();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(code, 1, "malleated signature bytes were accepted: {stderr}");
+    assert!(
+        stderr.contains("do not match the write-locked owner-ceremony evidence"),
+        "{stderr}"
+    );
+
+    // A different evidence document cannot bless those bytes: its exact digest
+    // is not the one stored in the TPM completion record.
+    fs::write(
+        fx.path("state/access-profile-v1.sig"),
+        &historical_signature,
+    )
+    .unwrap();
+    let mut changed_evidence = historical_evidence.clone();
+    changed_evidence.push(b' ');
+    fs::write(
+        fx.path("state/owner-ceremony-evidence-v1.json"),
+        changed_evidence,
+    )
+    .unwrap();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(
+        code, 1,
+        "unauthenticated evidence bytes were accepted: {stderr}"
+    );
+    assert!(
+        stderr.contains("do not match the write-locked TPM completion record"),
+        "{stderr}"
+    );
+
+    // Defense in depth after the NV binding: even a test fixture that advances
+    // its simulated completion digest around a bad bundle cannot bypass the
+    // existing signature verification, strict DER parser or scalar range.
+    fx.write_historical_high_s_access_profile_anchor("customer-locked", 1);
+    let json_path = fx.path("state/access-profile-v1.json");
+    let changed_json = String::from_utf8(fs::read(&json_path).unwrap())
+        .unwrap()
+        .replace("2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z");
+    fs::write(&json_path, changed_json).unwrap();
+    fx.write_ceremony_evidence();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(code, 1, "wrong signed payload was accepted: {stderr}");
+    assert!(
+        stderr.contains("not signed by this machine's device root"),
+        "{stderr}"
+    );
+
+    fx.write_historical_high_s_access_profile_anchor("customer-locked", 1);
+    let foreign_der = fx.path("foreign-anchor-signature.der");
+    openssl(&[
+        "dgst",
+        "-sha256",
+        "-sign",
+        fx.path("foreign-device-root.key").to_str().unwrap(),
+        "-out",
+        foreign_der.to_str().unwrap(),
+        fx.path("anchor-payload.bin").to_str().unwrap(),
+    ]);
+    force_high_s(&foreign_der);
+    fs::write(
+        fx.path("state/access-profile-v1.sig"),
+        base64_of(&fs::read(foreign_der).unwrap()),
+    )
+    .unwrap();
+    fx.write_ceremony_evidence();
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(code, 1, "wrong-key high-S signature was accepted: {stderr}");
+    assert!(
+        stderr.contains("not signed by this machine's device root"),
+        "{stderr}"
+    );
+
+    for invalid in [
+        vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00],
+        {
+            let mut der = vec![0x30, 0x26, 0x02, 0x01, 0x01, 0x02, 0x21, 0x00];
+            der.extend_from_slice(&[
+                0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+                0xfc, 0x63, 0x25, 0x51,
+            ]);
+            der
+        },
+    ] {
+        fs::write(fx.path("state/access-profile-v1.sig"), base64_of(&invalid)).unwrap();
+        fx.write_ceremony_evidence();
+        let (code, _, stderr) = command(&cfg);
+        assert_eq!(code, 1, "invalid DER/scalar was accepted: {stderr}");
+        assert!(stderr.contains("anchor signature is invalid"), "{stderr}");
+    }
+
+    fx.write_access_profile_anchor("customer-locked", 1);
+    let (code, _, stderr) = command(&cfg);
+    assert_eq!(
+        code, 0,
+        "the final restored good anchor was refused: {stderr}"
+    );
 
     let (code, _, stderr) = command_on_machine(&cfg, "NI_TEST_OWNER_AUTH_SET", "0");
     assert_eq!(code, 1, "OTA ran before the owner ceremony: {stderr}");
@@ -3244,6 +3456,7 @@ fn delegated_usb_verifies_exact_local_bundle_without_persisting_state() {
             .env("NI_OTA_TPM2_NVREAD", fx.path("tpm2_nvread"))
             .env("NI_OTA_TPM2_NVREADPUBLIC", fx.path("tpm2_nvreadpublic"))
             .env("NI_OTA_TPM2_GETCAP", fx.path("tpm2_getcap"))
+            .env("NI_OTA_TPM_STATE_HELPER", fx.path("tpm-state"))
             .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
             .env(
                 "NI_OTA_APPLIANCE_VARIANT_FILE",
