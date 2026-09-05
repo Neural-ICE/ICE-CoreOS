@@ -112,6 +112,12 @@ ESP_OPTIONAL = frozenset(
         # signed UKI command line and rechecked below before acceptance.
         "ice-coreos/tpm2-pcr-public-key.pem",
         "ice-coreos/tpm2-pcr-signature.json",
+        "ice-coreos/preseal/preseal-set.json",
+        "ice-coreos/preseal/delegation-snapshot.json",
+        "ice-coreos/preseal/delegation-snapshot.sig",
+        "ice-coreos/preseal/ota-release-authorization.json",
+        "ice-coreos/preseal/ota-release-authorization.sig",
+        "ice-coreos/preseal/bom.json",
     }
 )
 # Every ESP artefact whose digest the sealed command line pins, and the karg that
@@ -310,7 +316,7 @@ class Fat:
                 continue
             yield name, attributes, cluster, size
 
-    def read_file(self, path: str) -> bytes:
+    def read_file(self, path: str, limit: int | None = None) -> bytes:
         parts = [part for part in path.strip("/").split("/") if part]
         block = self._root_bytes()
         for depth, part in enumerate(parts):
@@ -325,6 +331,8 @@ class Fat:
             if depth == len(parts) - 1:
                 if attributes & 0x10:
                     raise InspectionError(f"/{path} is a directory, not a file")
+                if limit is not None and size > limit:
+                    raise InspectionError(f"/{path} exceeds its {limit}-byte bound")
                 return self._chain_bytes(cluster, size)[:size]
             if not attributes & 0x10:
                 raise InspectionError(f"/{'/'.join(parts[: depth + 1])} is not a directory")
@@ -472,6 +480,7 @@ SEALED_INSTALL_OPTIONAL_KEYS = (
     "neuralice.sshkey",
     "neuralice.relauth_sha256",
     "neuralice.relauth_sig_sha256",
+    "neuralice.preseal",
     "neuralice.mirror_ca_sha256",
     "neuralice.mirror_ready",
     "neuralice.mirror_manifest",
@@ -629,6 +638,7 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
     if key in (
         "neuralice.relauth_sha256",
         "neuralice.relauth_sig_sha256",
+        "neuralice.preseal",
         "neuralice.mirror_ca_sha256",
         "neuralice.mirror_ready",
         "neuralice.mirror_manifest",
@@ -812,6 +822,12 @@ def classify_sealed_cmdline(cmdline: str) -> str:
         for key in ("neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"):
             if key in optional:
                 raise SelectorRefusal("release-authorization-without-registry-source")
+
+    if "neuralice.preseal" in optional:
+        if source != "registry":
+            raise SelectorRefusal("preseal-without-registry-source")
+        if sealed_fields(cmdline)["neuralice.access_profile"] != "lab-managed":
+            raise SelectorRefusal("preseal-not-permitted-outside-lab-managed")
 
     # THE MIRROR IS LAB TRANSPORT AND NOTHING ELSE. A mirror on a CUSTOMER
     # appliance puts a lab host in the boot path of a machine that must never
@@ -1100,6 +1116,108 @@ def check_esp_hash_bound(paths: set[str], read_file, cmdline: str) -> None:
             )
 
 
+PRESEAL_PREFIX = "ice-coreos/preseal/"
+PRESEAL_FILES = {
+    PRESEAL_PREFIX + "preseal-set.json": 16 * 1024,
+    PRESEAL_PREFIX + "delegation-snapshot.json": 16 * 1024,
+    PRESEAL_PREFIX + "delegation-snapshot.sig": 1024,
+    PRESEAL_PREFIX + "ota-release-authorization.json": 64 * 1024,
+    PRESEAL_PREFIX + "ota-release-authorization.sig": 1024,
+    PRESEAL_PREFIX + "bom.json": 128 * 1024,
+}
+PRESEAL_FIELDS = {
+    "access_policy_sha256", "access_profile", "attestation_set_sha256",
+    "bom_file_sha256", "bom_sha256", "bundle_seq", "channel_record_sha256",
+    "compat_max", "compat_min", "delegation_seq",
+    "delegation_snapshot_file_sha256", "delegation_snapshot_sha256",
+    "delegation_snapshot_signature_sha256", "hardware_target",
+    "installer_authorization_sha256", "installer_authorization_signature_sha256",
+    "ota_release_authorization_file_sha256", "ota_release_authorization_sha256",
+    "ota_release_authorization_signature_sha256", "ota_state_profile",
+    "release_key_id", "release_signing_role", "ring", "schema", "seed_ref",
+    "signed_boot_trust_policy_id", "target_os_ref", "train", "variant",
+}
+
+
+def _preseal_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise InspectionError(f"preseal-set.json duplicates field {key}")
+        result[key] = value
+    return result
+
+
+def check_preseal_set(paths: set[str], read_file, cmdline: str, fields: dict[str, str]) -> None:
+    """Independently bind every small pre-seal carrier to the signed UKI."""
+    sealed = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
+    expected = sealed.get("neuralice.preseal")
+    present = paths.intersection(PRESEAL_FILES)
+    if expected is None:
+        if present:
+            raise InspectionError("the ESP carries an unbound preseal set")
+        return
+    if present != set(PRESEAL_FILES):
+        raise InspectionError("the signed preseal set is incomplete on the ESP")
+    blobs = {path: read_file(path, limit) for path, limit in PRESEAL_FILES.items()}
+    set_path = PRESEAL_PREFIX + "preseal-set.json"
+    raw = blobs[set_path]
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise InspectionError("preseal-set.json does not match neuralice.preseal")
+    try:
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=_preseal_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InspectionError(f"preseal-set.json is malformed: {error}") from error
+    if not isinstance(document, dict) or set(document) != PRESEAL_FIELDS:
+        raise InspectionError("preseal-set.json does not have its exact closed field set")
+    canonical = (json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    if raw != canonical:
+        raise InspectionError("preseal-set.json is not canonical compact sorted JSON plus LF")
+    exact = {
+        "schema": "neural-ice-installer-preseal-set-v1",
+        "ota_state_profile": "owner-sealed-ota-state-v1",
+        "hardware_target": fields["neuralice.hardware_target"],
+        "variant": "sealed-lab", "access_profile": fields["neuralice.access_profile"],
+        "signed_boot_trust_policy_id": fields["neuralice.trust_policy_id"],
+        "ring": "lab", "release_signing_role": "release-lab",
+        "release_key_id": "release-lab-v1", "delegation_seq": 2,
+        "delegation_snapshot_sha256": "3378808da1841f89db7dcc125fa1c7025662e9b3c099cf8f67a69c5f7341dad0",
+        "target_os_ref": sealed.get("neuralice.osimage"),
+    }
+    for key, value in exact.items():
+        if document.get(key) != value:
+            raise InspectionError(f"preseal-set.json disagrees with {key}")
+    if not document["target_os_ref"].split("@", 1)[0].endswith(
+        "/neural-ice/neural-ice-appliance"
+    ):
+        raise InspectionError("preseal-set.json target_os_ref names the wrong repository")
+    for key in ("bundle_seq", "compat_min", "compat_max"):
+        value = document.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= 9_007_199_254_740_991:
+            raise InspectionError(f"preseal-set.json {key} is not a positive JSON safe integer")
+    if document["compat_min"] > document["compat_max"]:
+        raise InspectionError("preseal-set.json compatibility interval is empty")
+    if not isinstance(document.get("seed_ref"), str) or not re.fullmatch(r"[0-9a-f]{40}", document["seed_ref"]):
+        raise InspectionError("preseal-set.json seed_ref is invalid")
+    if not isinstance(document.get("train"), str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", document["train"]):
+        raise InspectionError("preseal-set.json train is invalid")
+    for key in (name for name in PRESEAL_FIELDS if name.endswith("_sha256")):
+        if not isinstance(document.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", document[key]):
+            raise InspectionError(f"preseal-set.json {key} is not lowercase SHA-256")
+    bindings = {
+        "delegation_snapshot_file_sha256": (PRESEAL_PREFIX + "delegation-snapshot.json", 16 * 1024),
+        "delegation_snapshot_signature_sha256": (PRESEAL_PREFIX + "delegation-snapshot.sig", 1024),
+        "ota_release_authorization_file_sha256": (PRESEAL_PREFIX + "ota-release-authorization.json", 64 * 1024),
+        "ota_release_authorization_signature_sha256": (PRESEAL_PREFIX + "ota-release-authorization.sig", 1024),
+        "bom_file_sha256": (PRESEAL_PREFIX + "bom.json", 128 * 1024),
+        "installer_authorization_sha256": ("ice-coreos/release-authorization.json", 1024),
+        "installer_authorization_signature_sha256": ("ice-coreos/release-authorization.sig", 4 * 1024),
+    }
+    for key, (path, limit) in bindings.items():
+        if path not in paths or document[key] != hashlib.sha256(read_file(path, limit)).hexdigest():
+            raise InspectionError(f"preseal-set.json does not bind {path}")
+
+
 def check_tpm_policy_document(paths: set[str], read_file, cmdline: str) -> None:
     """Prove the staged systemd policy cryptographically authorises generation."""
     signature_path = "ice-coreos/tpm2-pcr-signature.json"
@@ -1244,8 +1362,42 @@ def check_required_pcr_policy_material(paths: set[str], mode: str) -> None:
             )
 
 
+def canonical_esp_paths(discovered: list[str]) -> list[str]:
+    """Map known FAT names to their contract spelling, refusing aliases.
+
+    FAT lookup is case-insensitive and short 8.3 names such as ``preseal`` may
+    be enumerated as ``PRESEAL`` even when created in lowercase. Treating those
+    as different paths makes an honest image unverifiable; accepting two names
+    with the same fold would instead make which bytes are checked ambiguous.
+    """
+    folded: dict[str, str] = {}
+    for path in discovered:
+        key = path.casefold()
+        if key in folded:
+            raise InspectionError(
+                f"the ESP carries case-insensitive path aliases {folded[key]!r} and {path!r}"
+            )
+        folded[key] = path
+    known = set(ESP_REQUIRED) | ESP_OPTIONAL
+    canonical = {path.casefold(): path for path in known}
+    result = []
+    for path in discovered:
+        match = re.fullmatch(
+            r"efi/neural-ice/installer-(install|live)\.efi\.manifest",
+            path,
+            re.IGNORECASE,
+        )
+        if match:
+            result.append(
+                f"EFI/neural-ice/installer-{match.group(1).lower()}.efi.manifest"
+            )
+        else:
+            result.append(canonical.get(path.casefold(), path))
+    return result
+
+
 def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, str]]:
-    paths = sorted(esp.walk())
+    paths = canonical_esp_paths(sorted(esp.walk()))
     manifests = [path for path in paths if ESP_MANIFEST_RE.fullmatch(path)]
     if len(manifests) != 1:
         raise InspectionError(
@@ -1317,6 +1469,7 @@ def check_esp(esp: Fat, arguments: argparse.Namespace) -> tuple[str, dict[str, s
     # and a real medium, and a control that only exists behind that fixture is a
     # control nobody notices the loss of.
     check_esp_hash_bound(set(paths), esp.read_file, cmdline)
+    check_preseal_set(set(paths), esp.read_file, cmdline, fields)
     check_tpm_policy_document(set(paths), esp.read_file, cmdline)
     if not arguments.allow_unsigned and not pe_has_signature(blob):
         raise InspectionError("BOOTAA64.EFI carries no signature")

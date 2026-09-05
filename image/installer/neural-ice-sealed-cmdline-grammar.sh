@@ -260,7 +260,7 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
     neuralice.seed_trusted_now)
       [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
       ;;
-    neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature)
+    neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.preseal|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature)
       # SHA-256 of an artefact the producer staged on the ESP, or of the exact
       # release closure a mirror declares READY. Sealed into the UKI so the
       # mutable ESP cannot decide any of them.
@@ -295,6 +295,7 @@ _ni_sealed_install_optional_keys=(
   neuralice.imgref neuralice.source neuralice.osimage neuralice.mirror
   neuralice.systemsize neuralice.target neuralice.sshkey
   neuralice.relauth_sha256 neuralice.relauth_sig_sha256
+  neuralice.preseal
   neuralice.mirror_ca_sha256 neuralice.mirror_ready neuralice.mirror_manifest
   neuralice.mirror_generation
   neuralice.seed_closure neuralice.seed_manifest neuralice.seed_trusted_now
@@ -540,6 +541,16 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
       || { _ni_sealed_refuse release-authorization-without-registry-source; return 1; }
     [[ -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
       || { _ni_sealed_refuse release-authorization-without-registry-source; return 1; }
+  fi
+
+  # A pre-seal set is an install-time byte-closure for the LAB LIGHT registry
+  # path. It is never a customer or Live-media capability, and without the
+  # registry authorization pair its references would have no signed authority.
+  if [[ -n "${optional_seen[neuralice.preseal]:-}" ]]; then
+    (( registry_source == 1 )) \
+      || { _ni_sealed_refuse preseal-without-registry-source; return 1; }
+    [[ "$(ni_sealed_argument_value neuralice.access_profile "${words[@]}")" == lab-managed ]] \
+      || { _ni_sealed_refuse preseal-not-permitted-outside-lab-managed; return 1; }
   fi
 
   # ------------------------------------------------------------------------- #

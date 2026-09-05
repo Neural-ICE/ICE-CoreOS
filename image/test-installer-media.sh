@@ -31,6 +31,42 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/ni-media.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# FAT is case-insensitive and may enumerate an 8.3 directory in uppercase.
+# Canonicalise only known allowlisted paths, and never let a second spelling
+# choose which entry the inspector reads. This pure check runs even when the
+# host lacks the real media toolchain used below.
+python3 - "$ROOT/image/inspect-installer-media.py" <<'PYEOF'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("media_inspector", pathlib.Path(sys.argv[1]))
+module = importlib.util.module_from_spec(spec)
+assert spec.loader
+spec.loader.exec_module(module)
+expected_bounds = {
+    "ice-coreos/preseal/preseal-set.json": 16 * 1024,
+    "ice-coreos/preseal/delegation-snapshot.json": 16 * 1024,
+    "ice-coreos/preseal/delegation-snapshot.sig": 1024,
+    "ice-coreos/preseal/ota-release-authorization.json": 64 * 1024,
+    "ice-coreos/preseal/ota-release-authorization.sig": 1024,
+    "ice-coreos/preseal/bom.json": 128 * 1024,
+}
+assert module.PRESEAL_FILES == expected_bounds
+paths = module.canonical_esp_paths([
+    "EFI/BOOT/BOOTAA64.EFI", "ice-coreos/PRESEAL/bom.json", "FOREIGN/PATH",
+    "EFI/NEURAL-ICE/INSTALLER-INSTALL.EFI.MANIFEST",
+])
+assert "ice-coreos/preseal/bom.json" in paths
+assert "EFI/neural-ice/installer-install.efi.manifest" in paths
+assert "FOREIGN/PATH" in paths
+try:
+    module.canonical_esp_paths([
+        "ice-coreos/preseal/bom.json", "ICE-COREOS/PRESEAL/BOM.JSON",
+    ])
+except module.InspectionError:
+    pass
+else:
+    raise SystemExit("case-insensitive FAT aliases were accepted")
+PYEOF
+
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
 
@@ -375,6 +411,10 @@ registry_esp_files=(
   "::/ice-coreos/release-authorization.sig=$TMP/relauth.sig"
   "::/ice-coreos/mirror-ca.crt=$TMP/mirror-ca.crt"
 )
+preseal_auth_files=(
+  "::/ice-coreos/release-authorization.json=$TMP/relauth.json"
+  "::/ice-coreos/release-authorization.sig=$TMP/relauth.sig"
+)
 make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
   installer-install.efi.manifest "${registry_esp_files[@]}"
 assemble "$ESP" "$SEALED/payload.img"
@@ -418,6 +458,138 @@ grep -q "neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${r
   || fail "the inspector did not surface the sealed digest-pinned appliance image"
 grep -q 'neuralice.mirror=bench.example.test:5000' "$TMP/inspect-registry.out" \
   || fail "the inspector did not surface the sealed mirror transport"
+
+# A LAB LIGHT medium binds one closed six-file pre-seal set to the signed UKI.
+PRESEAL_DIR="$TMP/preseal"
+mkdir "$PRESEAL_DIR"
+printf '{"snapshot":"synthetic"}\n' > "$PRESEAL_DIR/delegation-snapshot.json"
+printf 'synthetic snapshot signature\n' > "$PRESEAL_DIR/delegation-snapshot.sig"
+printf '{"authorization":"synthetic"}\n' > "$PRESEAL_DIR/ota-release-authorization.json"
+printf 'synthetic authorization signature\n' > "$PRESEAL_DIR/ota-release-authorization.sig"
+printf '{"bom":"synthetic"}\n' > "$PRESEAL_DIR/bom.json"
+python3 - "$PRESEAL_DIR" "$TMP/relauth.json" "$TMP/relauth.sig" \
+  "release.example.test/neural-ice/neural-ice-appliance@${registry_digest}" \
+  "$POLICY_ID" <<'PYEOF'
+import hashlib, json, pathlib, sys
+root, auth, sig = map(pathlib.Path, sys.argv[1:4])
+target = sys.argv[4]
+policy_id = sys.argv[5]
+sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+doc = {
+    "access_policy_sha256":"1"*64,"access_profile":"lab-managed",
+    "attestation_set_sha256":"2"*64,"bom_file_sha256":sha(root/"bom.json"),
+    "bom_sha256":"3"*64,"bundle_seq":7,"channel_record_sha256":"4"*64,
+    "compat_max":9,"compat_min":3,"delegation_seq":2,
+    "delegation_snapshot_file_sha256":sha(root/"delegation-snapshot.json"),
+    "delegation_snapshot_sha256":"3378808da1841f89db7dcc125fa1c7025662e9b3c099cf8f67a69c5f7341dad0",
+    "delegation_snapshot_signature_sha256":sha(root/"delegation-snapshot.sig"),
+    "hardware_target":"nvidia-gb10-arm64","installer_authorization_sha256":sha(auth),
+    "installer_authorization_signature_sha256":sha(sig),
+    "ota_release_authorization_file_sha256":sha(root/"ota-release-authorization.json"),
+    "ota_release_authorization_sha256":"5"*64,
+    "ota_release_authorization_signature_sha256":sha(root/"ota-release-authorization.sig"),
+    "ota_state_profile":"owner-sealed-ota-state-v1","release_key_id":"release-lab-v1",
+    "release_signing_role":"release-lab","ring":"lab",
+    "schema":"neural-ice-installer-preseal-set-v1","seed_ref":"6"*40,
+    "signed_boot_trust_policy_id":policy_id,
+    "target_os_ref":target,"train":"lab-20260905","variant":"sealed-lab",
+}
+(root/"preseal-set.json").write_text(json.dumps(doc,sort_keys=True,separators=(",",":"))+"\n")
+PYEOF
+preseal_sha="$(sha256sum "$PRESEAL_DIR/preseal-set.json" | awk '{print $1}')"
+preseal_kargs="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-appliance@${registry_digest} ${registry_relauth} neuralice.preseal=${preseal_sha}"
+build_uki installer-preseal "$preseal_kargs" >/dev/null \
+  || fail "the LAB LIGHT preseal UKI failed to build"
+preseal_names=(preseal-set.json delegation-snapshot.json delegation-snapshot.sig \
+  ota-release-authorization.json ota-release-authorization.sig bom.json)
+make_preseal_esp() { # $1=uki name [$2=omitted name] [$3=replacement name=path]
+  local uki_name=$1 omitted=${2:-} replacement=${3:-} name source
+  make_esp "$SEALED/$uki_name.efi" "$SEALED/$uki_name.efi.manifest" \
+    installer-install.efi.manifest "${preseal_auth_files[@]}"
+  mmd -i "$ESP" ::/ice-coreos/preseal
+  for name in "${preseal_names[@]}"; do
+    [[ "$name" != "$omitted" ]] || continue
+    source="$PRESEAL_DIR/$name"
+    [[ "${replacement%%=*}" != "$name" ]] || source="${replacement#*=}"
+    mcopy -i "$ESP" "$source" "::/ice-coreos/preseal/$name"
+  done
+}
+make_preseal_esp installer-preseal
+assemble "$ESP" "$SEALED/payload.img"
+inspect >"$TMP/inspect-preseal.out" \
+  || { cat "$TMP/inspect-preseal.out"; fail "the complete UKI-bound preseal set was refused"; }
+grep -q "neuralice.preseal=${preseal_sha}" "$TMP/inspect-preseal.out" \
+  || fail "the inspector did not surface the UKI-bound preseal set"
+
+for name in "${preseal_names[@]}"; do
+  make_preseal_esp installer-preseal "$name"
+  assemble "$ESP" "$SEALED/payload.img"
+  inspect >/dev/null 2>&1 && fail "a preseal medium missing $name was accepted"
+  printf 'substituted %s\n' "$name" > "$TMP/preseal-swapped"
+  make_preseal_esp installer-preseal '' "$name=$TMP/preseal-swapped"
+  assemble "$ESP" "$SEALED/payload.img"
+  inspect >/dev/null 2>&1 && fail "a preseal medium with drifted $name was accepted"
+done
+
+make_preseal_esp installer-preseal
+printf 'foreign\n' > "$TMP/preseal-foreign"
+mcopy -i "$ESP" "$TMP/preseal-foreign" ::/ice-coreos/preseal/foreign.json
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "a preseal namespace with an unknown file was accepted"
+build_uki installer-preseal-unbound "${preseal_kargs% neuralice.preseal=*}" >/dev/null \
+  || fail "the unbound preseal mutation UKI failed to build"
+make_preseal_esp installer-preseal-unbound
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "an ESP preseal set unbound by its UKI was accepted"
+
+python3 - "$PRESEAL_DIR/preseal-set.json" "$TMP/preseal-duplicate.json" <<'PYEOF'
+import pathlib, sys
+raw = pathlib.Path(sys.argv[1]).read_text()
+pathlib.Path(sys.argv[2]).write_text(raw.replace('{"access_policy_sha256":', '{"access_profile":"lab-managed","access_policy_sha256":'))
+PYEOF
+duplicate_sha="$(sha256sum "$TMP/preseal-duplicate.json" | awk '{print $1}')"
+build_uki installer-preseal-duplicate "${preseal_kargs%neuralice.preseal=*}neuralice.preseal=${duplicate_sha}" >/dev/null \
+  || fail "the duplicate-field preseal UKI failed to build"
+make_preseal_esp installer-preseal-duplicate '' "preseal-set.json=$TMP/preseal-duplicate.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "a preseal set with a duplicate JSON field was accepted"
+
+python3 - "$PRESEAL_DIR/preseal-set.json" "$TMP/preseal-unknown-field.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["unexpected"] = "field"
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc,sort_keys=True,separators=(",",":"))+"\n")
+PYEOF
+unknown_field_sha="$(sha256sum "$TMP/preseal-unknown-field.json" | awk '{print $1}')"
+build_uki installer-preseal-unknown "${preseal_kargs%neuralice.preseal=*}neuralice.preseal=${unknown_field_sha}" >/dev/null \
+  || fail "the unknown-field preseal UKI failed to build"
+make_preseal_esp installer-preseal-unknown '' "preseal-set.json=$TMP/preseal-unknown-field.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "a preseal set with an unknown JSON field was accepted"
+
+python3 - "$PRESEAL_DIR/preseal-set.json" "$TMP/preseal-wrong-installer-auth.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["installer_authorization_sha256"] = "f" * 64
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc,sort_keys=True,separators=(",",":"))+"\n")
+PYEOF
+wrong_auth_sha="$(sha256sum "$TMP/preseal-wrong-installer-auth.json" | awk '{print $1}')"
+build_uki installer-preseal-wrong-auth "${preseal_kargs%neuralice.preseal=*}neuralice.preseal=${wrong_auth_sha}" >/dev/null \
+  || fail "the wrong-authorization-binding preseal UKI failed to build"
+make_preseal_esp installer-preseal-wrong-auth '' "preseal-set.json=$TMP/preseal-wrong-installer-auth.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "a preseal set that does not bind installer authorization bytes was accepted"
+
+build_uki installer-preseal-customer "$preseal_kargs" VARIANT=prod >/dev/null \
+  || fail "the customer-profile preseal mutation UKI failed to build"
+make_preseal_esp installer-preseal-customer
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "a customer-profile medium carrying a preseal set was accepted"
+
+# Restore the ordinary registry fixture for the existing mutation cases below.
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest "${registry_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
 build_uki installer-registry-tag \
   "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos:stable" \
   >/dev/null || fail "the mutable-tag registry mutation UKI failed to build"
@@ -657,6 +829,19 @@ grep -Fq 'UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")' "$USB" \
   || fail "the installer SSH key remains replaceable on mutable vfat instead of sealed in the UKI"
 grep -Fq 'neuralice.live=1' "$USB" \
   || fail "the media producer does not seal an affirmative Live selector"
+grep -Fq 'PRESEAL_SET_DIR and PRESEAL_SET_SHA256 must be supplied together' "$USB" \
+  || fail "the media producer accepts a partial preseal build input"
+grep -Fq 'UKI_KARGS+=("neuralice.preseal=${PRESEAL_SET_SHA256}")' "$USB" \
+  || fail "the media producer does not bind the protected preseal snapshot into the UKI"
+preseal_snapshot_line="$(grep -n 'python3 "$PRESEAL_HELPER" snapshot' "$USB" | head -1 | cut -d: -f1)"
+uki_build_line="$(grep -n 'bash "$REPO_ROOT/image/build-installer-uki.sh"' "$USB" | head -1 | cut -d: -f1)"
+preseal_install_line="$(grep -n 'sudo python3 "$PRESEAL_HELPER" install' "$USB" | head -1 | cut -d: -f1)"
+media_inspect_line="$(grep -n 'python3 "$REPO_ROOT/image/inspect-installer-media.py"' "$USB" | head -1 | cut -d: -f1)"
+[[ -n "$preseal_snapshot_line" && -n "$uki_build_line" && -n "$preseal_install_line" \
+   && -n "$media_inspect_line" && "$preseal_snapshot_line" -lt "$uki_build_line" \
+   && "$uki_build_line" -lt "$preseal_install_line" \
+   && "$preseal_install_line" -lt "$media_inspect_line" ]] \
+  || fail "the producer does not snapshot, UKI-bind, stage and independently inspect preseal evidence in order"
 
 HOOK="$ROOT/image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity.sh"
 [ -f "$HOOK" ] || fail "there is no initramfs hook to open the sealed payload"

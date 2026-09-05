@@ -75,9 +75,13 @@ LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
 LAB_BASELINE_SIGNATURE_FILE="${LAB_BASELINE_SIGNATURE_FILE:-}"
 LAB_BASELINE_SIGNATURE_SHA256="${LAB_BASELINE_SIGNATURE_SHA256:-}"
 LAB_BASELINE_STAGE_ROOT=""
+PRESEAL_SET_DIR="${PRESEAL_SET_DIR:-}"
+PRESEAL_SET_SHA256="${PRESEAL_SET_SHA256:-}"
+PRESEAL_STAGE_ROOT=""
 INSTALLER_IID_DIR=""
 INSTALLER_IID_FILE=""
 LAB_BASELINE_HELPER="$REPO_ROOT/ota/neural-ice-lab-baseline-handoff.sh"
+PRESEAL_HELPER="$REPO_ROOT/ota/neural-ice-preseal-handoff.py"
 # --------------------------------------------------------------------------- #
 # 🔴 THE SIGNED RELEASE AUTHORIZATION A REGISTRY MEDIUM CANNOT BOOT WITHOUT
 # (independent review 2026-09-02, P0 #3).
@@ -210,6 +214,11 @@ cleanup_lab_baseline_stage() {
     rm -rf -- "$LAB_BASELINE_STAGE_ROOT"
     LAB_BASELINE_STAGE_ROOT=""
   fi
+  if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
+    chmod -R u+w -- "$PRESEAL_STAGE_ROOT" 2>/dev/null || true
+    rm -rf -- "$PRESEAL_STAGE_ROOT"
+    PRESEAL_STAGE_ROOT=""
+  fi
 }
 trap cleanup_lab_baseline_stage EXIT
 
@@ -306,6 +315,21 @@ case "$lab_baseline_input_count" in
     exit 1
     ;;
 esac
+if [[ -n "$PRESEAL_SET_DIR" || -n "$PRESEAL_SET_SHA256" ]]; then
+  [[ -n "$PRESEAL_SET_DIR" && -n "$PRESEAL_SET_SHA256" ]] \
+    || { echo "ERROR: PRESEAL_SET_DIR and PRESEAL_SET_SHA256 must be supplied together" >&2; exit 1; }
+  [[ "$MEDIA_MODE" == install && "$VARIANT" == sealed-lab \
+     && "$INSTALL_SOURCE" == registry && "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
+    || { echo "ERROR: a preseal set is only permitted on sealed-lab lab-managed registry Install media" >&2; exit 1; }
+  [[ -n "$RELEASE_AUTHORIZATION_FILE" && -n "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
+    || { echo "ERROR: a preseal set requires the registry installer authorization pair" >&2; exit 1; }
+  PRESEAL_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ni-preseal-media.XXXXXX")"
+  chmod 0700 "$PRESEAL_STAGE_ROOT"
+  python3 "$PRESEAL_HELPER" snapshot \
+    "$PRESEAL_SET_DIR" "$PRESEAL_SET_SHA256" \
+    "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
+    "$PRESEAL_STAGE_ROOT/preseal"
+fi
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -721,6 +745,12 @@ case "$MEDIA_MODE" in
         UKI_KARGS+=("neuralice.relauth_sha256=${RELEASE_AUTHORIZATION_SHA256}" \
                     "neuralice.relauth_sig_sha256=${RELEASE_AUTHORIZATION_SIGNATURE_SHA256}")
         RELEASE_AUTHORIZATION_STAGE_ROOT=staged
+        if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
+          python3 "$PRESEAL_HELPER" verify \
+            "$PRESEAL_STAGE_ROOT/preseal" "$PRESEAL_SET_SHA256" \
+            "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
+            || { echo "ERROR: the release authorization pair drifted from the protected preseal snapshot" >&2; exit 1; }
+        fi
         _release_auth_fields="$(release_auth_parse "$RELEASE_AUTHORIZATION_FILE")" \
           || { echo "ERROR: release authorization does not satisfy the closed consumer contract" >&2; exit 1; }
         AUTH_IMAGE_REPOSITORY="$(sed -n 's/^image_repository=//p' <<<"$_release_auth_fields")"
@@ -729,6 +759,14 @@ case "$MEDIA_MODE" in
         [[ "$AUTH_IMAGE_REPOSITORY" == "${OS_IMAGE%@sha256:*}" \
            && "$AUTH_IMAGE_INDEX_DIGEST" == "${OS_IMAGE##*@}" ]] \
           || { echo "ERROR: release authorization repository/index does not bind OS_IMAGE" >&2; exit 1; }
+        if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
+          _preseal_target_os_ref="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target_os_ref"])' \
+            "$PRESEAL_STAGE_ROOT/preseal/preseal-set.json")" \
+            || { echo "ERROR: cannot read the protected preseal set snapshot" >&2; exit 1; }
+          [[ "$_preseal_target_os_ref" == "$OS_IMAGE" ]] \
+            || { echo "ERROR: preseal target_os_ref does not bind OS_IMAGE" >&2; exit 1; }
+          UKI_KARGS+=("neuralice.preseal=${PRESEAL_SET_SHA256}")
+        fi
 
         if [[ -n "$INSTALL_MIRROR" ]]; then
           ni_sealed_value_is_valid neuralice.mirror "$INSTALL_MIRROR" \
@@ -957,6 +995,17 @@ if [[ -n "$RELEASE_AUTHORIZATION_STAGE_ROOT" ]]; then
   [[ "$staged_doc" == "$RELEASE_AUTHORIZATION_SHA256" && "$staged_sig" == "$RELEASE_AUTHORIZATION_SIGNATURE_SHA256" ]] \
     || { echo "ERROR: the release authorization on the ESP does not hash to the value sealed in the signature" >&2; exit 1; }
   echo "    staged the signed release authorization on the ESP (doc ${staged_doc}, sig ${staged_sig}; both sealed in the UKI)"
+fi
+if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
+  sudo python3 "$PRESEAL_HELPER" install \
+    "$PRESEAL_STAGE_ROOT/preseal" "$PRESEAL_SET_SHA256" \
+    "$MNT/ice-coreos/release-authorization.json" \
+    "$MNT/ice-coreos/release-authorization.sig" \
+    "$MNT/ice-coreos/preseal" --mode media
+  sudo python3 "$PRESEAL_HELPER" verify \
+    "$MNT/ice-coreos/preseal" "$PRESEAL_SET_SHA256" \
+    "$MNT/ice-coreos/release-authorization.json" \
+    "$MNT/ice-coreos/release-authorization.sig"
 fi
 if [[ -n "$MIRROR_CA_FILE" ]]; then
   sudo install -d -m 0755 "$MNT/ice-coreos"
