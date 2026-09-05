@@ -214,6 +214,11 @@ COPY ota/neural-ice-access-profile-anchor.sh /usr/libexec/neural-ice-access-prof
 # upgrade — the installer's `anchor_seq` means nothing if nothing later compares
 # against it.
 COPY ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state
+# Dormant owner-sealed OTA-state support. This immutable marker states only
+# which profile the image can consume; it never proves that a device TPM was
+# provisioned under that profile. Runtime selection remains bound to
+# authenticated completion evidence and the exact live TPM public state.
+COPY ota/neural-ice-ota-tpm-state.sh /usr/libexec/neural-ice-ota-tpm-state
 COPY ota/neural-ice-firstboot-tpm-ceremony.sh /usr/libexec/neural-ice-firstboot-tpm-ceremony
 COPY ota/neural-ice-luks-token-evidence.py /usr/libexec/neural-ice-luks-token-evidence
 # Container-image signature policy: the MECHANISM, never the identity.
@@ -236,6 +241,13 @@ RUN set -euxo pipefail; \
     chmod 0755 /usr/libexec/neural-ice-device-root; \
     chmod 0755 /usr/libexec/neural-ice-access-profile-anchor; \
     chmod 0755 /usr/libexec/neural-ice-tpm-state; \
+    chmod 0755 /usr/libexec/neural-ice-ota-tpm-state; \
+    bash -n /usr/libexec/neural-ice-ota-tpm-state; \
+    test "$(stat -c '%u:%g:%a' /usr/libexec/neural-ice-ota-tpm-state)" = 0:0:755; \
+    printf '%s\n' owner-sealed-ota-state-v1 > /usr/lib/neural-ice/ota-state-profile; \
+    chmod 0444 /usr/lib/neural-ice/ota-state-profile; \
+    printf '%s\n' owner-sealed-ota-state-v1 | cmp - /usr/lib/neural-ice/ota-state-profile; \
+    test "$(stat -c '%u:%g:%a' /usr/lib/neural-ice/ota-state-profile)" = 0:0:444; \
     chmod 0755 /usr/libexec/neural-ice-firstboot-tpm-ceremony; \
     chmod 0755 /usr/libexec/neural-ice-luks-token-evidence; \
     chmod 0755 /usr/libexec/neural-ice-render-container-policy; \
