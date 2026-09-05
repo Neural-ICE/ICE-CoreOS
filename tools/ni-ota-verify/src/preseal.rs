@@ -143,6 +143,25 @@ pub(crate) struct VerifiedPreseal {
     pub(crate) bundle_seq: u64,
     pub(crate) receipt_sha256: String,
     pub(crate) set_sha256: String,
+    pub(crate) target_os_ref: String,
+    pub(crate) target_os_manifest_digest: String,
+    pub(crate) seed_ref: String,
+}
+
+pub(crate) struct RetainedPresealPaths<'a> {
+    pub(crate) set: &'a Path,
+    pub(crate) snapshot: &'a Path,
+    pub(crate) snapshot_signature: &'a Path,
+    pub(crate) release: &'a Path,
+    pub(crate) release_signature: &'a Path,
+    pub(crate) bom: &'a Path,
+    pub(crate) installer_authorization: &'a Path,
+    pub(crate) installer_authorization_signature: &'a Path,
+    pub(crate) receipt: &'a Path,
+    pub(crate) expected_set_sha256: &'a str,
+    pub(crate) expected_receipt_sha256: &'a str,
+    pub(crate) scratch_dir: &'a Path,
+    pub(crate) config: &'a Path,
 }
 
 enum VerificationMode<'a> {
@@ -170,6 +189,63 @@ pub(crate) fn run_retained(args: &[String]) -> Result<u8, InternalError> {
 }
 
 fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
+    match verify_command(args, retained)? {
+        Ok((verified, created)) => {
+            println!(
+                "{{\"bundle_seq\":{},\"idempotent\":{},\"preseal_receipt_sha256\":\"{}\",\"verdict\":\"pass\"}}",
+                verified.bundle_seq,
+                if created { "false" } else { "true" },
+                verified.receipt_sha256
+            );
+            Ok(EXIT_PASS)
+        }
+        Err(reason) => refusal(reason),
+    }
+}
+
+pub(crate) fn verify_retained(
+    paths: &RetainedPresealPaths<'_>,
+) -> Result<Result<VerifiedPreseal, String>, InternalError> {
+    let pairs = [
+        ("set", paths.set),
+        ("snapshot", paths.snapshot),
+        ("snapshot-sig", paths.snapshot_signature),
+        ("release", paths.release),
+        ("release-sig", paths.release_signature),
+        ("bom", paths.bom),
+        ("installer-authorization", paths.installer_authorization),
+        (
+            "installer-authorization-sig",
+            paths.installer_authorization_signature,
+        ),
+        ("receipt", paths.receipt),
+        ("scratch-dir", paths.scratch_dir),
+        ("config", paths.config),
+    ];
+    let mut args = Vec::with_capacity(pairs.len() * 2 + 4);
+    for (name, path) in pairs {
+        args.push(format!("--{name}"));
+        args.push(path.to_string_lossy().into_owned());
+    }
+    args.extend([
+        "--expected-set-sha256".into(),
+        paths.expected_set_sha256.into(),
+        "--expected-receipt-sha256".into(),
+        paths.expected_receipt_sha256.into(),
+    ]);
+    match verify_command(&args, true)? {
+        Ok((verified, false)) => Ok(Ok(verified)),
+        Ok((_verified, true)) => Err(InternalError(
+            "retained preseal verification unexpectedly published state".into(),
+        )),
+        Err(reason) => Ok(Err(reason)),
+    }
+}
+
+fn verify_command(
+    args: &[String],
+    retained: bool,
+) -> Result<Result<(VerifiedPreseal, bool), String>, InternalError> {
     let flags = parse_flags(
         args,
         &[
@@ -215,7 +291,7 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
     let expected_receipt = state_dir.join("preseal/receipt.json");
     let receipt_path = PathBuf::from(required(if retained { "receipt" } else { "receipt-out" })?);
     if receipt_path != expected_receipt {
-        return refusal(format!(
+        return verification_refusal(format!(
             "receipt path must be exactly {}",
             expected_receipt.display()
         ));
@@ -242,7 +318,7 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         .as_slice()
     };
     if forbidden.iter().any(|name| flags.contains_key(*name)) {
-        return refusal(format!(
+        return verification_refusal(format!(
             "{command} received a flag for the other verification mode"
         ));
     }
@@ -270,7 +346,7 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         path: receipt_path.clone(),
     };
     if let Err(reason) = receipt_store.validate_bootstrap_parent() {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
     let scratch_store = if retained {
         let scratch = PathBuf::from(required("scratch-dir")?);
@@ -282,11 +358,13 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
                 )
             })
         {
-            return refusal("retained preseal scratch path is not canonical absolute".into());
+            return verification_refusal(
+                "retained preseal scratch path is not canonical absolute".into(),
+            );
         }
         #[cfg(not(feature = "test-path-overrides"))]
         if !scratch.starts_with("/run") {
-            return refusal("retained preseal scratch must be beneath /run".into());
+            return verification_refusal("retained preseal scratch must be beneath /run".into());
         }
         Some(FileStateStore {
             path: scratch.join("preseal-retained-operation"),
@@ -297,14 +375,14 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
     let operation_store = scratch_store.as_ref().unwrap_or(&receipt_store);
     let _lock = match operation_store.lock_bootstrap() {
         Ok(lock) => lock,
-        Err(reason) => return refusal(reason),
+        Err(reason) => return verification_refusal(reason),
     };
 
     macro_rules! snap {
         ($flag:literal, $label:literal, $max:expr) => {{
             match snapshot(operation_store, Path::new(required($flag)?), $label, $max)? {
                 Ok(value) => value,
-                Err(reason) => return refusal(reason),
+                Err(reason) => return verification_refusal(reason),
             }
         }};
     }
@@ -334,17 +412,17 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
     );
     let root_path = match config.root_pubkey.as_deref() {
         Some(path) => path,
-        None => return refusal("root_pubkey is required".into()),
+        None => return verification_refusal("root_pubkey is required".into()),
     };
     let root_file = match snapshot(operation_store, root_path, "root public key", MAX_SMALL)? {
         Ok(value) => value,
-        Err(reason) => return refusal(reason),
+        Err(reason) => return verification_refusal(reason),
     };
 
     let set_bytes = set_file.read()?;
     let set: PresealSet = match parse_canonical(&set_bytes, "preseal set") {
         Ok(value) => value,
-        Err(reason) => return refusal(reason),
+        Err(reason) => return verification_refusal(reason),
     };
     let set_hash = runner::sha256_bytes(&set_bytes)?;
     let expected_set_hash = match &mode {
@@ -357,10 +435,10 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         } => *expected_set_sha256,
     };
     if !sha256(expected_set_hash) || expected_set_hash != set_hash {
-        return refusal("preseal set differs from the signed UKI hash".into());
+        return verification_refusal("preseal set differs from the signed UKI hash".into());
     }
     if let Err(reason) = validate_set_shape(&set) {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
 
     let snapshot_bytes = snapshot_file.read()?;
@@ -373,7 +451,7 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         operation_store,
     ) {
         Ok(value) => value,
-        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return verification_refusal(reason),
         Err(ContractError::Internal(error)) => return Err(error),
     };
     let authority = authenticated.snapshot();
@@ -384,22 +462,22 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         || set.delegation_snapshot_file_sha256 != runner::sha256_bytes(&snapshot_bytes)?
         || set.delegation_snapshot_signature_sha256 != runner::sha256_bytes(&snapshot_sig_bytes)?
     {
-        return refusal("preseal delegation epoch binding is invalid".into());
+        return verification_refusal("preseal delegation epoch binding is invalid".into());
     }
 
     let release_bytes = release_file.read()?;
     let release: ReleaseAuthorization =
         match parse_canonical(&release_bytes, "release authorization") {
             Ok(value) => value,
-            Err(reason) => return refusal(reason),
+            Err(reason) => return verification_refusal(reason),
         };
     let key = match validate_release(&release, authority, authenticated.canonical_sha256(), &set) {
         Ok(value) => value,
-        Err(reason) => return refusal(reason),
+        Err(reason) => return verification_refusal(reason),
     };
     let release_pem = match public_key_pem(&key.public_key) {
         Ok(value) => value,
-        Err(ContractError::Refusal(reason)) => return refusal(reason),
+        Err(ContractError::Refusal(reason)) => return verification_refusal(reason),
         Err(ContractError::Internal(error)) => return Err(error),
     };
     let release_sig_bytes = release_sig.read()?;
@@ -410,48 +488,48 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         &release_sig_bytes,
         operation_store,
     )? {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
     if set.ota_release_authorization_file_sha256 != runner::sha256_bytes(&release_bytes)?
         || set.ota_release_authorization_sha256
             != match canonical_hash(&release_bytes) {
                 Ok(value) => value,
-                Err(ContractError::Refusal(reason)) => return refusal(reason),
+                Err(ContractError::Refusal(reason)) => return verification_refusal(reason),
                 Err(ContractError::Internal(error)) => return Err(error),
             }
         || set.ota_release_authorization_signature_sha256
             != runner::sha256_bytes(&release_sig_bytes)?
     {
-        return refusal("preseal release artifact hash binding is invalid".into());
+        return verification_refusal("preseal release artifact hash binding is invalid".into());
     }
 
     let bom_bytes = bom_file.read()?;
     let bom: BomCore = match serde_json::from_slice(&bom_bytes) {
         Ok(value) => value,
-        Err(error) => return refusal(format!("invalid BOM JSON: {error}")),
+        Err(error) => return verification_refusal(format!("invalid BOM JSON: {error}")),
     };
     if let Err(reason) = bom.require_media_independent() {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
     if set.bom_file_sha256 != runner::sha256_bytes(&bom_bytes)?
         || set.bom_sha256 != set.bom_file_sha256
         || set.bom_sha256 != release.bom_sha256
     {
-        return refusal("preseal BOM hash binding is invalid".into());
+        return verification_refusal("preseal BOM hash binding is invalid".into());
     }
 
     let installer_bytes = installer_file.read()?;
     let installer: InstallerAuthorization =
         match parse_canonical_no_lf(&installer_bytes, "installer authorization") {
             Ok(value) => value,
-            Err(reason) => return refusal(reason),
+            Err(reason) => return verification_refusal(reason),
         };
     let installer_sig_bytes = installer_sig.read()?;
     if set.installer_authorization_sha256 != runner::sha256_bytes(&installer_bytes)?
         || set.installer_authorization_signature_sha256
             != runner::sha256_bytes(&installer_sig_bytes)?
     {
-        return refusal("installer authorization hash binding is invalid".into());
+        return verification_refusal("installer authorization hash binding is invalid".into());
     }
     if let VerificationMode::Initial {
         sealed_installer_sha256,
@@ -462,7 +540,9 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         if set.installer_authorization_sha256 != **sealed_installer_sha256
             || set.installer_authorization_signature_sha256 != **sealed_installer_signature_sha256
         {
-            return refusal("installer authorization differs from the signed UKI hashes".into());
+            return verification_refusal(
+                "installer authorization differs from the signed UKI hashes".into(),
+            );
         }
     }
     let observed_os = match &mode {
@@ -476,7 +556,7 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
     if let Err(reason) =
         validate_installer(&installer, &set, observed_os, &release_pem, authority, key)
     {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
     if let Err(reason) = verify_installer_signature(
         &release_pem,
@@ -484,21 +564,23 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         &installer_sig_bytes,
         operation_store,
     )? {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
 
     let hardware = immutable_hardware_target()?;
     let variant = immutable_appliance_variant()?;
     if set.hardware_target != hardware || set.variant != variant {
-        return refusal("preseal selection differs from immutable host identity".into());
+        return verification_refusal(
+            "preseal selection differs from immutable host identity".into(),
+        );
     }
     if config.device_compat != Some((set.compat_min as i64, set.compat_max as i64)) {
-        return refusal(
+        return verification_refusal(
             "preseal compatibility range differs from immutable device configuration".into(),
         );
     }
     if let Err(reason) = validate_bom(&bom, &set) {
-        return refusal(reason);
+        return verification_refusal(reason);
     }
     if let VerificationMode::Initial {
         current_seed_ref,
@@ -507,10 +589,12 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
     } = &mode
     {
         if *current_seed_ref != set.seed_ref {
-            return refusal("current seed differs from the signed preseal selection".into());
+            return verification_refusal(
+                "current seed differs from the signed preseal selection".into(),
+            );
         }
         if let Err(reason) = validate_candidate(candidate_root, &set, current_seed_ref) {
-            return refusal(reason);
+            return verification_refusal(reason);
         }
     }
 
@@ -558,12 +642,15 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
         bundle_seq: receipt.bundle_seq,
         receipt_sha256: receipt_hash.clone(),
         set_sha256: receipt.preseal_set_sha256.clone(),
+        target_os_ref: receipt.target_os_ref.clone(),
+        target_os_manifest_digest: installer.image_manifest_digest.clone(),
+        seed_ref: receipt.seed_ref.clone(),
     };
     let created = match &mode {
         VerificationMode::Initial { .. } => {
             match publish_receipt(&receipt_store, &receipt_bytes)? {
                 Ok(value) => value,
-                Err(reason) => return refusal(reason),
+                Err(reason) => return verification_refusal(reason),
             }
         }
         VerificationMode::Retained {
@@ -573,23 +660,23 @@ fn run_command(args: &[String], retained: bool) -> Result<u8, InternalError> {
             if !sha256(expected_receipt_sha256)
                 || **expected_receipt_sha256 != verified.receipt_sha256
             {
-                return refusal(
+                return verification_refusal(
                     "preseal receipt differs from authenticated completion evidence".into(),
                 );
             }
             match compare_retained_receipt(operation_store, &receipt_path, &receipt_bytes)? {
                 Ok(()) => false,
-                Err(reason) => return refusal(reason),
+                Err(reason) => return verification_refusal(reason),
             }
         }
     };
-    println!(
-        "{{\"bundle_seq\":{},\"idempotent\":{},\"preseal_receipt_sha256\":\"{}\",\"verdict\":\"pass\"}}",
-        verified.bundle_seq,
-        if created { "false" } else { "true" },
-        verified.receipt_sha256
-    );
-    Ok(EXIT_PASS)
+    Ok(Ok((verified, created)))
+}
+
+fn verification_refusal(
+    reason: String,
+) -> Result<Result<(VerifiedPreseal, bool), String>, InternalError> {
+    Ok(Err(reason))
 }
 
 fn validate_set_shape(value: &PresealSet) -> Result<(), String> {

@@ -3,9 +3,12 @@
 //! the image (cosign is version-pinned in Containerfile.bootc §2b, sha256sum
 //! is coreutils) — a missing binary is an internal error, never a verdict.
 
-use std::io::Write;
+use std::cell::Cell;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::InternalError;
 
@@ -18,6 +21,191 @@ use crate::InternalError;
 /// seam only for an unprivileged process outside a release image — the same
 /// gate every shell seam in this tree applies.
 const COSIGN_DEFAULT: &str = "/usr/bin/cosign";
+const MAX_HELPER_OUTPUT: usize = 64 * 1024;
+const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+
+thread_local! {
+    /// Optional deadline for one top-level verification operation. Helpers use
+    /// the earlier of this deadline and their own bound. This is thread-local
+    /// because all verifier command chains are synchronous and it prevents an
+    /// unrelated concurrent verification from shortening another operation.
+    static OPERATION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct DeadlineGuard(Option<Instant>);
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        OPERATION_DEADLINE.set(self.0);
+    }
+}
+
+/// Bound a complete synchronous verification chain, including every nested
+/// helper. The caller reserves enough time after this deadline for ordinary
+/// error propagation and volatile-state cleanup before its outer supervisor
+/// kills the verifier process group.
+pub(crate) fn with_operation_deadline<T>(duration: Duration, operation: impl FnOnce() -> T) -> T {
+    let requested = Instant::now() + duration;
+    let previous = OPERATION_DEADLINE.replace(Some(
+        OPERATION_DEADLINE
+            .get()
+            .map_or(requested, |current| current.min(requested)),
+    ));
+    let _guard = DeadlineGuard(previous);
+    operation()
+}
+
+/// Refuse cooperatively once the current top-level verification budget has
+/// elapsed. This prevents new helpers and bounded local traversal work from
+/// starting after the caller's fail-closed deadline. It cannot interrupt a
+/// kernel syscall which is already blocked in uninterruptible sleep.
+pub(crate) fn check_operation_deadline(label: &str) -> Result<(), InternalError> {
+    if OPERATION_DEADLINE
+        .get()
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Err(InternalError(format!(
+            "authenticated OTA status deadline exceeded before {label}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) timed_out: bool,
+    pub(crate) overflowed: bool,
+}
+
+pub(crate) fn bounded_output(
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+    label: &str,
+) -> Result<BoundedOutput, InternalError> {
+    bounded_output_with_timeout(command, stdin, label, HELPER_TIMEOUT)
+}
+
+fn bounded_output_with_timeout(
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+    label: &str,
+    helper_timeout: Duration,
+) -> Result<BoundedOutput, InternalError> {
+    check_operation_deadline(label)?;
+    let started = Instant::now();
+    let helper_deadline = started + helper_timeout;
+    let deadline = OPERATION_DEADLINE
+        .get()
+        .map_or(helper_deadline, |operation| operation.min(helper_deadline));
+    command
+        .process_group(0)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| InternalError(format!("failed to run {label}: {error}")))?;
+    let pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| InternalError(format!("{label} stdout pipe is unavailable")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| InternalError(format!("{label} stderr pipe is unavailable")))?;
+    let reader = |pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.take(MAX_HELPER_OUTPUT as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        })
+    };
+    let stdout_thread = reader(Box::new(stdout));
+    let stderr_thread = reader(Box::new(stderr));
+    let stdin_thread = stdin.map(|bytes| {
+        let mut pipe = child.stdin.take().expect("configured piped stdin");
+        std::thread::spawn(move || pipe.write_all(&bytes))
+    });
+    let (status, timed_out) = loop {
+        if Instant::now() >= deadline {
+            terminate_process_group(pid);
+            let _ = child.kill();
+            let status = child.wait().map_err(|error| {
+                InternalError(format!("cannot reap timed-out {label}: {error}"))
+            })?;
+            break (status, true);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                terminate_process_group(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(InternalError(format!("cannot wait for {label}: {error}")));
+            }
+        }
+    };
+    // The direct process may exit while a descendant keeps one of its pipes
+    // open. It belongs to the dedicated process group and has no role after
+    // the helper exits, so terminate it before joining reader/writer threads.
+    terminate_process_group(pid);
+    let join_reader = |thread: std::thread::JoinHandle<std::io::Result<Vec<u8>>>, stream: &str| {
+        thread
+            .join()
+            .map_err(|_| InternalError(format!("{label} {stream} reader panicked")))?
+            .map_err(|error| InternalError(format!("cannot read {label} {stream}: {error}")))
+    };
+    let stdout = join_reader(stdout_thread, "stdout")?;
+    let stderr = join_reader(stderr_thread, "stderr")?;
+    if let Some(thread) = stdin_thread {
+        match thread.join() {
+            Ok(Ok(())) => {}
+            // A helper that closes stdin early reports its real exit status;
+            // EPIPE is not promoted over that result.
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Ok(Err(error)) => {
+                return Err(InternalError(format!(
+                    "cannot provide {label} input: {error}"
+                )))
+            }
+            Err(_) => return Err(InternalError(format!("{label} stdin writer panicked"))),
+        }
+    }
+    Ok(BoundedOutput {
+        status,
+        overflowed: stdout.len() > MAX_HELPER_OUTPUT || stderr.len() > MAX_HELPER_OUTPUT,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn terminate_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: the spawned child is explicitly made leader of a fresh
+        // process group whose numeric ID is its PID. A negative PID targets
+        // only that group. Failure is followed by Child::kill/wait above.
+        unsafe {
+            kill(-pid, 9);
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
 
 #[cfg(not(feature = "test-path-overrides"))]
 fn resolved_cosign() -> Result<PathBuf, InternalError> {
@@ -90,16 +278,23 @@ pub(crate) fn verify_blob(
     sig: &Path,
     file: &Path,
 ) -> Result<Result<(), String>, InternalError> {
-    let output = Command::new(cosign)
+    let mut command = Command::new(cosign);
+    command
         .arg("verify-blob")
         .arg("--key")
         .arg(pubkey)
         .arg("--insecure-ignore-tlog=true")
         .arg("--signature")
         .arg(sig)
-        .arg(file)
-        .output()
-        .map_err(|e| InternalError(format!("failed to run cosign ({}): {e}", cosign.display())))?;
+        .arg(file);
+    let output = bounded_output(
+        &mut command,
+        None,
+        &format!("cosign ({})", cosign.display()),
+    )?;
+    if output.timed_out || output.overflowed {
+        return Err(InternalError("cosign exceeded its process bound".into()));
+    }
     if output.status.success() {
         return Ok(Ok(()));
     }
@@ -121,10 +316,12 @@ pub(crate) fn verify_blob(
 /// byte-identical BOM). Not signature crypto — cosign stays the only
 /// signature stack.
 pub(crate) fn sha256_file(path: &Path) -> Result<String, InternalError> {
-    let output = Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .map_err(|e| InternalError(format!("failed to run sha256sum: {e}")))?;
+    let mut command = Command::new("sha256sum");
+    command.arg(path);
+    let output = bounded_output(&mut command, None, "sha256sum")?;
+    if output.timed_out || output.overflowed {
+        return Err(InternalError("sha256sum exceeded its process bound".into()));
+    }
     if !output.status.success() {
         return Err(InternalError(format!(
             "sha256sum failed for {}: {}",
@@ -146,21 +343,11 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, InternalError> {
 /// Hash verifier-generated bytes without publishing them in an untrusted
 /// filesystem namespace.
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, InternalError> {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| InternalError(format!("failed to run sha256sum: {e}")))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| InternalError("sha256sum stdin unavailable".to_string()))?
-        .write_all(bytes)
-        .map_err(|e| InternalError(format!("cannot feed sha256sum: {e}")))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| InternalError(format!("cannot wait for sha256sum: {e}")))?;
+    let mut command = Command::new("sha256sum");
+    let output = bounded_output(&mut command, Some(bytes.to_vec()), "sha256sum")?;
+    if output.timed_out || output.overflowed {
+        return Err(InternalError("sha256sum exceeded its process bound".into()));
+    }
     if !output.status.success() {
         return Err(InternalError(format!(
             "sha256sum failed: {}",
@@ -181,9 +368,15 @@ mod tests {
     use super::cosign_path;
     #[cfg(feature = "test-path-overrides")]
     use super::seam::select_cosign;
+    #[cfg(feature = "test-path-overrides")]
+    use super::{bounded_output, bounded_output_with_timeout, with_operation_deadline};
     use super::{sha256_file, COSIGN_DEFAULT};
     use std::io::Write;
     use std::path::PathBuf;
+    #[cfg(feature = "test-path-overrides")]
+    use std::process::Command;
+    #[cfg(feature = "test-path-overrides")]
+    use std::time::{Duration, Instant};
 
     #[test]
     fn sha256_matches_known_vector() {
@@ -198,6 +391,63 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn bounded_runner_reaps_a_timed_out_helper_process_group() {
+        let started = Instant::now();
+        let mut command = Command::new("bash");
+        command.args(["-c", "sleep 30 & wait"]);
+        let output = bounded_output_with_timeout(
+            &mut command,
+            None,
+            "timeout fixture",
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn operation_deadline_shortens_the_current_helper_bound() {
+        let started = Instant::now();
+        let output = with_operation_deadline(Duration::from_millis(40), || {
+            let mut command = Command::new("bash");
+            command.args(["-c", "sleep 30 & wait"]);
+            bounded_output(&mut command, None, "operation deadline fixture").unwrap()
+        });
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn expired_operation_deadline_refuses_before_spawning_a_helper() {
+        let dir =
+            std::env::temp_dir().join(format!("ni-ota-runner-expired-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let error = with_operation_deadline(Duration::ZERO, || {
+            let mut command = Command::new("touch");
+            command.arg(&marker);
+            bounded_output(&mut command, None, "expired operation fixture")
+        })
+        .unwrap_err();
+        assert!(error.0.contains("deadline exceeded"), "{}", error.0);
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn bounded_runner_marks_oversized_output() {
+        let mut command = Command::new("python3");
+        command.args(["-c", "import sys; sys.stderr.write('x' * 65537)"]);
+        let output = bounded_output(&mut command, None, "overflow fixture").unwrap();
+        assert!(output.overflowed);
     }
 
     #[cfg(feature = "test-path-overrides")]
