@@ -1792,8 +1792,27 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   # `podman image mount` exposes the merged filesystem to the HOST; the files are
   # read with the installer's own tools and not one byte of the candidate is
   # executed.
-  _img_root="$(podman --cgroup-manager=cgroupfs --events-backend=file image mount "$OS_IMAGE" 2>/dev/null)" \
-    || die "cannot inspect the pulled image without executing it"
+  # 🔴 A CREATED, NEVER STARTED container, not `image mount`. With the sealed
+  # image store attached as an additional (read-only) store, the pulled image's
+  # layers are deduplicated into that store and `podman image mount` refuses
+  # with "layer not known" (containers/storage looks the top layer up in the
+  # writable store only; measured on the bench, podman 6.0.2, 2026-09-06). A
+  # container mount resolves layers across every store, exactly like the
+  # pre-wipe medium probe above, and executes nothing: no start, an entrypoint
+  # that does not exist, the merged tree read by US.
+  readonly _candidate_probe=neural-ice-candidate-probe
+  candidate_probe_release() {
+    local rc=0
+    podman --cgroup-manager=cgroupfs --events-backend=file unmount "$_candidate_probe" >/dev/null 2>&1 || rc=1
+    podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || rc=1
+    return "$rc"
+  }
+  podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || true
+  podman --cgroup-manager=cgroupfs --events-backend=file create --name "$_candidate_probe" \
+      --entrypoint /nonexistent "$OS_IMAGE" >/dev/null 2>&1 \
+    || die "cannot stage the pulled image for host-side inspection without executing it"
+  _img_root="$(podman --cgroup-manager=cgroupfs --events-backend=file mount "$_candidate_probe" 2>/dev/null)" \
+    || { candidate_probe_release || true; die "cannot inspect the pulled image without executing it"; }
   [[ -n "$_img_root" && -d "$_img_root" ]] \
     || die "the pulled image did not mount to a directory for host-side inspection"
   _img_read() { # $1=path relative to the image root — a plain regular file, read by US
@@ -1819,42 +1838,42 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   if ! release_auth_gate_pulled "$RELEASE_AUTH" "$SEALED_ANCHOR" \
       "$got_index" "$got_manifest" "$img_profile" "$img_variant" "$img_target" "$img_policy" \
       "$img_platform"; then
-    podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+    candidate_probe_release || true
     die "the pulled image does not match its release authorization or this medium's sealed profile"
   fi
   if [[ "$img_platform" != "$INSTALL_PLATFORM" ]]; then
-    podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+    candidate_probe_release || true
     die "the pulled image is for platform '$img_platform' but this machine installs '$INSTALL_PLATFORM'"
   fi
 
   case "$img_ota_state_profile" in
     owner-sealed-ota-state-v1)
       (( PRESEAL_ACTIVE == 1 )) \
-        || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the selected owner-sealed appliance has no UKI-bound preseal inputs"; }
+        || { candidate_probe_release || true; die "the selected owner-sealed appliance has no UKI-bound preseal inputs"; }
       ;;
     "")
       (( PRESEAL_ACTIVE == 0 )) \
-        || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the selected legacy appliance cannot consume this medium's owner-profile preseal inputs"; }
+        || { candidate_probe_release || true; die "the selected legacy appliance cannot consume this medium's owner-profile preseal inputs"; }
       ;;
     *)
-      podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true
+      candidate_probe_release || true
       die "the selected appliance declares an unsupported OTA-state profile"
       ;;
   esac
   if (( PRESEAL_ACTIVE == 1 )); then
     [[ "$img_seed_ref" =~ ^[0-9a-f]{40}$ ]] \
-      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the selected owner-sealed appliance carries no bounded PAYLOAD_ID"; }
+      || { candidate_probe_release || true; die "the selected owner-sealed appliance carries no bounded PAYLOAD_ID"; }
     install -d -m 0700 "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_STATE/preseal"
     write_preseal_verifier_config "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_CONFIG"
     PRESEAL_BUNDLE_SEQ="$(verify_preseal_candidate "$PRESEAL_SNAPSHOT" \
       "$_img_root" "$img_seed_ref" "$PRESEAL_PREFLIGHT_CONFIG" "$PRESEAL_PREFLIGHT_RECEIPT")" \
-      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation"; }
+      || { candidate_probe_release || true; die "the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation"; }
     sync -f "$PRESEAL_PREFLIGHT_RECEIPT" \
-      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "cannot fsync the authenticated pre-wipe preseal receipt"; }
+      || { candidate_probe_release || true; die "cannot fsync the authenticated pre-wipe preseal receipt"; }
     sync -f "$PRESEAL_PREFLIGHT_STATE/preseal" \
-      || { podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 || true; die "cannot fsync the authenticated pre-wipe preseal receipt directory"; }
+      || { candidate_probe_release || true; die "cannot fsync the authenticated pre-wipe preseal receipt directory"; }
   fi
-  podman --cgroup-manager=cgroupfs --events-backend=file image umount "$OS_IMAGE" >/dev/null 2>&1 \
+  candidate_probe_release \
     || die "cannot release the authenticated candidate image mount before disk mutation"
 
   # From here the object in local storage is the ONLY thing that may be
