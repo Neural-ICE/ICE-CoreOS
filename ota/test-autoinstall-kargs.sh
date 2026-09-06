@@ -188,6 +188,45 @@ while IFS= read -r name; do
   [[ -z "$first_use" ]] \
     || fail "$name is read at line $first_use before its assignment at line $def"
 done < <(grep -oE '^[A-Z_][A-Z_0-9]*="\$\(ni_path ' "$AUTOINSTALL" | sed 's/=.*//' | sort -u)
+# 🔴 THE PRESEAL VERIFIER CONFIG TAKES DEVICE COMPAT FROM THE UKI-BOUND SET.
+# The vanilla image ships device_compat_min/max unset by design; the writer used
+# to require them and refused every registry install of a vanilla image
+# (bench 2026-09-06). Exercise the real function against fixtures.
+{
+  awk '/^write_preseal_verifier_config\(\) \{/,/^}$/' "$AUTOINSTALL"
+} > "$TMP/preseal-config.sh"
+grep -q '^write_preseal_verifier_config()' "$TMP/preseal-config.sh" \
+  || fail "cannot extract write_preseal_verifier_config from the installer"
+compat_root="$TMP/verity-root"
+mkdir -p "$compat_root/etc/neural-ice/keys"
+printf 'enforce=0\nroot_pubkey=/etc/neural-ice/keys/ota-root.pub\nstate_dir=/var/lib/neural-ice/ota\nhardware_target=nvidia-gb10-arm64\n#device_compat_min=1\n#device_compat_max=3\n' \
+  > "$compat_root/etc/neural-ice/ota.conf"
+: > "$compat_root/etc/neural-ice/keys/ota-root.pub"
+printf '{"compat_max":5,"compat_min":5,"schema":"neural-ice-installer-preseal-set-v1"}\n' > "$TMP/preseal-set.json"
+compat_out="$(
+  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+    set -euo pipefail
+    die() { echo "die: $*" >&2; exit 1; }
+    source "$1"
+    write_preseal_verifier_config "$2" "$3" "$4"
+    cat "$3"
+  ' _ "$TMP/preseal-config.sh" "$TMP/state" "$TMP/verifier.conf" "$TMP/preseal-set.json"
+)" || fail "the preseal verifier config refused a vanilla image whose compat is unset"
+grep -qx 'device_compat_min=5' <<<"$compat_out" \
+  || fail "the preseal verifier config did not take device_compat_min from the preseal set"
+grep -qx 'device_compat_max=5' <<<"$compat_out" \
+  || fail "the preseal verifier config did not take device_compat_max from the preseal set"
+grep -qx "state_dir=$TMP/state" <<<"$compat_out" \
+  || fail "the preseal verifier config did not rebase state_dir"
+printf 'enforce=0\nroot_pubkey=/x\nstate_dir=/y\ndevice_compat_min=5\n' > "$compat_root/etc/neural-ice/ota.conf"
+if VERITY_ROOT_MOUNT="$compat_root" bash -c '
+    set -euo pipefail
+    die() { exit 1; }
+    source "$1"
+    write_preseal_verifier_config "$2" "$3" "$4"
+  ' _ "$TMP/preseal-config.sh" "$TMP/state" "$TMP/verifier2.conf" "$TMP/preseal-set.json" 2>/dev/null; then
+  fail "a half-declared device compat pair was accepted"
+fi
 unset -f line_of
 
 # A key that merely CONTAINS another key's name must not be counted as it: a
