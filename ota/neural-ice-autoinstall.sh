@@ -1351,8 +1351,10 @@ snapshot_preseal_from_esp() { # $1=destination
   return "$rc"
 }
 
-write_preseal_verifier_config() { # $1=state dir $2=destination
-  local state_dir=$1 destination=$2 source root_key
+write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated preseal set
+  local state_dir=$1 destination=$2 preseal_set=$3 source root_key
+  [[ -f "$preseal_set" && ! -L "$preseal_set" && "$(wc -c < "$preseal_set")" -le 16384 ]] \
+    || die "the preseal verifier configuration needs the authenticated preseal set"
   source="$VERITY_ROOT_MOUNT/etc/neural-ice/ota.conf"
   root_key="$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub"
   [[ -f "$source" && ! -L "$source" && "$(wc -c < "$source")" -le 65536 ]] \
@@ -1360,12 +1362,20 @@ write_preseal_verifier_config() { # $1=state dir $2=destination
   [[ -f "$root_key" && ! -L "$root_key" ]] \
     || die "the verified installer root carries no OTA root public key"
   install -m 0600 /dev/null "$destination"
-  python3 - "$source" "$destination" "$state_dir" "$root_key" <<'PRESEAL_CONFIG_PY' \
+  # 🔴 DEVICE COMPAT COMES FROM THE UKI-BOUND PRESEAL SET. The vanilla image
+  # deliberately ships `device_compat_min/max` unset (instance config, see
+  # image/bootc-overlay/etc/neural-ice/ota.conf), and the verifier's preseal
+  # baseline accepts exactly the set's compat_min/compat_max and nothing else
+  # (tools/ni-ota-verify/src/preseal.rs). Requiring the keys in the image's
+  # ota.conf made every registry install of a vanilla image refuse here (bench
+  # 2026-09-06). A half-declared pair is still refused; a fully declared pair
+  # is kept, and the verifier then decides whether it equals the set.
+  python3 - "$source" "$destination" "$state_dir" "$root_key" "$preseal_set" <<'PRESEAL_CONFIG_PY' \
     || die "cannot create the bounded preseal verifier configuration"
+import json
 import pathlib
 import sys
-
-source, destination, state_dir, root_key = map(pathlib.Path, sys.argv[1:])
+source, destination, state_dir, root_key, preseal_set = map(pathlib.Path, sys.argv[1:])
 lines = source.read_text(encoding="utf-8").splitlines()
 counts = {"root_pubkey": 0, "state_dir": 0,
           "device_compat_min": 0, "device_compat_max": 0}
@@ -1380,9 +1390,20 @@ for line in lines:
     elif key == "state_dir":
         line = f"state_dir={state_dir}"
     result.append(line)
-if counts != {"root_pubkey": 1, "state_dir": 1,
-              "device_compat_min": 1, "device_compat_max": 1}:
+if counts["root_pubkey"] != 1 or counts["state_dir"] != 1:
     raise SystemExit("required OTA verifier configuration keys are absent or duplicated")
+declared = (counts["device_compat_min"], counts["device_compat_max"])
+if declared == (0, 0):
+    with open(preseal_set, "rb") as handle:
+        value = json.loads(handle.read(16384))
+    lo, hi = value.get("compat_min"), value.get("compat_max")
+    if (not isinstance(lo, int) or not isinstance(hi, int) or isinstance(lo, bool)
+            or isinstance(hi, bool) or lo < 1 or hi < lo):
+        raise SystemExit("the preseal set carries no bounded compat range")
+    result.append(f"device_compat_min={lo}")
+    result.append(f"device_compat_max={hi}")
+elif declared != (1, 1):
+    raise SystemExit("device compat keys are half-declared or duplicated")
 destination.write_text("\n".join(result) + "\n", encoding="utf-8")
 PRESEAL_CONFIG_PY
   chmod 0600 "$destination"
@@ -1864,7 +1885,8 @@ if [ "$INSTALL_SOURCE" = registry ]; then
     [[ "$img_seed_ref" =~ ^[0-9a-f]{40}$ ]] \
       || { candidate_probe_release || true; die "the selected owner-sealed appliance carries no bounded PAYLOAD_ID"; }
     install -d -m 0700 "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_STATE/preseal"
-    write_preseal_verifier_config "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_CONFIG"
+    write_preseal_verifier_config "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_CONFIG" \
+      "$PRESEAL_SNAPSHOT/preseal-set.json"
     PRESEAL_BUNDLE_SEQ="$(verify_preseal_candidate "$PRESEAL_SNAPSHOT" \
       "$_img_root" "$img_seed_ref" "$PRESEAL_PREFLIGHT_CONFIG" "$PRESEAL_PREFLIGHT_RECEIPT")" \
       || { candidate_probe_release || true; die "the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation"; }
@@ -2619,7 +2641,8 @@ if (( PRESEAL_ACTIVE == 1 )); then
     "$PRESEAL_INSTALLED_INPUTS" "$PRESEAL_SET_SHA256" \
     || die "the installed eight-file preseal handoff failed exact readback"
   install -d -m 0700 "$ota_state/preseal"
-  write_preseal_verifier_config "$ota_state" "$PRESEAL_INSTALLED_CONFIG"
+  write_preseal_verifier_config "$ota_state" "$PRESEAL_INSTALLED_CONFIG" \
+    "$PRESEAL_INSTALLED_INPUTS/preseal-set.json"
   _installed_preseal_floor="$(verify_installed_preseal_candidate "$PRESEAL_INSTALLED_INPUTS" \
     "$img_seed_ref" "$PRESEAL_INSTALLED_CONFIG" "$PRESEAL_INSTALLED_RECEIPT")" \
     || die "the installed candidate and persistent preseal inputs failed reauthentication"
