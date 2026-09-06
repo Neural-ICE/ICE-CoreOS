@@ -106,7 +106,16 @@ NI_SEALED_LIVE_SELECTOR='neuralice.live=1'
 # Hard bounds. A sealed cmdline is produced by one function with a fixed key
 # order; anything appreciably longer or wider than that is not a medium this
 # repository cut, and an unbounded loop over attacker-chosen words is a cost.
-NI_SEALED_CMDLINE_MAX_BYTES=4096
+#
+# 🔴 THE BYTE BOUND IS THE KERNEL'S, NOT OURS. arm64 COMMAND_LINE_SIZE is 2048
+# and this product's kernel reserves part of it, so its EFI stub hands the
+# runtime readers at most 1957 bytes and silently drops the rest: measured on
+# 2026-09-06, a 2078-byte registry-mirror line booted as "EFI stub: ERROR:
+# Command line is too long: truncated to 1957 bytes", lost its last two mirror
+# pins, and the generator refused the medium on the bench. A line the kernel
+# cannot deliver intact is refused HERE, by the producer's own readback, before
+# it is ever signed -- the former 4096 admitted a medium that could not boot.
+NI_SEALED_CMDLINE_MAX_BYTES=1957
 NI_SEALED_CMDLINE_MAX_WORDS=64
 
 # The reason the last classification failed. Callers print it; the tests assert
