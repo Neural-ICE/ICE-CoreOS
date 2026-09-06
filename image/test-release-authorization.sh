@@ -482,8 +482,16 @@ grep -Fq 'podman image exists "$OS_IMAGE"' "$AUTOINSTALL" \
 # markers by RUNNING that image's own `cat`. A contradictory image can ship a
 # `cat` that prints whatever satisfies the gate, so every comparison afterwards
 # agreed about a lie.
-grep -Fq 'podman --cgroup-manager=cgroupfs --events-backend=file image mount "$OS_IMAGE"' "$AUTOINSTALL" \
-  || fail "the installer does not inspect the pulled image host-side"
+grep -Fq 'create --name "$_candidate_probe" \' "$AUTOINSTALL" \
+  && grep -Fq -- '--entrypoint /nonexistent "$OS_IMAGE"' "$AUTOINSTALL" \
+  && grep -Fq 'mount "$_candidate_probe" 2>/dev/null' "$AUTOINSTALL" \
+  || fail "the installer does not inspect the pulled image host-side through a created, never started container"
+# `podman image mount` refuses "layer not known" once the pulled image's layers
+# are deduplicated into the read-only sealed store (bench 2026-09-06).
+grep -Fq 'image mount "$OS_IMAGE"' "$AUTOINSTALL" \
+  && fail "the installer still inspects the pulled image with image mount, which fails beside the sealed additional store"
+grep -Fq 'podman --cgroup-manager=cgroupfs --events-backend=file start' "$AUTOINSTALL" \
+  && fail "the installer starts a container out of the candidate image"
 grep -Eq 'run --rm --entrypoint .+"\$OS_IMAGE" cat ' "$AUTOINSTALL" \
   && fail "the installer still executes a binary out of the candidate image to read its markers"
 
