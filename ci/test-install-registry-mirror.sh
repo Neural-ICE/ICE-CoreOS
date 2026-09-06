@@ -30,6 +30,13 @@ check "the mirror value is validated as a bare host[:port]" -F '^[A-Za-z0-9._-]+
 check "the mirror is digest-only"                           -F 'pull-from-mirror = "digest-only"'
 check "the drop-in lands in the LIVE environment only"      -F '/etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf'
 check "the target is checked for a leaked mirror drop-in"   -F '"$dep"/etc/containers/registries.conf.d/*neural-ice-install-mirror*'
+# containers/image resolves sigstore attachments by the physical (mirror)
+# location; without this the sealed policy refuses the mirrored image as
+# unsigned (bench 2026-09-06).
+check "sigstore attachments are enabled for the mirror location" -F '/etc/containers/registries.d/99-neural-ice-install-mirror.yaml'
+check "the mirror sigstore entry names the mirror scope"      -F '  $INSTALL_MIRROR/$_scope:'
+check "the mirror sigstore entry enables attachments"         -F '    use-sigstore-attachments: true'
+check "the target is checked for a leaked mirror sigstore file" -F '"$dep"/etc/containers/registries.d/*neural-ice-install-mirror*'
 check "a leaked drop-in is removed, not merely reported"    -E 'rm -f -- "\$\{_leaked\[@\]\}"'
 
 # The original authority comes only from the required digest-pinned image ref.

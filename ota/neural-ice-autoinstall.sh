@@ -1569,7 +1569,7 @@ MIRROR_READY_PY
   # host can no longer answer for the mirror name.
   install -d -m 0755 "/etc/containers/certs.d/$INSTALL_MIRROR"
   install -m 0644 "$MIRROR_CA_FILE" "/etc/containers/certs.d/$INSTALL_MIRROR/ca.crt"
-  install -d -m 0755 /etc/containers/registries.conf.d
+  install -d -m 0755 /etc/containers/registries.conf.d /etc/containers/registries.d
   for _scope in neural-ice vendor; do
     cat >> /etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf <<EOF
 [[registry]]
@@ -1579,6 +1579,19 @@ location = "$INSTALL_REGISTRY_AUTHORITY/$_scope"
   location = "$INSTALL_MIRROR/$_scope"
   pull-from-mirror = "digest-only"
 
+EOF
+    # 🔴 THE SIGNATURE IS FETCHED FROM WHERE THE BYTES COME FROM. containers/image
+    # looks up sigstore attachments by the PHYSICAL location it pulls from, and
+    # the image's registries.d only names the canonical authority; through a
+    # mirror it therefore never asked for the .sig tag and the sealed policy
+    # refused the image as unsigned ("A signature was required, but no
+    # signature exists", bench 2026-09-06). This install-time file names the
+    # mirror scopes too. The policy itself is unchanged: the signature is still
+    # verified against the sealed image-ci key for the canonical repository.
+    cat >> /etc/containers/registries.d/99-neural-ice-install-mirror.yaml <<EOF
+docker:
+  $INSTALL_MIRROR/$_scope:
+    use-sigstore-attachments: true
 EOF
   done
   log "LAN registry mirror enabled for this install only: $INSTALL_MIRROR (digest-only, CA pinned to ${MIRROR_CA_SHA256}, READY for release closure ${MIRROR_READY_SHA256}, canonical authority ${INSTALL_REGISTRY_AUTHORITY} retained)"
@@ -2523,7 +2536,8 @@ echo "[neural-ice-autoinstall] Strict container signature policy restored on the
 # a strict policy, and without this one nothing would have CHECKED that the
 # mirror stayed behind.
 shopt -s nullglob
-_leaked=("$dep"/etc/containers/registries.conf.d/*neural-ice-install-mirror*)
+_leaked=("$dep"/etc/containers/registries.conf.d/*neural-ice-install-mirror* \
+         "$dep"/etc/containers/registries.d/*neural-ice-install-mirror*)
 shopt -u nullglob
 if (( ${#_leaked[@]} )); then
   rm -f -- "${_leaked[@]}" \
