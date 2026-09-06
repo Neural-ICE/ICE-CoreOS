@@ -224,7 +224,7 @@ grep -Fq 'COPY ota/neural-ice-device-root-installer-only.conf' \
 grep -Fq 'systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service' \
   "$ROOT/image/Containerfile.installer"
 grep -Fq '/usr/libexec/neural-ice-device-root ensure' "$ROOT/ota/neural-ice-autoinstall.sh"
-grep -Fq 'installer_device_root_dropin=' "$ROOT/ota/neural-ice-autoinstall.sh"
+grep -Fq 'remove_installer_device_root_guard "$dep" "$INSTALL_SOURCE"' "$ROOT/ota/neural-ice-autoinstall.sh"
 grep -Fq 'cannot remove the installer-only device-root Live guard' \
   "$ROOT/ota/neural-ice-autoinstall.sh"
 grep -Fq 'ExecStart=/usr/libexec/neural-ice-device-root ensure' \

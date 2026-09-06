@@ -10,6 +10,7 @@ on:
       - "ota/neural-ice-device-root-tpm.sh"
       - "ota/neural-ice-device-root-installer-only.conf"
       - "ota/test-neural-ice-device-root-tpm.sh"
+      - "ota/test-installer-device-root-guard.sh"
       - "image/Containerfile.bootc"
       - "image/Containerfile.installer"
       - "image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service"
@@ -38,7 +39,8 @@ jobs:
             ota/neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-lab-baseline-handoff.sh \
             ota/neural-ice-device-root-tpm.sh \
-            ota/test-neural-ice-device-root-tpm.sh
+            ota/test-neural-ice-device-root-tpm.sh \
+            ota/test-installer-device-root-guard.sh
           # The libraries the autoinstaller sources are given to the same
           # invocation: shellcheck can only follow a `source` whose target it was
           # also handed, and an unfollowed source is an SC1091 finding that fails
@@ -55,6 +57,7 @@ jobs:
             ota/test-neural-ice-lab-baseline-handoff.sh \
             ota/neural-ice-device-root-tpm.sh \
             ota/test-neural-ice-device-root-tpm.sh \
+            ota/test-installer-device-root-guard.sh \
             image/build-preloaded.sh \
             image/lib/preloaded-sizing.sh \
             image/lib/preloaded-output-set.sh
@@ -62,6 +65,7 @@ jobs:
         run: |
           ./ota/test-neural-ice-lab-baseline-handoff.sh
           ./ota/test-neural-ice-device-root-tpm.sh
+          ./ota/test-installer-device-root-guard.sh
 
   test-root-install:
     # The X64 runner intentionally has neither sudo nor user namespaces. The

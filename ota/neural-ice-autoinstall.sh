@@ -240,6 +240,45 @@ heartbeat_start() { # $1=label — proof-of-life tick on the console every 20 s
   BG_PID=$!
 }
 
+# Installer-only device-root Live guard. The dual-mode installer image carries
+# /etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf so
+# that a non-installing Live/rescue boot cannot create a persistent TPM object
+# (ota/neural-ice-device-root-installer-only.conf). It must NOT survive in the
+# installed appliance: kept, it would suppress the first-boot ceremony and every
+# later attestation for ever. WHERE the guard can come from decides what is
+# measured on the staged deployment, and that is the install source:
+#   medium   — bootc deploys the sealed store's image and the deployment /etc
+#              replicates the installer's, so the guard IS there and is removed;
+#              its absence means this is not the deployment the installer staged.
+#   registry — bootc deploys the pulled appliance image's own /etc; the guard
+#              never existed there. Its presence would be foreign content that
+#              the pinned appliance ships, and a medium must not silently repair
+#              the appliance it deploys.
+# Measured 2026-09-07 (QEMU, LIGHT 0.60.0 f25a, neuralice.source=registry): the
+# medium-only expectation killed phase 6 in front of a correct deployment.
+remove_installer_device_root_guard() { # $1=deployment root  $2=install source
+  local dep="$1" source="$2" dropin
+  dropin="$dep/etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf"
+  [[ ! -L "$dropin" ]] \
+    || die "installer device-root Live guard is a symlink in the target deployment"
+  case "$source" in
+    medium)
+      [[ -f "$dropin" ]] \
+        || die "installer device-root Live guard is missing from the target deployment"
+      ;;
+    registry)
+      [[ ! -e "$dropin" ]] \
+        || die "installer device-root Live guard is present in a registry-sourced deployment"
+      log "Registry-sourced deployment carries no installer-only device-root guard (as expected); nothing to remove."
+      return 0
+      ;;
+    *) die "unknown install source for the device-root Live guard: $source" ;;
+  esac
+  rm -f -- "$dropin" \
+    || die "cannot remove the installer-only device-root Live guard"
+  rmdir --ignore-fail-on-non-empty "$(dirname -- "$dropin")" 2>/dev/null || true
+}
+
 # %/rate/ETA reporter for the seed staging. The copy itself stays cp -a: the
 # overlay store's hardlink/xattr semantics are load-bearing, and the bootc base
 # image ships neither rsync nor pv (verified; the installer adds no packages by
@@ -2427,12 +2466,6 @@ command -v setfiles >/dev/null || die "setfiles not available in the installer i
 dep="$(ls -d "$TGT"/ostree/deploy/*/deploy/*.0 2>/dev/null | head -1)"
 [[ -n "$dep" && -d "$dep" ]] || die "cannot locate the ostree deployment under $TGT"
 stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
-# This installer-only Live guard is intentionally not part of the installed
-# deployment.  Keeping the base unit enabled makes first-boot and later
-# attestation idempotent; leaving the guard would suppress both forever.
-installer_device_root_dropin="$dep/etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf"
-[[ -f "$installer_device_root_dropin" && ! -L "$installer_device_root_dropin" ]] \
-  || die "installer device-root Live guard is missing from the target deployment"
 # bootc >= 1.16 remounts the target read-only while finalizing the install;
 # every post-bootc mutation of the deployment below needs it writable again.
 # Recovery: a remount failure dies BEFORE any mutation — the disk then holds a
@@ -2444,9 +2477,10 @@ installer_device_root_dropin="$dep/etc/systemd/system/neural-ice-device-root.ser
 # installed system or its upgrade path.
 mount -o remount,rw "$TGT" \
   || die "cannot remount the target read-write after bootc finalize"
-rm -f -- "$installer_device_root_dropin" \
-  || die "cannot remove the installer-only device-root Live guard"
-rmdir --ignore-fail-on-non-empty "$(dirname -- "$installer_device_root_dropin")" 2>/dev/null || true
+# The installer-only Live guard is intentionally not part of the installed
+# deployment (see remove_installer_device_root_guard): what the deployment
+# must carry depends on which /etc bootc deployed, i.e. on the install source.
+remove_installer_device_root_guard "$dep" "$INSTALL_SOURCE"
 
 # The first-boot ceremony unit is the pinned appliance's own
 # (/usr/lib/systemd/system, shipped by ICE-CoreOS). Appliance digests before
