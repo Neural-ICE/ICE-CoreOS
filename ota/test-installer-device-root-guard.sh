@@ -37,10 +37,11 @@ run_case() { # $1=name $2=source $3=fixture(present|absent|symlink) -> prints di
     absent) ;;
   esac
   ( set -euo pipefail
-    # Stand-ins for the installer's console helpers; the extracted function calls them.
-    # shellcheck disable=SC2329
+    # Stand-ins for the installer's console helpers; the extracted function
+    # calls them (invoked indirectly, hence the two shellcheck directives).
+    # shellcheck disable=SC2329,SC2317
     die() { printf 'die: %s\n' "$*"; exit 1; }
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2329,SC2317
     log() { printf 'log: %s\n' "$*"; }
     # shellcheck disable=SC1090,SC1091
     source "$TMP/guard.sh"
