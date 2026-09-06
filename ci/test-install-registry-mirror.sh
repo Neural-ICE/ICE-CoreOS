@@ -36,6 +36,14 @@ check "the target is checked for a leaked mirror drop-in"   -F '"$dep"/etc/conta
 check "sigstore attachments are enabled for the mirror location" -F '/etc/containers/registries.d/99-neural-ice-install-mirror.yaml'
 check "the mirror sigstore entry names the mirror scope"      -F '  $INSTALL_MIRROR/$_scope:'
 check "the mirror sigstore entry enables attachments"         -F '    use-sigstore-attachments: true'
+# The file is one YAML document: the header is written once, outside the scope
+# loop; a header per scope is a duplicate mapping key and a refused pull.
+check "the mirror sigstore YAML header is written once, before the loop" -F "printf 'docker:\\n' > /etc/containers/registries.d/99-neural-ice-install-mirror.yaml"
+if grep -A3 'registries.d/99-neural-ice-install-mirror.yaml <<EOF' "$S" | grep -q '^docker:$'; then
+  printf '  FAIL  the mirror sigstore heredoc repeats the docker: header per scope\n'; fail=1
+else
+  printf '  ok    the mirror sigstore heredoc carries only scope entries\n'
+fi
 check "the target is checked for a leaked mirror sigstore file" -F '"$dep"/etc/containers/registries.d/*neural-ice-install-mirror*'
 check "a leaked drop-in is removed, not merely reported"    -E 'rm -f -- "\$\{_leaked\[@\]\}"'
 
