@@ -705,7 +705,11 @@ SEALED_INSTALL_TARGET = "systemd.unit=neural-ice-installer.target"
 SEALED_INSTALL_SELECTOR = "neuralice.autoinstall=1"
 SEALED_LIVE_TARGET = "systemd.unit=neural-ice-live.target"
 SEALED_LIVE_SELECTOR = "neuralice.live=1"
-SEALED_CMDLINE_MAX_BYTES = 4096
+# The kernel's deliverable bound, not a generous one: this product's arm64 EFI
+# stub truncates a longer line to 1957 bytes and boots without the tail (see
+# NI_SEALED_CMDLINE_MAX_BYTES in the shell grammar). A finished medium sealing
+# more than that is refused here exactly as the producer refuses to cut it.
+SEALED_CMDLINE_MAX_BYTES = 1957
 SEALED_CMDLINE_MAX_WORDS = 64
 # Install only. `bootc install` relabels the target and the enforcing live policy
 # denies it; a Live boot relabels nothing, so a Live medium sealing this is a

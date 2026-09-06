@@ -88,8 +88,11 @@ if [[ -z "${NEURAL_ICE_INSTALLER_TRUST_LIB_LOADED:-}" ]]; then
   readonly NEURAL_ICE_TRUST_POLICY_ID_RELPATH="usr/lib/neural-ice/signed-boot-trust-policy-id"
   readonly NEURAL_ICE_RELAUTH_KEY_RELPATH="usr/lib/neural-ice/keys/release-authorization.pub"
   # A kernel command line is bounded by the kernel itself; anything longer than
-  # this is a corrupted or padded section, not a cmdline we should parse.
-  readonly NEURAL_ICE_INSTALLER_TRUST_MAX_CMDLINE_BYTES=4096
+  # this is a corrupted or padded section, not a cmdline we should parse. The
+  # bound is what this product's arm64 kernel actually delivers (2048 less its
+  # reserved bytes: 1957, measured 2026-09-06), the same figure the sealed
+  # grammar enforces -- see NI_SEALED_CMDLINE_MAX_BYTES.
+  readonly NEURAL_ICE_INSTALLER_TRUST_MAX_CMDLINE_BYTES=1957
 fi
 
 # --------------------------------------------------------------------------- #
