@@ -1570,6 +1570,10 @@ MIRROR_READY_PY
   install -d -m 0755 "/etc/containers/certs.d/$INSTALL_MIRROR"
   install -m 0644 "$MIRROR_CA_FILE" "/etc/containers/certs.d/$INSTALL_MIRROR/ca.crt"
   install -d -m 0755 /etc/containers/registries.conf.d /etc/containers/registries.d
+  # One YAML document, one top-level `docker:` key: appending the header per
+  # scope produced a duplicate mapping key and containers/image refused the
+  # whole file before its first request (bench 2026-09-06, attempt 7).
+  printf 'docker:\n' > /etc/containers/registries.d/99-neural-ice-install-mirror.yaml
   for _scope in neural-ice vendor; do
     cat >> /etc/containers/registries.conf.d/99-neural-ice-install-mirror.conf <<EOF
 [[registry]]
@@ -1589,7 +1593,6 @@ EOF
     # mirror scopes too. The policy itself is unchanged: the signature is still
     # verified against the sealed image-ci key for the canonical repository.
     cat >> /etc/containers/registries.d/99-neural-ice-install-mirror.yaml <<EOF
-docker:
   $INSTALL_MIRROR/$_scope:
     use-sigstore-attachments: true
 EOF
