@@ -477,6 +477,16 @@ fi
 # FAB-0040: a light medium boots, and the bytes come off the LAN.
 #
 # ⚠️ DEFAULT IS `medium`. Without the karg not one line of the USB path changes.
+# 🔴 DEFINED BEFORE THE REGISTRY BLOCK THAT READS THEM. Under `set -u` a use of
+# either name before its assignment kills the installer with no `die`, no
+# evidence and no console line -- exactly how the first registry-mirror medium
+# failed on the bench (2026-09-06): the policy gate below referenced both while
+# they were still declared ~70 lines further down, and every test had them
+# exported through the test seam, so nothing ever ran this order for real.
+NEURALICE_REGISTRY_AUTHORISATION="$(ni_path NEURALICE_REGISTRY_AUTHORISATION /usr/lib/neural-ice/registry-authorisation.py)"
+readonly NEURALICE_REGISTRY_AUTHORISATION
+NEURALICE_CONTAINER_POLICY="$(ni_path NEURALICE_CONTAINER_POLICY /etc/containers/policy.json)"
+readonly NEURALICE_CONTAINER_POLICY
 INSTALL_SOURCE=medium
 _source_karg="$(karg_once neuralice.source)"
 if [[ -n "$_source_karg" ]]; then
@@ -646,10 +656,6 @@ readonly OTA_VERIFY
 # The ONE signature-policy reader, and the file it reads. Both are fixed
 # production paths: the reader lives in the dm-verity-protected /usr the UKI
 # seals, and the policy is the medium's own, so neither is an argument.
-NEURALICE_REGISTRY_AUTHORISATION="$(ni_path NEURALICE_REGISTRY_AUTHORISATION /usr/lib/neural-ice/registry-authorisation.py)"
-readonly NEURALICE_REGISTRY_AUTHORISATION
-NEURALICE_CONTAINER_POLICY="$(ni_path NEURALICE_CONTAINER_POLICY /etc/containers/policy.json)"
-readonly NEURALICE_CONTAINER_POLICY
 
 # WHERE THE SEALED MEDIUM PUT ITSELF. The signed initramfs opened both
 # dm-verity extents, mounted them read-only and gave this system an overlay over

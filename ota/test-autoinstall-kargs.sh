@@ -162,6 +162,32 @@ for required in \
   grep -Fq -- "$required" "$AUTOINSTALL" \
     || fail "the owner-profile preseal contract is incomplete: $required"
 done
+# 🔴 A NAME READ BEFORE IT IS ASSIGNED IS A SILENT DEATH, NOT A REFUSAL. The
+# installer runs under `set -u`; a top-level reference that precedes the
+# assignment exits with no `die`, no evidence and no console line. The first
+# registry-mirror medium died exactly so on the bench (2026-09-06): the signature
+# policy gate referenced NEURALICE_REGISTRY_AUTHORISATION and
+# NEURALICE_CONTAINER_POLICY ~70 lines before either was assigned, and every
+# suite had them exported through the test seam, so no test ran this order.
+registry_reader_def="$(grep -nE '^NEURALICE_REGISTRY_AUTHORISATION="\$\(ni_path ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+container_policy_def="$(grep -nE '^NEURALICE_CONTAINER_POLICY="\$\(ni_path ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+registry_gate_line="$(line_of '[[ -f "$NEURALICE_REGISTRY_AUTHORISATION" && ! -L "$NEURALICE_REGISTRY_AUTHORISATION" ]]')"
+container_policy_gate_line="$(line_of '[[ -f "$NEURALICE_CONTAINER_POLICY" && ! -L "$NEURALICE_CONTAINER_POLICY" ]]')"
+[[ -n "$registry_reader_def" && -n "$container_policy_def" \
+   && -n "$registry_gate_line" && -n "$container_policy_gate_line" \
+   && "$registry_reader_def" -lt "$registry_gate_line" \
+   && "$container_policy_def" -lt "$container_policy_gate_line" ]] \
+  || fail "the registry signature-policy gate reads a name the installer has not assigned yet (set -u kills it silently on a registry medium)"
+# The same class, generically: no top-level `$NAME` may precede `NAME=` for any
+# ni_path-assigned NAME. Function bodies are skipped because they run later.
+while IFS= read -r name; do
+  def="$(grep -nE "^${name}=\"\\\$\(ni_path " "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+  first_use="$(awk -v n="$name" -v def="$def" '
+    /^[A-Za-z_][A-Za-z_0-9]*\(\) *\{/ { infn=1 } infn && /^\}$/ { infn=0; next }
+    !infn && NR < def && $0 !~ /^[[:space:]]*#/ && index($0, "$" n) { print NR; exit }' "$AUTOINSTALL")"
+  [[ -z "$first_use" ]] \
+    || fail "$name is read at line $first_use before its assignment at line $def"
+done < <(grep -oE '^[A-Z_][A-Z_0-9]*="\$\(ni_path ' "$AUTOINSTALL" | sed 's/=.*//' | sort -u)
 unset -f line_of
 
 # A key that merely CONTAINS another key's name must not be counted as it: a
