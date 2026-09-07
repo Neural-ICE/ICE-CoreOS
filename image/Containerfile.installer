@@ -85,6 +85,15 @@ RUN bash -euxo pipefail -c '\
     lsinitrd -f /etc/systemd/system/systemd-cryptsetup@.service.d/10-neural-ice-policy.conf "$initramfs" \
       | grep -F "Requires=neural-ice-tpm-policy.service" >/dev/null'
 
+# The autoinstaller and every policy/trust library it sources form one reviewed
+# destructive-path program. BASE_IMAGE can legitimately be older than this
+# derived installer, so never inherit these callees while replacing the caller.
+COPY image/lib/access-policy.sh /usr/lib/neural-ice/lib/access-policy.sh
+COPY image/lib/hardware-identity.sh /usr/lib/neural-ice/lib/hardware-identity.sh
+COPY image/lib/installer-payload.sh /usr/lib/neural-ice/lib/installer-payload.sh
+COPY image/lib/installer-ssh-key.sh /usr/lib/neural-ice/lib/installer-ssh-key.sh
+COPY image/lib/installer-trust.sh /usr/lib/neural-ice/lib/installer-trust.sh
+COPY image/lib/release-authorization.sh /usr/lib/neural-ice/lib/release-authorization.sh
 # Auto-install service (gated by the neuralice.autoinstall kernel argument).
 COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
 # The installer must derive PolicyPCR from the live PCR with the same
@@ -183,6 +192,12 @@ RUN set -euxo pipefail; \
     chmod 0644 /usr/lib/neural-ice/sealed-cmdline-grammar.sh \
       /usr/lib/neural-ice/installer-failure-policy \
       /usr/lib/neural-ice/registry-authorisation.py; \
+    chmod 0444 /usr/lib/neural-ice/lib/access-policy.sh \
+      /usr/lib/neural-ice/lib/hardware-identity.sh \
+      /usr/lib/neural-ice/lib/installer-payload.sh \
+      /usr/lib/neural-ice/lib/installer-ssh-key.sh \
+      /usr/lib/neural-ice/lib/installer-trust.sh \
+      /usr/lib/neural-ice/lib/release-authorization.sh; \
     bash -n /usr/libexec/neural-ice-installer-failure; \
     python3 -c 'import ast,sys; [ast.parse(open(path).read()) for path in sys.argv[1:]]' \
       /usr/lib/neural-ice/registry-authorisation.py \

@@ -326,6 +326,75 @@ grep -Fq 'for _ni_lib in access-policy hardware-identity installer-payload insta
   "$AUTOINSTALL" \
   || fail "the autoinstaller does not require every access library before it reasons about access"
 
+# The derived installer must take the caller and every library it sources from
+# this checkout. A base image is an immutable input, but it can predate a gate
+# change: exercise the actual COPY mapping against a deliberately stale base so
+# a source-only test cannot pass while the built installer retains old callees.
+INSTALLER_CONTAINERFILE="$ROOT/image/Containerfile.installer"
+installer_libs=(
+  access-policy
+  hardware-identity
+  installer-payload
+  installer-ssh-key
+  installer-trust
+  release-authorization
+)
+derived_root="$work/derived-installer-root"
+derived_lib="$derived_root/usr/lib/neural-ice/lib"
+mkdir -p "$derived_lib"
+for _lib in "${installer_libs[@]}"; do
+  printf '#!/usr/bin/env bash\nreturn 64 2>/dev/null || exit 64\n' \
+    > "$derived_lib/${_lib}.sh"
+done
+if bash "$derived_lib/access-policy.sh" permits-installer-ssh lab-managed; then
+  fail "the stale base fixture unexpectedly permits the current LAB policy"
+fi
+
+while read -r instruction source destination remainder; do
+  [[ "$instruction" == COPY && -z "${remainder:-}" ]] || continue
+  for _lib in "${installer_libs[@]}"; do
+    if [[ "$source" == "image/lib/${_lib}.sh" \
+          && "$destination" == "/usr/lib/neural-ice/lib/${_lib}.sh" ]]; then
+      cp "$ROOT/$source" "$derived_root$destination"
+    fi
+  done
+done < "$INSTALLER_CONTAINERFILE"
+
+caller_line="$(grep -nF 'COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh' \
+  "$INSTALLER_CONTAINERFILE" | cut -d: -f1)"
+[[ -n "$caller_line" ]] || fail "the installer recipe no longer stages the autoinstall caller"
+installer_seal_block="$(sed -n \
+  '\|chmod 0444 /usr/lib/neural-ice/lib/access-policy.sh|,\|/usr/lib/neural-ice/lib/release-authorization.sh; \\|p' \
+  "$INSTALLER_CONTAINERFILE")"
+[[ -n "$installer_seal_block" ]] \
+  || fail "the installer recipe has no read-only library sealing block"
+for _lib in "${installer_libs[@]}"; do
+  cmp "$ROOT/image/lib/${_lib}.sh" "$derived_lib/${_lib}.sh" \
+    || fail "the derived installer retains stale ${_lib}.sh bytes from BASE_IMAGE"
+  copy_line="$(grep -nF "COPY image/lib/${_lib}.sh /usr/lib/neural-ice/lib/${_lib}.sh" \
+    "$INSTALLER_CONTAINERFILE" | cut -d: -f1)"
+  [[ -n "$copy_line" && "$copy_line" -lt "$caller_line" ]] \
+    || fail "the installer recipe does not stage current ${_lib}.sh before its caller"
+  grep -Fq "/usr/lib/neural-ice/lib/${_lib}.sh" <<<"$installer_seal_block" \
+    || fail "the installer recipe does not seal ${_lib}.sh read-only"
+done
+bash "$derived_lib/access-policy.sh" gate-installer-ssh \
+  lab-managed registry 1 authenticated-pulled-target \
+  || fail "the assembled installer refuses authenticated pulled-target LAB access"
+if bash "$derived_lib/access-policy.sh" gate-installer-ssh \
+  lab-managed registry 1 verified-medium-root >/dev/null 2>&1; then
+  fail "the assembled installer accepts registry access without pulled-target proof"
+fi
+if bash "$derived_lib/access-policy.sh" gate-installer-ssh \
+  customer-locked registry 1 authenticated-pulled-target >/dev/null 2>&1; then
+  fail "the assembled installer accepts customer-locked registry access"
+fi
+trust_bound="$(bash -c \
+  'source "$1/access-policy.sh"; source "$1/installer-trust.sh"; printf "%s" "$NEURAL_ICE_INSTALLER_TRUST_MAX_CMDLINE_BYTES"' \
+  -- "$derived_lib")"
+[[ "$trust_bound" == 1957 ]] \
+  || fail "the assembled installer executes a stale sealed-command-line trust gate"
+
 # --------------------------------------------------------------------------- #
 # 8) TPM provisioning and owner sealing are one mandatory first-boot lifecycle.
 #    The installer persists the prerequisites and intent; runtime never creates
