@@ -30,6 +30,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
   awk '/^candidate_ota_state_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^require_medium_source_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^verify_installed_preseal_candidate\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^encode_snapshotted_ssh_key\(\) \{/,/^}$/' "$AUTOINSTALL"
 } > "$TMP/reader.sh"
 grep -q '^karg_count()' "$TMP/reader.sh" || fail "cannot extract karg_count from the installer"
 grep -q '^karg_once()'  "$TMP/reader.sh" || fail "cannot extract karg_once from the installer"
@@ -41,6 +42,43 @@ die() { echo "die: $*" >&2; exit 1; }
 NEURALICE_CMDLINE_FILE="$CMDLINE"
 # shellcheck source=/dev/null
 source "$TMP/reader.sh"
+
+# A registry key is snapshotted before the candidate pull and consumed only
+# after authentication. Encoding must therefore revalidate the exact snapshot,
+# not trust the earlier verdict or reread the mutable ESP path.
+grep -q '^encode_snapshotted_ssh_key()' "$TMP/reader.sh" \
+  || fail "cannot extract encode_snapshotted_ssh_key from the installer"
+# shellcheck source=image/lib/installer-ssh-key.sh
+source "$ROOT/image/lib/installer-ssh-key.sh"
+key_fixture="$TMP/operator-key"
+ssh-keygen -q -t ed25519 -N '' -f "$key_fixture" </dev/null
+key_snapshot="$TMP/operator-snapshot.pub"
+cp "$key_fixture.pub" "$key_snapshot"
+key_snapshot_sha256="$(sha256sum "$key_snapshot" | awk '{print $1}')"
+encoded_snapshot="$(encode_snapshotted_ssh_key "$key_snapshot" "$key_snapshot_sha256")" \
+  || fail "an unchanged single public-key snapshot was refused"
+printf '%s' "$encoded_snapshot" | base64 -d > "$TMP/encoded-snapshot.pub"
+cmp -s "$key_snapshot" "$TMP/encoded-snapshot.pub" \
+  || fail "the installed SSH karg bytes differ from the validated snapshot"
+
+ssh-keygen -q -t ed25519 -N '' -f "$TMP/other-key" </dev/null
+cp "$TMP/other-key.pub" "$key_snapshot"
+encode_snapshotted_ssh_key "$key_snapshot" "$key_snapshot_sha256" >/dev/null 2>&1 \
+  && fail "a changed SSH snapshot was encoded after its validation verdict"
+cat "$key_fixture.pub" "$TMP/other-key.pub" > "$TMP/multiple-keys.pub"
+multiple_sha256="$(sha256sum "$TMP/multiple-keys.pub" | awk '{print $1}')"
+encode_snapshotted_ssh_key "$TMP/multiple-keys.pub" "$multiple_sha256" >/dev/null 2>&1 \
+  && fail "multiple SSH keys were encoded"
+printf '%s\n' not-an-openssh-key > "$TMP/malformed-key.pub"
+malformed_sha256="$(sha256sum "$TMP/malformed-key.pub" | awk '{print $1}')"
+encode_snapshotted_ssh_key "$TMP/malformed-key.pub" "$malformed_sha256" >/dev/null 2>&1 \
+  && fail "a malformed SSH snapshot was encoded"
+ln -s "$key_fixture.pub" "$TMP/symlink-key.pub"
+encode_snapshotted_ssh_key "$TMP/symlink-key.pub" \
+  "$(sha256sum "$key_fixture.pub" | awk '{print $1}')" >/dev/null 2>&1 \
+  && fail "a symlink SSH snapshot was encoded"
+grep -Fq 'sshkey_karg=(--karg "neuralice.sshkey=$SSHKEY_B64")' "$AUTOINSTALL" \
+  || fail "the installed kernel argument is not built from the accepted snapshot encoding"
 
 set_cmdline() { printf '%s\n' "$*" > "$CMDLINE"; }
 

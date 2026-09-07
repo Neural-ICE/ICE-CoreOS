@@ -1099,35 +1099,70 @@ ACCESS_POLICY="$(access_policy_read "$VERITY_ROOT_MOUNT" 2>/dev/null)" \
   || die "the installer root states access policy '$ACCESS_POLICY' but the signed UKI seals '$SEALED_ACCESS_PROFILE'"
 log "Immutable image access policy: $ACCESS_POLICY (agrees with the signed UKI)"
 
+# Encode only a snapshot whose structure and identity still match the verdict
+# recorded when it was copied away from the mutable ESP/karg input. Revalidate
+# after encoding as well: the installed karg must contain the exact bytes that
+# passed both checks, never a later read of the medium path.
+encode_snapshotted_ssh_key() { # $1=snapshot $2=expected SHA-256
+  local snapshot=$1 expected_sha256=$2 encoded
+  [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  installer_ssh_key_validate_file "$snapshot" || return 1
+  [[ "$(sha256sum "$snapshot" | awk '{print $1}')" == "$expected_sha256" ]] || return 1
+  encoded="$(base64 -w0 < "$snapshot")" || return 1
+  installer_ssh_key_validate_file "$snapshot" || return 1
+  [[ "$(sha256sum "$snapshot" | awk '{print $1}')" == "$expected_sha256" ]] || return 1
+  printf '%s' "$encoded" | base64 -d | cmp -s - "$snapshot" || return 1
+  printf '%s\n' "$encoded"
+}
+
 # PRESENCE first, CONTENT later. The policy refusal must fire on the mere
 # OFFER of a key, before anything reads the supplied bytes: a customer-locked
 # appliance must refuse a crafted ESP entry, not first try to parse it.
 SSHKEY_B64=""
 SSHKEY_ORIGIN=""
 SSHKEY_ESP_FILE=""
+SSHKEY_SNAPSHOT_SHA256=""
+_sshkey_candidate=""
+_sshkey_esp_mounted_by_us=0
+_sshkey_esp_mountpoint=""
 # awk's default field splitting is exactly kernel-command-line splitting, and
 # unlike a greedy `sed .*` it can SEE a second occurrence instead of silently
 # keeping the last one.
 _sshkey_kargs="$(karg_count neuralice.sshkey)"
 (( _sshkey_kargs <= 1 )) \
   || die "the installer command line carries ${_sshkey_kargs} neuralice.sshkey arguments"
-if (( _sshkey_kargs == 1 )); then
-  SSHKEY_ORIGIN="kernel command line"
-else
-  _usb_esp="$(media_vfat_partition || true)"
-  if [[ -n "${_usb_esp:-}" ]]; then
-    _esp_mp="$(mounted_at "/dev/$_usb_esp" || true)"
-    if [[ -n "$_esp_mp" ]] && [[ -e "$_esp_mp/ice-coreos/authorized_keys" || -L "$_esp_mp/ice-coreos/authorized_keys" ]]; then
-      SSHKEY_ESP_FILE="$_esp_mp/ice-coreos/authorized_keys"
-      SSHKEY_ORIGIN="installer ESP"
-    fi
+_usb_esp="$(media_vfat_partition || true)"
+if [[ -n "${_usb_esp:-}" ]]; then
+  _esp_mp="$(mounted_at "/dev/$_usb_esp" || true)"
+  if [[ -z "$_esp_mp" ]]; then
+    _esp_mp=/run/neural-ice-installer/sshkey-esp
+    install -d -m 0700 "$_esp_mp"
+    mount -o ro,nodev,nosuid,noexec "/dev/$_usb_esp" "$_esp_mp" \
+      || die "cannot mount the installer ESP read-only to inspect operator-key presence"
+    _sshkey_esp_mounted_by_us=1
   fi
+  _sshkey_esp_mountpoint="$_esp_mp"
+  if [[ -e "$_esp_mp/ice-coreos/authorized_keys" || -L "$_esp_mp/ice-coreos/authorized_keys" ]]; then
+    SSHKEY_ESP_FILE="$_esp_mp/ice-coreos/authorized_keys"
+  fi
+fi
+if (( _sshkey_kargs == 1 )) && [[ -n "$SSHKEY_ESP_FILE" ]]; then
+  die "the installer carries operator SSH keys in both the kernel command line and ESP"
+elif (( _sshkey_kargs == 1 )); then
+  SSHKEY_ORIGIN="kernel command line"
+elif [[ -n "$SSHKEY_ESP_FILE" ]]; then
+  SSHKEY_ORIGIN="installer ESP"
 fi
 
 if [[ -n "$SSHKEY_ORIGIN" ]]; then
-  # Refuse LOUDLY, and before the disk is touched.
-  access_policy_gate_installer_ssh "$ACCESS_POLICY" "$INSTALL_SOURCE" 1 \
-    || die "an SSH key was supplied on the ${SSHKEY_ORIGIN} but this image refuses installer SSH provisioning (policy=$ACCESS_POLICY, source=$INSTALL_SOURCE)"
+  # Refuse a forbidden profile before reading one byte of the supplied key.
+  # A permitted registry key is only snapshotted here; target authorization
+  # happens after the pull and complete preseal validation below.
+  if ! access_policy_permits_installer_ssh "$ACCESS_POLICY"; then
+    access_policy_gate_installer_ssh "$ACCESS_POLICY" "$INSTALL_SOURCE" 1 unauthenticated-target \
+      || die "an SSH key was supplied on the ${SSHKEY_ORIGIN} but this image refuses installer SSH provisioning (policy=$ACCESS_POLICY, source=$INSTALL_SOURCE)"
+    die "the access-policy gate admitted a key for forbidden policy $ACCESS_POLICY"
+  fi
 
   # The policy says a key MAY be provisioned; it says nothing about whether THIS
   # byte string is a key. Structure is checked here so a malformed, multiple,
@@ -1152,14 +1187,28 @@ if [[ -n "$SSHKEY_ORIGIN" ]]; then
     installer_ssh_key_validate_file "$_sshkey_candidate" \
       || die "the SSH key supplied on the ${SSHKEY_ORIGIN} is not exactly one plain OpenSSH public key"
   fi
-  # Encode from the VALIDATED bytes, so the karg carries exactly what was checked.
-  SSHKEY_B64="$(base64 -w0 < "$_sshkey_candidate")"
-  log "Operator SSH key accepted from the ${SSHKEY_ORIGIN} (policy=$ACCESS_POLICY) — 'core' will be provisioned on first boot."
-  rm -rf -- "$_sshkey_scratch"
+  # Validate the immutable snapshot, including the ESP copy, and remember its
+  # identity. Acceptance and encoding remain pending until the selected target
+  # has passed its source-specific proof.
+  installer_ssh_key_validate_file "$_sshkey_candidate" \
+    || die "the snapshotted SSH key from the ${SSHKEY_ORIGIN} is not exactly one plain OpenSSH public key"
+  SSHKEY_SNAPSHOT_SHA256="$(sha256sum "$_sshkey_candidate" | awk '{print $1}')"
+  [[ "$SSHKEY_SNAPSHOT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "cannot identify the snapshotted SSH key from the ${SSHKEY_ORIGIN}"
+  if (( _sshkey_esp_mounted_by_us == 1 )); then
+    umount "$_sshkey_esp_mountpoint" \
+      || die "cannot unmount the installer ESP after snapshotting the operator key"
+    _sshkey_esp_mounted_by_us=0
+  fi
 else
+  if (( _sshkey_esp_mounted_by_us == 1 )); then
+    umount "$_sshkey_esp_mountpoint" \
+      || die "cannot unmount the installer ESP after checking operator-key presence"
+    _sshkey_esp_mounted_by_us=0
+  fi
   # No key offered. The policy is still validated above, so an image with no
   # recognised access posture never installs at all.
-  access_policy_gate_installer_ssh "$ACCESS_POLICY" "$INSTALL_SOURCE" 0 \
+  access_policy_gate_installer_ssh "$ACCESS_POLICY" "$INSTALL_SOURCE" 0 no-key \
     || die "the source image access policy is not acceptable to this installer"
   log "No operator SSH key provided; none will be set (policy=$ACCESS_POLICY)."
 fi
@@ -2001,6 +2050,27 @@ else
 fi
 readonly RELEASE_AUTH_VERIFIED_REF
 readonly PRESEAL_ACTIVE PRESEAL_BUNDLE_SEQ
+
+# The exact target is now fixed in local containers-storage. On registry
+# installs this point follows signed request authorization, pulled index/child
+# identity checks, candidate profile/variant/target/trust/platform matching,
+# applicable owner-preseal verification, and successful release of the
+# host-side candidate mount. Only now may the pending medium key become an
+# accepted installed karg.
+if [[ -n "$SSHKEY_ORIGIN" ]]; then
+  if [[ "$INSTALL_SOURCE" == registry ]]; then
+    access_policy_gate_installer_ssh "$img_profile" registry 1 authenticated-pulled-target \
+      || die "the authenticated pulled target refuses the SSH key supplied on the ${SSHKEY_ORIGIN} (policy=${img_profile:-unreadable})"
+  else
+    access_policy_gate_installer_ssh "$ACCESS_POLICY" medium 1 verified-medium-root \
+      || die "the verified medium image refuses the SSH key supplied on the ${SSHKEY_ORIGIN} (policy=$ACCESS_POLICY)"
+  fi
+  SSHKEY_B64="$(encode_snapshotted_ssh_key "$_sshkey_candidate" "$SSHKEY_SNAPSHOT_SHA256")" \
+    || die "the snapshotted SSH key changed or became invalid before target authorization completed"
+  log "Operator SSH key accepted from the ${SSHKEY_ORIGIN} (policy=${img_profile:-$ACCESS_POLICY}) — 'core' will be provisioned on first boot."
+  rm -rf -- "$_sshkey_scratch"
+fi
+readonly SSHKEY_B64
 
 # --------------------------------------------------------------------------- #
 # 2c) 🔴 THE OFFLINE SEED, VERIFIED IN FULL BEFORE THE FIRST DISK MUTATION
