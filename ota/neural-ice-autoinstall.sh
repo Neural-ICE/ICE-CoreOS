@@ -1390,17 +1390,21 @@ snapshot_preseal_from_esp() { # $1=destination
   return "$rc"
 }
 
-write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated preseal set
-  local state_dir=$1 destination=$2 preseal_set=$3 source root_key
+write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated set [$4=source $5=root key value $6=root key source]
+  local state_dir=$1 destination=$2 preseal_set=$3 source root_key root_key_source destination_dir
+  source="${4:-$VERITY_ROOT_MOUNT/etc/neural-ice/ota.conf}"
+  root_key="${5:-$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub}"
+  root_key_source="${6:-$root_key}"
   [[ -f "$preseal_set" && ! -L "$preseal_set" && "$(wc -c < "$preseal_set")" -le 16384 ]] \
     || die "the preseal verifier configuration needs the authenticated preseal set"
-  source="$VERITY_ROOT_MOUNT/etc/neural-ice/ota.conf"
-  root_key="$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub"
   [[ -f "$source" && ! -L "$source" && "$(wc -c < "$source")" -le 65536 ]] \
     || die "the verified installer root carries no bounded OTA verifier configuration"
-  [[ -f "$root_key" && ! -L "$root_key" ]] \
+  [[ -f "$root_key_source" && ! -L "$root_key_source" ]] \
     || die "the verified installer root carries no OTA root public key"
-  install -m 0600 /dev/null "$destination"
+  destination_dir="$(dirname -- "$destination")"
+  [[ -d "$destination_dir" && ! -L "$destination_dir" \
+      && ! -e "$destination" && ! -L "$destination" ]] \
+    || die "the preseal verifier configuration destination is unsafe or already exists"
   # 🔴 DEVICE COMPAT COMES FROM THE UKI-BOUND PRESEAL SET. The vanilla image
   # deliberately ships `device_compat_min/max` unset (instance config, see
   # image/bootc-overlay/etc/neural-ice/ota.conf), and the verifier's preseal
@@ -1412,10 +1416,44 @@ write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated
   python3 - "$source" "$destination" "$state_dir" "$root_key" "$preseal_set" <<'PRESEAL_CONFIG_PY' \
     || die "cannot create the bounded preseal verifier configuration"
 import json
+import os
 import pathlib
+import stat
 import sys
 source, destination, state_dir, root_key, preseal_set = map(pathlib.Path, sys.argv[1:])
-lines = source.read_text(encoding="utf-8").splitlines()
+
+def bounded_regular(path, maximum):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
+        raise SystemExit(f"unsafe or empty input: {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(fd)
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            part = os.read(fd, remaining)
+            if not part:
+                break
+            chunks.append(part)
+            remaining -= len(part)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    after = os.lstat(path)
+    identity = (before.st_dev, before.st_ino)
+    if ((opened.st_dev, opened.st_ino) != identity
+            or (after.st_dev, after.st_ino) != identity
+            or not stat.S_ISREG(after.st_mode) or not 0 < len(raw) <= maximum):
+        raise SystemExit(f"unstable input: {path}")
+    return raw
+
+for mapped in (state_dir, root_key):
+    if (not mapped.is_absolute() or ".." in mapped.parts
+            or "\n" in str(mapped) or "\r" in str(mapped)):
+        raise SystemExit("verifier paths must be clean absolute paths")
+
+lines = bounded_regular(source, 65536).decode("utf-8").splitlines()
 counts = {"root_pubkey": 0, "state_dir": 0,
           "device_compat_min": 0, "device_compat_max": 0}
 result = []
@@ -1433,8 +1471,7 @@ if counts["root_pubkey"] != 1 or counts["state_dir"] != 1:
     raise SystemExit("required OTA verifier configuration keys are absent or duplicated")
 declared = (counts["device_compat_min"], counts["device_compat_max"])
 if declared == (0, 0):
-    with open(preseal_set, "rb") as handle:
-        value = json.loads(handle.read(16384))
+    value = json.loads(bounded_regular(preseal_set, 16384))
     lo, hi = value.get("compat_min"), value.get("compat_max")
     if (not isinstance(lo, int) or not isinstance(hi, int) or isinstance(lo, bool)
             or isinstance(hi, bool) or lo < 1 or hi < lo):
@@ -1443,10 +1480,24 @@ if declared == (0, 0):
     result.append(f"device_compat_max={hi}")
 elif declared != (1, 1):
     raise SystemExit("device compat keys are half-declared or duplicated")
-destination.write_text("\n".join(result) + "\n", encoding="utf-8")
+payload = ("\n".join(result) + "\n").encode("utf-8")
+fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+    os.fsync(fd)
+finally:
+    os.close(fd)
 PRESEAL_CONFIG_PY
+  [[ -f "$destination" && ! -L "$destination" ]] \
+    || die "the generated preseal verifier configuration is not a regular file"
   chmod 0600 "$destination"
   sync -f "$destination" || die "cannot fsync the preseal verifier configuration"
+  sync -f "$destination_dir" || die "cannot fsync the preseal verifier configuration directory"
 }
 
 verify_preseal_candidate() { # $1=input root $2=candidate root $3=current seed $4=config $5=receipt
@@ -2668,6 +2719,15 @@ if (( PRESEAL_ACTIVE == 1 )); then
   readonly PRESEAL_INSTALLED_CONFIG=/run/neural-ice-installer/preseal-installed-verifier.conf
   readonly PRESEAL_INSTALLED_INPUTS="$ota_state/preseal-input-v1"
   readonly PRESEAL_INSTALLED_RECEIPT="$ota_state/preseal/receipt.json"
+  readonly INSTALLED_OTA_CONFIG_DIR="$dep/etc/neural-ice"
+  readonly INSTALLED_OTA_CONFIG="$INSTALLED_OTA_CONFIG_DIR/ota.conf"
+  readonly INSTALLED_OTA_ROOT_KEY="$INSTALLED_OTA_CONFIG_DIR/keys/ota-root.pub"
+  readonly INSTALLED_OTA_CONFIG_CANDIDATE="$INSTALLED_OTA_CONFIG_DIR/.ota.conf.neural-ice-installer"
+  [[ -d "$INSTALLED_OTA_CONFIG_DIR" && ! -L "$INSTALLED_OTA_CONFIG_DIR" \
+      && -f "$INSTALLED_OTA_CONFIG" && ! -L "$INSTALLED_OTA_CONFIG" \
+      && -f "$INSTALLED_OTA_ROOT_KEY" && ! -L "$INSTALLED_OTA_ROOT_KEY" \
+      && ! -e "$INSTALLED_OTA_CONFIG_CANDIDATE" && ! -L "$INSTALLED_OTA_CONFIG_CANDIDATE" ]] \
+    || die "the installed OTA configuration or its staging path is unsafe"
   "$PRESEAL_HANDOFF" install-persistent \
     "$PRESEAL_SNAPSHOT" "$PRESEAL_SET_SHA256" "$PRESEAL_INSTALLED_INPUTS" \
     || die "cannot atomically publish the authenticated eight-file preseal handoff"
@@ -2675,8 +2735,15 @@ if (( PRESEAL_ACTIVE == 1 )); then
     "$PRESEAL_INSTALLED_INPUTS" "$PRESEAL_SET_SHA256" \
     || die "the installed eight-file preseal handoff failed exact readback"
   install -d -m 0700 "$ota_state/preseal"
+  # Build the exact first-boot config from the deployed vanilla file. Runtime
+  # paths stay rooted at /; only the second config maps them into the mounted
+  # deployment so the installer can reauthenticate these same compat values.
+  write_preseal_verifier_config "/var/lib/neural-ice/ota" \
+    "$INSTALLED_OTA_CONFIG_CANDIDATE" "$PRESEAL_INSTALLED_INPUTS/preseal-set.json" \
+    "$INSTALLED_OTA_CONFIG" "/etc/neural-ice/keys/ota-root.pub" "$INSTALLED_OTA_ROOT_KEY"
   write_preseal_verifier_config "$ota_state" "$PRESEAL_INSTALLED_CONFIG" \
-    "$PRESEAL_INSTALLED_INPUTS/preseal-set.json"
+    "$PRESEAL_INSTALLED_INPUTS/preseal-set.json" "$INSTALLED_OTA_CONFIG_CANDIDATE" \
+    "$INSTALLED_OTA_ROOT_KEY" "$INSTALLED_OTA_ROOT_KEY"
   _installed_preseal_floor="$(verify_installed_preseal_candidate "$PRESEAL_INSTALLED_INPUTS" \
     "$img_seed_ref" "$PRESEAL_INSTALLED_CONFIG" "$PRESEAL_INSTALLED_RECEIPT")" \
     || die "the installed candidate and persistent preseal inputs failed reauthentication"
@@ -2688,6 +2755,18 @@ if (( PRESEAL_ACTIVE == 1 )); then
     || die "cannot fsync the installed preseal receipt"
   sync -f "$ota_state/preseal" \
     || die "cannot fsync the installed preseal receipt directory"
+
+  [[ -f "$INSTALLED_OTA_CONFIG_CANDIDATE" && ! -L "$INSTALLED_OTA_CONFIG_CANDIDATE" \
+      && -f "$INSTALLED_OTA_CONFIG" && ! -L "$INSTALLED_OTA_CONFIG" ]] \
+    || die "the authenticated installed OTA configuration changed before publication"
+  mv -T -- "$INSTALLED_OTA_CONFIG_CANDIDATE" "$INSTALLED_OTA_CONFIG" \
+    || die "cannot atomically publish the authenticated installed OTA configuration"
+  [[ -f "$INSTALLED_OTA_CONFIG" && ! -L "$INSTALLED_OTA_CONFIG" ]] \
+    || die "the published installed OTA configuration is not a regular file"
+  sync -f "$INSTALLED_OTA_CONFIG" \
+    || die "cannot fsync the installed OTA configuration"
+  sync -f "$INSTALLED_OTA_CONFIG_DIR" \
+    || die "cannot fsync the installed OTA configuration directory"
 
   [[ "$("$OTA_TPM_STATE" prepare "$PRESEAL_BUNDLE_SEQ")" == prepared ]] \
     || die "cannot prepare the owner-sealed OTA baseline state"
