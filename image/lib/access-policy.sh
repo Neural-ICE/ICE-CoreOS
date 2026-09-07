@@ -115,18 +115,21 @@ access_policy_permits_installer_ssh() {
 }
 
 # The installer-side gate, extracted so it can be exercised without a disk.
-#   $1 policy as read from the SOURCE image (may be empty = unreadable)
+#   $1 policy from the selected target image (may be empty = unreadable); on a
+#      registry install the caller supplies it only after authenticating target
 #   $2 install source: medium | registry
 #   $3 1 when the medium supplies an SSH key (karg or ESP), 0 otherwise
+#   $4 proof context: no-key | verified-medium-root |
+#      authenticated-pulled-target
 # Returns 0 to allow the install to continue, 1 to refuse. It refuses LOUDLY on
 # a supplied key it may not honour: silently dropping it would hand the operator
 # an appliance they believe is reachable, and hand an attacker a free retry.
 access_policy_gate_installer_ssh() {
-  if (( $# != 3 )); then
-    echo "access_policy_gate_installer_ssh requires policy, install source and key presence" >&2
+  if (( $# != 4 )); then
+    echo "access_policy_gate_installer_ssh requires policy, install source, key presence and proof context" >&2
     return 2
   fi
-  local policy=$1 install_source=$2 key_present=$3
+  local policy=$1 install_source=$2 key_present=$3 proof_context=$4
 
   case "$install_source" in
     medium | registry) ;;
@@ -147,26 +150,42 @@ access_policy_gate_installer_ssh() {
   # A missing marker means the source image is not one this installer
   # understands, and the honest response to that is to install nothing.
   access_policy_is_known "$policy" || {
-    echo "the source image carries no recognised immutable access policy" >&2
+    echo "the selected image carries no recognised immutable access policy" >&2
     return 1
   }
-  (( key_present == 1 )) || return 0
+  if (( key_present == 0 )); then
+    [[ "$proof_context" == no-key ]] || {
+      echo "a keyless install requires the no-key proof context" >&2
+      return 1
+    }
+    return 0
+  fi
 
   access_policy_permits_installer_ssh "$policy" || {
     echo "access policy '$policy' forbids installer SSH provisioning; the supplied key or karg is refused" >&2
     return 1
   }
 
-  # On the registry path the deployment is written from an image PULLED at
-  # install time, not from this medium -- so the policy read above describes the
-  # live installer, not the system being installed. There is no honest way to
-  # gate a key against an image we have not fetched yet, and fetching it first
-  # would move the decision after the disk is already partitioned. Refuse.
-  if [[ "$install_source" == registry ]]; then
-    echo "installer SSH provisioning is only available when installing the medium's own image" >&2
-    return 1
-  fi
-  return 0
+  case "$install_source:$proof_context" in
+    medium:verified-medium-root) return 0 ;;
+    registry:authenticated-pulled-target)
+      # Registry provisioning is a LAB operator path only. Debug images are
+      # direct-digest diagnostics, not registry release targets.
+      [[ "$policy" == lab-managed ]] || {
+        echo "registry SSH provisioning requires a lab-managed pulled target" >&2
+        return 1
+      }
+      return 0
+      ;;
+    registry:*)
+      echo "registry SSH provisioning requires the authenticated pulled-target proof" >&2
+      return 1
+      ;;
+    *)
+      echo "installer SSH proof context '$proof_context' does not match source '$install_source'" >&2
+      return 1
+      ;;
+  esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
@@ -178,7 +197,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     permits-installer-ssh) access_policy_permits_installer_ssh "$@" ;;
     gate-installer-ssh) access_policy_gate_installer_ssh "$@" ;;
     *)
-      echo "usage: $0 {for-variant VARIANT|read ROOT|permits-installer-ssh POLICY|gate-installer-ssh POLICY SOURCE KEY_PRESENT}" >&2
+      echo "usage: $0 {for-variant VARIANT|read ROOT|permits-installer-ssh POLICY|gate-installer-ssh POLICY SOURCE KEY_PRESENT PROOF_CONTEXT}" >&2
       exit 2
       ;;
   esac

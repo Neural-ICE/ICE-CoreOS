@@ -91,30 +91,46 @@ bash "$LIB" read "$dir_marker" >/dev/null 2>&1 && fail "a directory marker was a
 gate() { bash "$LIB" gate-installer-ssh "$@" >/dev/null 2>&1; }
 
 # Allowed: the lab path, installing the medium's own image.
-gate lab-managed medium 1 || fail "a lab-managed medium install refused an operator key"
-gate lab-managed medium 0 || fail "a lab-managed medium install refused a keyless install"
-gate developer-diagnostic medium 1 || fail "the developer diagnostic image refused a key"
+gate lab-managed medium 1 verified-medium-root \
+  || fail "a lab-managed medium install refused an operator key"
+gate lab-managed medium 0 no-key || fail "a lab-managed medium install refused a keyless install"
+gate developer-diagnostic medium 1 verified-medium-root \
+  || fail "the developer diagnostic image refused a key"
 
 # Refused: the customer image, with or without a crafted ESP or karg.
-gate customer-locked medium 1 && fail "a customer-locked image accepted an installer SSH key"
-gate customer-locked medium 0 || fail "a customer-locked keyless install was refused"
+gate customer-locked medium 1 verified-medium-root \
+  && fail "a customer-locked image accepted an installer SSH key"
+gate customer-locked medium 0 no-key || fail "a customer-locked keyless install was refused"
 
 # Refused: no readable policy at all, whether or not a key is offered.
 for presence in 0 1; do
-  gate '' medium "$presence" && fail "an empty policy passed the installer gate (key=$presence)"
-  gate wide-open medium "$presence" && fail "an unknown policy passed the installer gate (key=$presence)"
+  gate '' medium "$presence" no-key && fail "an empty policy passed the installer gate (key=$presence)"
+  gate wide-open medium "$presence" no-key && fail "an unknown policy passed the installer gate (key=$presence)"
 done
 
-# Refused: the registry path with a key. The deployment is written from an image
-# pulled at install time, so the policy the installer can read describes the
-# LIVE medium, not the system being installed — there is nothing honest to gate
-# against, and fetching first would move the decision after the disk is gone.
-gate lab-managed registry 1 && fail "a registry install accepted a medium-supplied SSH key"
-gate lab-managed registry 0 || fail "a keyless registry install was refused"
+# A registry key stays pending until the exact pulled object has passed release
+# authorization, profile/trust/target/platform checks and applicable preseal.
+# The explicit context is accepted only for lab-managed; a boolean or a
+# medium-style context cannot turn a registry request into an allow.
+gate lab-managed registry 1 unauthenticated-target \
+  && fail "a registry install accepted a key without an authenticated target"
+gate lab-managed registry 1 verified-medium-root \
+  && fail "a registry install reused the medium proof for a pulled target"
+gate lab-managed registry 1 authenticated-pulled-target \
+  || fail "an authenticated intended lab target refused an operator key"
+gate customer-locked registry 1 authenticated-pulled-target \
+  && fail "an authenticated customer target accepted an operator key"
+gate developer-diagnostic registry 1 authenticated-pulled-target \
+  && fail "a non-LAB registry target accepted an operator key"
+gate wide-open registry 1 authenticated-pulled-target \
+  && fail "an unknown registry target accepted an operator key"
+gate lab-managed registry 0 no-key || fail "a keyless registry install was refused"
 
 # Malformed invocations refuse rather than default.
-gate lab-managed elsewhere 1 && fail "an unknown install source was accepted"
-gate lab-managed medium 2 && fail "a non-boolean key presence was accepted"
+gate lab-managed elsewhere 1 verified-medium-root && fail "an unknown install source was accepted"
+gate lab-managed medium 2 verified-medium-root && fail "a non-boolean key presence was accepted"
+gate lab-managed medium 1 && fail "a missing proof context was accepted"
+gate lab-managed medium 1 true && fail "a boolean-like proof context was accepted"
 
 # --------------------------------------------------------------------------- #
 # 4) The autoinstaller must consult the gate BEFORE it can touch a disk. A gate
@@ -132,6 +148,49 @@ destructive_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luks
 [ "$gate_line" -lt "$destructive_line" ] \
   || fail "the access-policy gate runs at line $gate_line, AFTER the first disk write at line $destructive_line"
 [ "$read_line" -lt "$gate_line" ] || fail "the autoinstaller gates before it reads the policy"
+
+# Registry acceptance is tied to the real runtime proof sequence. It must use
+# the pulled image profile, follow the pulled-object authorization and optional
+# preseal verifier, and happen only after the host-side candidate mount is
+# released. A caller-controlled true/false alone is not this proof.
+pulled_auth_line="$(grep -n 'if ! release_auth_gate_pulled' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+preseal_verify_line="$(grep -n 'PRESEAL_BUNDLE_SEQ="$(verify_preseal_candidate' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+candidate_release_line="$(grep -nF '  candidate_probe_release' "$AUTOINSTALL" | tail -1 | cut -d: -f1)"
+registry_gate_line="$(grep -n 'access_policy_gate_installer_ssh "$img_profile" registry 1 authenticated-pulled-target' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+encode_line="$(grep -n 'SSHKEY_B64="$(encode_snapshotted_ssh_key' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$pulled_auth_line" && -n "$preseal_verify_line" && -n "$candidate_release_line" \
+    && -n "$registry_gate_line" && -n "$encode_line" \
+    && "$pulled_auth_line" -lt "$preseal_verify_line" \
+    && "$preseal_verify_line" -lt "$candidate_release_line" \
+    && "$candidate_release_line" -lt "$registry_gate_line" \
+    && "$registry_gate_line" -lt "$encode_line" \
+    && "$encode_line" -lt "$destructive_line" ]] \
+  || fail "registry SSH acceptance is not ordered after target authentication/preseal/release and before disk mutation"
+grep -Fq 'access_policy_gate_installer_ssh "$ACCESS_POLICY" "$INSTALL_SOURCE" 1 unauthenticated-target' "$AUTOINSTALL" \
+  || fail "a forbidden source profile can reach key payload parsing before refusal"
+
+# The ESP is not guaranteed to be mounted when key presence is checked. A LAB
+# registry medium must mount it read-only, snapshot the key, and unmount before
+# the network pull; treating an empty mounted_at result as "no key" would
+# silently ship an unreachable appliance.
+esp_mount_line="$(grep -nF 'mount -o ro,nodev,nosuid,noexec "/dev/$_usb_esp" "$_esp_mp"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+esp_presence_line="$(grep -nF '[[ -e "$_esp_mp/ice-coreos/authorized_keys" || -L "$_esp_mp/ice-coreos/authorized_keys" ]]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+esp_validate_line="$(grep -nF 'installer_ssh_key_validate_file "$SSHKEY_ESP_FILE"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+esp_snapshot_line="$(grep -nF 'install -m 0600 "$SSHKEY_ESP_FILE" "$_sshkey_candidate"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+esp_unmount_line="$(grep -nF 'cannot unmount the installer ESP after snapshotting the operator key' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+registry_pull_line="$(grep -nF 'podman --cgroup-manager=cgroupfs --events-backend=file pull "$OS_IMAGE"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$esp_mount_line" && -n "$esp_presence_line" && -n "$esp_validate_line" \
+    && -n "$esp_snapshot_line" && -n "$esp_unmount_line" && -n "$registry_pull_line" \
+    && "$esp_mount_line" -lt "$esp_presence_line" \
+    && "$esp_presence_line" -lt "$esp_validate_line" \
+    && "$esp_validate_line" -lt "$esp_snapshot_line" \
+    && "$esp_snapshot_line" -lt "$esp_unmount_line" \
+    && "$esp_unmount_line" -lt "$registry_pull_line" ]] \
+  || fail "an unmounted installer ESP is not safely snapshotted and released before the registry pull"
+grep -Fq 'cannot mount the installer ESP read-only to inspect operator-key presence' "$AUTOINSTALL" \
+  || fail "an ESP mount failure can silently look like an absent operator key"
+grep -Fq 'the installer carries operator SSH keys in both the kernel command line and ESP' "$AUTOINSTALL" \
+  || fail "two operator keys from different medium surfaces are not refused"
 
 # And it must validate the supplied key's structure before turning it into a
 # karg: a payload that is not exactly one public key must never be installed.

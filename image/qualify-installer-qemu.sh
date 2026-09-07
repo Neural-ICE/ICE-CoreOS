@@ -34,6 +34,153 @@ EOF
 die() { printf 'qualify-installer-qemu: REFUSED: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is unavailable"; }
 
+qmp_guest_request() { # $1=private QMP unix socket $2=system_powerdown|send-key-ret
+  local socket=$1 request=$2
+  python3 - "$socket" "$request" <<'PY'
+import json
+import socket
+import sys
+import time
+
+path, request = sys.argv[1:]
+if request == "system_powerdown":
+    command = {"execute": "system_powerdown"}
+elif request == "send-key-ret":
+    command = {
+        "execute": "send-key",
+        "arguments": {"keys": [{"type": "qcode", "data": "ret"}]},
+    }
+else:
+    raise SystemExit("unsupported QMP guest request")
+deadline = time.monotonic() + 10
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(1)
+while True:
+    try:
+        client.connect(path)
+        break
+    except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+        if time.monotonic() >= deadline:
+            raise SystemExit("QMP socket did not become ready")
+        time.sleep(0.1)
+
+stream = client.makefile("rwb", buffering=0)
+
+def receive(label):
+    while True:
+        raw = stream.readline(65537)
+        if not raw:
+            raise SystemExit(f"QMP closed before {label}")
+        if len(raw) > 65536 or not raw.endswith(b"\n"):
+            raise SystemExit(f"QMP {label} exceeded the bounded line contract")
+        try:
+            message = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SystemExit(f"QMP {label} was not JSON: {error}")
+        if not isinstance(message, dict):
+            raise SystemExit(f"QMP {label} was not an object")
+        if "event" in message:
+            continue
+        return message
+
+greeting = receive("greeting")
+if not isinstance(greeting.get("QMP"), dict):
+    raise SystemExit("QMP greeting was absent")
+
+for current in ({"execute": "qmp_capabilities"}, command):
+    stream.write(json.dumps(current, separators=(",", ":")).encode() + b"\r\n")
+    label = current["execute"]
+    response = receive(label)
+    if "error" in response or "return" not in response:
+        raise SystemExit(f"QMP {label} was refused")
+PY
+}
+
+wait_for_exit() { # $1=pid $2=tenths of a second
+  local pid=$1 attempts=$2 step
+  for (( step = 0; step < attempts; step++ )); do
+    ! kill -0 "$pid" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+wait_for_session_exit() { # $1=process-group leader $2=tenths of a second
+  local leader=$1 attempts=$2 step
+  for (( step = 0; step < attempts; step++ )); do
+    ! process_group_exists "$leader" && return 0
+    sleep 0.1
+  done
+  ! process_group_exists "$leader"
+}
+
+process_group_exists() { # $1=process-group id, including unprivileged and root members
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+group = int(sys.argv[1])
+for stat_path in pathlib.Path("/proc").glob("[0-9]*/stat"):
+    try:
+        stat = stat_path.read_text(encoding="ascii")
+        # comm is parenthesized and may contain spaces or ')'; pgrp is the third
+        # field after the final closing parenthesis.
+        fields = stat[stat.rfind(")") + 2:].split()
+        if len(fields) >= 3 and int(fields[2]) == group:
+            raise SystemExit(0)
+    except (FileNotFoundError, PermissionError, ValueError):
+        continue
+raise SystemExit(1)
+PY
+}
+
+terminate_qemu_session() { # $1=setsid session leader
+  local leader=$1
+  [[ "$leader" =~ ^[1-9][0-9]*$ ]] || return 0
+  process_group_exists "$leader" || return 0
+  # `setsid --wait` makes this PID the leader of a private process group. Killing
+  # that group reaches timeout, confinement wrappers and QEMU without guessing
+  # which direct child a wrapper happened to create.
+  kill -TERM -- "-$leader" 2>/dev/null || true
+  wait_for_session_exit "$leader" 50 && return 0
+  kill -KILL -- "-$leader" 2>/dev/null || true
+  wait_for_session_exit "$leader" 50
+}
+
+successful_scenario_completed() { # $1=phase $2=tpm-state $3=shutdown-mode $4=qemu-rc
+  local phase=$1 tpm_state=$2 shutdown_mode=$3 qemu_rc=$4 expected_mode
+  case "$phase:$tpm_state" in
+    install:virgin|install:preceremony) expected_mode=send-key-ret ;;
+    firstboot:*) expected_mode=system_powerdown ;;
+    *) return 0 ;; # Expected-negative installer scenarios keep forced cleanup.
+  esac
+  [[ "$shutdown_mode" == "$expected_mode" && "$qemu_rc" -eq 0 ]]
+}
+
+stop_task_process() { # $1=exact pid $2=description
+  local pid=$1 description=$2
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'qualify-installer-qemu: invalid %s PID: %s\n' "$description" "$pid" >&2
+    return 1
+  }
+  kill -0 "$pid" 2>/dev/null || return 0
+  if ! kill "$pid" 2>/dev/null; then
+    wait_for_exit "$pid" 1 && return 0
+    printf 'qualify-installer-qemu: could not stop %s PID %s\n' "$description" "$pid" >&2
+    return 1
+  fi
+  wait_for_exit "$pid" 50 && return 0
+  printf 'qualify-installer-qemu: %s PID %s survived bounded shutdown\n' "$description" "$pid" >&2
+  return 1
+}
+
+# The behavioral test sources these exact helpers. This cannot turn a production
+# invocation into a test because it is accepted only while the file is sourced.
+if [[ "${NI_QEMU_HARNESS_SOURCE_ONLY:-}" == 1 ]]; then
+  [[ "${BASH_SOURCE[0]}" != "$0" ]] || die "source-only mode requires sourcing the harness"
+  return 0
+fi
+
 (( $# >= 1 )) || { usage >&2; exit 2; }
 case "$1" in -h|--help) usage; exit 0 ;; esac
 phase=$1
@@ -101,7 +248,7 @@ if [[ -n "$ssh_port" ]]; then
     || die "--ssh-port requires --network restricted-user"
 fi
 
-for tool in qemu-system-aarch64 qemu-img swtpm timeout grep pgrep; do need "$tool"; done
+for tool in qemu-system-aarch64 qemu-img swtpm tpm2_shutdown timeout grep python3 setsid; do need "$tool"; done
 [[ "$(uname -m)" == aarch64 ]] || die "the QEMU gate requires an ARM64 host"
 [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is unavailable"
 [[ -f "$firmware_code" && -r "$firmware_code" ]] || die "AAVMF code is unreadable"
@@ -114,6 +261,8 @@ tpm_ctrl=$tpm_server.ctrl
 tpm_pidfile=$work_dir/swtpm.pid
 console=$work_dir/${phase}.console.log
 qemu_stderr=$work_dir/${phase}.qemu.stderr
+qmp_socket=$work_dir/${phase}.qmp.sock
+[[ ! -e "$qmp_socket" ]] || die "QMP socket path already exists"
 
 if [[ "$phase" == install ]]; then
   [[ -n "$raw" && -f "$raw" && ! -L "$raw" && -r "$raw" ]] \
@@ -141,13 +290,24 @@ swtpm socket --tpm2 --tpmstate "dir=$tpm_dir" \
   --ctrl "type=unixio,path=$tpm_ctrl,mode=0600" \
   --pid "file=$tpm_pidfile" --flags not-need-init,startup-clear --daemon
 
+timeout_pid=
 cleanup() {
+  local original_rc=$? cleanup_rc=0 pid
+  trap - EXIT
+  if [[ -n "$timeout_pid" ]]; then
+    terminate_qemu_session "$timeout_pid" || {
+      printf 'qualify-installer-qemu: task-owned QEMU session %s survived cleanup\n' \
+        "$timeout_pid" >&2
+      cleanup_rc=1
+    }
+  fi
   if [[ -f "$tpm_pidfile" ]]; then
     pid=$(<"$tpm_pidfile")
-    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
-      kill "$pid" 2>/dev/null || true
-    fi
+    stop_task_process "$pid" swtpm || cleanup_rc=1
   fi
+  rm -f -- "$qmp_socket"
+  (( original_rc != 0 )) && exit "$original_rc"
+  exit "$cleanup_rc"
 }
 trap cleanup EXIT
 for _ in {1..50}; do [[ -S "$tpm_server" && -S "$tpm_ctrl" ]] && break; sleep 0.1; done
@@ -193,19 +353,16 @@ if [[ "$phase" == install && "$tpm_state" != virgin ]]; then
       ;;
   esac
 fi
+tpm2_shutdown -c >/dev/null \
+  || die "provisioning swtpm refused an orderly TPM2_Shutdown"
 unset TPM2TOOLS_TCTI
 
 # QEMU speaks the swtpm control protocol and supplies the TPM data channel
 # itself. A swtpm server socket is needed only for tpm2-tools provisioning; it
 # must not still own the data channel when QEMU sends CMD_SET_DATAFD.
 provisioning_pid=$(<"$tpm_pidfile")
-kill "$provisioning_pid"
-for _ in {1..50}; do
-  kill -0 "$provisioning_pid" 2>/dev/null || break
-  sleep 0.1
-done
-kill -0 "$provisioning_pid" 2>/dev/null \
-  && die "provisioning swtpm did not stop"
+stop_task_process "$provisioning_pid" "provisioning swtpm" \
+  || die "provisioning swtpm did not stop"
 rm -f -- "$tpm_server" "$tpm_ctrl" "$tpm_pidfile"
 swtpm socket --tpm2 --tpmstate "dir=$tpm_dir" \
   --ctrl "type=unixio,path=$tpm_ctrl,mode=0600" \
@@ -225,6 +382,8 @@ declare -a qemu=(
   -chardev "socket,id=chrtpm,path=$tpm_ctrl"
   -tpmdev "emulator,id=tpm0,chardev=chrtpm"
   -device "tpm-tis-device,tpmdev=tpm0"
+  -device "virtio-keyboard-pci"
+  -qmp "unix:$qmp_socket,server=on,wait=off"
 )
 
 if [[ "$phase" == install ]]; then
@@ -277,39 +436,82 @@ all_expected_patterns_seen() {
 }
 
 set +e
-timeout "$timeout_seconds" "${qemu[@]}" >"$console" 2>"$qemu_stderr" &
+# The private session is also the exact cleanup boundary when a refusal, QMP
+# failure or timeout leaves wrappers between this harness and QEMU.
+setsid --wait timeout --foreground "$timeout_seconds" "${qemu[@]}" \
+  >"$console" 2>"$qemu_stderr" &
 timeout_pid=$!
+shutdown_mode=none
+loop_failure=
 while kill -0 "$timeout_pid" 2>/dev/null; do
-  stop=0
+  stop_reason=
   for pattern in "${rejects[@]}"; do
     if grep -Eq -- "$pattern" "$console" 2>/dev/null; then
-      stop=1
+      stop_reason=reject
       break
     fi
   done
-  if (( stop == 0 )); then
+  if [[ -z "$stop_reason" ]]; then
     if [[ "$phase" == install ]]; then
-      grep -Fq -- "$scenario_pattern" "$console" 2>/dev/null \
-        && all_expected_patterns_seen && stop=1
+      if grep -Fq -- "$scenario_pattern" "$console" 2>/dev/null \
+          && all_expected_patterns_seen; then
+        case "$tpm_state" in
+          virgin|preceremony) stop_reason=success ;;
+          *) stop_reason=expected-refusal ;;
+        esac
+      fi
     elif all_expected_patterns_seen; then
-      stop=1
+      stop_reason=success
     fi
   fi
-  if (( stop == 1 )); then
-    # The appliance intentionally waits for a physical Enter key at the end of
-    # installation, and first boot remains running after it becomes healthy.
-    # Once the required terminal evidence is durable in the console, terminate
-    # only this task-owned VM; QEMU flushes its block backend on SIGTERM.
+  if [[ -n "$stop_reason" ]]; then
     sleep 2
-    qemu_pid="$(pgrep -P "$timeout_pid" 2>/dev/null || true)"
-    [[ -z "$qemu_pid" ]] || kill "$qemu_pid" 2>/dev/null
+    if [[ "$stop_reason" == success ]]; then
+      # The installer deliberately reaches only basic.target, where logind is
+      # not a dependable ACPI-power-key consumer. Its completed screen already
+      # waits for Enter before invoking the product's reboot path, so model that
+      # operator action. An installed first boot reaches the normal service
+      # graph and can consume an ACPI powerdown request.
+      if [[ "$phase" == install ]]; then
+        guest_request=send-key-ret
+        request_description="installer Enter key"
+      else
+        guest_request=system_powerdown
+        request_description="guest powerdown"
+      fi
+      if ! qmp_guest_request "$qmp_socket" "$guest_request"; then
+        loop_failure="QMP $request_description was not acknowledged"
+        terminate_qemu_session "$timeout_pid" || true
+      elif ! wait_for_exit "$timeout_pid" 600; then
+        loop_failure="guest did not exit within 60 seconds after QMP $request_description"
+        terminate_qemu_session "$timeout_pid" || true
+      else
+        shutdown_mode="$guest_request"
+      fi
+    else
+      shutdown_mode=forced-after-terminal-refusal
+      terminate_qemu_session "$timeout_pid" || true
+    fi
     break
   fi
   sleep 1
 done
+session_leader=$timeout_pid
 wait "$timeout_pid"
 qemu_rc=$?
+if process_group_exists "$session_leader"; then
+  terminate_qemu_session "$session_leader" || true
+fi
+session_residual=0
+process_group_exists "$session_leader" && session_residual=1
+timeout_pid=
 set -e
+
+[[ -z "$loop_failure" ]] || die "$loop_failure"
+(( session_residual == 0 )) \
+  || die "task-owned QEMU process group $session_leader survived bounded cleanup"
+successful_scenario_completed "$phase" "$tpm_state" "$shutdown_mode" "$qemu_rc" \
+  || die "successful $phase/$tpm_state scenario lacked its clean guest exit (mode=$shutdown_mode rc=$qemu_rc)"
 
 for pattern in "${expects[@]}"; do
   grep -Eq -- "$pattern" "$console" \
@@ -351,5 +553,6 @@ fi
 
 printf 'QEMU_PHASE=%s\nTPM_STATE=%s\nSOURCE_TRANSPORT=%s\nQEMU_EXIT=%s\n' \
   "$phase" "$tpm_state" "$source_transport" "$qemu_rc"
+printf 'QEMU_SHUTDOWN=%s\n' "$shutdown_mode"
 printf 'CONSOLE=%s\nQEMU_STDERR=%s\nTARGET=%s\n' "$console" "$qemu_stderr" "$target"
 [[ "$qemu_rc" -ne 124 ]] || die "QEMU exceeded the bounded timeout"

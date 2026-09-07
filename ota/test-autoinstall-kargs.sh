@@ -30,6 +30,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
   awk '/^candidate_ota_state_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^require_medium_source_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^verify_installed_preseal_candidate\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^encode_snapshotted_ssh_key\(\) \{/,/^}$/' "$AUTOINSTALL"
 } > "$TMP/reader.sh"
 grep -q '^karg_count()' "$TMP/reader.sh" || fail "cannot extract karg_count from the installer"
 grep -q '^karg_once()'  "$TMP/reader.sh" || fail "cannot extract karg_once from the installer"
@@ -41,6 +42,43 @@ die() { echo "die: $*" >&2; exit 1; }
 NEURALICE_CMDLINE_FILE="$CMDLINE"
 # shellcheck source=/dev/null
 source "$TMP/reader.sh"
+
+# A registry key is snapshotted before the candidate pull and consumed only
+# after authentication. Encoding must therefore revalidate the exact snapshot,
+# not trust the earlier verdict or reread the mutable ESP path.
+grep -q '^encode_snapshotted_ssh_key()' "$TMP/reader.sh" \
+  || fail "cannot extract encode_snapshotted_ssh_key from the installer"
+# shellcheck source=image/lib/installer-ssh-key.sh
+source "$ROOT/image/lib/installer-ssh-key.sh"
+key_fixture="$TMP/operator-key"
+ssh-keygen -q -t ed25519 -N '' -f "$key_fixture" </dev/null
+key_snapshot="$TMP/operator-snapshot.pub"
+cp "$key_fixture.pub" "$key_snapshot"
+key_snapshot_sha256="$(sha256sum "$key_snapshot" | awk '{print $1}')"
+encoded_snapshot="$(encode_snapshotted_ssh_key "$key_snapshot" "$key_snapshot_sha256")" \
+  || fail "an unchanged single public-key snapshot was refused"
+printf '%s' "$encoded_snapshot" | base64 -d > "$TMP/encoded-snapshot.pub"
+cmp -s "$key_snapshot" "$TMP/encoded-snapshot.pub" \
+  || fail "the installed SSH karg bytes differ from the validated snapshot"
+
+ssh-keygen -q -t ed25519 -N '' -f "$TMP/other-key" </dev/null
+cp "$TMP/other-key.pub" "$key_snapshot"
+encode_snapshotted_ssh_key "$key_snapshot" "$key_snapshot_sha256" >/dev/null 2>&1 \
+  && fail "a changed SSH snapshot was encoded after its validation verdict"
+cat "$key_fixture.pub" "$TMP/other-key.pub" > "$TMP/multiple-keys.pub"
+multiple_sha256="$(sha256sum "$TMP/multiple-keys.pub" | awk '{print $1}')"
+encode_snapshotted_ssh_key "$TMP/multiple-keys.pub" "$multiple_sha256" >/dev/null 2>&1 \
+  && fail "multiple SSH keys were encoded"
+printf '%s\n' not-an-openssh-key > "$TMP/malformed-key.pub"
+malformed_sha256="$(sha256sum "$TMP/malformed-key.pub" | awk '{print $1}')"
+encode_snapshotted_ssh_key "$TMP/malformed-key.pub" "$malformed_sha256" >/dev/null 2>&1 \
+  && fail "a malformed SSH snapshot was encoded"
+ln -s "$key_fixture.pub" "$TMP/symlink-key.pub"
+encode_snapshotted_ssh_key "$TMP/symlink-key.pub" \
+  "$(sha256sum "$key_fixture.pub" | awk '{print $1}')" >/dev/null 2>&1 \
+  && fail "a symlink SSH snapshot was encoded"
+grep -Fq 'sshkey_karg=(--karg "neuralice.sshkey=$SSHKEY_B64")' "$AUTOINSTALL" \
+  || fail "the installed kernel argument is not built from the accepted snapshot encoding"
 
 set_cmdline() { printf '%s\n' "$*" > "$CMDLINE"; }
 
@@ -130,19 +168,27 @@ wipe_line="$(grep -nE '^[[:space:]]*wipefs -a "\$target"' "$AUTOINSTALL" | head 
 bootc_line="$(awk '$1 == "bootc" && $2 == "install" && $3 == "to-filesystem" { print NR; exit }' "$AUTOINSTALL")"
 handoff_line="$(line_of '"$PRESEAL_HANDOFF" install-persistent')"
 installed_verify_line="$(line_of '_installed_preseal_floor="$(verify_installed_preseal_candidate "$PRESEAL_INSTALLED_INPUTS"')"
+installed_runtime_config_line="$(line_of 'write_preseal_verifier_config "/var/lib/neural-ice/ota"')"
+installed_mapped_config_line="$(line_of 'write_preseal_verifier_config "$ota_state" "$PRESEAL_INSTALLED_CONFIG"')"
+installed_config_publish_line="$(line_of 'mv -T -- "$INSTALLED_OTA_CONFIG_CANDIDATE" "$INSTALLED_OTA_CONFIG"')"
 prepare_line="$(line_of '"$OTA_TPM_STATE" prepare "$PRESEAL_BUNDLE_SEQ"')"
 inspect_line="$(line_of '"$OTA_TPM_STATE" inspect-v2')"
 status_line="$(line_of '"$TPM_STATE" provisioning-status)" == preseal-prepared')"
 [[ -n "$preseal_snapshot_line" && -n "$preseal_preflight_line" \
    && -n "$medium_profile_gate_line" && -n "$wipe_line" \
    && -n "$bootc_line" && -n "$handoff_line" && -n "$installed_verify_line" \
-   && -n "$prepare_line" && -n "$inspect_line" && -n "$status_line" \
+   && -n "$installed_runtime_config_line" && -n "$installed_mapped_config_line" \
+   && -n "$installed_config_publish_line" && -n "$prepare_line" \
+   && -n "$inspect_line" && -n "$status_line" \
    && "$preseal_snapshot_line" -lt "$preseal_preflight_line" \
    && "$preseal_preflight_line" -lt "$wipe_line" \
    && "$medium_profile_gate_line" -lt "$wipe_line" \
    && "$wipe_line" -lt "$bootc_line" && "$bootc_line" -lt "$handoff_line" \
-   && "$handoff_line" -lt "$installed_verify_line" \
-   && "$installed_verify_line" -lt "$prepare_line" \
+   && "$handoff_line" -lt "$installed_runtime_config_line" \
+   && "$installed_runtime_config_line" -lt "$installed_mapped_config_line" \
+   && "$installed_mapped_config_line" -lt "$installed_verify_line" \
+   && "$installed_verify_line" -lt "$installed_config_publish_line" \
+   && "$installed_config_publish_line" -lt "$prepare_line" \
    && "$prepare_line" -lt "$inspect_line" && "$inspect_line" -lt "$status_line" ]] \
   || fail "the authenticated eight-input preseal handoff is not ordered around the wipe and bootc install"
 
@@ -218,6 +264,109 @@ grep -qx 'device_compat_max=5' <<<"$compat_out" \
   || fail "the preseal verifier config did not take device_compat_max from the preseal set"
 grep -qx "state_dir=$TMP/state" <<<"$compat_out" \
   || fail "the preseal verifier config did not rebase state_dir"
+
+# The authenticated compat range must survive into the installed runtime
+# configuration, not only the installer's /run verifier file. Start from the
+# exact vanilla config shipped by the image; a handcrafted already-correct
+# fixture would hide the production regression. The same generated bytes are
+# then mapped back to installer-visible paths, matching the post-bootc
+# reauthentication that precedes first boot.
+installed_root="$TMP/installed-root"
+installed_config="$installed_root/etc/neural-ice/ota.conf"
+installed_root_key="$installed_root/etc/neural-ice/keys/ota-root.pub"
+installed_candidate="$installed_root/etc/neural-ice/.ota.conf.neural-ice-installer"
+mkdir -p "$(dirname "$installed_root_key")"
+cp "$ROOT/image/bootc-overlay/etc/neural-ice/ota.conf" "$installed_config"
+: > "$installed_root_key"
+runtime_out="$(
+  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+    set -euo pipefail
+    die() { echo "die: $*" >&2; exit 1; }
+    source "$1"
+    write_preseal_verifier_config "/var/lib/neural-ice/ota" "$2" "$3" \
+      "$4" "/etc/neural-ice/keys/ota-root.pub" "$5"
+    cat "$2"
+  ' _ "$TMP/preseal-config.sh" "$installed_candidate" "$TMP/preseal-set.json" \
+    "$installed_config" "$installed_root_key"
+)" || fail "the production helper could not derive installed config from the vanilla target"
+grep -qx 'root_pubkey=/etc/neural-ice/keys/ota-root.pub' <<<"$runtime_out" \
+  || fail "the installed config retained the installer's root-key path"
+grep -qx 'state_dir=/var/lib/neural-ice/ota' <<<"$runtime_out" \
+  || fail "the installed config retained the installer's mounted state path"
+grep -qx 'device_compat_min=5' <<<"$runtime_out" \
+  || fail "the installed config did not persist authenticated device_compat_min"
+grep -qx 'device_compat_max=5' <<<"$runtime_out" \
+  || fail "the installed config did not persist authenticated device_compat_max"
+for adjacent in 'enforce=0' 'nv_index=0x01500001' \
+  'state_nv_index=0x01500002' 'hardware_target=nvidia-gb10-arm64'; do
+  grep -qx "$adjacent" <<<"$runtime_out" \
+    || fail "the installed config lost adjacent runtime key: $adjacent"
+done
+if grep -Fq "$TMP" <<<"$runtime_out" || grep -q '^root_pubkey=/run/' <<<"$runtime_out"; then
+  fail "the installed config persisted an installer-only path"
+fi
+
+mv -T -- "$installed_candidate" "$installed_config"
+mapped_out="$(
+  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+    set -euo pipefail
+    die() { echo "die: $*" >&2; exit 1; }
+    source "$1"
+    write_preseal_verifier_config "$2" "$3" "$4" "$5" "$6" "$6"
+    cat "$3"
+  ' _ "$TMP/preseal-config.sh" "$TMP/installed-state" "$TMP/installed-verifier.conf" \
+    "$TMP/preseal-set.json" "$installed_config" "$installed_root_key"
+)" || fail "the installed runtime config could not be mapped for post-bootc reauthentication"
+grep -qx "root_pubkey=$installed_root_key" <<<"$mapped_out" \
+  || fail "the post-bootc config did not map the runtime root key into the deployment"
+grep -qx "state_dir=$TMP/installed-state" <<<"$mapped_out" \
+  || fail "the post-bootc config did not map runtime state into the installed stateroot"
+if ! grep -qx 'device_compat_min=5' <<<"$mapped_out" \
+    || ! grep -qx 'device_compat_max=5' <<<"$mapped_out"; then
+  fail "the post-bootc mapping changed the persisted authenticated compat range"
+fi
+
+# A complete image-declared range remains authoritative input to the verifier.
+# The helper must not rewrite a mismatch into apparent success; the production
+# verifier's mismatch refusal is covered by preseal_cli.rs and is ordered above
+# before publication.
+declared_config="$TMP/declared-compat.conf"
+sed -e 's/^#device_compat_min=1$/device_compat_min=4/' \
+  -e 's/^#device_compat_max=3$/device_compat_max=5/' \
+  "$ROOT/image/bootc-overlay/etc/neural-ice/ota.conf" > "$declared_config"
+declared_out="$(
+  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+    set -euo pipefail
+    die() { echo "die: $*" >&2; exit 1; }
+    source "$1"
+    write_preseal_verifier_config "/var/lib/neural-ice/ota" "$2" "$3" \
+      "$4" "/etc/neural-ice/keys/ota-root.pub" "$5"
+    cat "$2"
+  ' _ "$TMP/preseal-config.sh" "$TMP/declared-output.conf" "$TMP/preseal-set.json" \
+    "$declared_config" "$installed_root_key"
+)" || fail "a complete declared compat range was rejected before authentication"
+if ! grep -qx 'device_compat_min=4' <<<"$declared_out" \
+    || ! grep -qx 'device_compat_max=5' <<<"$declared_out"; then
+  fail "a declared compatibility mismatch was silently rewritten"
+fi
+
+symlink_victim="$TMP/symlink-victim"
+symlink_destination="$TMP/symlink-config"
+printf '%s\n' unchanged > "$symlink_victim"
+ln -s "$symlink_victim" "$symlink_destination"
+if VERITY_ROOT_MOUNT="$compat_root" bash -c '
+    set -euo pipefail
+    die() { exit 1; }
+    source "$1"
+    write_preseal_verifier_config "/var/lib/neural-ice/ota" "$2" "$3" \
+      "$4" "/etc/neural-ice/keys/ota-root.pub" "$5"
+  ' _ "$TMP/preseal-config.sh" "$symlink_destination" "$TMP/preseal-set.json" \
+    "$installed_config" "$installed_root_key" 2>/dev/null; then
+  fail "a symlink verifier-config destination was accepted"
+fi
+[[ "$(cat "$symlink_victim")" == unchanged ]] \
+  || fail "the rejected verifier-config symlink write altered its target"
+
 printf 'enforce=0\nroot_pubkey=/x\nstate_dir=/y\ndevice_compat_min=5\n' > "$compat_root/etc/neural-ice/ota.conf"
 if VERITY_ROOT_MOUNT="$compat_root" bash -c '
     set -euo pipefail

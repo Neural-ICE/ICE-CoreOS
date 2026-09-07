@@ -75,9 +75,17 @@ build flavour cannot inherit permissiveness by omission.
   deployment being written. A key offered to a `customer-locked` image aborts the
   install; it is never silently dropped, because silently dropping it hands the
   operator an appliance they believe is reachable and hands an attacker a free
-  retry. The `registry` install source refuses a medium-supplied key outright:
-  the deployment comes from an image pulled later, so there is nothing honest to
-  gate against at preflight.
+  retry. On the `registry` path a permitted medium key is copied once into a
+  bounded, root-only snapshot but remains unaccepted. The installer first pulls
+  the exact digest-pinned object, verifies its signed release authorization and
+  resolved index/manifest identity, requires its profile, variant, hardware
+  target, trust policy and platform to match, and completes the applicable
+  owner-preseal verification. Only after the host-side candidate mount is
+  released, and still before the first disk mutation, may a `lab-managed`
+  pulled target accept and encode the unchanged snapshot. `customer-locked`, an
+  unknown profile, a different target profile, or any missing proof context
+  still refuses; the medium's own policy cannot be passed off as proof of the
+  pulled target.
 - **First boot** (`image/firstboot/neural-ice-firstboot-sshkey.sh`). Re-states
   the whole decision against the *installed* image's own `/usr`. On
   `customer-locked` a kernel argument is refused with no `authorized_keys` write
