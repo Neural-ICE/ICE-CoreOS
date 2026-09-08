@@ -122,7 +122,7 @@ grep -q 'create --pull=never' "$TMP/store-preflight.sh" \
   || fail "the extracted store preflight has no no-pull container creation"
 # The variables and functions are consumed by the sourced production block;
 # ShellCheck does not connect that generated file to this lexical scope.
-# shellcheck disable=SC2034,SC2329
+# shellcheck disable=SC2034,SC2317,SC2329
 store_preflight_attempt() (
   local object_present=$1 boundary=$2
   PRESEAL_SET_SHA256="$(printf '%064d' 8)"
