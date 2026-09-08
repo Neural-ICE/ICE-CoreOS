@@ -2196,18 +2196,17 @@ pub(crate) fn verify_seed_with(
     {
         return refuse("authorization delegation/scope/device binding is invalid");
     }
-    // Fabric binds the immutable measured-boot baseline as the exact policy
-    // hash. Key/signature/sequence remain sealed installer inputs and are
-    // checked for strict shape here; they are not substituted for Fabric's
-    // signed policy identity.
+    // The signed authorization's Secure Boot trust-policy identity is bound
+    // independently to the closure below. The PCR policy digest, key,
+    // signature and sequence are sealed installer inputs in a different hash
+    // domain, so this boundary validates their strict shape without comparing
+    // them to the Secure Boot policy executable hash.
     if !is_hex64(&expectation.pcr_policy_digest)
         || !is_hex64(&expectation.pcr_policy_public_key_sha256)
         || !is_hex64(&expectation.pcr_policy_signature_sha256)
-        || string(auth, "boot_trust_policy_sha256", "release authorization")?
-            != expectation.pcr_policy_digest
         || expectation.pcr_policy_seq == 0
     {
-        return refuse("release authorization does not bind the sealed PCR policy generation");
+        return refuse("sealed PCR policy generation inputs are invalid");
     }
     let issued_at = string(auth, "issued_at", "release authorization")?;
     let valid_until = string(auth, "valid_until", "release authorization")?;
