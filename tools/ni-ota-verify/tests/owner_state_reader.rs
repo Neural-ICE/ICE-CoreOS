@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+const OWNER_REPOSITORY: &str = "release.example.test/neural-ice/neural-ice-appliance";
+const OWNER_INDEX: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OWNER_CHILD: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const OWNER_CHECKSUM: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 struct Fixture {
     root: PathBuf,
@@ -530,6 +534,121 @@ fn success_command(fixture: &Fixture) -> Command {
     command
 }
 
+struct OstreeFixture {
+    bootc_denied: PathBuf,
+    command: PathBuf,
+    deployment_root: PathBuf,
+    metadata: PathBuf,
+    origin: PathBuf,
+    status: PathBuf,
+}
+
+fn owner_status_command(
+    fixture: &Fixture,
+    profile: &Path,
+    payload: &Path,
+    ostree: &OstreeFixture,
+) -> Command {
+    let mut command = success_command(fixture);
+    command
+        // The old implementation consumes this seam and reproduces the
+        // capability-bound bootc failure. The capability-free implementation
+        // does not read it.
+        .env("NI_OTA_AUTH_STATUS_BOOTC", &ostree.bootc_denied)
+        .env("NI_OTA_AUTH_STATUS_PROFILE_MARKER", profile)
+        .env("NI_OTA_AUTH_STATUS_OSTREE", &ostree.command)
+        .env("NI_OTA_AUTH_STATUS_DEPLOY_ROOT", &ostree.deployment_root)
+        .env("NI_OTA_AUTH_STATUS_PAYLOAD_ID", payload);
+    command
+}
+
+fn run_owner_status(
+    fixture: &Fixture,
+    profile: &Path,
+    payload: &Path,
+    ostree: &OstreeFixture,
+) -> Output {
+    owner_status_command(fixture, profile, payload, ostree)
+        .env(
+            "NI_OTA_OWNER_STATE_HELPER",
+            fixture.root.join("owner-state"),
+        )
+        .output()
+        .unwrap()
+}
+
+fn assert_owner_status_refused(fixture: &Fixture, output: &Output, before: &[ObservedTreeEntry]) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(observe_tree(&fixture.state), before);
+    assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0);
+}
+
+fn write_default_ostree_command(command: &Path, status: &Path, metadata: &Path) {
+    write_mode(
+        command,
+        format!(
+            "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1 $2 $3\" = 'admin status --json' ]; then\n  cat '{}'\nelif [ \"$#\" -eq 4 ] && [ \"$1\" = show ] && [ \"$2\" = --repo=/sysroot/ostree/repo ] && [ \"$3\" = --print-metadata-key=ostree.manifest-digest ] && [ \"$4\" = {OWNER_CHECKSUM} ]; then\n  cat '{}'\nelse\n  exit 97\nfi\n",
+            status.display(),
+            metadata.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+}
+
+fn install_ostree_fixture(fixture: &Fixture) -> OstreeFixture {
+    assert_ne!(OWNER_INDEX, OWNER_CHILD);
+    let status = fixture.root.join("ostree-status.json");
+    fs::write(
+        &status,
+        serde_json::to_vec(&json!({"deployments":[{
+            "booted":true,"checksum":OWNER_CHECKSUM,"serial":0,"stateroot":"default"
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata = fixture.root.join("ostree-manifest-digest");
+    fs::write(&metadata, format!("'{OWNER_CHILD}'\n")).unwrap();
+    let command = fixture.root.join("ostree");
+    write_default_ostree_command(&command, &status, &metadata);
+    let bootc_denied = fixture.root.join("bootc-denied");
+    write_mode(
+        &bootc_denied,
+        b"#!/bin/sh\necho 'requires full root privileges (CAP_SYS_ADMIN)' >&2\nexit 1\n",
+        0o755,
+    );
+    let deployment_root = fixture.root.join("ostree-deploy");
+    let stateroot = deployment_root.join("default");
+    let deployment = stateroot.join("deploy");
+    fs::create_dir_all(&deployment).unwrap();
+    for directory in [&deployment_root, &stateroot, &deployment] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let origin = deployment.join(format!("{OWNER_CHECKSUM}.0.origin"));
+    write_mode(
+        &origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@{OWNER_INDEX}\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    OstreeFixture {
+        bootc_denied,
+        command,
+        deployment_root,
+        metadata,
+        origin,
+        status,
+    }
+}
+
 fn install_historical_state(fixture: &Fixture) -> (String, String) {
     let root = fixture.state.join("state-v1");
     let generations = root.join("generations");
@@ -705,9 +824,6 @@ fn public_spki(public: &Path) -> (String, String) {
 }
 
 fn install_owner_preseal(fixture: &Fixture) -> (String, String) {
-    const REPOSITORY: &str = "release.example.test/neural-ice/neural-ice-appliance";
-    const INDEX: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const CHILD: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SEED: &str = "cccccccccccccccccccccccccccccccccccccccc";
     let input = fixture.state.join("preseal-input-v1");
     let preseal = fixture.state.join("preseal");
@@ -783,7 +899,7 @@ fn install_owner_preseal(fixture: &Fixture) -> (String, String) {
     );
     let snapshot_canonical = hash(&snapshot[..snapshot.len() - 1]);
     let bom = serde_json::to_vec_pretty(&json!({
-        "appliance":{"os_base":{"digest":INDEX,"image":REPOSITORY},"version":"0.50.9-lab.20260905"},
+        "appliance":{"os_base":{"digest":OWNER_INDEX,"image":OWNER_REPOSITORY},"version":"0.50.9-lab.20260905"},
         "bundle_seq":5,"compat_min":5,"compat_version":5,"hardware_target":"nvidia-gb10-arm64",
         "sources":{"seed":{"ref":SEED,"repo":"ICE-Fabric"}},"train":"0.50.9-lab.20260905"
     }))
@@ -806,9 +922,9 @@ fn install_owner_preseal(fixture: &Fixture) -> (String, String) {
         "release",
     );
     let installer = serde_json::to_vec(&json!({
-        "access_profile":"lab-managed","hardware_target":"nvidia-gb10-arm64","image_index_digest":INDEX,
-        "image_manifest_digest":CHILD,"image_platform":"linux/arm64","image_publication_shape":"index",
-        "image_repository":REPOSITORY,"issuance_id":"install-lab-5","issuance_seq":"5",
+        "access_profile":"lab-managed","hardware_target":"nvidia-gb10-arm64","image_index_digest":OWNER_INDEX,
+        "image_manifest_digest":OWNER_CHILD,"image_platform":"linux/arm64","image_publication_shape":"index",
+        "image_repository":OWNER_REPOSITORY,"issuance_id":"install-lab-5","issuance_seq":"5",
         "issued_at":"2026-09-05T00:00:00Z","key_id":release_pem_sha,
         "schema":"neural-ice-installer-release-authorization-v2","signed_boot_trust_policy_id":"neural-ice-secureboot-lab-v1","variant":"sealed-lab"
     })).unwrap();
@@ -830,7 +946,7 @@ fn install_owner_preseal(fixture: &Fixture) -> (String, String) {
         "ota_release_authorization_signature_sha256":hash(&release_sig),"ota_state_profile":"owner-sealed-ota-state-v1",
         "release_key_id":"release-lab-v1","release_signing_role":"release-lab","ring":"lab",
         "schema":"neural-ice-installer-preseal-set-v1","seed_ref":SEED,
-        "signed_boot_trust_policy_id":"neural-ice-secureboot-lab-v1","target_os_ref":format!("{REPOSITORY}@{INDEX}"),
+        "signed_boot_trust_policy_id":"neural-ice-secureboot-lab-v1","target_os_ref":format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"),
         "train":"0.50.9-lab.20260905","variant":"sealed-lab"
     }));
     for (name, bytes) in [
@@ -903,9 +1019,9 @@ fn install_owner_preseal(fixture: &Fixture) -> (String, String) {
         .arg(hash(&installer_sig))
         .args([
             "--current-os-ref",
-            &format!("{REPOSITORY}@{INDEX}"),
+            &format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"),
             "--current-os-manifest-digest",
-            CHILD,
+            OWNER_CHILD,
             "--current-seed-ref",
             SEED,
         ])
@@ -1029,26 +1145,13 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
         b"cccccccccccccccccccccccccccccccccccccccc\n",
         0o644,
     );
-    let bootc = fixture.root.join("bootc");
-    let bootc_status = serde_json::to_string(&json!({
-        "spec":{"image":{"image":"release.example.test/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
-        "status":{"booted":{"image":{"image":{"image":"release.example.test/neural-ice/neural-ice-appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-            "imageDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
-    })).unwrap();
-    write_mode(
-        &bootc,
-        format!("#!/bin/sh\nprintf '%s\\n' '{bootc_status}'\n").as_bytes(),
-        0o755,
-    );
+    let ostree = install_ostree_fixture(&fixture);
     let before = observe_tree(&fixture.state);
-    let output = success_command(&fixture)
+    let output = owner_status_command(&fixture, &profile, &payload, &ostree)
         .env(
             "NI_OTA_OWNER_STATE_HELPER",
             fixture.root.join("owner-state"),
         )
-        .env("NI_OTA_AUTH_STATUS_PROFILE_MARKER", &profile)
-        .env("NI_OTA_AUTH_STATUS_BOOTC", &bootc)
-        .env("NI_OTA_AUTH_STATUS_PAYLOAD_ID", &payload)
         .output()
         .unwrap();
     assert_eq!(
@@ -1072,14 +1175,11 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
     // The image producer seals this marker as 0444. A writable marker is not
     // the shipped contract, even when its contents name the expected profile.
     fs::set_permissions(&profile, fs::Permissions::from_mode(0o644)).unwrap();
-    let rejected = success_command(&fixture)
+    let rejected = owner_status_command(&fixture, &profile, &payload, &ostree)
         .env(
             "NI_OTA_OWNER_STATE_HELPER",
             fixture.root.join("owner-state"),
         )
-        .env("NI_OTA_AUTH_STATUS_PROFILE_MARKER", &profile)
-        .env("NI_OTA_AUTH_STATUS_BOOTC", &bootc)
-        .env("NI_OTA_AUTH_STATUS_PAYLOAD_ID", &payload)
         .output()
         .unwrap();
     assert_eq!(rejected.status.code(), Some(1));
@@ -1088,6 +1188,244 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
         .contains("cannot authenticate immutable OTA profile marker"));
     assert_eq!(observe_tree(&fixture.state), before);
     assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0);
+}
+
+#[test]
+fn owner_pristine_baseline_refuses_hostile_or_changing_ostree_identity() {
+    let fixture = Fixture::new("owner-hostile-ostree", "");
+    let access = install_access_profile(&fixture, "lab-managed");
+    let (receipt_sha, set_sha) = install_owner_preseal(&fixture);
+    install_completion_v2(&fixture, &access, &receipt_sha, &set_sha);
+    let public = owner_public(
+        "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "policywrite|authread|ownerread|no_da|nt=extend",
+    );
+    install_read_only_tpm(&fixture, &access, &public, None, 5);
+    let profile = fixture.root.join("ota-state-profile");
+    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o444);
+    let payload = fixture.root.join("PAYLOAD_ID");
+    write_mode(
+        &payload,
+        b"cccccccccccccccccccccccccccccccccccccccc\n",
+        0o644,
+    );
+    let ostree = install_ostree_fixture(&fixture);
+    let before = observe_tree(&fixture.state);
+
+    fs::write(&ostree.metadata, format!("'sha256:{}'\n", "e".repeat(64))).unwrap();
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    fs::write(&ostree.metadata, format!("'{OWNER_CHILD}'\n")).unwrap();
+
+    write_mode(
+        &ostree.origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@sha256:{}\n",
+            "e".repeat(64)
+        )
+        .as_bytes(),
+        0o644,
+    );
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    write_mode(
+        &ostree.origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@{OWNER_INDEX}\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@{OWNER_INDEX}\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    write_mode(
+        &ostree.origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@{OWNER_INDEX}\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+
+    write_mode(&ostree.origin, &vec![b'x'; 4097], 0o644);
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    write_mode(
+        &ostree.origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@{OWNER_INDEX}\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+
+    fs::set_permissions(&ostree.origin, fs::Permissions::from_mode(0o664)).unwrap();
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    fs::set_permissions(&ostree.origin, fs::Permissions::from_mode(0o644)).unwrap();
+    let saved_origin = ostree.origin.with_extension("origin.saved");
+    fs::rename(&ostree.origin, &saved_origin).unwrap();
+    symlink(&saved_origin, &ostree.origin).unwrap();
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    fs::remove_file(&ostree.origin).unwrap();
+    fs::rename(&saved_origin, &ostree.origin).unwrap();
+
+    let deployment_directory = ostree.origin.parent().unwrap();
+    let saved_directory = deployment_directory.with_extension("saved");
+    fs::rename(deployment_directory, &saved_directory).unwrap();
+    symlink(&saved_directory, deployment_directory).unwrap();
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    fs::remove_file(deployment_directory).unwrap();
+    fs::rename(&saved_directory, deployment_directory).unwrap();
+
+    fs::write(&payload, b"different-seed\n").unwrap();
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    fs::write(&payload, b"cccccccccccccccccccccccccccccccccccccccc\n").unwrap();
+
+    for hostile in [
+        json!({"deployments":[
+            {"booted":true,"checksum":OWNER_CHECKSUM,"serial":0,"stateroot":"default"},
+            {"booted":true,"checksum":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","serial":1,"stateroot":"default"}
+        ]}),
+        json!({"deployments":[{"booted":true,"checksum":"not-a-checksum","serial":0,"stateroot":"default"}]}),
+        json!({"deployments":[{"booted":true,"checksum":OWNER_CHECKSUM,"serial":0,"stateroot":"../default"}]}),
+        json!({"deployments":[{"booted":true,"checksum":OWNER_CHECKSUM,"serial":9_007_199_254_740_992_u64,"stateroot":"default"}]}),
+    ] {
+        fs::write(&ostree.status, serde_json::to_vec(&hostile).unwrap()).unwrap();
+        assert_owner_status_refused(
+            &fixture,
+            &run_owner_status(&fixture, &profile, &payload, &ostree),
+            &before,
+        );
+    }
+    fs::write(
+        &ostree.status,
+        serde_json::to_vec(&json!({"deployments":[{
+            "booted":true,"checksum":OWNER_CHECKSUM,"serial":0,"stateroot":"default"
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &ostree.status,
+        format!(
+            "{{\"deployments\":[{{\"booted\":true,\"checksum\":\"{OWNER_CHECKSUM}\",\"serial\":0,\"stateroot\":\"default\"}}],\"deployments\":[]}}"
+        ),
+    )
+    .unwrap();
+    assert_owner_status_refused(
+        &fixture,
+        &run_owner_status(&fixture, &profile, &payload, &ostree),
+        &before,
+    );
+    fs::write(
+        &ostree.status,
+        serde_json::to_vec(&json!({"deployments":[{
+            "booted":true,"checksum":OWNER_CHECKSUM,"serial":0,"stateroot":"default"
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let metadata_marker = fixture.root.join("metadata-mutation-fired");
+    write_mode(
+        &ostree.command,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = 'admin status --json' ]; then\n  cat '{}'\nelif [ \"$1\" = show ]; then\n  if [ ! -e '{}' ]; then\n    cat '{}'\n    : > '{}'\n    printf \"'sha256:%s'\\n\" '{}' > '{}'\n  else\n    cat '{}'\n  fi\nelse\n  exit 97\nfi\n",
+            ostree.status.display(),
+            metadata_marker.display(),
+            ostree.metadata.display(),
+            metadata_marker.display(),
+            "e".repeat(64),
+            ostree.metadata.display(),
+            ostree.metadata.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let changed_metadata = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_owner_status_refused(&fixture, &changed_metadata, &before);
+    assert!(String::from_utf8_lossy(&changed_metadata.stderr)
+        .contains("booted deployment changed during authenticated inspection"));
+    fs::write(&ostree.metadata, format!("'{OWNER_CHILD}'\n")).unwrap();
+
+    let final_status = fixture.root.join("ostree-final-status.json");
+    fs::write(
+        &final_status,
+        serde_json::to_vec(&json!({"deployments":[{
+            "booted":true,"checksum":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "serial":1,"stateroot":"default"
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let status_marker = fixture.root.join("status-mutation-fired");
+    write_mode(
+        &ostree.command,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = 'admin status --json' ]; then\n  if [ -e '{}' ]; then cat '{}'; else cat '{}'; : > '{}'; fi\nelif [ \"$1\" = show ]; then\n  cat '{}'\nelse\n  exit 97\nfi\n",
+            status_marker.display(),
+            final_status.display(),
+            ostree.status.display(),
+            status_marker.display(),
+            ostree.metadata.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let changed_status = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_owner_status_refused(&fixture, &changed_status, &before);
+    assert!(String::from_utf8_lossy(&changed_status.stderr)
+        .contains("booted deployment changed during authenticated inspection"));
+    write_default_ostree_command(&ostree.command, &ostree.status, &ostree.metadata);
+
+    let mutation_marker = fixture.root.join("origin-mutation-fired");
+    write_mode(
+        &ostree.command,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = 'admin status --json' ]; then\n  cat '{}'\nelif [ \"$1\" = show ]; then\n  if [ ! -e '{}' ]; then\n    : > '{}'\n    printf '%s\\n' '[origin]' 'container-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@sha256:{}' > '{}'\n    chmod 0644 '{}'\n  fi\n  cat '{}'\nelse\n  exit 97\nfi\n",
+            ostree.status.display(),
+            mutation_marker.display(),
+            mutation_marker.display(),
+            "e".repeat(64),
+            ostree.origin.display(),
+            ostree.origin.display(),
+            ostree.metadata.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let changed = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_owner_status_refused(&fixture, &changed, &before);
+    assert!(String::from_utf8_lossy(&changed.stderr)
+        .contains("booted deployment changed during authenticated inspection"));
 }
 
 #[test]
