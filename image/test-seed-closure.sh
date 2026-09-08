@@ -22,7 +22,7 @@ for spec in "acme alpha $rev_a alpha-bytes" "acme beta $rev_b beta-bytes"; do
   ln -s "../../blobs/$digest" "$model/snapshots/$revision/model.safetensors"
 done
 cat > "$ROOT/profiles.json" <<EOF
-{"profiles":{"alpha":{"catalog_status":"validated","model":"acme/alpha"},"beta":{"catalog_status":"validated","model":"acme/beta"}},"serving_roles":{}}
+{"profiles":{"alpha":{"catalog_status":"validated","model":"acme/alpha"}},"serving_roles":{"beta":{"catalog_status":"validated","model":"acme/beta"}}}
 EOF
 cat > "$ROOT/catalogue.json" <<EOF
 {"models":[{"catalog_status":"validated","file_count":1,"hf_revision":"$rev_a","id":"alpha","model":"acme/alpha","size_bytes":11},{"catalog_status":"validated","file_count":1,"hf_revision":"$rev_b","id":"beta","model":"acme/beta","size_bytes":10}]}
@@ -74,4 +74,20 @@ fi
 if rg -n 'podman .*load|SEED_IMAGES|SEED_MODELS|/store/' image/build-preloaded.sh >/dev/null; then
   echo "legacy overlay producer remains in build-preloaded.sh" >&2; exit 1
 fi
-echo "seed-producer-consumer: 3 cases passed"
+# A serving-role ID cannot shadow a generation profile in the card namespace.
+python3 - "$ROOT/profiles.json" "$ROOT/duplicate-profiles.json" <<'PYTEST'
+import json,sys
+value=json.load(open(sys.argv[1]))
+value["serving_roles"]["alpha"]=value["profiles"]["alpha"]
+open(sys.argv[2],"w").write(json.dumps(value))
+PYTEST
+if image/model-cache-contract.py produce --hf-cache "$hf" \
+  --profiles "$ROOT/duplicate-profiles.json" --catalogue "$ROOT/catalogue.json" \
+  --objects "$ROOT/duplicate-objects" > "$ROOT/duplicate.log" 2>&1; then
+  echo "duplicate profile/serving-role id unexpectedly passed" >&2; exit 1
+fi
+rg -q 'repeats a card id across profiles and serving_roles' "$ROOT/duplicate.log"
+echo "seed-producer-consumer: 4 cases passed"
+
+# Run composition input joins and wrapper domain routing in the same CI gate.
+python3 "$(dirname "${BASH_SOURCE[0]}")/test-preloaded-inputs.py"

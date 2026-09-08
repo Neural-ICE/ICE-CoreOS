@@ -47,10 +47,20 @@ printf '1\n' > "$data/release/PCR-POLICY-SEQ"
 printf '%s\n' nvidia-gb10-arm64 > "$ROOT/usr/lib/neural-ice/hardware-target"
 printf '%s\n' lab-managed > "$ROOT/usr/lib/neural-ice/access-policy"
 printf '%s\n' lab-v1 > "$ROOT/usr/lib/neural-ice/signed-boot-trust-policy-id"
-printf key > "$ROOT/usr/lib/neural-ice/keys/release-authorization.pub"
+printf delegated-key > "$ROOT/usr/lib/neural-ice/keys/release-authorization.pub"
+mkdir -p "$ROOT/etc/neural-ice/keys"
+printf ota-root-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
 cat > "$ROOT/usr/bin/ni-ota-verify" <<'EOF'
 #!/bin/sh
-exit 0
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --pubkey ]; then
+    shift
+    [ "$(cat "$1")" = ota-root-key ] || exit 61
+    exit 0
+  fi
+  shift
+done
+exit 62
 EOF
 chmod 0755 "$ROOT/usr/bin/ni-ota-verify"
 install -m 0755 image/model-cache-contract.py "$ROOT/usr/libexec/neural-ice-model-cache-contract"
@@ -66,7 +76,7 @@ for spec in "acme alpha $rev_a alpha-bytes" "acme beta $rev_b beta-bytes"; do
   ln -s "../../blobs/$digest" "$model/snapshots/$revision/model.safetensors"
 done
 cat > "$ROOT/profiles.json" <<EOF
-{"profiles":{"alpha":{"catalog_status":"validated","model":"acme/alpha"},"beta":{"catalog_status":"validated","model":"acme/beta"}},"serving_roles":{}}
+{"profiles":{"alpha":{"catalog_status":"validated","model":"acme/alpha"}},"serving_roles":{"beta":{"catalog_status":"validated","model":"acme/beta"}}}
 EOF
 cat > "$ROOT/catalogue.json" <<EOF
 {"models":[{"catalog_status":"validated","file_count":1,"hf_revision":"$rev_a","id":"alpha","model":"acme/alpha","size_bytes":11},{"catalog_status":"validated","file_count":1,"hf_revision":"$rev_b","id":"beta","model":"acme/beta","size_bytes":10}]}
@@ -113,6 +123,15 @@ for card_id, card_digest in (("alpha",card_a),("beta",card_b)):
 document = {"artifacts":artifacts}
 open(path,"w",encoding="ascii").write(json.dumps(document,separators=(",",":"),sort_keys=True)+"\n")
 PY
+
+# A delegated installer key is not the root that authenticates the snapshot.
+printf delegated-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
+if PATH="$FAKEBIN:$PATH" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=1 \
+  image/firstboot/neural-ice-seed-import.sh >/dev/null 2>&1; then
+  echo "substituted delegation root unexpectedly passed" >&2; exit 1
+fi
+test ! -e "$data/offline-current"
+printf ota-root-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
 
 PATH="$FAKEBIN:$PATH" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=1 \
   image/firstboot/neural-ice-seed-import.sh
@@ -262,4 +281,4 @@ fi
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 
-echo "seed-firstboot-import: 22 cases passed"
+echo "seed-firstboot-import: 23 cases passed"

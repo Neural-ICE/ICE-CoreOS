@@ -34,6 +34,10 @@ source "$REPO_ROOT/image/lib/preloaded-output-set.sh"
 
 RELEASE_MANIFEST_FILE="${RELEASE_MANIFEST_FILE:-}"
 RELEASE_CLOSURE_FILE="${RELEASE_CLOSURE_FILE:-}"
+# Distinct signing domains: Fabric OTA-v2 proves the SEED before raw construction;
+# installer-v2 authorizes the measured installer. Neither substitutes for the other.
+SEED_RELEASE_AUTHORIZATION_FILE="${SEED_RELEASE_AUTHORIZATION_FILE:-}"
+SEED_RELEASE_AUTHORIZATION_SIGNATURE_FILE="${SEED_RELEASE_AUTHORIZATION_SIGNATURE_FILE:-}"
 RELEASE_AUTHORIZATION_FILE="${RELEASE_AUTHORIZATION_FILE:-}"
 RELEASE_AUTHORIZATION_SIGNATURE_FILE="${RELEASE_AUTHORIZATION_SIGNATURE_FILE:-}"
 DELEGATION_SNAPSHOT_FILE="${DELEGATION_SNAPSHOT_FILE:-}"
@@ -83,7 +87,8 @@ preloaded_require_fresh_output_set "$REPO_ROOT" "$OUT" "$COMPRESS"
 
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "BASE_IMAGE is required as the signed train's digest-pinned appliance ref" >&2; exit 1; }
-for variable in RELEASE_MANIFEST_FILE RELEASE_CLOSURE_FILE RELEASE_AUTHORIZATION_FILE \
+for variable in RELEASE_MANIFEST_FILE RELEASE_CLOSURE_FILE SEED_RELEASE_AUTHORIZATION_FILE \
+  SEED_RELEASE_AUTHORIZATION_SIGNATURE_FILE RELEASE_AUTHORIZATION_FILE \
   RELEASE_AUTHORIZATION_SIGNATURE_FILE DELEGATION_SNAPSHOT_FILE \
   DELEGATION_SNAPSHOT_SIGNATURE_FILE RELEASE_ROOT_PUBLIC_KEY_FILE SEED_OBJECT_ROOTS \
   SEED_TRUSTED_NOW RELEASE_AUTHORITY HARDWARE_TARGET ACCESS_PROFILE TRUST_POLICY_ID; do
@@ -94,6 +99,14 @@ for variable in PCR_POLICY_DIGEST PCR_POLICY_PUBLIC_KEY_FILE PCR_POLICY_PUBLIC_K
   [[ -n ${!variable} ]] || { echo "missing required $variable" >&2; exit 1; }
 done
 [[ -x $NI_OTA_VERIFY ]] || { echo "missing built ni-ota-verify: $NI_OTA_VERIFY" >&2; exit 1; }
+
+# Join both authority chains and the runtime model baseline before staging.
+python3 "$REPO_ROOT/image/lib/preloaded-inputs.py" \
+  --authorization "$SEED_RELEASE_AUTHORIZATION_FILE" \
+  --closure "$RELEASE_CLOSURE_FILE" --manifest "$RELEASE_MANIFEST_FILE" \
+  --base-image "$BASE_IMAGE" --target-image "${TARGET_IMGREF:-$BASE_IMAGE}" \
+  --profiles "$MODEL_PROFILES" --catalogue "$MODEL_CATALOGUE" \
+  --root-pubkey "$RELEASE_ROOT_PUBLIC_KEY_FILE"
 
 # Stage and prove the seed BEFORE building/signing the base medium, because its
 # closure hash is itself a sealed UKI input. Colon-separated roots are explicit
@@ -106,7 +119,7 @@ IFS=: read -r -a seed_roots <<<"$SEED_OBJECT_ROOTS"
 for root in "${seed_roots[@]}"; do seed_args+=(--objects "$root"); done
 seed_output="$(./image/build-seed-v2.sh --output "$SEED_STAGE" \
   --release-manifest "$RELEASE_MANIFEST_FILE" --release-closure "$RELEASE_CLOSURE_FILE" \
-  --authorization "$RELEASE_AUTHORIZATION_FILE" --authorization-sig "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
+  --authorization "$SEED_RELEASE_AUTHORIZATION_FILE" --authorization-sig "$SEED_RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
   --delegation "$DELEGATION_SNAPSHOT_FILE" --delegation-sig "$DELEGATION_SNAPSHOT_SIGNATURE_FILE" \
   --root-pubkey "$RELEASE_ROOT_PUBLIC_KEY_FILE" --registry-host "$RELEASE_AUTHORITY" \
   --hardware-target "$HARDWARE_TARGET" --access-profile "$ACCESS_PROFILE" \
@@ -138,6 +151,8 @@ env -u OUT BASE_IMAGE="$BASE_IMAGE" TARGET_IMGREF="${TARGET_IMGREF:-$BASE_IMAGE}
   UKI_SIGNING_KEY="$UKI_SIGNING_KEY" UKI_SIGNING_CERT="$UKI_SIGNING_CERT" \
   ALLOW_UNSIGNED_MEDIA="$ALLOW_UNSIGNED_MEDIA" \
   SEED_CLOSURE="$SEED_CLOSURE" SEED_TRUSTED_NOW="$SEED_TRUSTED_NOW" \
+  RELEASE_AUTHORIZATION_FILE="$RELEASE_AUTHORIZATION_FILE" \
+  RELEASE_AUTHORIZATION_SIGNATURE_FILE="$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
   RELEASE_MANIFEST_FILE="$RELEASE_MANIFEST_FILE" \
   RELEASE_CLOSURE_FILE="$RELEASE_CLOSURE_FILE" \
   DELEGATION_SNAPSHOT_FILE="$DELEGATION_SNAPSHOT_FILE" \

@@ -2382,7 +2382,7 @@ if [[ -n "$SEED_CLOSURE" ]]; then
   done
   [[ -x "$NEURALICE_SEED_VERIFIER" ]] \
     || die "this medium carries no seed-closure verifier at ${NEURALICE_SEED_VERIFIER}; refusing to stage an offline closure nothing would verify"
-  _seed_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
+  _seed_key="$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub"
   [[ -f "$_seed_key" && ! -L "$_seed_key" ]] \
     || die "the verified installer root carries no release-authorization public key to verify the offline seed with"
   log "Verifying the offline release closure ${SEED_CLOSURE} before the target disk is touched…"
@@ -2747,7 +2747,7 @@ if [[ -n "$SEED_VERIFIED_ROOT" ]]; then
   heartbeat_start "verifying the staged release closure on the data volume"
   "$NEURALICE_SEED_VERIFIER" verify-seed-closure \
     --seed-root "$_seed_dst" \
-    --pubkey "$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub" \
+    --pubkey "$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub" \
     --registry-host "$NEURALICE_RELEASE_AUTHORITY" \
     --hardware-target "$SEALED_HARDWARE_TARGET" \
     --access-profile "$SEALED_ACCESS_PROFILE" \
