@@ -6,6 +6,7 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -1178,7 +1179,9 @@ fn helper_timeout_and_oversized_output_refuse_without_success_or_residue() {
         let fixture = Fixture::new(name, "");
         fixture.replace_nvreadpublic(script);
         let before = metadata(&fixture.state);
+        let started = Instant::now();
         let output = fixture.run();
+        let elapsed = started.elapsed();
         assert_eq!(output.status.code(), Some(expected_code), "{name}");
         assert!(output.stdout.is_empty(), "{name}");
         assert!(
@@ -1189,6 +1192,10 @@ fn helper_timeout_and_oversized_output_refuse_without_success_or_residue() {
         assert_eq!(metadata(&fixture.state), before, "{name}");
         assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0, "{name}");
         if name == "timeout" {
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the test-only three-second deadline was widened with production: {elapsed:?}"
+            );
             let child: u32 = fs::read_to_string(fixture.nvreadpublic.with_extension("child"))
                 .unwrap()
                 .trim()
