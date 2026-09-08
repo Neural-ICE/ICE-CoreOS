@@ -242,6 +242,8 @@ PYEOF
 
 # The sealed hashes are the REAL hashes of the produced documents, so a negative
 # case fails on the field it changed rather than on a digest nobody updated.
+# Variables are consumed by the exact production functions sourced below.
+# shellcheck disable=SC2034
 compose_reconcile() { # $1=root [ENV=VALUE …] -> 0 when the installer would proceed
   local root=$1; shift
   local closure manifest preseal
@@ -350,6 +352,8 @@ printf '{"bundle_seq":13,"bundle_seq":13,"host_digest":"%s","train":"1.0.0"}\n' 
 # --------------------------------------------------------------------------- #
 # The PRODUCER side of the same rule.
 # --------------------------------------------------------------------------- #
+# Variables are consumed by the exact production functions sourced below.
+# shellcheck disable=SC2034
 compose_seal() { # $1=source $2=root [ENV=VALUE …] -> 0 when the medium would be cut
   local source=$1 root=$2; shift 2
   (
