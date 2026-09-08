@@ -9,10 +9,16 @@ The image is inspected through a never-started, task-owned local container.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+
+
+ROOTFUL_PODMAN = ("sudo", "podman")
+IMAGE_PROBE_TIMEOUT = 120
+IMAGE_PULL_TIMEOUT = 20 * 60
 
 
 def read(path):
@@ -56,10 +62,40 @@ def bind(args):
             raise ValueError(f"{field} differs from exact input bytes")
 
 
+def acquire_base_image(base_image):
+    probe = subprocess.run(
+        [*ROOTFUL_PODMAN, "image", "exists", base_image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=IMAGE_PROBE_TIMEOUT,
+    )
+    if probe.returncode == 0:
+        return
+    if probe.returncode != 1:
+        raise ValueError(
+            f"rootful Podman image probe returned unexpected status {probe.returncode}"
+        )
+
+    command = [*ROOTFUL_PODMAN, "pull"]
+    authfile = os.environ.get("REGISTRY_AUTH_FILE")
+    if authfile:
+        command.extend(("--authfile", authfile))
+    result = subprocess.run(
+        [*command, base_image],
+        timeout=IMAGE_PULL_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            f"rootful Podman image pull failed with status {result.returncode}"
+        )
+
+
 def baked_inputs(args):
-    # No pull, no start, no image entrypoint execution, no shared container name.
+    # Bind has already selected the exact digest. Acquire it in the same rootful
+    # store used by the child media builder, then inspect without starting it.
+    acquire_base_image(args.base_image)
     container = subprocess.check_output([
-        "podman", "create", "--pull=never", "--network=none",
+        *ROOTFUL_PODMAN, "create", "--pull=never", "--network=none",
         "--entrypoint=/bin/true", args.base_image,
     ], text=True, timeout=120).strip()
     if not re.fullmatch(r"[0-9a-f]{64}", container):
@@ -72,12 +108,12 @@ def baked_inputs(args):
                 ("/etc/neural-ice/keys/ota-root.pub", args.root_pubkey, "OTA root"),
             ):
                 target = Path(scratch) / "input"
-                subprocess.run(["podman", "cp", f"{container}:{source}", str(target)], check=True, timeout=120)
+                subprocess.run([*ROOTFUL_PODMAN, "cp", f"{container}:{source}", str(target)], check=True, timeout=120)
                 if read(target) != read(supplied):
                     raise ValueError(f"{label} differs from the pinned appliance")
                 target.unlink()
     finally:
-        subprocess.run(["podman", "rm", container], check=True, stdout=subprocess.DEVNULL, timeout=120)
+        subprocess.run([*ROOTFUL_PODMAN, "rm", container], check=True, stdout=subprocess.DEVNULL, timeout=120)
 
 
 def main():

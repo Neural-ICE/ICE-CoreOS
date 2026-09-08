@@ -93,17 +93,19 @@ class Inputs(unittest.TestCase):
             removed = []
 
             def create(command, **kwargs):
-                self.assertEqual(command, ["podman", "create", "--pull=never", "--network=none", "--entrypoint=/bin/true", self.args.base_image])
+                self.assertEqual(command, ["sudo", "podman", "create", "--pull=never", "--network=none", "--entrypoint=/bin/true", self.args.base_image])
                 return "c" * 64 + "\n"
 
             def run(command, **kwargs):
-                if command[:2] == ["podman", "rm"]:
-                    removed.append(command[2])
+                if command[:4] == ["sudo", "podman", "image", "exists"]:
+                    return subprocess.CompletedProcess(command, 0)
+                if command[:3] == ["sudo", "podman", "rm"]:
+                    removed.append(command[3])
                 else:
-                    self.assertEqual(command[:2], ["podman", "cp"])
-                    source = command[2]
+                    self.assertEqual(command[:3], ["sudo", "podman", "cp"])
+                    source = command[3]
                     content = b"fixture public root" if source.endswith("ota-root.pub") else b"{}\n"
-                    Path(command[3]).write_bytes(b"wrong" if mismatch and source.endswith(mismatch) else content)
+                    Path(command[4]).write_bytes(b"wrong" if mismatch and source.endswith(mismatch) else content)
                 return subprocess.CompletedProcess(command, 0)
 
             with self.subTest(mismatch=mismatch), patch.object(MODULE.subprocess, "check_output", create), patch.object(MODULE.subprocess, "run", run):
@@ -113,6 +115,75 @@ class Inputs(unittest.TestCase):
                 else:
                     MODULE.baked_inputs(self.args)
                 self.assertEqual(removed, ["c" * 64])
+
+    def test_clean_rootful_store_pulls_with_explicit_authfile_then_inspects(self):
+        authfile = self.root / "registry-auth.json"
+        authfile.write_text("fixture must never be read by this test")
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[:4] == ["sudo", "podman", "image", "exists"]:
+                return subprocess.CompletedProcess(command, 1)
+            if command[:3] == ["sudo", "podman", "pull"]:
+                return subprocess.CompletedProcess(command, 0)
+            if command[:3] == ["sudo", "podman", "cp"]:
+                content = b"fixture public root" if command[3].endswith("ota-root.pub") else b"{}\n"
+                Path(command[4]).write_bytes(content)
+                return subprocess.CompletedProcess(command, 0)
+            if command[:3] == ["sudo", "podman", "rm"]:
+                return subprocess.CompletedProcess(command, 0)
+            self.fail(f"unexpected command: {command}")
+
+        with patch.dict(MODULE.os.environ, {"REGISTRY_AUTH_FILE": str(authfile)}), \
+             patch.object(MODULE.subprocess, "run", run), \
+             patch.object(MODULE.subprocess, "check_output", return_value="c" * 64 + "\n"):
+            MODULE.baked_inputs(self.args)
+
+        self.assertEqual(calls[0][0], ["sudo", "podman", "image", "exists", self.args.base_image])
+        self.assertEqual(calls[0][1]["timeout"], MODULE.IMAGE_PROBE_TIMEOUT)
+        self.assertEqual(calls[1][0], ["sudo", "podman", "pull", "--authfile", str(authfile), self.args.base_image])
+        self.assertEqual(calls[1][1]["timeout"], MODULE.IMAGE_PULL_TIMEOUT)
+        self.assertFalse(any("run" in command[2:3] for command, _ in calls))
+
+    def test_image_probe_and_pull_fail_closed_before_container_creation(self):
+        for name, statuses in (
+            ("unexpected exists status", [125]),
+            ("pull failure", [1, 125]),
+        ):
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                return subprocess.CompletedProcess(command, statuses[len(calls) - 1])
+
+            with self.subTest(name=name), \
+                 patch.object(MODULE.subprocess, "run", run), \
+                 patch.object(MODULE.subprocess, "check_output") as create:
+                with self.assertRaisesRegex(ValueError, "rootful Podman"):
+                    MODULE.baked_inputs(self.args)
+                create.assert_not_called()
+
+    def test_invalid_binding_precedes_rootful_store_access(self):
+        self.auth["purpose"] = "install"
+        self.save()
+        arguments = [
+            "preloaded-inputs.py",
+            "--authorization", str(self.args.authorization),
+            "--closure", str(self.args.closure),
+            "--manifest", str(self.args.manifest),
+            "--base-image", self.args.base_image,
+            "--target-image", self.args.target_image,
+            "--profiles", str(self.args.profiles),
+            "--catalogue", str(self.args.catalogue),
+            "--root-pubkey", str(self.args.root_pubkey),
+        ]
+        with patch("sys.argv", arguments), \
+             patch.object(MODULE, "baked_inputs") as inspect_image, \
+             self.assertRaises(SystemExit) as refusal:
+            MODULE.main()
+        self.assertEqual(refusal.exception.code, 1)
+        inspect_image.assert_not_called()
 
     def test_wrapper_routes_distinct_authorizations(self):
         # Execute the real wrapper through its two child producer interfaces.

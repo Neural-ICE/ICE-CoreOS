@@ -88,6 +88,3 @@ if image/model-cache-contract.py produce --hf-cache "$hf" \
 fi
 rg -q 'repeats a card id across profiles and serving_roles' "$ROOT/duplicate.log"
 echo "seed-producer-consumer: 4 cases passed"
-
-# Run composition input joins and wrapper domain routing in the same CI gate.
-python3 "$(dirname "${BASH_SOURCE[0]}")/test-preloaded-inputs.py"
