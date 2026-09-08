@@ -6,6 +6,25 @@ FAKEBIN="$ROOT/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/skopeo" <<'EOF'
 #!/bin/sh
 [ "${FAIL_SKOPEO:-0}" = 0 ] || exit 42
+if [ "${ASSERT_STORAGE_CONTRACT:-0}" = 1 ]; then
+  case "${1:-}" in
+    copy)
+      for arg in "$@"; do
+        [ "$arg" != --all ] || { echo 'storage transport rejects --all' >&2; exit 43; }
+      done
+      printf copied > "$COPY_MARKER"
+      exit 0 ;;
+    inspect)
+      [ -f "$COPY_MARKER" ] || exit 44
+      case "${2:-}" in
+        *@"$EXPECTED_IMPORT_DIGEST")
+          printf '{"Digest":"%s"}\n' "${RETURN_IMPORT_DIGEST:-$EXPECTED_IMPORT_DIGEST}" ;;
+        *) printf '{"Digest":"sha256:child-digest-not-index"}\n' ;;
+      esac
+      exit 0 ;;
+    *) exit 45 ;;
+  esac
+fi
 if [ "${1:-}" = inspect ]; then
   printf '{"Digest":"%s"}\n' "${EXPECTED_IMPORT_DIGEST:-sha256:missing}"
 fi
@@ -210,4 +229,37 @@ if command -v setpriv >/dev/null && setpriv --reuid=0 --regid=0 --clear-groups \
   exit 1
 fi
 
-echo "seed-firstboot-import: 20 cases passed"
+# Exercise the successful storage path, not dry-run: the strict transport fake
+# reproduces the measured --all refusal and index-vs-tag digest distinction.
+# Relabel commands are stubs because this is an unprivileged filesystem fixture;
+# native Skopeo/Podman and SELinux qualification remain separate checks.
+for command in chcon restorecon; do
+  printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/$command"
+  chmod 0755 "$FAKEBIN/$command"
+done
+storage_closure=$(printf storage-success | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$storage_closure"
+printf 'sha256:%s\n' "$storage_closure" > "$data/release/CLOSURE"
+PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
+  EXPECTED_IMPORT_DIGEST="sha256:$blob" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+  image/firstboot/neural-ice-seed-import.sh
+test -f "$ROOT/copied"
+test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
+grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+
+# A transport that returns another digest must not publish its generation.
+wrong_closure=$(printf wrong-import-readback | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$wrong_closure"
+printf 'sha256:%s\n' "$wrong_closure" > "$data/release/CLOSURE"
+rm -- "$ROOT/copied"
+if PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
+    EXPECTED_IMPORT_DIGEST="sha256:$blob" RETURN_IMPORT_DIGEST=sha256:wrong \
+    NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+    image/firstboot/neural-ice-seed-import.sh 2>/dev/null; then
+  echo "wrong storage readback digest unexpectedly passed" >&2
+  exit 1
+fi
+test -f "$ROOT/copied"
+test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
+
+echo "seed-firstboot-import: 22 cases passed"
