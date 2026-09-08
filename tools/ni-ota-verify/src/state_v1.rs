@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::delegated::contract::{
-    canonical_hash, parse_canonical, safe_uint, sha256, timestamp, validate_chain, ContractError,
-    Snapshot,
+    canonical_hash, ident, parse_canonical, safe_uint, sha256, timestamp, validate_chain,
+    ContractError, Snapshot,
 };
 use crate::runner;
 use crate::state::{
@@ -189,37 +189,17 @@ struct OwnerStateInspection {
     schema: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct BootcStatus {
-    spec: BootcSpec,
-    status: BootcState,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct OstreeAdminStatus {
+    deployments: Vec<OstreeDeployment>,
 }
 
-#[derive(Debug, Deserialize)]
-struct BootcSpec {
-    image: BootcSpecImage,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootcSpecImage {
-    image: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootcState {
-    booted: BootcBooted,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootcBooted {
-    image: BootcBootedImage,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BootcBootedImage {
-    image: BootcSpecImage,
-    image_digest: String,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct OstreeDeployment {
+    booted: bool,
+    checksum: String,
+    serial: u64,
+    stateroot: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2835,42 +2815,42 @@ fn validate_owner_inspection(
 
 fn verify_running_baseline(value: &crate::preseal::VerifiedPreseal) -> Result<(), String> {
     #[cfg(feature = "test-path-overrides")]
-    let bootc = std::env::var_os("NI_OTA_AUTH_STATUS_BOOTC")
-        .map_or_else(|| PathBuf::from("/usr/bin/bootc"), PathBuf::from);
+    let ostree = std::env::var_os("NI_OTA_AUTH_STATUS_OSTREE")
+        .map_or_else(|| PathBuf::from("/usr/bin/ostree"), PathBuf::from);
     #[cfg(not(feature = "test-path-overrides"))]
-    let bootc = PathBuf::from("/usr/bin/bootc");
+    let ostree = PathBuf::from("/usr/bin/ostree");
+    #[cfg(feature = "test-path-overrides")]
+    let deployment_root = std::env::var_os("NI_OTA_AUTH_STATUS_DEPLOY_ROOT")
+        .map_or_else(|| PathBuf::from("/sysroot/ostree/deploy"), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let deployment_root = PathBuf::from("/sysroot/ostree/deploy");
     #[cfg(feature = "test-path-overrides")]
     let payload = std::env::var_os("NI_OTA_AUTH_STATUS_PAYLOAD_ID")
         .map_or_else(|| PathBuf::from(PAYLOAD_ID_MARKER), PathBuf::from);
     #[cfg(not(feature = "test-path-overrides"))]
     let payload = PathBuf::from(PAYLOAD_ID_MARKER);
-    verify_running_baseline_at(value, &bootc, &payload)
+    verify_running_baseline_at(value, &ostree, &deployment_root, &payload)
 }
 
 fn verify_running_baseline_at(
     value: &crate::preseal::VerifiedPreseal,
-    bootc: &Path,
+    ostree: &Path,
+    deployment_root: &Path,
     payload: &Path,
 ) -> Result<(), String> {
-    let mut command = Command::new(bootc);
-    command.args(["status", "--json"]);
-    let output =
-        run_status_helper(&mut command, "booted deployment inspection").map_err(|error| error.0)?;
-    if output.timed_out || output.overflowed || !output.status.success() {
-        return Err("booted deployment inspection failed or exceeded its bound".into());
-    }
-    let status: BootcStatus = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("bootc status is malformed: {error}"))?;
-    if status.spec.image.image != status.status.booted.image.image.image
-        || status.spec.image.image != value.target_os_ref
-        || status.status.booted.image.image_digest != value.target_os_manifest_digest
-        || !status
-            .status
-            .booted
-            .image
-            .image_digest
-            .strip_prefix("sha256:")
-            .is_some_and(sha256)
+    let (initial_status, initial_bytes) = inspect_booted_deployment(ostree)?;
+    let origin_name = format!(
+        "{}.{}.origin",
+        initial_status.checksum, initial_status.serial
+    );
+    let initial_origin =
+        read_deployment_origin(deployment_root, &initial_status.stateroot, &origin_name)?;
+    let origin_ref = parse_deployment_origin(&initial_origin.bytes)?;
+    let initial_manifest = inspect_booted_manifest(ostree, &initial_status.checksum)?;
+
+    if origin_ref != value.target_os_ref
+        || initial_manifest != value.target_os_manifest_digest
+        || !initial_manifest.strip_prefix("sha256:").is_some_and(sha256)
     {
         return Err("booted deployment differs from authenticated preseal baseline".into());
     }
@@ -2879,7 +2859,143 @@ fn verify_running_baseline_at(
     if bytes != format!("{}\n", value.seed_ref).as_bytes() {
         return Err("running PAYLOAD_ID differs from authenticated preseal baseline".into());
     }
+
+    // Re-read every mutable observation after the baseline comparison. An
+    // update which stages or switches a deployment while status is running is
+    // a refusal, even if the new origin happens to name the same image.
+    let final_manifest = inspect_booted_manifest(ostree, &initial_status.checksum)?;
+    let final_origin =
+        read_deployment_origin(deployment_root, &initial_status.stateroot, &origin_name)?;
+    let (final_status, final_bytes) = inspect_booted_deployment(ostree)?;
+    if initial_manifest != final_manifest
+        || initial_origin != final_origin
+        || initial_status != final_status
+        || initial_bytes != final_bytes
+    {
+        return Err("booted deployment changed during authenticated inspection".into());
+    }
     Ok(())
+}
+
+fn inspect_booted_deployment(ostree: &Path) -> Result<(OstreeDeployment, Vec<u8>), String> {
+    let mut command = Command::new(ostree);
+    command.args(["admin", "status", "--json"]);
+    let output =
+        run_status_helper(&mut command, "booted deployment inspection").map_err(|error| error.0)?;
+    if output.timed_out || output.overflowed || !output.status.success() {
+        return Err("booted deployment inspection failed or exceeded its bound".into());
+    }
+    let status: OstreeAdminStatus = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("ostree admin status is malformed: {error}"))?;
+    if status.deployments.is_empty() || status.deployments.len() > 16 {
+        return Err("ostree deployment inventory has an unsafe cardinality".into());
+    }
+    let mut booted = status.deployments.into_iter().filter(|entry| entry.booted);
+    let selected = booted
+        .next()
+        .ok_or_else(|| "ostree deployment inventory has no booted entry".to_owned())?;
+    if booted.next().is_some()
+        || !ident(&selected.stateroot)
+        || !sha256(&selected.checksum)
+        || selected.serial > 9_007_199_254_740_991
+    {
+        return Err("ostree booted deployment identity is ambiguous or malformed".into());
+    }
+    Ok((selected, output.stdout))
+}
+
+fn inspect_booted_manifest(ostree: &Path, checksum: &str) -> Result<String, String> {
+    let mut command = Command::new(ostree);
+    command.args([
+        "show",
+        "--repo=/sysroot/ostree/repo",
+        "--print-metadata-key=ostree.manifest-digest",
+        checksum,
+    ]);
+    let output =
+        run_status_helper(&mut command, "booted manifest inspection").map_err(|error| error.0)?;
+    if output.timed_out || output.overflowed || !output.status.success() {
+        return Err("booted manifest inspection failed or exceeded its bound".into());
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "booted manifest metadata is not UTF-8".to_owned())?;
+    let digest = text
+        .strip_suffix('\n')
+        .and_then(|value| value.strip_prefix('\''))
+        .and_then(|value| value.strip_suffix('\''))
+        .filter(|value| value.strip_prefix("sha256:").is_some_and(sha256))
+        .ok_or_else(|| "booted manifest metadata is malformed".to_owned())?;
+    Ok(digest.to_owned())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableRegular {
+    bytes: Vec<u8>,
+    identity: TreeEntry,
+}
+
+fn read_deployment_origin(
+    deployment_root: &Path,
+    stateroot: &str,
+    name: &str,
+) -> Result<StableRegular, String> {
+    let root = open_readonly_directory(deployment_root)
+        .map_err(|error| format!("cannot open OSTree deployment root: {error}"))?;
+    validate_readonly_directory(&root.metadata().map_err(|error| error.to_string())?)?;
+    let stateroot = open_readonly_directory_at(&root, std::ffi::OsStr::new(stateroot))
+        .map_err(|error| format!("cannot open OSTree stateroot: {error}"))?;
+    validate_readonly_directory(&stateroot.metadata().map_err(|error| error.to_string())?)?;
+    let deployments = open_readonly_directory_at(&stateroot, std::ffi::OsStr::new("deploy"))
+        .map_err(|error| format!("cannot open OSTree deployment directory: {error}"))?;
+    validate_readonly_directory(&deployments.metadata().map_err(|error| error.to_string())?)?;
+    read_readonly_regular_at(&deployments, std::ffi::OsStr::new(name), 0o644, 4096)
+        .map_err(|error| format!("cannot authenticate OSTree deployment origin: {error}"))
+}
+
+fn parse_deployment_origin(bytes: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "OSTree deployment origin is not UTF-8".to_owned())?;
+    if text.is_empty() || !text.ends_with('\n') || text.contains('\r') || text.contains('\0') {
+        return Err("OSTree deployment origin has malformed text framing".into());
+    }
+    let mut section = None;
+    let mut sections = std::collections::BTreeSet::new();
+    let mut keys = std::collections::BTreeSet::new();
+    let mut image = None;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            if !ident(name) || !sections.insert(name) {
+                return Err("OSTree deployment origin has a duplicate or malformed section".into());
+            }
+            section = Some(name);
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| "OSTree deployment origin has a malformed entry".to_owned())?;
+        let section = section
+            .ok_or_else(|| "OSTree deployment origin has an entry outside a section".to_owned())?;
+        if !ident(key) || !keys.insert((section, key)) {
+            return Err("OSTree deployment origin has a duplicate or malformed key".into());
+        }
+        if section == "origin" && key == "container-image-reference" {
+            image = Some(
+                value
+                    .strip_prefix("ostree-unverified-registry:")
+                    .ok_or_else(|| {
+                        "OSTree deployment origin uses an unexpected transport".to_owned()
+                    })?
+                    .to_owned(),
+            );
+        }
+    }
+    image.ok_or_else(|| "OSTree deployment origin lacks its container image reference".into())
 }
 
 pub(crate) type StatusHelperOutput = runner::BoundedOutput;
@@ -3180,14 +3296,24 @@ fn read_noatime_regular(path: &Path, mode: u32, maximum: usize) -> Result<Vec<u8
     let before = file
         .metadata()
         .map_err(|error| InternalError(error.to_string()))?;
-    if !before.file_type().is_file() || before.mode() & 0o7777 != mode || before.nlink() != 1 {
+    let named_before =
+        std::fs::symlink_metadata(path).map_err(|error| InternalError(error.to_string()))?;
+    if !before.file_type().is_file()
+        || !named_before.file_type().is_file()
+        || before.dev() != named_before.dev()
+        || before.ino() != named_before.ino()
+        || before.mode() & 0o7777 != mode
+        || before.nlink() != 1
+        || (unsafe { geteuid() } == 0 && before.uid() != 0)
+    {
         return Err(InternalError(format!(
             "{} has unsafe metadata",
             path.display()
         )));
     }
     let mut bytes = Vec::new();
-    file.take(maximum as u64 + 1)
+    (&file)
+        .take(maximum as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| InternalError(error.to_string()))?;
     if bytes.len() > maximum {
@@ -3196,7 +3322,81 @@ fn read_noatime_regular(path: &Path, mode: u32, maximum: usize) -> Result<Vec<u8
             path.display()
         )));
     }
+    let after = file
+        .metadata()
+        .map_err(|error| InternalError(error.to_string()))?;
+    let named_after =
+        std::fs::symlink_metadata(path).map_err(|error| InternalError(error.to_string()))?;
+    if tree_entry(&before, None) != tree_entry(&after, None)
+        || tree_entry(&before, None) != tree_entry(&named_after, None)
+    {
+        return Err(InternalError(format!(
+            "{} changed during bounded read",
+            path.display()
+        )));
+    }
     Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn open_readonly_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(status_o_directory() | O_NOFOLLOW | 0o1000000)
+        .open(path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_readonly_directory_at(parent: &File, name: &std::ffi::OsStr) -> std::io::Result<File> {
+    status_openat(parent, name, status_o_directory() | O_NOFOLLOW | 0o1000000)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_readonly_directory(metadata: &std::fs::Metadata) -> Result<(), String> {
+    if !metadata.file_type().is_dir()
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() == 0
+        || (unsafe { geteuid() } == 0 && metadata.uid() != 0)
+    {
+        return Err("OSTree deployment path has unsafe mode/owner/type metadata".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_readonly_regular_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    mode: u32,
+    maximum: usize,
+) -> Result<StableRegular, String> {
+    let file = status_openat(parent, name, O_NOFOLLOW | 0o1000000 | 0o4000)
+        .map_err(|error| error.to_string())?;
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    if !before.file_type().is_file()
+        || before.mode() & 0o7777 != mode
+        || before.nlink() != 1
+        || (unsafe { geteuid() } == 0 && before.uid() != 0)
+    {
+        return Err("OSTree deployment origin has unsafe mode/owner/type metadata".into());
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > maximum {
+        return Err("OSTree deployment origin exceeds its read bound".into());
+    }
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    let named_after = status_openat(parent, name, O_NOFOLLOW | 0o1000000 | 0o4000)
+        .and_then(|file| file.metadata())
+        .map_err(|error| error.to_string())?;
+    let identity = tree_entry(&before, None);
+    if identity != tree_entry(&after, None) || identity != tree_entry(&named_after, None) {
+        return Err("OSTree deployment origin changed during bounded read".into());
+    }
+    Ok(StableRegular { bytes, identity })
 }
 
 #[cfg(target_os = "linux")]
@@ -5570,20 +5770,51 @@ mod tests {
         ));
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let image = "registry.example.test/neural-ice/appliance@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let index = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let image = format!("registry.example.test/neural-ice/appliance@{index}");
         let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let bootc = root.join("bootc");
-        let bootc_status = serde_json::to_string(&serde_json::json!({
-            "spec":{"image":{"image":image}},
-            "status":{"booted":{"image":{"image":{"image":image},"imageDigest":digest}}}
-        }))
-        .unwrap();
+        assert_ne!(index, digest);
+        let checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let status = root.join("status.json");
         std::fs::write(
-            &bootc,
-            format!("#!/bin/sh\nprintf '%s\\n' '{bootc_status}'\n"),
+            &status,
+            serde_json::to_vec(&serde_json::json!({"deployments":[{
+                "booted":true,"checksum":checksum,"serial":0,"stateroot":"default"
+            }]}))
+            .unwrap(),
         )
         .unwrap();
-        std::fs::set_permissions(&bootc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = root.join("manifest-digest");
+        std::fs::write(&metadata, format!("'{digest}'\n")).unwrap();
+        let ostree = root.join("ostree");
+        std::fs::write(
+            &ostree,
+            format!(
+                "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'admin status --json') cat '{}' ;;\n  show*) cat '{}' ;;\n  *) exit 97 ;;\nesac\n",
+                status.display(),
+                metadata.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ostree, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deployment_root = root.join("deploy");
+        let stateroot_dir = deployment_root.join("default");
+        let deployment = stateroot_dir.join("deploy");
+        std::fs::create_dir_all(&deployment).unwrap();
+        for directory in [
+            deployment_root.as_path(),
+            stateroot_dir.as_path(),
+            deployment.as_path(),
+        ] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let origin = deployment.join(format!("{checksum}.0.origin"));
+        std::fs::write(
+            &origin,
+            format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{image}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&origin, std::fs::Permissions::from_mode(0o644)).unwrap();
         let payload = root.join("PAYLOAD_ID");
         std::fs::write(&payload, b"fabric-seed-revision\n").unwrap();
         std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -5591,17 +5822,21 @@ mod tests {
             bundle_seq: 13,
             receipt_sha256: "c".repeat(64),
             set_sha256: "d".repeat(64),
-            target_os_ref: image.into(),
+            target_os_ref: image.clone(),
             target_os_manifest_digest: digest.into(),
             seed_ref: "fabric-seed-revision".into(),
         };
-        let result = verify_running_baseline_at(&verified, &bootc, &payload);
+        let result = verify_running_baseline_at(&verified, &ostree, &deployment_root, &payload);
         assert!(result.is_ok(), "{result:?}");
         verified.target_os_manifest_digest = format!("sha256:{}", "e".repeat(64));
-        assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_err());
+        assert!(
+            verify_running_baseline_at(&verified, &ostree, &deployment_root, &payload).is_err()
+        );
         verified.target_os_manifest_digest = digest.into();
         std::fs::write(&payload, b"different-seed\n").unwrap();
-        assert!(verify_running_baseline_at(&verified, &bootc, &payload).is_err());
+        assert!(
+            verify_running_baseline_at(&verified, &ostree, &deployment_root, &payload).is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
