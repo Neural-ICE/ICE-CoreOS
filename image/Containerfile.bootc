@@ -388,6 +388,7 @@ COPY image/lib/tpm2-nv-public.sh /usr/lib/dracut/modules.d/91neural-ice-tpm-poli
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
 COPY image/firstboot/neural-ice-seed-import.sh           /usr/local/bin/neural-ice-seed-import.sh
 COPY image/model-cache-contract.py                       /usr/libexec/neural-ice-model-cache-contract
+COPY image/content-cache-contract.py                     /usr/libexec/neural-ice-content-cache-contract
 # TWO units, one script. Provisioning is ordered Before=sshd.service and writes
 # the key without ever starting or polling sshd (it cannot: the manager holds
 # the sshd job until the oneshot exits). Activation is ordered after both the
@@ -519,6 +520,7 @@ RUN set -euxo pipefail; \
     data=/var/lib/neural-ice/data; \
     install -d -m 0700 "$data/offline-generations/empty/seed-store/graphroot" \
       "$data/offline-generations/empty/content" "$data/offline-generations/empty/models" \
+      "$data/offline-generations/empty/content-caches" \
       "$data/offline-generations/empty/hf-cache/hub" "$data/seed-store" \
       "$data/content" "$data/models" "$data/hf-cache"; \
     ln -s offline-generations/empty "$data/offline-current"; \
@@ -526,7 +528,7 @@ RUN set -euxo pipefail; \
     ln -s ../offline-current/content "$data/content/current"; \
     ln -s ../offline-current/models "$data/models/current"; \
     ln -s ../offline-current/hf-cache/hub "$data/hf-cache/hub"; \
-    printf 'd /var/lib/neural-ice/data/offline-generations 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/seed-store/graphroot 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/content 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/models 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/hf-cache/hub 0700 root root -\nL /var/lib/neural-ice/data/offline-current - - - - offline-generations/empty\nd /var/lib/neural-ice/data/seed-store 0700 root root -\nL /var/lib/neural-ice/data/seed-store/current - - - - ../offline-current/seed-store/graphroot\nd /var/lib/neural-ice/data/content 0700 root root -\nL /var/lib/neural-ice/data/content/current - - - - ../offline-current/content\nd /var/lib/neural-ice/data/models 0700 root root -\nL /var/lib/neural-ice/data/models/current - - - - ../offline-current/models\nd /var/lib/neural-ice/data/hf-cache 0700 root root -\nL /var/lib/neural-ice/data/hf-cache/hub - - - - ../offline-current/hf-cache/hub\n' \
+    printf 'd /var/lib/neural-ice/data/offline-generations 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/seed-store/graphroot 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/content 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/models 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/content-caches 0700 root root -\nd /var/lib/neural-ice/data/offline-generations/empty/hf-cache/hub 0700 root root -\nL /var/lib/neural-ice/data/offline-current - - - - offline-generations/empty\nd /var/lib/neural-ice/data/seed-store 0700 root root -\nL /var/lib/neural-ice/data/seed-store/current - - - - ../offline-current/seed-store/graphroot\nd /var/lib/neural-ice/data/content 0700 root root -\nL /var/lib/neural-ice/data/content/current - - - - ../offline-current/content\nd /var/lib/neural-ice/data/models 0700 root root -\nL /var/lib/neural-ice/data/models/current - - - - ../offline-current/models\nd /var/lib/neural-ice/data/hf-cache 0700 root root -\nL /var/lib/neural-ice/data/hf-cache/hub - - - - ../offline-current/hf-cache/hub\n' \
         > /usr/lib/tmpfiles.d/neural-ice-seed-store.conf; \
     install -d /etc/containers; \
     if [ ! -f "$src" ]; then \
@@ -565,6 +567,7 @@ RUN set -euxo pipefail; \
                /usr/local/bin/neural-ice-seed-import.sh \
                /usr/local/bin/neural-ice-status-screen.sh \
                /usr/libexec/neural-ice-model-cache-contract \
+               /usr/libexec/neural-ice-content-cache-contract \
                /usr/local/bin/neural-ice-hostname-init.sh \
                /usr/local/bin/neural-ice-dhcp-retry.sh \
                /usr/local/bin/neural-ice-payload-apply.sh; \

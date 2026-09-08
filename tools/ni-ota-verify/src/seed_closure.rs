@@ -639,6 +639,8 @@ struct ManifestRoot {
     artifact_key: String,
     repository: String,
     digest: String,
+    required_entitlement: String,
+    contract: String,
     allowed_classes: &'static [&'static str],
 }
 
@@ -651,8 +653,22 @@ struct ParsedManifest {
 }
 
 const MANIFEST_READER_VERSION: u64 = 1;
-const SUPPORTED_PAYLOAD_CONTRACTS: &[&str] =
-    &["content-model-v1", "host-bootc-v1", "oci-component-v1"];
+const SUPPORTED_PAYLOAD_CONTRACTS: &[&str] = &[
+    "content-cache-v1",
+    "content-model-v1",
+    "host-bootc-v1",
+    "oci-component-v1",
+];
+
+const CONTENT_CACHE_ARTIFACT_TYPE: &str = "application/vnd.neural-ice.content-cache.v1";
+const CONTENT_CACHE_CONFIG_MEDIA_TYPE: &str = "application/vnd.neural-ice.content-cache.v1+json";
+const CONTENT_CACHE_SEGMENT_MEDIA_TYPE: &str =
+    "application/vnd.neural-ice.content-cache.segment.v1";
+const CONTENT_CACHE_SCHEMA: &str = "neural-ice-content-cache-v1";
+const MAX_CONTENT_CACHE_SEGMENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_CONTENT_CACHE_SEGMENTS: usize = 64;
+const MAX_CONTENT_CACHE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+const MAX_CONTENT_CACHE_CONFIG_BYTES: u64 = 64 * 1024;
 
 fn parse_manifest_roots(
     value: &serde_json::Value,
@@ -751,6 +767,8 @@ fn parse_manifest_roots(
             artifact_key: key,
             repository: repository.to_owned(),
             digest: digest.to_owned(),
+            required_entitlement: string(entry, "required_entitlement", label)?.to_owned(),
+            contract: contract.to_owned(),
             allowed_classes,
         });
         Ok(())
@@ -787,6 +805,7 @@ fn parse_manifest_roots(
         &["portable-multiarch-image", "hardware-targeted-manifest"],
         "release manifest.host",
     )?;
+    let mut content_cache_ids = BTreeSet::new();
     for (field, id_field, prefix, classes) in [
         (
             "components",
@@ -824,19 +843,63 @@ fn parse_manifest_roots(
             }
             exact_keys(object, &keys, &[], &label)?;
             let identifier = string(object, id_field, &label)?;
+            let contract = string(object, "contract", &label)?;
             let expected_contract = if field == "components" {
-                "oci-component-v1"
+                contract == "oci-component-v1"
             } else {
-                "content-model-v1"
+                matches!(contract, "content-model-v1" | "content-cache-v1")
             };
-            if string(object, "contract", &label)? != expected_contract {
+            if !expected_contract {
                 return refuse(format!("{label} carries an unsupported payload contract"));
             }
             if !valid_identifier(identifier) {
                 return refuse(format!("{label}.{id_field} is invalid"));
             }
-            add(entry, format!("{prefix}{identifier}"), classes, &label)?;
+            let allowed_classes = if contract == "content-cache-v1" {
+                &["oci-artifact"][..]
+            } else {
+                classes
+            };
+            if contract == "content-cache-v1" {
+                let expected = match identifier {
+                    "ch-caselaw-seed" => (
+                        "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed",
+                        "ICE-CASELAW-CH",
+                    ),
+                    "paddlex-cache" => (
+                        "registry.neural-ice.ch/neural-ice/content-cache-paddlex-cache",
+                        "ICE-CORE",
+                    ),
+                    _ => {
+                        return refuse(format!("{label} has an unsupported content-cache identity"))
+                    }
+                };
+                if registry != "registry.neural-ice.ch"
+                    || string(object, "repository", &label)? != expected.0
+                    || string(object, "required_entitlement", &label)? != expected.1
+                    || string(object, "media_type", &label)? != CONTENT_CACHE_ARTIFACT_TYPE
+                    || object["reboot_required"].as_bool() != Some(false)
+                    || object["restart_scope"]
+                        .as_array()
+                        .is_none_or(|value| !value.is_empty())
+                {
+                    return refuse(format!("{label} violates its fixed content-cache profile"));
+                }
+                content_cache_ids.insert(identifier);
+            }
+            add(
+                entry,
+                format!("{prefix}{identifier}"),
+                allowed_classes,
+                &label,
+            )?;
         }
+    }
+    let expected_content_cache_ids = BTreeSet::from(["ch-caselaw-seed", "paddlex-cache"]);
+    if declared_contracts.contains("content-cache-v1")
+        && content_cache_ids != expected_content_cache_ids
+    {
+        return refuse("content-cache-v1 requires exactly the two fixed cache identities");
     }
     let evidence = root["evidence"]
         .as_array()
@@ -901,12 +964,208 @@ fn reconcile_manifest_closure(manifest: &[ManifestRoot], closure: &Closure) -> R
             || !reference
                 .allowed_classes
                 .contains(&artifact.artifact_class.as_str())
+            || artifact.required_entitlement != reference.required_entitlement
+            || (reference.contract == "content-cache-v1"
+                && artifact.artifact_class != "oci-artifact")
         {
             return refuse(format!(
                 "manifest root {} is reclassified by closure",
                 reference.artifact_key
             ));
         }
+    }
+    Ok(())
+}
+
+fn canonical_value_no_lf(bytes: &[u8], label: &str) -> Result<serde_json::Value, Refusal> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Refusal(format!("{label} is not JSON: {e}")))?;
+    if !ascii_json(&value) {
+        return refuse(format!("{label} leaves the ASCII/integer canonical domain"));
+    }
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|e| Refusal(format!("cannot canonicalise {label}: {e}")))?;
+    if encoded != bytes {
+        return refuse(format!(
+            "{label} is not canonical compact sorted JSON without LF"
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_content_cache_artifact(root: &Path, artifact: &Artifact) -> Result<(), Refusal> {
+    let root_node = artifact
+        .nodes
+        .iter()
+        .find(|node| node.digest == artifact.root.digest)
+        .ok_or_else(|| Refusal("content-cache root node is absent".into()))?;
+    let typed_root = root_node.artifact_type.as_deref() == Some(CONTENT_CACHE_ARTIFACT_TYPE);
+    let Some(content_id) = artifact.artifact_key.strip_prefix("content:") else {
+        if typed_root {
+            return refuse("content-cache root has a non-content artifact key");
+        }
+        return Ok(());
+    };
+    let profile = match content_id {
+        "ch-caselaw-seed" => Some((
+            "sqlite3",
+            "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed",
+            "ghcr.io/neural-ice/content-cache-ch-caselaw-seed",
+            "ICE-CASELAW-CH",
+        )),
+        "paddlex-cache" => Some((
+            "tar+zstd",
+            "registry.neural-ice.ch/neural-ice/content-cache-paddlex-cache",
+            "ghcr.io/neural-ice/content-cache-paddlex-cache",
+            "ICE-CORE",
+        )),
+        _ => None,
+    };
+    if !typed_root && profile.is_none() {
+        return Ok(());
+    }
+    let (expected_format, expected_repository, expected_candidate, expected_entitlement) =
+        profile.ok_or_else(|| Refusal("content-cache root has an unsupported identity".into()))?;
+    if artifact.artifact_class != "oci-artifact"
+        || artifact.repository != expected_repository
+        || artifact.candidate_repository != expected_candidate
+        || artifact.required_entitlement != expected_entitlement
+        || !typed_root
+        || root_node.kind != "manifest"
+        || root_node.media_type != "application/vnd.oci.image.manifest.v1+json"
+    {
+        return refuse(format!(
+            "content-cache {content_id} violates its fixed root profile"
+        ));
+    }
+    let manifest_bytes = read_bounded(
+        &object_path(root, &artifact.root.digest)?,
+        MAX_OCI_DOCUMENT_BYTES,
+    )?;
+    let manifest_value = canonical_value_no_lf(&manifest_bytes, "content-cache OCI manifest")?;
+    let manifest = as_object(&manifest_value, "content-cache OCI manifest")?;
+    exact_keys(
+        manifest,
+        &[
+            "schemaVersion",
+            "mediaType",
+            "artifactType",
+            "config",
+            "layers",
+        ],
+        &[],
+        "content-cache OCI manifest",
+    )?;
+    if uint(manifest, "schemaVersion", "content-cache OCI manifest")? != 2
+        || string(manifest, "mediaType", "content-cache OCI manifest")?
+            != "application/vnd.oci.image.manifest.v1+json"
+        || string(manifest, "artifactType", "content-cache OCI manifest")?
+            != CONTENT_CACHE_ARTIFACT_TYPE
+    {
+        return refuse("content-cache OCI manifest type is invalid");
+    }
+    let config_descriptor = as_object(&manifest["config"], "content-cache config descriptor")?;
+    exact_keys(
+        config_descriptor,
+        &["digest", "mediaType", "size"],
+        &[],
+        "content-cache config descriptor",
+    )?;
+    if string(
+        config_descriptor,
+        "mediaType",
+        "content-cache config descriptor",
+    )? != CONTENT_CACHE_CONFIG_MEDIA_TYPE
+    {
+        return refuse("content-cache config media type is invalid");
+    }
+    let config_digest = string(
+        config_descriptor,
+        "digest",
+        "content-cache config descriptor",
+    )?;
+    let config_bytes = read_bounded(
+        &object_path(root, config_digest)?,
+        MAX_CONTENT_CACHE_CONFIG_BYTES,
+    )?;
+    if uint(config_descriptor, "size", "content-cache config descriptor")?
+        != config_bytes.len() as u64
+        || hex_digest(&config_bytes) != digest_hex(config_digest)?
+    {
+        return refuse("content-cache config descriptor does not match its object");
+    }
+    let config_value = canonical_value_no_lf(&config_bytes, "content-cache config")?;
+    let config = as_object(&config_value, "content-cache config")?;
+    exact_keys(
+        config,
+        &[
+            "schema",
+            "content_id",
+            "format",
+            "sha256",
+            "size_bytes",
+            "segments",
+        ],
+        &[],
+        "content-cache config",
+    )?;
+    let whole_digest = string(config, "sha256", "content-cache config")?;
+    let whole_size = uint(config, "size_bytes", "content-cache config")?;
+    if string(config, "schema", "content-cache config")? != CONTENT_CACHE_SCHEMA
+        || string(config, "content_id", "content-cache config")? != content_id
+        || string(config, "format", "content-cache config")? != expected_format
+        || !is_hex64(whole_digest)
+        || whole_size == 0
+        || whole_size > MAX_CONTENT_CACHE_BYTES
+    {
+        return refuse(format!(
+            "content-cache {content_id} config identity/size is invalid"
+        ));
+    }
+    let segments = config["segments"]
+        .as_array()
+        .ok_or_else(|| Refusal("content-cache segments is not an array".into()))?;
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or_else(|| Refusal("content-cache layers is not an array".into()))?;
+    if segments.is_empty()
+        || segments.len() > MAX_CONTENT_CACHE_SEGMENTS
+        || segments.len() != layers.len()
+    {
+        return refuse("content-cache segment set is empty, oversized, or differs from layers");
+    }
+    let mut total = 0_u64;
+    for (index, (segment_value, layer_value)) in segments.iter().zip(layers).enumerate() {
+        let segment = as_object(segment_value, "content-cache segment")?;
+        let layer = as_object(layer_value, "content-cache layer")?;
+        exact_keys(segment, &["digest", "size"], &[], "content-cache segment")?;
+        exact_keys(
+            layer,
+            &["digest", "mediaType", "size"],
+            &[],
+            "content-cache layer",
+        )?;
+        let digest = string(segment, "digest", "content-cache segment")?;
+        let size = uint(segment, "size", "content-cache segment")?;
+        if digest_hex(digest).is_err()
+            || size == 0
+            || size > MAX_CONTENT_CACHE_SEGMENT_BYTES
+            || (index + 1 < segments.len() && size != MAX_CONTENT_CACHE_SEGMENT_BYTES)
+            || string(layer, "digest", "content-cache layer")? != digest
+            || string(layer, "mediaType", "content-cache layer")?
+                != CONTENT_CACHE_SEGMENT_MEDIA_TYPE
+            || uint(layer, "size", "content-cache layer")? != size
+        {
+            return refuse(format!(
+                "content-cache segment {index} is invalid or misordered"
+            ));
+        }
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| Refusal("content-cache size overflow".into()))?;
+    }
+    if total != whole_size {
+        return refuse("content-cache segment sizes do not equal whole size");
     }
     Ok(())
 }
@@ -1478,6 +1737,7 @@ fn validate_closure(
                 ));
             }
         }
+        validate_content_cache_artifact(root, artifact)?;
         let mut prior_attachment: Option<(&str, &str, &str, &str)> = None;
         for attachment in &artifact.attachments {
             let current = (
