@@ -71,7 +71,7 @@ test ! -e "$output/seed/$closure/oci/index.json"
 if image/build-seed-v2.sh --release "$inputs/release-manifest.json" 2>/dev/null; then
   echo "legacy --release interface unexpectedly passed" >&2; exit 1
 fi
-if rg -n 'podman .*load|SEED_IMAGES|SEED_MODELS|/store/' image/build-preloaded.sh >/dev/null; then
+if grep -Eq 'podman .*load|SEED_IMAGES|SEED_MODELS|/store/' image/build-preloaded.sh; then
   echo "legacy overlay producer remains in build-preloaded.sh" >&2; exit 1
 fi
 # A serving-role ID cannot shadow a generation profile in the card namespace.
@@ -86,5 +86,5 @@ if image/model-cache-contract.py produce --hf-cache "$hf" \
   --objects "$ROOT/duplicate-objects" > "$ROOT/duplicate.log" 2>&1; then
   echo "duplicate profile/serving-role id unexpectedly passed" >&2; exit 1
 fi
-rg -q 'repeats a card id across profiles and serving_roles' "$ROOT/duplicate.log"
+grep -Fq 'repeats a card id across profiles and serving_roles' "$ROOT/duplicate.log"
 echo "seed-producer-consumer: 4 cases passed"
