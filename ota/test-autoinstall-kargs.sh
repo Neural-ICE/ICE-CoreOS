@@ -100,9 +100,71 @@ rm -f "$destructive"
 printf '%s\n' owner-sealed-ota-state-v1 > "$medium_root/usr/lib/neural-ice/ota-state-profile"
 medium_attempt >/dev/null 2>&1 && fail "an owner-profile medium without preseal transport was admitted"
 [[ ! -e "$destructive" ]] || fail "an owner-profile medium reached the destructive boundary"
+# Consumed by the exact extracted require_medium_source_profile helper.
+# shellcheck disable=SC2034
+PRESEAL_SET_SHA256="$(printf '%064d' 8)"
+medium_attempt || fail "an owner-profile medium carrying its authenticated preseal transport was refused"
+[[ -e "$destructive" ]] \
+  || fail "the admitted offline owner-profile medium did not reach the synthetic destructive boundary"
+rm -f "$destructive"
+unset PRESEAL_SET_SHA256
 printf '%s\n' owner-sealed-ota-state-v1 malformed > "$medium_root/usr/lib/neural-ice/ota-state-profile"
 medium_attempt >/dev/null 2>&1 && fail "a malformed medium OTA-state profile was admitted"
 [[ ! -e "$destructive" ]] || fail "a malformed medium profile reached the destructive boundary"
+
+# Execute the production sealed-store preflight with a fake Podman that refuses
+# every create lacking --pull=never. An absent local object must fail here,
+# before the synthetic wipe boundary, rather than trigger registry resolution.
+printf '%s\n' owner-sealed-ota-state-v1 > "$medium_root/usr/lib/neural-ice/ota-state-profile"
+awk '/^podman .* image exists "\$STORE_IMAGE_NAME"/,/^log "Sealed image store registered read-only/' \
+  "$AUTOINSTALL" > "$TMP/store-preflight.sh"
+grep -q 'create --pull=never' "$TMP/store-preflight.sh" \
+  || fail "the extracted store preflight has no no-pull container creation"
+# The variables and functions are consumed by the sourced production block;
+# ShellCheck does not connect that generated file to this lexical scope.
+# shellcheck disable=SC2034,SC2329
+store_preflight_attempt() (
+  local object_present=$1 boundary=$2
+  PRESEAL_SET_SHA256="$(printf '%064d' 8)"
+  STORE_IMAGE_NAME=localhost/bootc
+  STORE_MOUNT="$TMP/store"
+  INSTALL_SOURCE=medium
+  podman() {
+    case " $* " in
+      *" image exists "*) (( object_present == 1 )) ;;
+      *" image inspect "*) printf 'sha256:%064d\n' 9 ;;
+      *" create "*)
+        [[ " $* " == *" --pull=never "* ]] || return 97
+        (( object_present == 1 ))
+        ;;
+      *" mount "*) printf '%s\n' "$medium_root" ;;
+      *" unmount "*|*" rm "*) return 0 ;;
+      *) return 96 ;;
+    esac
+  }
+  log() { :; }
+  # shellcheck source=/dev/null
+  source "$TMP/store-preflight.sh"
+  : > "$boundary"
+)
+store_preflight_boundary="$TMP/store-preflight-boundary"
+store_preflight_attempt 1 "$store_preflight_boundary" \
+  || fail "the exact no-pull sealed-store preflight refused its present local object"
+[[ -e "$store_preflight_boundary" ]] \
+  || fail "the successful local store preflight did not reach its synthetic wipe boundary"
+rm -f "$store_preflight_boundary"
+store_preflight_attempt 0 "$store_preflight_boundary" >/dev/null 2>&1 \
+  && fail "the exact sealed-store preflight admitted an absent local object"
+[[ ! -e "$store_preflight_boundary" ]] \
+  || fail "an absent local object reached the synthetic wipe boundary"
+
+# Both later consumers are equally forbidden from resolving a network name:
+# candidate inspection and the bootc runner must consume only the object proved
+# above. Their actual command lines are kept explicit and audited here.
+[[ "$(grep -c 'create --pull=never' "$AUTOINSTALL")" == 2 ]] \
+  || fail "not every pre-wipe container creation is pinned to the local store"
+grep -Fq 'run --pull=never --rm --privileged' "$AUTOINSTALL" \
+  || fail "the bootc installer container may apply a registry pull policy"
 
 # The post-bootc verifier consumes the resolved deployment root, not the
 # /var/tmp/nitarget OSTree sysroot. Make the distinction executable with the
@@ -119,11 +181,15 @@ verify_preseal_candidate() {
      && "$(cat "$2/usr/lib/neural-ice/product-payload/PAYLOAD_ID")" == "$(printf '%040d' 6)" \
      && "$3" == "$(printf '%040d' 6)" \
      && "$4" == "$TMP/installed.conf" \
-     && "$5" == "$TMP/receipt.json" ]] || return 1
+     && "$5" == "$TMP/receipt.json" \
+     && "$6" == "release.example.test/neural-ice/neural-ice-appliance@sha256:$(printf '%064d' 8)" \
+     && "$7" == "sha256:$(printf '%064d' 9)" ]] || return 1
   printf '%s\n' 7
 }
 [[ "$(verify_installed_preseal_candidate "$TMP/installed-inputs" \
-  "$(printf '%040d' 6)" "$TMP/installed.conf" "$TMP/receipt.json")" == 7 ]] \
+  "$(printf '%040d' 6)" "$TMP/installed.conf" "$TMP/receipt.json" \
+  "release.example.test/neural-ice/neural-ice-appliance@sha256:$(printf '%064d' 8)" \
+  "sha256:$(printf '%064d' 9)")" == 7 ]] \
   || fail "the installed preseal verifier did not receive the resolved OSTree deployment root"
 
 # --------------------------------------------------------------------------- #
@@ -196,8 +262,8 @@ for required in \
   'the selected owner-sealed appliance has no UKI-bound preseal inputs' \
   'the selected legacy appliance cannot consume this medium' \
   'the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation' \
-  '--current-os-ref "$OS_IMAGE"' \
-  '--current-os-manifest-digest "$got_manifest"' \
+  '--current-os-ref "$current_os_ref"' \
+  '--current-os-manifest-digest "$current_manifest"' \
   '--current-seed-ref "$current_seed"' \
   '--candidate-root "$candidate_root"' \
   '"$PRESEAL_HANDOFF" verify-persistent' \

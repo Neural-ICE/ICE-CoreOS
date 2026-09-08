@@ -56,6 +56,7 @@ INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
 # handle. When the caller does not supply one, it is made task-unique from the
 # atomic build result below rather than sharing the mutable build tag.
 INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-}"
+STORE_STORAGE_NAME="${STORE_STORAGE_NAME:-}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
 OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
@@ -150,7 +151,7 @@ sha256_of() { # $1=path -> lowercase hex
 # either cannot verify what it carries or carries what nothing verifies.
 # --------------------------------------------------------------------------- #
 seal_offline_seed_kargs() { # appends to UKI_KARGS; $1=install source
-  local install_source=$1 seed_manifest_sha256
+  local install_source=$1 seed_manifest_sha256 _seed_expected_os_ref
   if [[ -z "$SEED_CLOSURE" ]]; then
     [[ -z "$SEED_TRUSTED_NOW" && -z "$RELEASE_MANIFEST_FILE" ]] \
       || { echo "ERROR: SEED_TRUSTED_NOW/RELEASE_MANIFEST_FILE describe an offline seed and SEED_CLOSURE names none; a medium either carries the seed it was cut with or carries no seed argument at all" >&2; exit 1; }
@@ -169,18 +170,20 @@ seal_offline_seed_kargs() { # appends to UKI_KARGS; $1=install source
     || { echo "ERROR: RELEASE_MANIFEST_FILE is larger than the 16 MiB document bound the seed verifier reads" >&2; exit 1; }
   seed_manifest_sha256="$(sha256_of "$RELEASE_MANIFEST_FILE")"
 
-  if [[ "$install_source" == registry ]]; then
+  if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
     # 🔴 ONE RELEASE, PROVED BEFORE THE MEDIUM EXISTS. Without the preseal set
     # there is no signed statement naming the release the registry half installs,
     # so there is nothing to reconcile the seed against -- which is exactly the
     # unreconciled-sources finding the flat old refusal was written for. The
     # sealed grammar refuses this combination too; refusing HERE means the
     # operator learns before the medium is cut.
-    [[ -n "$PRESEAL_STAGE_ROOT" ]] \
-      || { echo "ERROR: an offline seed beside INSTALL_SOURCE=registry requires the signed preseal set (PRESEAL_SET_DIR/PRESEAL_SET_SHA256); nothing else on the medium can prove the seed and the pulled appliance are one release" >&2; exit 1; }
+    _seed_expected_os_ref="$TARGET_IMGREF"
+    if [[ "$install_source" == registry ]]; then
+      _seed_expected_os_ref="$OS_IMAGE"
+    fi
     python3 - "$RELEASE_MANIFEST_FILE" "$PRESEAL_STAGE_ROOT/preseal/preseal-set.json" \
-      "$OS_IMAGE" "$HARDWARE_TARGET" <<'SEED_PRESEAL_PY' \
-      || { echo "ERROR: the offline seed's release manifest is not the release this registry medium installs; refusing to cut a medium carrying two unrelated releases" >&2; exit 1; }
+      "$_seed_expected_os_ref" "$HARDWARE_TARGET" <<'SEED_PRESEAL_PY' \
+      || { echo "ERROR: the offline seed's release manifest is not the release this medium installs; refusing to cut a medium carrying two unrelated releases" >&2; exit 1; }
 import json
 import pathlib
 import sys
@@ -235,6 +238,9 @@ if manifest.get("hardware_target") != hardware_target:
     )
 SEED_PRESEAL_PY
     echo "    offline seed reconciled: bundle_seq/hardware target/appliance root all equal the signed preseal selection"
+  elif [[ "$install_source" == registry ]]; then
+    echo "ERROR: an offline seed beside INSTALL_SOURCE=registry requires the signed preseal set (PRESEAL_SET_DIR/PRESEAL_SET_SHA256); nothing else on the medium can prove the seed and the pulled appliance are one release" >&2
+    exit 1
   fi
 
   # A mirror that declares a different release than the seed carries is two
@@ -374,6 +380,10 @@ if [[ -n "$INSTALLER_STORAGE_NAME" ]]; then
   [[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
     || { echo "ERROR: INSTALLER_STORAGE_NAME must be a tagged localhost image name: $INSTALLER_STORAGE_NAME" >&2; exit 1; }
 fi
+if [[ -n "$STORE_STORAGE_NAME" ]]; then
+  [[ "$STORE_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+    || { echo "ERROR: STORE_STORAGE_NAME must be a tagged localhost image name: $STORE_STORAGE_NAME" >&2; exit 1; }
+fi
 
 if [[ "$TARGET_IMGREF" != "$BASE_IMAGE" ]]; then
   if command -v skopeo >/dev/null 2>&1; then
@@ -442,10 +452,10 @@ if [[ -n "$PRESEAL_SET_DIR" || -n "$PRESEAL_SET_SHA256" ]]; then
   [[ -n "$PRESEAL_SET_DIR" && -n "$PRESEAL_SET_SHA256" ]] \
     || { echo "ERROR: PRESEAL_SET_DIR and PRESEAL_SET_SHA256 must be supplied together" >&2; exit 1; }
   [[ "$MEDIA_MODE" == install && "$VARIANT" == sealed-lab \
-     && "$INSTALL_SOURCE" == registry && "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
-    || { echo "ERROR: a preseal set is only permitted on sealed-lab lab-managed registry Install media" >&2; exit 1; }
+     && "$INSTALL_SOURCE" =~ ^(medium|registry)$ && "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
+    || { echo "ERROR: a preseal set is only permitted on sealed-lab lab-managed Install media" >&2; exit 1; }
   [[ -n "$RELEASE_AUTHORIZATION_FILE" && -n "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
-    || { echo "ERROR: a preseal set requires the registry installer authorization pair" >&2; exit 1; }
+    || { echo "ERROR: a preseal set requires the installer authorization pair" >&2; exit 1; }
   PRESEAL_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ni-preseal-media.XXXXXX")"
   chmod 0700 "$PRESEAL_STAGE_ROOT"
   python3 "$PRESEAL_HELPER" snapshot \
@@ -470,6 +480,42 @@ else
   [[ -n "${REGISTRY_AUTH_FILE:-}" ]] && pull_auth=(--authfile "$REGISTRY_AUTH_FILE")
   sudo podman pull "${pull_auth[@]}" "$BASE_IMAGE"
 fi
+# The sealed store installs the ORIGINAL host image, not the derived live
+# installer. Resolve its config and platform-manifest identities once from the
+# digest-pinned BASE_IMAGE, then bind the old skopeo transport to that immutable
+# object. The repository digest proves this local object came from the exact
+# signed index/reference selected by the release inputs.
+_base_image_id_raw="$(sudo podman image inspect "$BASE_IMAGE" --format '{{.Id}}' 2>/dev/null | tr -d '[:space:]')" \
+  || { echo "ERROR: cannot resolve the immutable BASE_IMAGE config identity" >&2; exit 1; }
+BASE_IMAGE_ID="${_base_image_id_raw#sha256:}"
+[[ "$BASE_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: BASE_IMAGE has no immutable config identity" >&2; exit 1; }
+BASE_IMAGE_REF="sha256:${BASE_IMAGE_ID}"
+BASE_MANIFEST_DIGEST="$(sudo podman image inspect "$BASE_IMAGE" --format '{{.Digest}}' 2>/dev/null | tr -d '[:space:]')" \
+  || { echo "ERROR: cannot resolve the BASE_IMAGE platform manifest digest" >&2; exit 1; }
+[[ "$BASE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: BASE_IMAGE reports no immutable platform manifest digest" >&2; exit 1; }
+BASE_REPODIGEST_MATCHES="$(sudo podman image inspect "$BASE_IMAGE" \
+  --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+  | awk -v exact="$BASE_IMAGE" '$0 == exact {n++} END {print n+0}')"
+[[ "$BASE_REPODIGEST_MATCHES" == 1 ]] \
+  || { echo "ERROR: local BASE_IMAGE does not carry exactly one repo digest equal to $BASE_IMAGE" >&2; exit 1; }
+if [[ -z "$STORE_STORAGE_NAME" ]]; then
+  STORE_STORAGE_NAME="localhost/ice-coreos-host:build-${BASE_IMAGE_ID:0:16}"
+fi
+sudo podman tag "$BASE_IMAGE_REF" "$STORE_STORAGE_NAME"
+readonly BASE_IMAGE_REF BASE_IMAGE_ID BASE_MANIFEST_DIGEST STORE_STORAGE_NAME
+
+assert_store_tag_unmoved() { # $1=what has just been done
+  local now manifest_now
+  now="$(sudo podman image inspect "$STORE_STORAGE_NAME" --format '{{.Id}}' 2>/dev/null \
+    | tr -d '[:space:]' | sed 's/^sha256://')"
+  manifest_now="$(sudo podman image inspect "$STORE_STORAGE_NAME" --format '{{.Digest}}' 2>/dev/null \
+    | tr -d '[:space:]')"
+  [[ "$now" == "$BASE_IMAGE_ID" && "$manifest_now" == "$BASE_MANIFEST_DIGEST" ]] \
+    || { echo "ERROR: host storage name $STORE_STORAGE_NAME moved during $1; refusing a store that is not the selected BASE_IMAGE" >&2; exit 1; }
+}
+assert_store_tag_unmoved "the initial host-image binding"
 if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" || -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
   # The discriminator is the Secure Boot ANCHOR, not the debug posture.
   #
@@ -623,10 +669,13 @@ cmp -s "$SEALED_DIR/image-identity.fingerprints" "$HARDWARE_IDENTITY_FILE" \
 echo "==> build the sealed installer root and image store"
 sudo env \
   INSTALLER_IMG="$INSTALLER_IMAGE_REF" \
+  STORE_IMG="$BASE_IMAGE_REF" \
   ROOT_IMAGE_OUT="$SEALED_DIR/installer-root.img" \
   STORE_IMAGE_OUT="$SEALED_DIR/installer-store.img" \
   STORE_IMAGE_NAME="$STORE_IMAGE_NAME" \
   INSTALLER_STORAGE_NAME="$INSTALLER_STORAGE_NAME" \
+  STORE_STORAGE_NAME="$STORE_STORAGE_NAME" \
+  STORE_MANIFEST_DIGEST="$BASE_MANIFEST_DIGEST" \
   bash "$REPO_ROOT/image/build-installer-root.sh" \
   || { echo "ERROR: cannot build the sealed installer root and store" >&2; exit 1; }
 sudo chown -R "$(id -u):$(id -g)" "$SEALED_DIR" 2>/dev/null || true
@@ -637,11 +686,15 @@ sudo chown -R "$(id -u):$(id -g)" "$SEALED_DIR" 2>/dev/null || true
 SEALED_ROOT_MANIFEST="$SEALED_DIR/installer-root.img.manifest"
 sealed_image_id="$(sed -n 's/^installer_image_id=//p' "$SEALED_ROOT_MANIFEST")"
 sealed_store_image_id="$(sed -n 's/^store_image_id=//p' "$SEALED_ROOT_MANIFEST")"
+sealed_store_manifest_digest="$(sed -n 's/^store_image_manifest_digest=//p' "$SEALED_ROOT_MANIFEST")"
 [[ "$sealed_image_id" == "$INSTALLER_IMAGE_ID" ]] \
   || { echo "ERROR: the sealed installer root was built from image '${sealed_image_id:-nothing}', not ${INSTALLER_IMAGE_ID}" >&2; exit 1; }
-[[ "$sealed_store_image_id" == "$INSTALLER_IMAGE_ID" ]] \
-  || { echo "ERROR: the sealed image store holds image '${sealed_store_image_id:-nothing}', not ${INSTALLER_IMAGE_ID}; the medium would install a different image than it boots" >&2; exit 1; }
+[[ "$sealed_store_image_id" == "$BASE_IMAGE_ID" ]] \
+  || { echo "ERROR: the sealed image store holds image '${sealed_store_image_id:-nothing}', not original host ${BASE_IMAGE_ID}" >&2; exit 1; }
+[[ "$sealed_store_manifest_digest" == "$BASE_MANIFEST_DIGEST" ]] \
+  || { echo "ERROR: the sealed image store records manifest '${sealed_store_manifest_digest:-nothing}', not original host ${BASE_MANIFEST_DIGEST}" >&2; exit 1; }
 assert_installer_tag_unmoved "the sealed root and store build"
+assert_store_tag_unmoved "the sealed root and store build"
 
 # --------------------------------------------------------------------------- #
 # THE INITRAMFS THAT OPENS THEM. Built inside the installer image so it carries
@@ -769,6 +822,45 @@ assert_registry_install_authorised() { # $1=digest-pinned OS_IMAGE
     || { echo "ERROR: this medium carries no explicitly configured signed docker scope that would verify ${repository} as an object; a registry install from it would verify nothing" >&2; exit 1; }
   echo "    registry install authorised: ${repository} is covered by an object-bound signed docker scope"
 }
+
+seal_install_authorization() { # $1=canonical target ref [$2=observed local child]
+  local expected_ref=$1 observed_manifest=${2:-} input fields preseal_target
+  for input in "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE"; do
+    [[ -n "$input" && -f "$input" && ! -L "$input" && -s "$input" ]] \
+      || { echo "ERROR: this install source requires a non-empty release authorization pair" >&2; exit 1; }
+  done
+  RELEASE_AUTHORIZATION_SHA256="$(sha256_of "$RELEASE_AUTHORIZATION_FILE")"
+  RELEASE_AUTHORIZATION_SIGNATURE_SHA256="$(sha256_of "$RELEASE_AUTHORIZATION_SIGNATURE_FILE")"
+  [[ "$RELEASE_AUTHORIZATION_SHA256" != "$RELEASE_AUTHORIZATION_SIGNATURE_SHA256" ]] \
+    || { echo "ERROR: the release authorization and its detached signature are the same bytes; that pins neither" >&2; exit 1; }
+  fields="$(release_auth_parse "$RELEASE_AUTHORIZATION_FILE")" \
+    || { echo "ERROR: release authorization does not satisfy the closed consumer contract" >&2; exit 1; }
+  AUTH_IMAGE_REPOSITORY="$(sed -n 's/^image_repository=//p' <<<"$fields")"
+  AUTH_IMAGE_INDEX_DIGEST="$(sed -n 's/^image_index_digest=//p' <<<"$fields")"
+  AUTH_IMAGE_MANIFEST_DIGEST="$(sed -n 's/^image_manifest_digest=//p' <<<"$fields")"
+  [[ "$AUTH_IMAGE_REPOSITORY" == "${expected_ref%@sha256:*}" \
+     && "$AUTH_IMAGE_INDEX_DIGEST" == "${expected_ref##*@}" ]] \
+    || { echo "ERROR: release authorization repository/index does not bind the selected install target" >&2; exit 1; }
+  if [[ -n "$observed_manifest" && "$AUTH_IMAGE_MANIFEST_DIGEST" != "$observed_manifest" ]]; then
+    echo "ERROR: release authorization child $AUTH_IMAGE_MANIFEST_DIGEST does not bind the sealed BASE_IMAGE child $observed_manifest" >&2
+    exit 1
+  fi
+  if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
+    python3 "$PRESEAL_HELPER" verify \
+      "$PRESEAL_STAGE_ROOT/preseal" "$PRESEAL_SET_SHA256" \
+      "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
+      || { echo "ERROR: the release authorization pair drifted from the protected preseal snapshot" >&2; exit 1; }
+    preseal_target="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target_os_ref"])' \
+      "$PRESEAL_STAGE_ROOT/preseal/preseal-set.json")" \
+      || { echo "ERROR: cannot read the protected preseal set snapshot" >&2; exit 1; }
+    [[ "$preseal_target" == "$expected_ref" ]] \
+      || { echo "ERROR: preseal target_os_ref does not bind the selected install target" >&2; exit 1; }
+  fi
+  UKI_KARGS+=("neuralice.relauth_sha256=${RELEASE_AUTHORIZATION_SHA256}" \
+    "neuralice.relauth_sig_sha256=${RELEASE_AUTHORIZATION_SIGNATURE_SHA256}")
+  [[ -z "$PRESEAL_STAGE_ROOT" ]] || UKI_KARGS+=("neuralice.preseal=${PRESEAL_SET_SHA256}")
+  RELEASE_AUTHORIZATION_STAGE_ROOT=staged
+}
 case "$MEDIA_MODE" in
   install)
     UKI_NAME="installer-install"
@@ -817,13 +909,17 @@ case "$MEDIA_MODE" in
       medium)
         [[ -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
           || { echo "ERROR: OS_IMAGE and INSTALL_MIRROR require INSTALL_SOURCE=registry" >&2; exit 1; }
-        # A medium install is air-gapped and installs the medium's own image; a
-        # release authorization would be staged on its ESP with nothing to read
-        # it, and the sealed grammar refuses the kargs that would pin it.
-        [[ -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
-          || { echo "ERROR: RELEASE_AUTHORIZATION_FILE/RELEASE_AUTHORIZATION_SIGNATURE_FILE require INSTALL_SOURCE=registry" >&2; exit 1; }
+        UKI_KARGS+=("neuralice.source=medium")
+        [[ "$TARGET_IMGREF" == "$BASE_IMAGE" ]] \
+          || { echo "ERROR: an offline medium must install the exact digest-pinned BASE_IMAGE it carries" >&2; exit 1; }
         [[ -z "$MIRROR_CA_FILE" && -z "$MIRROR_READY_SHA256" ]] \
           || { echo "ERROR: MIRROR_CA_FILE/MIRROR_READY_SHA256 require INSTALL_SOURCE=registry and INSTALL_MIRROR" >&2; exit 1; }
+        if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
+          seal_install_authorization "$TARGET_IMGREF" "$BASE_MANIFEST_DIGEST"
+        else
+          [[ -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
+            || { echo "ERROR: a medium release authorization requires PRESEAL_SET_DIR/PRESEAL_SET_SHA256" >&2; exit 1; }
+        fi
         seal_offline_seed_kargs medium
         ;;
       registry)
@@ -839,48 +935,7 @@ case "$MEDIA_MODE" in
           || { echo "ERROR: OS_IMAGE is not at the release authority ${RELEASE_AUTHORITY}: $OS_IMAGE" >&2; exit 1; }
         UKI_KARGS+=("neuralice.source=registry" "neuralice.osimage=${OS_IMAGE}")
 
-        # 🔴 STAGE THE AUTHORIZATION, AND SEAL WHICH ONE. Both files are
-        # mandatory for a registry medium -- the installer refuses without them,
-        # so a producer that does not demand them cuts a medium that refuses
-        # itself. Their digests go into the signed command line, which is what
-        # makes the ESP a carrier rather than a chooser.
-        for _relauth_input in "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE"; do
-          [[ -n "$_relauth_input" ]] \
-            || { echo "ERROR: INSTALL_SOURCE=registry requires RELEASE_AUTHORIZATION_FILE and RELEASE_AUTHORIZATION_SIGNATURE_FILE; the installer refuses a registry install without a signed release authorization on the ESP" >&2; exit 1; }
-          [[ -f "$_relauth_input" && ! -L "$_relauth_input" ]] \
-            || { echo "ERROR: release-authorization input is missing or not a regular file: $_relauth_input" >&2; exit 1; }
-          [[ -s "$_relauth_input" ]] \
-            || { echo "ERROR: release-authorization input is empty: $_relauth_input" >&2; exit 1; }
-        done
-        RELEASE_AUTHORIZATION_SHA256="$(sha256_of "$RELEASE_AUTHORIZATION_FILE")"
-        RELEASE_AUTHORIZATION_SIGNATURE_SHA256="$(sha256_of "$RELEASE_AUTHORIZATION_SIGNATURE_FILE")"
-        [[ "$RELEASE_AUTHORIZATION_SHA256" != "$RELEASE_AUTHORIZATION_SIGNATURE_SHA256" ]] \
-          || { echo "ERROR: the release authorization and its detached signature are the same bytes; that pins neither" >&2; exit 1; }
-        UKI_KARGS+=("neuralice.relauth_sha256=${RELEASE_AUTHORIZATION_SHA256}" \
-                    "neuralice.relauth_sig_sha256=${RELEASE_AUTHORIZATION_SIGNATURE_SHA256}")
-        RELEASE_AUTHORIZATION_STAGE_ROOT=staged
-        if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
-          python3 "$PRESEAL_HELPER" verify \
-            "$PRESEAL_STAGE_ROOT/preseal" "$PRESEAL_SET_SHA256" \
-            "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
-            || { echo "ERROR: the release authorization pair drifted from the protected preseal snapshot" >&2; exit 1; }
-        fi
-        _release_auth_fields="$(release_auth_parse "$RELEASE_AUTHORIZATION_FILE")" \
-          || { echo "ERROR: release authorization does not satisfy the closed consumer contract" >&2; exit 1; }
-        AUTH_IMAGE_REPOSITORY="$(sed -n 's/^image_repository=//p' <<<"$_release_auth_fields")"
-        AUTH_IMAGE_INDEX_DIGEST="$(sed -n 's/^image_index_digest=//p' <<<"$_release_auth_fields")"
-        AUTH_IMAGE_MANIFEST_DIGEST="$(sed -n 's/^image_manifest_digest=//p' <<<"$_release_auth_fields")"
-        [[ "$AUTH_IMAGE_REPOSITORY" == "${OS_IMAGE%@sha256:*}" \
-           && "$AUTH_IMAGE_INDEX_DIGEST" == "${OS_IMAGE##*@}" ]] \
-          || { echo "ERROR: release authorization repository/index does not bind OS_IMAGE" >&2; exit 1; }
-        if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
-          _preseal_target_os_ref="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target_os_ref"])' \
-            "$PRESEAL_STAGE_ROOT/preseal/preseal-set.json")" \
-            || { echo "ERROR: cannot read the protected preseal set snapshot" >&2; exit 1; }
-          [[ "$_preseal_target_os_ref" == "$OS_IMAGE" ]] \
-            || { echo "ERROR: preseal target_os_ref does not bind OS_IMAGE" >&2; exit 1; }
-          UKI_KARGS+=("neuralice.preseal=${PRESEAL_SET_SHA256}")
-        fi
+        seal_install_authorization "$OS_IMAGE"
 
         if [[ -n "$INSTALL_MIRROR" ]]; then
           ni_sealed_value_is_valid neuralice.mirror "$INSTALL_MIRROR" \
