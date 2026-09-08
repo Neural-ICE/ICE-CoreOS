@@ -71,7 +71,7 @@ def node(repository, value, kind, media):
     return {"digest":"sha256:"+value,"kind":kind,"media_type":media,"repository":repository,
             "artifact_type":None,"signatures":[],"size":Path(objects,value).stat().st_size}
 primary_repo="registry.example.test/neural-ice/model"
-artifacts=[{"artifact_class":"oci-artifact","artifact_key":"content:model-test","attachments":[],
+artifacts=[{"artifact_class":"hardware-targeted-manifest","artifact_key":"image:runtime-test","attachments":[],
   "nodes":[node(primary_repo,digest,"manifest","application/vnd.oci.image.manifest.v1+json")],
   "repository":primary_repo,"root":{"digest":"sha256:"+digest,"repository":primary_repo}}]
 for card_id, card_digest in (("alpha",card_a),("beta",card_b)):
@@ -104,6 +104,16 @@ test "$(readlink "$data/models/current")" = '../offline-current/models'
 test "$(readlink "$data/hf-cache/hub")" = '../offline-current/hf-cache/hub'
 test "$(readlink "$data/OFFLINE-READY")" = 'offline-current/READY'
 test -f "$data/offline-generations/$closure/READY"
+# Only executable component images belong in containers-storage. Model cards
+# and their evidence remain in the verified content CAS, never image imports.
+python3 - "$data/offline-generations/$closure/seed-store/import-plan" <<'PLAN_CHECK'
+import pathlib, sys
+fields = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
+assert fields[-1] == b""
+records = [fields[i:i + 5] for i in range(0, len(fields) - 1, 5)]
+assert len(records) == 1, records
+assert records[0][3] == b"image:runtime-test", records
+PLAN_CHECK
 test -f "$data/content/current/sha256/$blob"
 test -f "$data/models/current/sha256/$blob"
 alpha_digest=$(printf %s alpha-bytes | sha256sum | awk '{print $1}')

@@ -1105,11 +1105,20 @@ def classify_sealed_cmdline(cmdline: str) -> str:
                 raise SelectorRefusal("mirror-pin-without-mirror")
 
     # A medium either carries an offline seed and seals its closure hash, or
-    # carries neither. A registry install pulls its bytes; a seed staged beside
-    # it would be a second, unreconciled source of the same objects.
+    # carries neither.
+    #
+    # 🔴 A SEED MAY SIT BESIDE A REGISTRY INSTALL, UNDER ONE CONDITION. The
+    # registry supplies the OS root and the seed supplies the runtime containers
+    # and models; that is one release carried by two transports, not two sources
+    # of the same objects -- PROVIDED something on the line can prove the two are
+    # the same release. `neuralice.preseal` is that document: it names the train,
+    # bundle_seq, hardware target and target OS reference the installer
+    # reconciles against the seed's own signed closure before the disk is
+    # touched, and it is itself restricted to a lab-managed registry medium.
+    # Without it there is nothing to reconcile, which is the original finding.
     if "neuralice.seed_closure" in optional:
-        if source == "registry":
-            raise SelectorRefusal("seed-closure-with-registry-source")
+        if source == "registry" and "neuralice.preseal" not in optional:
+            raise SelectorRefusal("seed-closure-without-preseal-on-registry-source")
         # The seed's release manifest names repositories under the release
         # authority, and the verifier is handed that authority explicitly.
         if release_authority is None:
@@ -1118,6 +1127,15 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             raise SelectorRefusal("seed-closure-without-manifest-hash")
         if "neuralice.seed_trusted_now" not in optional:
             raise SelectorRefusal("seed-closure-without-trusted-time")
+        # One release, not two that happen to be on one stick: the closure the
+        # LAN mirror declares READY and the closure the seed IS must be the same
+        # value, or the OS transport and the runtime artefacts were cut from
+        # different releases.
+        if "neuralice.mirror_ready" in optional:
+            if optional["neuralice.mirror_ready"] != optional["neuralice.seed_closure"]:
+                raise SelectorRefusal("mirror-ready-not-the-sealed-seed-closure")
+            if optional.get("neuralice.mirror_manifest") != optional["neuralice.seed_manifest"]:
+                raise SelectorRefusal("mirror-manifest-not-the-sealed-seed-manifest")
     elif "neuralice.seed_manifest" in optional or "neuralice.seed_trusted_now" in optional:
         raise SelectorRefusal("seed-manifest-without-closure")
     return mode

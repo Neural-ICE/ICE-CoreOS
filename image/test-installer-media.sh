@@ -129,6 +129,290 @@ with tempfile.TemporaryDirectory(prefix="ni-measurements-") as scratch_name:
         os.close(fifo_fd)
 PYEOF
 
+# --------------------------------------------------------------------------- #
+# 🔴 THE COMPOSED MEDIUM: A REGISTRY OS ROOT BESIDE THE SIGNED OFFLINE SEED.
+#
+# A LIGHT medium leaves the product images absent, and the private registry
+# needs a licence to serve the very images onboarding needs -- so a fresh USB
+# install could not reach first activation without a WAN. The seed already
+# carries and verifies those images; what was missing was proof that the seed
+# and the pulled appliance are ONE release. The sealed grammar now admits the
+# pair only beside `neuralice.preseal`, and the two gates below are what make
+# that admission safe:
+#
+#   producer   image/build-installer-usb.sh:seal_offline_seed_kargs -- refuses
+#              to CUT a medium whose seed and preseal set disagree;
+#   installer  ota/neural-ice-autoinstall.sh:assert_seed_is_the_preseal_release
+#              -- refuses to INSTALL one, before the target disk is touched.
+#
+# Both are lifted verbatim, the way image/test-installer-selector-grammar.sh
+# lifts the installer's own selector revalidation: the suite runs the SAME code
+# the build host and the appliance run, not a paraphrase of it.
+#
+# This section needs bash, python3 and sha256sum only, so it lives ABOVE the
+# sealed-medium fixture -- which `exit 0`s on a host without veritysetup. A
+# reconciliation control that disappears with a fixture is a control nobody
+# notices the loss of.
+# --------------------------------------------------------------------------- #
+COMPOSE="$TMP/compose"; mkdir -p "$COMPOSE"
+AUTOINSTALL="$ROOT/ota/neural-ice-autoinstall.sh"
+BUILDER="$ROOT/image/build-installer-usb.sh"
+awk '/^assert_sealed_document_digest\(\) \{/,/^}$/' "$AUTOINSTALL"  > "$COMPOSE/reconcile.sh"
+awk '/^assert_seed_is_the_preseal_release\(\) \{/,/^}$/' "$AUTOINSTALL" >> "$COMPOSE/reconcile.sh"
+grep -q '^assert_seed_is_the_preseal_release()' "$COMPOSE/reconcile.sh" \
+  || fail "the installer no longer reconciles the offline seed with the preseal release"
+grep -q 'SEED_PRESEAL_RECONCILE_PY' "$COMPOSE/reconcile.sh" \
+  || fail "the installer's seed reconciliation lost its bounded document reader"
+awk '/^seal_offline_seed_kargs\(\) \{/,/^}$/' "$BUILDER" > "$COMPOSE/seal.sh"
+grep -q '^seal_offline_seed_kargs()' "$COMPOSE/seal.sh" \
+  || fail "the producer no longer has one seed-sealing path for both install sources"
+
+# 🔴 AND IT IS ON THE PATH, BEFORE THE WIPE. A reconciliation that runs after
+# `wipefs` cannot mean "leave the machine as it was" -- which is the whole point
+# of doing it at all. Asserted by line number against the installer's own first
+# destructive command, exactly as the selector suite asserts its gate.
+compose_call_line="$(grep -n '^    assert_seed_is_the_preseal_release$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+compose_verify_line="$(grep -nF '  "$NEURALICE_SEED_VERIFIER" verify-seed-closure' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+compose_write_line="$(grep -nE '^[[:space:]]*(wipefs|sfdisk|mkfs\.|cryptsetup luksFormat) ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+{ [ -n "$compose_call_line" ] && [ -n "$compose_verify_line" ] && [ -n "$compose_write_line" ]; } \
+  || fail "cannot locate the seed verification, its reconciliation or the first mutation; the ordering assertion would be vacuous"
+[ "$compose_verify_line" -lt "$compose_call_line" ] \
+  || fail "the installer reconciles the seed (line $compose_call_line) before verifying its signed closure (line $compose_verify_line)"
+[ "$compose_call_line" -lt "$compose_write_line" ] \
+  || fail "the installer mutates the target disk (line $compose_write_line) before reconciling the offline seed (line $compose_call_line)"
+
+COMPOSE_OS_REPOSITORY="release.example.test/neural-ice/neural-ice-appliance"
+COMPOSE_OS_DIGEST="sha256:$(printf '%064d' 42)"
+COMPOSE_OS_IMAGE="$COMPOSE_OS_REPOSITORY@$COMPOSE_OS_DIGEST"
+
+# One release, written three times the way Fabric writes it: the closure, the
+# release manifest whose `host.digest` the closure's `host_digest` is derived
+# from, and the UKI-bound preseal set. `overrides` is a JSON object applied to
+# exactly one of them, which is how each negative case below states its one
+# difference and nothing else.
+compose_fixture() { # $1=destination $2=document $3=overrides-json
+  python3 - "$1" "$2" "$3" "$COMPOSE_OS_REPOSITORY" "$COMPOSE_OS_DIGEST" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+destination, document, overrides, repository, digest = sys.argv[1:]
+root = pathlib.Path(destination)
+seed = root / "seed"
+preseal = root / "preseal"
+seed.mkdir(parents=True, exist_ok=True)
+preseal.mkdir(parents=True, exist_ok=True)
+
+closure = {
+    "boot_trust_profile": "neural-ice-secureboot-lab-v1",
+    "bundle_seq": 13,
+    "hardware_target": "nvidia-gb10-arm64",
+    "host_digest": digest,
+    "release_id": "release-1-0-0",
+    "schema": "neural-ice-oci-release-closure-v1",
+    "train": "1.0.0",
+}
+manifest = {
+    "bundle_seq": 13,
+    "hardware_target": "nvidia-gb10-arm64",
+    "host": {"digest": digest, "repository": repository},
+    "release_id": "release-1-0-0",
+    "schema": "neural-ice-release-manifest-v1",
+}
+preseal_set = {
+    "bundle_seq": 13,
+    "hardware_target": "nvidia-gb10-arm64",
+    "ring": "lab",
+    "schema": "neural-ice-installer-preseal-set-v1",
+    "signed_boot_trust_policy_id": "neural-ice-secureboot-lab-v1",
+    "target_os_ref": f"{repository}@{digest}",
+    "train": "1.0.0",
+}
+documents = {"closure": closure, "manifest": manifest, "preseal": preseal_set}
+if document != "none":
+    documents[document].update(json.loads(overrides))
+(seed / "release-closure.json").write_text(
+    json.dumps(closure, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+(seed / "release-manifest.json").write_text(
+    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+(preseal / "preseal-set.json").write_text(
+    json.dumps(preseal_set, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+PYEOF
+}
+
+# The sealed hashes are the REAL hashes of the produced documents, so a negative
+# case fails on the field it changed rather than on a digest nobody updated.
+compose_reconcile() { # $1=root [ENV=VALUE …] -> 0 when the installer would proceed
+  local root=$1; shift
+  local closure manifest preseal
+  # An absent or unreadable document is one of the cases under test, so the
+  # hashes are read tolerantly here and the ASSERTION is left to the lifted
+  # installer code rather than to this harness.
+  closure="$(sha256sum -- "$root/seed/release-closure.json" 2>/dev/null | awk '{print tolower($1)}')"
+  manifest="$(sha256sum -- "$root/seed/release-manifest.json" 2>/dev/null | awk '{print tolower($1)}')"
+  preseal="$(sha256sum -- "$root/preseal/preseal-set.json" 2>/dev/null | awk '{print tolower($1)}')"
+  (
+    set -uo pipefail
+    # shellcheck disable=SC2329,SC2317
+    die() { echo "die: $*" >&2; exit 1; }
+    SEED_VERIFIED_ROOT="$root/seed"
+    PRESEAL_SNAPSHOT="$root/preseal"
+    SEED_CLOSURE="$closure"
+    SEED_MANIFEST_SHA256="$manifest"
+    PRESEAL_SET_SHA256="$preseal"
+    OS_IMAGE="$COMPOSE_OS_IMAGE"
+    SEALED_HARDWARE_TARGET=nvidia-gb10-arm64
+    SEALED_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1
+    DEVICE_CHANNEL=lab
+    INSTALL_MIRROR=""
+    MIRROR_READY_SHA256=""
+    MIRROR_READY_MANIFEST_SHA256=""
+    for assignment in "$@"; do export "${assignment?}"; eval "$assignment"; done
+    # shellcheck source=/dev/null
+    . "$COMPOSE/reconcile.sh"
+    assert_seed_is_the_preseal_release
+  ) >/dev/null 2>&1
+}
+
+compose_case() { # $1=expect accept|refuse $2=label $3=document $4=overrides [ENV…]
+  local expect=$1 label=$2 document=$3 overrides=$4; shift 4
+  local root="$COMPOSE/case"
+  rm -rf -- "$root"
+  compose_fixture "$root" "$document" "$overrides" \
+    || fail "cannot build the composed-medium fixture for: $label"
+  if compose_reconcile "$root" "$@"; then
+    [ "$expect" = accept ] \
+      || fail "the installer accepted a seed it must refuse: $label"
+  else
+    [ "$expect" = refuse ] \
+      || fail "the installer refused the supported composed medium: $label"
+  fi
+}
+
+compose_case accept "one release carried by two transports" none '{}'
+compose_case refuse "a seed from another train" closure '{"train":"1.1.0"}'
+compose_case refuse "a seed from another bundle sequence" closure '{"bundle_seq":14}'
+compose_case refuse "a seed cut around another appliance root" \
+  closure "{\"host_digest\":\"sha256:$(printf '%064d' 43)\"}"
+compose_case refuse "a seed for another hardware target" \
+  closure '{"hardware_target":"nvidia-other-arm64"}'
+compose_case refuse "a seed for another boot-trust policy" \
+  closure '{"boot_trust_profile":"neural-ice-secureboot-prod-v1"}'
+compose_case refuse "a release manifest naming a different appliance root" \
+  manifest "{\"host\":{\"digest\":\"sha256:$(printf '%064d' 43)\",\"repository\":\"$COMPOSE_OS_REPOSITORY\"}}"
+compose_case refuse "a release manifest from another release" manifest '{"release_id":"release-1-0-1"}'
+compose_case refuse "a preseal set for another train" preseal '{"train":"1.1.0"}'
+compose_case refuse "a preseal set for another ring than the sealed channel" preseal '{"ring":"beta"}'
+compose_case refuse "a preseal set naming another appliance" \
+  preseal "{\"target_os_ref\":\"$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)\"}"
+compose_case refuse "an appliance root that is not the one being installed" none '{}' \
+  "OS_IMAGE=$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)"
+compose_case refuse "a mirror declaring a different release than the seed" none '{}' \
+  "INSTALL_MIRROR=bench.example.test:5000" \
+  "MIRROR_READY_SHA256=$(printf '%064d' 9)"
+
+# The documents are re-hashed against their sealed values before a byte is
+# parsed, so a tree swapped between verification and reconciliation selects
+# nothing -- and a hostile or corrupt document is refused by the reader itself.
+compose_tampered() { # $1=how
+  local root="$COMPOSE/case"
+  rm -rf -- "$root"
+  compose_fixture "$root" none '{}' || fail "cannot build the tamper fixture"
+  case "$1" in
+    bytes)   printf '{"train":"1.0.0"}\n' > "$root/seed/release-closure.json" ;;
+    duplicate)
+      printf '{"train":"1.0.0","train":"1.1.0"}\n' > "$root/seed/release-closure.json" ;;
+    oversize)
+      python3 -c 'import sys; sys.stdout.write("{\"pad\":\"" + "x" * (17 * 1024 * 1024) + "\"}\n")' \
+        > "$root/seed/release-closure.json" ;;
+    symlink)
+      rm -f -- "$root/seed/release-closure.json"
+      ln -s /dev/null "$root/seed/release-closure.json" ;;
+    absent) rm -f -- "$root/seed/release-closure.json" ;;
+  esac
+  ! compose_reconcile "$root" \
+    || fail "the installer accepted a seed whose release closure was $1"
+}
+# `bytes` and `duplicate` are caught by the sealed-hash comparison; the others
+# prove the reader itself is bounded and refuses a non-regular input.
+for how in bytes duplicate oversize symlink absent; do compose_tampered "$how"; done
+
+# A duplicate key that survives the hash comparison -- i.e. the sealed hash is
+# the hash OF the duplicate document -- must still be refused by the reader.
+compose_duplicate_root="$COMPOSE/duplicate"
+rm -rf -- "$compose_duplicate_root"
+compose_fixture "$compose_duplicate_root" none '{}' || fail "cannot build the duplicate-key fixture"
+printf '{"bundle_seq":13,"bundle_seq":13,"host_digest":"%s","train":"1.0.0"}\n' \
+  "$COMPOSE_OS_DIGEST" > "$compose_duplicate_root/seed/release-closure.json"
+! compose_reconcile "$compose_duplicate_root" \
+  || fail "the installer's document reader accepted a duplicate JSON field"
+
+# --------------------------------------------------------------------------- #
+# The PRODUCER side of the same rule.
+# --------------------------------------------------------------------------- #
+compose_seal() { # $1=source $2=root [ENV=VALUE …] -> 0 when the medium would be cut
+  local source=$1 root=$2; shift 2
+  (
+    set -uo pipefail
+    sha256_of() { sha256sum -- "$1" | awk '{print tolower($1)}'; }
+    SEED_CLOSURE="$(printf '%064d' 7)"
+    SEED_TRUSTED_NOW=2026-09-02T07:00:00Z
+    RELEASE_MANIFEST_FILE="$root/seed/release-manifest.json"
+    PRESEAL_STAGE_ROOT="$root"
+    OS_IMAGE="$COMPOSE_OS_IMAGE"
+    HARDWARE_TARGET=nvidia-gb10-arm64
+    INSTALL_MIRROR=""
+    MIRROR_READY_SHA256=""
+    MIRROR_READY_MANIFEST_SHA256=""
+    UKI_KARGS=()
+    for assignment in "$@"; do eval "$assignment"; done
+    # shellcheck source=/dev/null
+    . "$COMPOSE/seal.sh"
+    seal_offline_seed_kargs "$source"
+    # A medium that seals nothing when a seed was asked for is not a medium that
+    # passed: the tuple is the point.
+    if [ -n "$SEED_CLOSURE" ]; then
+      printf '%s\n' "${UKI_KARGS[@]}" | grep -qx "neuralice.seed_closure=$SEED_CLOSURE"
+      printf '%s\n' "${UKI_KARGS[@]}" | grep -qx "neuralice.seed_trusted_now=$SEED_TRUSTED_NOW"
+      printf '%s\n' "${UKI_KARGS[@]}" \
+        | grep -qx "neuralice.seed_manifest=$(sha256_of "$RELEASE_MANIFEST_FILE")"
+    fi
+  ) >/dev/null 2>&1
+}
+
+compose_seal_root="$COMPOSE/seal-fixture"
+rm -rf -- "$compose_seal_root"
+compose_fixture "$compose_seal_root" none '{}' || fail "cannot build the producer fixture"
+compose_seal medium "$compose_seal_root" \
+  || fail "the producer no longer seals the offline seed tuple for a medium install"
+compose_seal registry "$compose_seal_root" \
+  || fail "the producer refuses the supported registry medium carrying a reconciled seed"
+compose_seal registry "$compose_seal_root" 'PRESEAL_STAGE_ROOT=""' \
+  && fail "the producer cut a registry medium with a seed and no preseal set to reconcile it against"
+compose_seal registry "$compose_seal_root" 'SEED_TRUSTED_NOW=""' \
+  && fail "the producer cut a medium sealing a closure with no verification time"
+compose_seal medium "$compose_seal_root" 'SEED_CLOSURE=""' \
+  && fail "the producer cut a medium carrying a release manifest that nothing seals"
+compose_seal registry "$compose_seal_root" \
+  "OS_IMAGE=$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)" \
+  && fail "the producer cut a registry medium whose seed is not the appliance it installs"
+compose_seal registry "$compose_seal_root" 'HARDWARE_TARGET=nvidia-other-arm64' \
+  && fail "the producer cut a medium whose seed is for another hardware target"
+compose_seal registry "$compose_seal_root" \
+  'INSTALL_MIRROR=bench.example.test:5000' "MIRROR_READY_SHA256=$(printf '%064d' 9)" \
+  && fail "the producer cut a medium whose mirror declares a different release than its seed"
+
+compose_mismatch_root="$COMPOSE/seal-mismatch"
+rm -rf -- "$compose_mismatch_root"
+compose_fixture "$compose_mismatch_root" manifest '{"bundle_seq":14}' \
+  || fail "cannot build the mismatched producer fixture"
+compose_seal registry "$compose_mismatch_root" \
+  && fail "the producer cut a registry medium whose seed and preseal set are different releases"
+compose_seal medium "$compose_mismatch_root" \
+  || fail "a pure medium install must keep sealing its own seed without a preseal set"
+
+echo "  composed medium: producer and installer both reconcile the seed with the preseal release"
+
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
 

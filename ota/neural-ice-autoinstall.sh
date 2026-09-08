@@ -2113,6 +2113,225 @@ readonly SSHKEY_B64
 # --------------------------------------------------------------------------- #
 NEURALICE_SEED_VERIFIER="$(ni_path NEURALICE_SEED_VERIFIER /usr/bin/ni-ota-verify)"
 readonly NEURALICE_SEED_VERIFIER
+
+# --------------------------------------------------------------------------- #
+# 🔴 A VERIFIED SEED IS NOT AUTOMATICALLY *THIS* RELEASE'S SEED.
+#
+# On a registry install the OS root arrives over the LAN and the runtime
+# containers and models arrive on the stick. Both halves are independently
+# authentic: `verify-seed-closure` above proved the seed is a signed Fabric
+# release closure for this hardware target, access profile, ring and boot-trust
+# policy, and §2b proved the pulled appliance is the one the UKI-bound preseal
+# set authorises. NEITHER proves they are the SAME release -- two correctly
+# signed releases on one stick would install an appliance whose product images
+# are a different bundle, and the appliance would discover it on first boot with
+# no installer left.
+#
+# So the two are joined here, on the identity fields both documents already
+# carry. Nothing new is trusted and nothing is invented:
+#
+#   release-closure.json   its raw bytes hash to `neuralice.seed_closure`, which
+#                          the UKI signature covers (the verifier compares the
+#                          same value, tools/ni-ota-verify/src/seed_closure.rs);
+#   release-manifest.json  its raw bytes hash to `neuralice.seed_manifest`,
+#                          likewise sealed, and Fabric derives the closure's
+#                          host_digest from this file's `host.digest`;
+#   preseal-set.json       the protected snapshot §2b already verified against
+#                          the sealed `neuralice.preseal` digest.
+#
+# Each is re-hashed HERE against its sealed value before a byte is parsed, so a
+# document swapped between verification and this point selects nothing. The
+# reader below is strict and bounded: regular non-symlink files, a size bound,
+# duplicate JSON keys refused, and only fields that exist in those schemas.
+#
+# The APPLIANCE ROOT is the strongest of the joins. Fabric builds the installer
+# authorization's `image_index_digest` FROM the closure's `host_digest`
+# (ICE-Fabric release-manifest/installer_authorization.py), the preseal verifier
+# requires that digest to be the one `target_os_ref` names, and `target_os_ref`
+# is required to be the very `neuralice.osimage` this install pulls. Requiring
+# `host_digest == ${OS_IMAGE##*@}` therefore ties the seed to the exact OCI root
+# the appliance is being installed from, not merely to a compatible-looking one.
+#
+# This is a NARROWING check. It can only refuse a seed the verifier already
+# accepted; it can never admit one the verifier refused, and it replaces no
+# signature. It runs BEFORE the first disk mutation, so its refusal leaves the
+# machine exactly as it was.
+# --------------------------------------------------------------------------- #
+assert_sealed_document_digest() { # $1=path $2=expected sha256 $3=what
+  local path=$1 expected=$2 what=$3 observed
+  [[ -f "$path" && ! -L "$path" ]] \
+    || die "the $what is not a regular file; refusing to reconcile the offline seed against something that is not a document"
+  observed="$(sha256sum -- "$path" | awk '{print tolower($1)}')" \
+    || die "cannot hash the $what"
+  [[ "$observed" == "$expected" ]] \
+    || die "the $what hashes to ${observed}, not the ${expected} this medium's signature seals"
+}
+
+assert_seed_is_the_preseal_release() {
+  local closure_path="$SEED_VERIFIED_ROOT/release-closure.json"
+  local manifest_path="$SEED_VERIFIED_ROOT/release-manifest.json"
+  local preseal_path="$PRESEAL_SNAPSHOT/preseal-set.json"
+  assert_sealed_document_digest "$closure_path" "$SEED_CLOSURE" \
+    "offline seed's release closure"
+  assert_sealed_document_digest "$manifest_path" "$SEED_MANIFEST_SHA256" \
+    "offline seed's release manifest"
+  assert_sealed_document_digest "$preseal_path" "$PRESEAL_SET_SHA256" \
+    "protected preseal set snapshot"
+  python3 - "$closure_path" "$manifest_path" "$preseal_path" \
+    "$OS_IMAGE" "$SEALED_HARDWARE_TARGET" "$SEALED_TRUST_POLICY_ID" "$DEVICE_CHANNEL" \
+    <<'SEED_PRESEAL_RECONCILE_PY' \
+    || die "the offline seed on this medium is not the release the authenticated preseal set installs; nothing has been written to the target disk"
+import json
+import os
+import pathlib
+import stat
+import sys
+
+
+def closed_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise SystemExit(f"duplicate field: {key}")
+        result[key] = value
+    return result
+
+
+def bounded_document(path, maximum):
+    """A bounded, stable, regular non-symlink JSON document with no duplicates."""
+    path = pathlib.Path(path)
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
+        raise SystemExit(f"unsafe, empty or oversize document: {path}")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            part = os.read(descriptor, remaining)
+            if not part:
+                break
+            chunks.append(part)
+            remaining -= len(part)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(path)
+    identity = (before.st_dev, before.st_ino)
+    if ((opened.st_dev, opened.st_ino) != identity
+            or (after.st_dev, after.st_ino) != identity
+            or not stat.S_ISREG(after.st_mode)
+            or not 0 < len(raw) <= maximum):
+        raise SystemExit(f"unstable document: {path}")
+    document = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_pairs)
+    if not isinstance(document, dict):
+        raise SystemExit(f"document is not a JSON object: {path}")
+    return document
+
+
+(closure_path, manifest_path, preseal_path, os_image, hardware_target,
+ trust_policy_id, device_channel) = sys.argv[1:]
+
+# The verifier's own bounds: 16 MiB for a release document, 16 KiB for the set.
+closure = bounded_document(closure_path, 16 * 1024 * 1024)
+manifest = bounded_document(manifest_path, 16 * 1024 * 1024)
+preseal = bounded_document(preseal_path, 16 * 1024)
+
+failures = []
+
+
+def require(condition, detail):
+    if not condition:
+        failures.append(detail)
+
+
+# 1) THE APPLIANCE ROOT. The seed's closure names the exact OCI root of the
+#    appliance the release was cut around; this install pulls a digest-pinned
+#    reference. They must be the same object.
+os_digest = os_image.rpartition("@")[2]
+require(
+    isinstance(closure.get("host_digest"), str)
+    and closure["host_digest"] == os_digest,
+    f"seed appliance root {closure.get('host_digest')!r} is not the installed"
+    f" appliance root {os_digest!r}",
+)
+host = manifest.get("host")
+require(isinstance(host, dict), "seed release manifest carries no host payload")
+if isinstance(host, dict):
+    require(
+        host.get("digest") == closure.get("host_digest"),
+        "the seed's release manifest and release closure name different"
+        " appliance roots",
+    )
+    require(
+        f"{host.get('repository')}@{host.get('digest')}" == os_image,
+        f"the seed's appliance root {host.get('repository')!r} is not the"
+        f" repository this install pulls",
+    )
+    require(
+        f"{host.get('repository')}@{host.get('digest')}"
+        == preseal.get("target_os_ref"),
+        "the seed's appliance root is not the preseal set's target_os_ref",
+    )
+
+# 2) THE RELEASE IDENTITY. train and bundle_seq are the release coordinates both
+#    documents carry; release_id and hardware_target must agree across all three.
+require(
+    isinstance(closure.get("train"), str)
+    and closure["train"] == preseal.get("train"),
+    f"seed train {closure.get('train')!r} is not the preseal train"
+    f" {preseal.get('train')!r}",
+)
+require(
+    isinstance(closure.get("bundle_seq"), int)
+    and not isinstance(closure.get("bundle_seq"), bool)
+    and closure["bundle_seq"] == preseal.get("bundle_seq"),
+    f"seed bundle_seq {closure.get('bundle_seq')!r} is not the preseal"
+    f" bundle_seq {preseal.get('bundle_seq')!r}",
+)
+require(
+    manifest.get("bundle_seq") == closure.get("bundle_seq")
+    and manifest.get("release_id") == closure.get("release_id")
+    and manifest.get("hardware_target") == closure.get("hardware_target"),
+    "the seed's release manifest and release closure disagree about the release",
+)
+
+# 3) THE DEVICE SCOPE. Restated on the bytes read here, against the values the
+#    UKI seals -- the seed verifier was handed the same words, and a gate that
+#    exists only inside another tool is a gate an edit to that tool removes.
+require(
+    closure.get("hardware_target") == hardware_target
+    and preseal.get("hardware_target") == hardware_target,
+    "the seed or the preseal set is not for this medium's sealed hardware target",
+)
+require(
+    closure.get("boot_trust_profile") == trust_policy_id
+    and preseal.get("signed_boot_trust_policy_id") == trust_policy_id,
+    "the seed or the preseal set is not for this medium's sealed boot-trust"
+    " policy",
+)
+require(
+    preseal.get("ring") == device_channel,
+    f"the preseal set's ring {preseal.get('ring')!r} is not this medium's"
+    f" sealed device channel {device_channel!r}",
+)
+
+if failures:
+    for detail in failures:
+        print(f"seed/preseal reconciliation: {detail}", file=sys.stderr)
+    raise SystemExit(1)
+SEED_PRESEAL_RECONCILE_PY
+  # And the transport, when there is one: a mirror that declares a different
+  # release closure than the seed carries is two releases on one stick. The
+  # sealed grammar refuses that line; this restates it on the values the
+  # installer itself read.
+  if [[ -n "$INSTALL_MIRROR" ]]; then
+    [[ "$MIRROR_READY_SHA256" == "$SEED_CLOSURE" \
+       && "$MIRROR_READY_MANIFEST_SHA256" == "$SEED_MANIFEST_SHA256" ]] \
+      || die "the LAN mirror declares release closure ${MIRROR_READY_SHA256} and the offline seed on this medium is ${SEED_CLOSURE}; refusing to install an OS and a runtime set from two different releases"
+  fi
+}
 readonly SEED_MOUNT="$INSTALLER_STATE_DIR/seed"
 SEED_CLOSURE="$(karg_once neuralice.seed_closure)"
 readonly SEED_CLOSURE
@@ -2186,6 +2405,12 @@ if [[ -n "$SEED_CLOSURE" ]]; then
     || die "the offline seed is not the signed release closure this medium seals; nothing has been written to the target disk"
   bg_stop
   log "Offline release closure verified in full: sha256:${SEED_CLOSURE} (every manifest, blob, model and evidence object present, reachable and digest-matched; no extra object)"
+  if [[ "$INSTALL_SOURCE" == registry ]]; then
+    (( PRESEAL_ACTIVE == 1 )) \
+      || die "this medium installs from a registry and carries an offline seed, and seals no preseal set; nothing would reconcile the seed with the appliance that is about to be pulled"
+    assert_seed_is_the_preseal_release
+    log "Offline seed reconciled with the authenticated appliance: same train, bundle_seq, hardware target and appliance root — one release on two transports"
+  fi
 else
   [[ -z "$_seed_partuuid" ]] \
     || die "this medium carries an ni-seed partition and its signature seals no offline release closure; an unauthorised seed is not staged"
