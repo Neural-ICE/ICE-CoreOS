@@ -156,6 +156,58 @@ fn canonical_domain_refuses_integers_outside_interoperable_range() {
     assert!(canonical_value(b"{\"n\":9007199254740992}\n", "large integer").is_err());
 }
 
+fn empty_model_node() -> Node {
+    Node {
+        repository: "registry.example.test/neural-ice/model-card-alpha".into(),
+        digest: EMPTY_SHA256_DIGEST.into(),
+        media_type: HF_MODEL_CARD_FILE_MEDIA_TYPE.into(),
+        size: 0,
+        kind: "layer".into(),
+        signatures: Vec::new(),
+        artifact_type: None,
+        provenance: None,
+        sbom: None,
+        subject: None,
+    }
+}
+
+#[test]
+fn closure_accepts_zero_size_only_for_the_exact_empty_model_file_layer() {
+    let exact = empty_model_node();
+    assert!(valid_node_size(&exact));
+
+    let mut cases = Vec::new();
+    let mut wrong_digest = empty_model_node();
+    wrong_digest.digest = format!("sha256:{}", "a".repeat(64));
+    cases.push(wrong_digest);
+    let mut wrong_media = empty_model_node();
+    wrong_media.media_type = "application/vnd.oci.image.layer.v1.tar".into();
+    cases.push(wrong_media);
+    let mut wrong_kind = empty_model_node();
+    wrong_kind.kind = "config".into();
+    cases.push(wrong_kind);
+    let mut ordinary_config = empty_model_node();
+    ordinary_config.kind = "config".into();
+    ordinary_config.media_type = "application/vnd.oci.image.config.v1+json".into();
+    cases.push(ordinary_config);
+    let mut content_cache = empty_model_node();
+    content_cache.media_type = CONTENT_CACHE_SEGMENT_MEDIA_TYPE.into();
+    cases.push(content_cache);
+    assert!(cases.iter().all(|node| !valid_node_size(node)));
+
+    let base = std::env::temp_dir().join(format!(
+        "ni-empty-model-object-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let empty_hex = EMPTY_SHA256_DIGEST.strip_prefix("sha256:").unwrap();
+    let object = base.join(empty_hex);
+    std::fs::write(&object, b"").unwrap();
+    assert_eq!(hash_file(&object).unwrap(), (empty_hex.into(), 0));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 fn content_cache_artifact_fixture(
     base: &Path,
     mutate_config: impl FnOnce(&mut serde_json::Value),
