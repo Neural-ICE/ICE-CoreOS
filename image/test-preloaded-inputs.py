@@ -24,7 +24,7 @@ class Inputs(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.digest = "sha256:" + "a" * 64
-        self.repository = "registry.neural-ice.ch/neural-ice/neural-ice-appliance"
+        self.repository = "registry.example.test/neural-ice/appliance"
         self.subject = {"repository": self.repository, "digest": self.digest}
         self.closure = {"host_digest": self.digest, "artifacts": [{"artifact_key": "os:neural-ice-appliance", "root": self.subject}]}
         self.args = argparse.Namespace(
