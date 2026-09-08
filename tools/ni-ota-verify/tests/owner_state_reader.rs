@@ -6,6 +6,7 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -1021,7 +1022,7 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
     );
     install_read_only_tpm(&fixture, &access, &public, None, 5);
     let profile = fixture.root.join("ota-state-profile");
-    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o644);
+    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o444);
     let payload = fixture.root.join("PAYLOAD_ID");
     write_mode(
         &payload,
@@ -1067,6 +1068,26 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
         2,
         "{calls}"
     );
+
+    // The image producer seals this marker as 0444. A writable marker is not
+    // the shipped contract, even when its contents name the expected profile.
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o644)).unwrap();
+    let rejected = success_command(&fixture)
+        .env(
+            "NI_OTA_OWNER_STATE_HELPER",
+            fixture.root.join("owner-state"),
+        )
+        .env("NI_OTA_AUTH_STATUS_PROFILE_MARKER", &profile)
+        .env("NI_OTA_AUTH_STATUS_BOOTC", &bootc)
+        .env("NI_OTA_AUTH_STATUS_PAYLOAD_ID", &payload)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("cannot authenticate immutable OTA profile marker"));
+    assert_eq!(observe_tree(&fixture.state), before);
+    assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0);
 }
 
 #[test]
@@ -1178,7 +1199,9 @@ fn helper_timeout_and_oversized_output_refuse_without_success_or_residue() {
         let fixture = Fixture::new(name, "");
         fixture.replace_nvreadpublic(script);
         let before = metadata(&fixture.state);
+        let started = Instant::now();
         let output = fixture.run();
+        let elapsed = started.elapsed();
         assert_eq!(output.status.code(), Some(expected_code), "{name}");
         assert!(output.stdout.is_empty(), "{name}");
         assert!(
@@ -1189,6 +1212,10 @@ fn helper_timeout_and_oversized_output_refuse_without_success_or_residue() {
         assert_eq!(metadata(&fixture.state), before, "{name}");
         assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0, "{name}");
         if name == "timeout" {
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the test-only three-second deadline was widened with production: {elapsed:?}"
+            );
             let child: u32 = fs::read_to_string(fixture.nvreadpublic.with_extension("child"))
                 .unwrap()
                 .trim()

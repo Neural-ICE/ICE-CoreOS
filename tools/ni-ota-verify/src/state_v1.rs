@@ -2453,11 +2453,14 @@ fn read_regular(path: &Path, mode: u32) -> Result<Vec<u8>, InternalError> {
 }
 
 pub(crate) fn run_authenticated_ota_status(args: &[String]) -> Result<u8, InternalError> {
-    // The host gate has a 15-second outer timeout. Start the complete reader
-    // budget at command entry and reserve three seconds for normal error
-    // propagation and volatile cleanup before that supervisor deadline.
+    // The owner lifecycle status alone takes 12.6 seconds on physical GB10
+    // hardware. Keep the complete reader bounded at 45 seconds so the existing
+    // 30-second per-helper ceiling remains effective while leaving time for
+    // the independent state captures and retained-preseal checks around it.
+    // The host gate reserves another five seconds for error propagation and
+    // volatile cleanup before it kills the verifier process group.
     #[cfg(not(feature = "test-path-overrides"))]
-    let operation_timeout = std::time::Duration::from_secs(12);
+    let operation_timeout = std::time::Duration::from_secs(45);
     #[cfg(feature = "test-path-overrides")]
     let operation_timeout = std::time::Duration::from_secs(3);
     crate::runner::with_operation_deadline(operation_timeout, || {
@@ -2894,7 +2897,7 @@ fn require_owner_profile_marker() -> Result<(), String> {
         .map_or_else(|| PathBuf::from(OWNER_PROFILE_MARKER), PathBuf::from);
     #[cfg(not(feature = "test-path-overrides"))]
     let marker = PathBuf::from(OWNER_PROFILE_MARKER);
-    let bytes = read_noatime_regular(&marker, 0o644, 128).map_err(|error| {
+    let bytes = read_noatime_regular(&marker, 0o444, 128).map_err(|error| {
         format!(
             "cannot authenticate immutable OTA profile marker: {}",
             error.0
