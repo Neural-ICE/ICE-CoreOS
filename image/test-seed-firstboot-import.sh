@@ -141,7 +141,7 @@ def put(body):
     digest=hashlib.sha256(body).hexdigest(); (objects/digest).write_bytes(body); return digest
 def canonical(value): return json.dumps(value,sort_keys=True,separators=(",",":")).encode("ascii")
 for content_id,(format_name,repo_name,entitlement,payload) in profiles.items():
-    repository="registry.neural-ice.ch/neural-ice/"+repo_name
+    repository="registry.example.test/neural-ice/"+repo_name
     segment=put(payload)
     config=canonical({"content_id":content_id,"format":format_name,
       "schema":"neural-ice-content-cache-v1",

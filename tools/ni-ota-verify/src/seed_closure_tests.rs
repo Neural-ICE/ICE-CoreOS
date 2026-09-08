@@ -190,7 +190,7 @@ fn content_cache_artifact_fixture(
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_digest = hex_digest(&manifest_bytes);
     std::fs::write(objects.join(&manifest_digest), &manifest_bytes).unwrap();
-    let repository = "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed";
+    let repository = "registry.example.test/neural-ice/content-cache-ch-caselaw-seed";
     let mut artifact = serde_json::json!({
         "artifact_class": "oci-artifact",
         "artifact_key": "content:ch-caselaw-seed",
@@ -252,7 +252,8 @@ fn content_cache_reader_accepts_exact_no_lf_contract_and_refuses_profile_drift()
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let accepted = content_cache_artifact_fixture(&base, |_| {}, |_| {}, |_| {});
-    validate_content_cache_artifact(&base, &accepted).unwrap();
+    validate_content_cache_artifact(&base, &accepted, "registry.example.test").unwrap();
+    assert!(validate_content_cache_artifact(&base, &accepted, "other.example.test").is_err());
     for (label, root, artifact) in [
         (
             "config media",
@@ -288,7 +289,7 @@ fn content_cache_reader_accepts_exact_no_lf_contract_and_refuses_profile_drift()
         ),
     ] {
         assert!(
-            validate_content_cache_artifact(&root, &artifact).is_err(),
+            validate_content_cache_artifact(&root, &artifact, "registry.example.test").is_err(),
             "{label} mutation unexpectedly passed"
         );
     }
@@ -311,20 +312,20 @@ fn content_cache_release_manifest() -> serde_json::Value {
             "content_id": "ch-caselaw-seed", "contract": "content-cache-v1",
             "digest": digest, "media_type": CONTENT_CACHE_ARTIFACT_TYPE,
             "reboot_required": false,
-            "repository": "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed",
+            "repository": "registry.example.test/neural-ice/content-cache-ch-caselaw-seed",
             "required_entitlement": "ICE-CASELAW-CH", "restart_scope": []
         }, {
             "content_id": "paddlex-cache", "contract": "content-cache-v1",
             "digest": digest, "media_type": CONTENT_CACHE_ARTIFACT_TYPE,
             "reboot_required": false,
-            "repository": "registry.neural-ice.ch/neural-ice/content-cache-paddlex-cache",
+            "repository": "registry.example.test/neural-ice/content-cache-paddlex-cache",
             "required_entitlement": "ICE-CORE", "restart_scope": []
         }],
         "evidence": [],
         "hardware_target": "nvidia-gb10-arm64",
         "host": {
             "contract": "host-bootc-v1", "digest": digest, "reboot_required": true,
-            "repository": "registry.neural-ice.ch/neural-ice/appliance",
+            "repository": "registry.example.test/neural-ice/appliance",
             "required_entitlement": "BASE", "restart_scope": []
         },
         "release_id": "appliance-0.60.1",
@@ -335,7 +336,7 @@ fn content_cache_release_manifest() -> serde_json::Value {
 #[test]
 fn content_cache_manifest_requires_both_fixed_authority_joins() {
     let manifest = content_cache_release_manifest();
-    let parsed = parse_manifest_roots(&manifest, "registry.neural-ice.ch").unwrap();
+    let parsed = parse_manifest_roots(&manifest, "registry.example.test").unwrap();
     assert_eq!(
         parsed
             .roots
@@ -346,11 +347,23 @@ fn content_cache_manifest_requires_both_fixed_authority_joins() {
     );
     let mut missing = manifest.clone();
     missing["content"].as_array_mut().unwrap().pop();
-    assert!(parse_manifest_roots(&missing, "registry.neural-ice.ch").is_err());
+    assert!(parse_manifest_roots(&missing, "registry.example.test").is_err());
     let mut entitlement = manifest.clone();
     entitlement["content"][0]["required_entitlement"] = serde_json::json!("ICE-CORE");
-    assert!(parse_manifest_roots(&entitlement, "registry.neural-ice.ch").is_err());
-    assert!(parse_manifest_roots(&manifest, "registry.example.test").is_err());
+    assert!(parse_manifest_roots(&entitlement, "registry.example.test").is_err());
+    assert!(parse_manifest_roots(&manifest, "other.example.test").is_err());
+
+    let mut alternate = manifest;
+    for entry in alternate["content"].as_array_mut().unwrap() {
+        let repository = entry["repository"].as_str().unwrap();
+        entry["repository"] = serde_json::json!(repository.replacen(
+            "registry.example.test/",
+            "other.example.test/",
+            1
+        ));
+    }
+    alternate["host"]["repository"] = serde_json::json!("other.example.test/neural-ice/appliance");
+    parse_manifest_roots(&alternate, "other.example.test").unwrap();
 }
 
 #[test]
@@ -395,7 +408,7 @@ fn fabric_content_cache_fixture_reaches_the_core_reader_when_available() {
     ] {
         std::fs::write(objects.join(digest), body).unwrap();
     }
-    let repository = "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed";
+    let repository = "registry.example.test/neural-ice/content-cache-ch-caselaw-seed";
     let artifact: Artifact = serde_json::from_value(serde_json::json!({
         "artifact_class": "oci-artifact",
         "artifact_key": "content:ch-caselaw-seed",
@@ -429,7 +442,7 @@ fn fabric_content_cache_fixture_reaches_the_core_reader_when_available() {
         "vendor": null
     }))
     .unwrap();
-    validate_content_cache_artifact(&base, &artifact).unwrap();
+    validate_content_cache_artifact(&base, &artifact, "registry.example.test").unwrap();
     std::fs::remove_dir_all(base).unwrap();
 }
 

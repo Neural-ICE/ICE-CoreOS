@@ -21,8 +21,9 @@ def canonical(value):
 
 
 class Fixture:
-    def __init__(self, root):
+    def __init__(self, root, registry="registry.example.test"):
         self.root = pathlib.Path(root)
+        self.registry = registry
         self.objects = self.root / "objects"
         self.objects.mkdir(parents=True)
         self.artifacts = []
@@ -39,6 +40,7 @@ class Fixture:
 
     def add(self, content_id, body):
         profile = contract.PROFILES[content_id]
+        repository = f"{self.registry}/{profile['repository_path']}"
         segment_digest = self.put(body)
         config = {
             "content_id": content_id,
@@ -75,7 +77,7 @@ class Fixture:
                 "digest": "sha256:" + root_digest,
                 "media_type": contract.ARTIFACT_TYPE,
                 "reboot_required": False,
-                "repository": profile["repository"],
+                "repository": repository,
                 "required_entitlement": profile["entitlement"],
                 "restart_scope": [],
             }
@@ -91,11 +93,11 @@ class Fixture:
                     {"digest": "sha256:" + config_digest, "kind": "config"},
                     {"digest": "sha256:" + segment_digest, "kind": "layer"},
                 ],
-                "repository": profile["repository"],
+                "repository": repository,
                 "required_entitlement": profile["entitlement"],
                 "root": {
                     "digest": "sha256:" + root_digest,
-                    "repository": profile["repository"],
+                    "repository": repository,
                 },
             }
         )
@@ -136,6 +138,7 @@ class ContentCacheContractTests(unittest.TestCase):
             manifest=str(self.fixture.manifest),
             objects=str(self.fixture.objects),
             destination=str(destination or self.root / "candidate"),
+            registry_host=self.fixture.registry,
         )
 
     def test_materializes_both_fixed_whole_files_and_exact_metadata(self):
@@ -166,13 +169,19 @@ class ContentCacheContractTests(unittest.TestCase):
                 fixture.write_documents()
                 with self.assertRaises(SystemExit):
                     contract.collect_specs(
-                        fixture.closure, fixture.manifest, fixture.objects
+                        fixture.closure,
+                        fixture.manifest,
+                        fixture.objects,
+                        fixture.registry,
                     )
         self.fixture.entries.pop()
         self.fixture.write_documents()
         with self.assertRaises(SystemExit):
             contract.collect_specs(
-                self.fixture.closure, self.fixture.manifest, self.fixture.objects
+                self.fixture.closure,
+                self.fixture.manifest,
+                self.fixture.objects,
+                self.fixture.registry,
             )
 
         unsupported = Fixture(self.root / "unsupported-class")
@@ -180,8 +189,64 @@ class ContentCacheContractTests(unittest.TestCase):
         unsupported.write_documents()
         with self.assertRaises(SystemExit):
             contract.collect_specs(
-                unsupported.closure, unsupported.manifest, unsupported.objects
+                unsupported.closure,
+                unsupported.manifest,
+                unsupported.objects,
+                unsupported.registry,
             )
+
+    def test_registry_authority_is_canonical_and_binds_both_fixed_repositories(self):
+        for authority in (
+            "registry.example.test",
+            "localhost:5055",
+            "192.0.2.1:5000",
+            "[2001:db8::1]:5000",
+        ):
+            with self.subTest(authority=authority):
+                self.assertTrue(contract.valid_registry_authority(authority))
+        for authority in (
+            "https://registry.example.test",
+            "Registry.example.test",
+            "registry.example.test/extra",
+            "registry.example.test:05055",
+            "[2001:0db8::1]",
+            "[fe80::1%eth0]",
+        ):
+            with self.subTest(authority=authority):
+                self.assertFalse(contract.valid_registry_authority(authority))
+        alternate = Fixture(self.root / "alternate", "other.example.test")
+        self.assertEqual(
+            len(
+                contract.collect_specs(
+                    alternate.closure,
+                    alternate.manifest,
+                    alternate.objects,
+                    alternate.registry,
+                )
+            ),
+            2,
+        )
+        with self.assertRaises(SystemExit):
+            contract.collect_specs(
+                self.fixture.closure,
+                self.fixture.manifest,
+                self.fixture.objects,
+                "other.example.test",
+            )
+
+    def test_registry_authority_matches_pinned_producer_vectors(self):
+        pack = json.loads(
+            (
+                MODULE_PATH.parent.parent
+                / "tools/ni-ota-verify/tests/fixtures/release-manifest-v1/producer/consumer-pack/release-manifest-v1.json"
+            ).read_bytes()
+        )
+        for vector in pack["repository_grammar"]["equivalence_vectors"]:
+            authority = vector["repository"].split("/", 1)[0]
+            with self.subTest(vector=vector["id"]):
+                self.assertEqual(
+                    contract.valid_registry_authority(authority), vector["accepted"]
+                )
 
     def test_refuses_segment_order_size_digest_corruption_and_symlink(self):
         entry = self.fixture.entries[0]
@@ -194,7 +259,10 @@ class ContentCacheContractTests(unittest.TestCase):
         self.fixture.write_documents()
         with self.assertRaises(SystemExit):
             contract.collect_specs(
-                self.fixture.closure, self.fixture.manifest, self.fixture.objects
+                self.fixture.closure,
+                self.fixture.manifest,
+                self.fixture.objects,
+                self.fixture.registry,
             )
 
         order = Fixture(self.root / "order")
@@ -228,7 +296,9 @@ class ContentCacheContractTests(unittest.TestCase):
         order.artifacts[0]["root"]["digest"] = entry["digest"]
         order.write_documents()
         with self.assertRaises(SystemExit):
-            contract.collect_specs(order.closure, order.manifest, order.objects)
+            contract.collect_specs(
+                order.closure, order.manifest, order.objects, order.registry
+            )
 
         corrupt = Fixture(self.root / "corrupt")
         segment_digest = next(
@@ -244,6 +314,7 @@ class ContentCacheContractTests(unittest.TestCase):
                     manifest=str(corrupt.manifest),
                     objects=str(corrupt.objects),
                     destination=str(corrupt.root / "candidate"),
+                    registry_host=corrupt.registry,
                 )
             )
 
@@ -265,6 +336,7 @@ class ContentCacheContractTests(unittest.TestCase):
                     manifest=str(linked.manifest),
                     objects=str(linked.objects),
                     destination=str(linked.root / "candidate"),
+                    registry_host=linked.registry,
                 )
             )
 

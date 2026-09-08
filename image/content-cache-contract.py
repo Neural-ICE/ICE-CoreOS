@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -21,18 +22,19 @@ MAX_CONFIG_BYTES = 64 * 1024
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 RESERVE_BYTES = 4 * 1024 * 1024 * 1024
 HEX = re.compile(r"^[0-9a-f]{64}$")
+DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 PROFILES = {
     "ch-caselaw-seed": {
         "format": "sqlite3",
-        "repository": "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed",
+        "repository_path": "neural-ice/content-cache-ch-caselaw-seed",
         "candidate_repository": "ghcr.io/neural-ice/content-cache-ch-caselaw-seed",
         "entitlement": "ICE-CASELAW-CH",
         "filename": "decisions.db",
     },
     "paddlex-cache": {
         "format": "tar+zstd",
-        "repository": "registry.neural-ice.ch/neural-ice/content-cache-paddlex-cache",
+        "repository_path": "neural-ice/content-cache-paddlex-cache",
         "candidate_repository": "ghcr.io/neural-ice/content-cache-paddlex-cache",
         "entitlement": "ICE-CORE",
         "filename": "paddlex-cache.tar.zst",
@@ -154,13 +156,106 @@ def closed(value, keys, label):
         fail(f"{label} has the wrong closed schema")
 
 
+def valid_ipv6_text(value):
+    if re.fullmatch(r"[0-9a-f:]+", value) is None:
+        return False
+    if "::" in value:
+        left, right = value.split("::", 1)
+        if "::" in right:
+            return False
+        compressed = True
+    else:
+        left, right, compressed = value, "", False
+
+    def parse_side(side):
+        if not side:
+            return []
+        groups = side.split(":")
+        if any(
+            not group or len(group) > 4 or len(group) > 1 and group.startswith("0")
+            for group in groups
+        ):
+            return None
+        return [int(group, 16) for group in groups]
+
+    left_groups, right_groups = parse_side(left), parse_side(right)
+    if left_groups is None or right_groups is None:
+        return False
+    explicit = len(left_groups) + len(right_groups)
+    if compressed:
+        missing = 8 - explicit
+        if missing < 2:
+            return False
+    elif explicit != 8:
+        return False
+    else:
+        missing = 0
+    groups = left_groups + [0] * missing + right_groups
+    best_start = best_length = index = 0
+    while index < len(groups):
+        if groups[index] != 0:
+            index += 1
+            continue
+        start = index
+        while index < len(groups) and groups[index] == 0:
+            index += 1
+        if index - start > best_length:
+            best_start, best_length = start, index - start
+    return (best_length < 2 and not compressed) or (
+        best_length >= 2
+        and compressed
+        and len(left_groups) == best_start
+        and missing == best_length
+    )
+
+
+def valid_registry_authority(value):
+    if not isinstance(value, str) or any(char in value for char in "/@?#"):
+        return False
+
+    def valid_port(port):
+        return (
+            port.isascii()
+            and port.isdigit()
+            and not port.startswith("0")
+            and len(port) <= 5
+            and int(port) <= 65_535
+        )
+
+    if value.startswith("["):
+        try:
+            literal, suffix = value[1:].split("]", 1)
+        except ValueError:
+            return False
+        return valid_ipv6_text(literal) and (
+            not suffix or suffix.startswith(":") and valid_port(suffix[1:])
+        )
+    if value.count(":") > 1:
+        return False
+    host, separator, port = value.rpartition(":")
+    if not separator:
+        host, port = value, None
+    if not host or len(host) > 253 or (port is not None and not valid_port(port)):
+        return False
+    if all(char.isascii() and (char.isdigit() or char == ".") for char in host):
+        try:
+            return str(ipaddress.IPv4Address(host)) == host
+        except ipaddress.AddressValueError:
+            return False
+    return (host == "localhost" or "." in host) and all(
+        DNS_LABEL.fullmatch(label) for label in host.split(".")
+    )
+
+
 def _artifact_root(artifact):
     root = artifact.get("root")
     closed(root, {"digest", "repository"}, "content-cache closure root")
     return root
 
 
-def collect_specs(closure_path, manifest_path, objects_path):
+def collect_specs(closure_path, manifest_path, objects_path, registry_host):
+    if not valid_registry_authority(registry_host):
+        fail("registry host is not a canonical OCI registry authority")
     closure, _ = load_json(closure_path)
     manifest, _ = load_json(manifest_path)
     objects = pathlib.Path(objects_path)
@@ -195,8 +290,9 @@ def collect_specs(closure_path, manifest_path, objects_path):
             "restart_scope",
         }
         closed(entry, expected, f"manifest cache {content_id}")
+        expected_repository = f"{registry_host}/{profile['repository_path']}"
         if (
-            entry["repository"] != profile["repository"]
+            entry["repository"] != expected_repository
             or entry["required_entitlement"] != profile["entitlement"]
             or entry["media_type"] != ARTIFACT_TYPE
             or entry["reboot_required"] is not False
@@ -213,6 +309,7 @@ def collect_specs(closure_path, manifest_path, objects_path):
     specs = []
     for content_id in sorted(PROFILES):
         entry, profile = by_id[content_id], PROFILES[content_id]
+        expected_repository = f"{registry_host}/{profile['repository_path']}"
         matches = []
         for artifact in artifacts:
             if not isinstance(artifact, dict):
@@ -221,7 +318,7 @@ def collect_specs(closure_path, manifest_path, objects_path):
             if (
                 isinstance(root, dict)
                 and root.get("digest") == entry["digest"]
-                and root.get("repository") == entry["repository"]
+                and root.get("repository") == expected_repository
             ):
                 matches.append(artifact)
         if len(matches) != 1:
@@ -233,7 +330,7 @@ def collect_specs(closure_path, manifest_path, objects_path):
         if (
             artifact.get("artifact_key") != f"content:{content_id}"
             or artifact.get("artifact_class") != "oci-artifact"
-            or artifact.get("repository") != profile["repository"]
+            or artifact.get("repository") != expected_repository
             or artifact.get("candidate_repository") != profile["candidate_repository"]
             or artifact.get("required_entitlement") != profile["entitlement"]
         ):
@@ -384,7 +481,7 @@ def _fsync_directory(path):
 
 
 def materialize(args):
-    specs = collect_specs(args.closure, args.manifest, args.objects)
+    specs = collect_specs(args.closure, args.manifest, args.objects, args.registry_host)
     destination, objects = pathlib.Path(args.destination), pathlib.Path(args.objects)
     if not specs:
         try:
@@ -470,6 +567,7 @@ def main():
     install.add_argument("--manifest", required=True)
     install.add_argument("--objects", required=True)
     install.add_argument("--destination", required=True)
+    install.add_argument("--registry-host", required=True)
     install.set_defaults(func=materialize)
     arguments = parser.parse_args()
     arguments.func(arguments)

@@ -90,8 +90,9 @@ IFS= read -r pcr_seq < "$RELEASE/PCR-POLICY-SEQ"
 IFS= read -r now < "$TRUSTED_NOW"
 [[ $now =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
   || die "sealed seed trusted time is malformed"
+registry_host=$(<"$REGISTRY")
 "$VERIFIER" verify-seed-closure --seed-root "$source_root" --pubkey "$ROOT_KEY" \
-  --registry-host "$(<"$REGISTRY")" --hardware-target "$(<"$HARDWARE")" \
+  --registry-host "$registry_host" --hardware-target "$(<"$HARDWARE")" \
   --access-profile "$(<"$PROFILE")" --trust-policy-id "$(<"$POLICY")" \
   --device-channel "$(<"$CHANNEL")" \
   --expect-closure "$closure" --expect-manifest "$manifest" --trusted-now "$now" \
@@ -270,6 +271,7 @@ done
   --closure "$source_root/release-closure.json" \
   --manifest "$source_root/release-manifest.json" \
   --objects "$source_root/objects/sha256" \
+  --registry-host "$registry_host" \
   --destination "$candidate/content-caches" >/dev/null \
   || die "cannot materialize the signed content caches"
 durable_boundary content-caches

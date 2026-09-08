@@ -862,20 +862,16 @@ fn parse_manifest_roots(
             };
             if contract == "content-cache-v1" {
                 let expected = match identifier {
-                    "ch-caselaw-seed" => (
-                        "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed",
-                        "ICE-CASELAW-CH",
-                    ),
-                    "paddlex-cache" => (
-                        "registry.neural-ice.ch/neural-ice/content-cache-paddlex-cache",
-                        "ICE-CORE",
-                    ),
+                    "ch-caselaw-seed" => {
+                        ("neural-ice/content-cache-ch-caselaw-seed", "ICE-CASELAW-CH")
+                    }
+                    "paddlex-cache" => ("neural-ice/content-cache-paddlex-cache", "ICE-CORE"),
                     _ => {
                         return refuse(format!("{label} has an unsupported content-cache identity"))
                     }
                 };
-                if registry != "registry.neural-ice.ch"
-                    || string(object, "repository", &label)? != expected.0
+                let expected_repository = format!("{registry}/{}", expected.0);
+                if string(object, "repository", &label)? != expected_repository
                     || string(object, "required_entitlement", &label)? != expected.1
                     || string(object, "media_type", &label)? != CONTENT_CACHE_ARTIFACT_TYPE
                     || object["reboot_required"].as_bool() != Some(false)
@@ -993,7 +989,11 @@ fn canonical_value_no_lf(bytes: &[u8], label: &str) -> Result<serde_json::Value,
     Ok(value)
 }
 
-fn validate_content_cache_artifact(root: &Path, artifact: &Artifact) -> Result<(), Refusal> {
+fn validate_content_cache_artifact(
+    root: &Path,
+    artifact: &Artifact,
+    registry: &str,
+) -> Result<(), Refusal> {
     let root_node = artifact
         .nodes
         .iter()
@@ -1009,13 +1009,13 @@ fn validate_content_cache_artifact(root: &Path, artifact: &Artifact) -> Result<(
     let profile = match content_id {
         "ch-caselaw-seed" => Some((
             "sqlite3",
-            "registry.neural-ice.ch/neural-ice/content-cache-ch-caselaw-seed",
+            "neural-ice/content-cache-ch-caselaw-seed",
             "ghcr.io/neural-ice/content-cache-ch-caselaw-seed",
             "ICE-CASELAW-CH",
         )),
         "paddlex-cache" => Some((
             "tar+zstd",
-            "registry.neural-ice.ch/neural-ice/content-cache-paddlex-cache",
+            "neural-ice/content-cache-paddlex-cache",
             "ghcr.io/neural-ice/content-cache-paddlex-cache",
             "ICE-CORE",
         )),
@@ -1024,8 +1024,9 @@ fn validate_content_cache_artifact(root: &Path, artifact: &Artifact) -> Result<(
     if !typed_root && profile.is_none() {
         return Ok(());
     }
-    let (expected_format, expected_repository, expected_candidate, expected_entitlement) =
+    let (expected_format, expected_path, expected_candidate, expected_entitlement) =
         profile.ok_or_else(|| Refusal("content-cache root has an unsupported identity".into()))?;
+    let expected_repository = format!("{registry}/{expected_path}");
     if artifact.artifact_class != "oci-artifact"
         || artifact.repository != expected_repository
         || artifact.candidate_repository != expected_candidate
@@ -1737,7 +1738,7 @@ fn validate_closure(
                 ));
             }
         }
-        validate_content_cache_artifact(root, artifact)?;
+        validate_content_cache_artifact(root, artifact, registry)?;
         let mut prior_attachment: Option<(&str, &str, &str, &str)> = None;
         for attachment in &artifact.attachments {
             let current = (
