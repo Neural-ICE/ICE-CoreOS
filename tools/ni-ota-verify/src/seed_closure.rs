@@ -31,6 +31,9 @@ const MAX_OCI_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OBJECTS: usize = 100_000;
 const MAX_DEPTH: u64 = 8;
 const SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
+const HF_MODEL_CARD_FILE_MEDIA_TYPE: &str = "application/vnd.neural-ice.hf-cache.model.file";
+const EMPTY_SHA256_DIGEST: &str =
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Refusal(pub(crate) String);
@@ -119,6 +122,17 @@ fn digest_hex(value: &str) -> Result<&str, Refusal> {
         .strip_prefix("sha256:")
         .filter(|v| is_hex64(v))
         .ok_or_else(|| Refusal(format!("{value} is not sha256:<64 lowercase hex>")))
+}
+
+fn is_empty_model_file(node: &Node) -> bool {
+    node.kind == "layer"
+        && node.media_type == HF_MODEL_CARD_FILE_MEDIA_TYPE
+        && node.digest == EMPTY_SHA256_DIGEST
+        && node.size == 0
+}
+
+fn valid_node_size(node: &Node) -> bool {
+    (node.size > 0 || is_empty_model_file(node)) && node.size <= SAFE_INTEGER_MAX
 }
 
 fn ascii_json(value: &serde_json::Value) -> bool {
@@ -1448,8 +1462,7 @@ fn validate_closure(
         for node in &artifact.nodes {
             let hex = digest_hex(&node.digest)?;
             if node.repository != artifact.repository
-                || node.size == 0
-                || node.size > SAFE_INTEGER_MAX
+                || !valid_node_size(node)
                 || !matches!(
                     node.kind.as_str(),
                     "index" | "manifest" | "config" | "layer"
