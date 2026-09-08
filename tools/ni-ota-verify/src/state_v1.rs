@@ -2897,7 +2897,7 @@ fn require_owner_profile_marker() -> Result<(), String> {
         .map_or_else(|| PathBuf::from(OWNER_PROFILE_MARKER), PathBuf::from);
     #[cfg(not(feature = "test-path-overrides"))]
     let marker = PathBuf::from(OWNER_PROFILE_MARKER);
-    let bytes = read_noatime_regular(&marker, 0o644, 128).map_err(|error| {
+    let bytes = read_noatime_regular(&marker, 0o444, 128).map_err(|error| {
         format!(
             "cannot authenticate immutable OTA profile marker: {}",
             error.0

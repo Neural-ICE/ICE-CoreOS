@@ -1022,7 +1022,7 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
     );
     install_read_only_tpm(&fixture, &access, &public, None, 5);
     let profile = fixture.root.join("ota-state-profile");
-    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o644);
+    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o444);
     let payload = fixture.root.join("PAYLOAD_ID");
     write_mode(
         &payload,
@@ -1068,6 +1068,26 @@ fn public_owner_pristine_status_is_exact_and_read_only() {
         2,
         "{calls}"
     );
+
+    // The image producer seals this marker as 0444. A writable marker is not
+    // the shipped contract, even when its contents name the expected profile.
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o644)).unwrap();
+    let rejected = success_command(&fixture)
+        .env(
+            "NI_OTA_OWNER_STATE_HELPER",
+            fixture.root.join("owner-state"),
+        )
+        .env("NI_OTA_AUTH_STATUS_PROFILE_MARKER", &profile)
+        .env("NI_OTA_AUTH_STATUS_BOOTC", &bootc)
+        .env("NI_OTA_AUTH_STATUS_PAYLOAD_ID", &payload)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("cannot authenticate immutable OTA profile marker"));
+    assert_eq!(observe_tree(&fixture.state), before);
+    assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0);
 }
 
 #[test]
