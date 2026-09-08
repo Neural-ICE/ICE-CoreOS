@@ -1764,9 +1764,11 @@ def measurements_document(
     sealed: dict[str, str],
 ) -> bytes:
     optional = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
-    if optional.get("neuralice.source") != "registry":
+    # These measurements bind accepted raw/UKI/rootfs bytes. Both closed-world
+    # Install transports are valid; source-less legacy media stays excluded.
+    if optional.get("neuralice.source") not in {"medium", "registry"}:
         raise InspectionError(
-            "measurements are available only for a registry Install medium"
+            "measurements require an explicit registry or medium Install source"
         )
     digests = {
         "medium_raw_sha256": raw_sha256,

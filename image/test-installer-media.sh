@@ -82,6 +82,26 @@ with tempfile.TemporaryDirectory(prefix="ni-measurements-") as scratch_name:
         "neuralice.source=registry",
         {"neuralice.rootverity": "4" * 64, "neuralice.relauth_keyid": "5" * 64},
     )
+    medium_document = module.measurements_document(
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        "neuralice.source=medium",
+        {"neuralice.rootverity": "4" * 64, "neuralice.relauth_keyid": "5" * 64},
+    )
+    assert medium_document == document
+    try:
+        module.measurements_document(
+            "1" * 64,
+            "2" * 64,
+            "3" * 64,
+            "neuralice.autoinstall=1",
+            {"neuralice.rootverity": "4" * 64, "neuralice.relauth_keyid": "5" * 64},
+        )
+    except module.InspectionError:
+        pass
+    else:
+        raise SystemExit("a source-less Install medium emitted measurements")
     with module.PinnedRaw(raw_path) as pinned:
         module.publish_measurements(output, document, pinned)
     fsynced_types = []
@@ -459,9 +479,9 @@ grep -q 'recomputed from the medium' "$TMP/inspect.out" \
   || fail "the inspector did not recompute the verity root hashes off the medium"
 NONREGISTRY_MEASUREMENTS="$TMP/nonregistry-measurements.json"
 inspect --measurements-output "$NONREGISTRY_MEASUREMENTS" >/dev/null 2>&1 \
-  && fail "a non-registry medium emitted final registry measurements"
+  && fail "an Install medium without an explicit source emitted final measurements"
 [[ ! -e "$NONREGISTRY_MEASUREMENTS" ]] \
-  || fail "a refused non-registry measurement left an output behind"
+  || fail "a refused source-less measurement left an output behind"
 
 # Public TPM policy material may travel on the mutable ESP only when the signed
 # UKI command line pins each file's digest, and the policy JSON must contain the
@@ -1031,7 +1051,8 @@ build_uki installer-preseal-offline "$offline_preseal_kargs" >/dev/null \
   || fail "the fully offline preseal UKI failed to build"
 make_preseal_esp installer-preseal-offline
 assemble "$ESP" "$SEALED/payload.img"
-inspect >"$TMP/inspect-preseal-offline.out" \
+OFFLINE_MEASUREMENTS="$TMP/offline-medium-measurements.json"
+inspect --measurements-output "$OFFLINE_MEASUREMENTS" >"$TMP/inspect-preseal-offline.out" \
   || { cat "$TMP/inspect-preseal-offline.out"; fail "the complete offline original-host preseal medium was refused"; }
 grep -q "neuralice.imgref=release.example.test/neural-ice/neural-ice-appliance@${registry_digest}" \
   "$TMP/inspect-preseal-offline.out" \
@@ -1041,6 +1062,53 @@ grep -q 'neuralice.source=medium' "$TMP/inspect-preseal-offline.out" \
 if grep -qE 'neuralice\.(osimage|mirror)=' "$TMP/inspect-preseal-offline.out"; then
   fail "the offline medium inspection invented a network transport"
 fi
+python3 - "$RAW" "$SEALED/installer-preseal-offline.efi" \
+  "$SEALED/installer-preseal-offline.efi.manifest" "$ROOT_HASH" \
+  "$OFFLINE_MEASUREMENTS" <<'PYEOF'
+import hashlib, json, pathlib, struct, sys
+
+raw, uki, manifest, root_hash, output = map(pathlib.Path, sys.argv[1:])
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+pe = uki.read_bytes()
+pe_offset = struct.unpack_from("<I", pe, 0x3C)[0]
+coff = pe_offset + 4
+count = struct.unpack_from("<H", pe, coff + 2)[0]
+optional_size = struct.unpack_from("<H", pe, coff + 16)[0]
+table = coff + 20 + optional_size
+cmdline = None
+for index in range(count):
+    entry = table + index * 40
+    if pe[entry:entry + 8].rstrip(b"\0") == b".cmdline":
+        raw_size = struct.unpack_from("<I", pe, entry + 16)[0]
+        raw_pointer = struct.unpack_from("<I", pe, entry + 20)[0]
+        cmdline = pe[raw_pointer:raw_pointer + raw_size]
+        break
+assert cmdline is not None
+manifest_values = dict(
+    line.split("=", 1)
+    for line in manifest.read_text(encoding="ascii").splitlines()
+    if "=" in line
+)
+expected = {
+    "medium_raw_sha256": sha256_file(raw),
+    "relauth_key_sha256": manifest_values["relauth_keyid"],
+    "rootfs_verity_hash_algorithm": "sha256",
+    "rootfs_verity_root_hash": str(root_hash),
+    "schema": "neural-ice-installer-medium-measurements-v1",
+    "uki_cmdline_sha256": hashlib.sha256(cmdline).hexdigest(),
+    "uki_pe_sha256": hashlib.sha256(pe).hexdigest(),
+}
+assert output.read_bytes() == (
+    json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("ascii")
+PYEOF
 
 for name in "${preseal_names[@]}"; do
   make_preseal_esp installer-preseal "$name"
