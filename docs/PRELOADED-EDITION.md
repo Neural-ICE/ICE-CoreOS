@@ -53,9 +53,10 @@ an already-trusted containers-storage graphroot:
 6. On first boot, `neural-ice-seed-import.service` re-verifies again with networking denied, builds
    a candidate containers-storage generation with `skopeo --preserve-digests`, reads every imported
    root digest back, constructs content/model CAS generations from signed manifest references,
-   relabels the store, fsyncs receipts and directories, then atomically switches all `current`
-   pointers. `OFFLINE-READY` is written last. A crash or refusal before that point leaves the prior
-   generation selected; an exact retry reuses a complete generation.
+   reconstructs typed content caches, relabels the store, fsyncs receipts and directories, then
+   atomically switches all `current` pointers. `OFFLINE-READY` is written last. A crash or refusal
+   before that point leaves the prior generation selected; an exact retry reuses a complete
+   generation.
 
 **Invariant (learned in the field):** the `additionalimagestores` path MUST exist on every edition —
 containers-storage hard-fails on a missing path. It is guaranteed three ways: baked into the image,
@@ -74,6 +75,23 @@ It is carried without extending Fabric's closure schema: a standard `oci-artifac
 has artifact type `application/vnd.neural-ice.hf-cache-model-card.v1`, the card JSON is its typed
 config, and the model bytes are typed layers. Thus the existing signed root and recursive OCI
 edges authenticate every byte and the importer never trusts an unbound loose file path.
+
+Large appliance data uses the separate required contract `content-cache-v1`. It admits exactly two
+fixed identities: `ch-caselaw-seed` (`sqlite3`, entitlement `ICE-CASELAW-CH`) and `paddlex-cache`
+(`tar+zstd`, entitlement `ICE-CORE`). Each root is a closed OCI artifact whose no-LF canonical JSON
+config binds the whole-file digest and size to an ordered list of at most 64 typed segments. A
+segment is at most 8 GiB and every non-final segment is exactly 8 GiB; total reconstructed content
+is bounded at 128 GiB per cache.
+
+First boot streams those segments from the already verified retained SEED object store into the
+inactive generation, verifies each segment and the reconstructed whole file, and reserves 4 GiB of
+free space before writing. The segment objects are excluded from the generic candidate CAS to avoid
+duplicating the large payload. The only published consumer paths are
+`offline-current/content-caches/ch-caselaw-seed/decisions.db` and
+`offline-current/content-caches/paddlex-cache/paddlex-cache.tar.zst`; authenticated configs are
+retained under `offline-current/content-caches/.metadata/`. CoreOS neither activates the CH licence
+nor extracts the Paddle archive. Those operations remain Fabric consumer responsibilities after the
+single generation pointer is committed.
 
 ## Compression — `COMPRESS` (speed vs size lever)
 The raw→archive compression is the build bottleneck (a ~110 GiB raw).
