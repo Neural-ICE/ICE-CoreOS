@@ -116,6 +116,12 @@ def produce(args):
     cards = profiles.get("profiles")
     if not isinstance(cards, dict):
         fail("model profiles lacks its profiles object")
+    roles = profiles.get("serving_roles", {})
+    if not isinstance(roles, dict) or not all(isinstance(value, dict) for value in [*cards.values(), *roles.values()]):
+        fail("model profiles and serving_roles must contain card objects")
+    if cards.keys() & roles.keys():
+        fail("model profiles repeats a card id across profiles and serving_roles")
+    cards = {**cards, **roles}
     selected = [entry for entry in catalogue.get("models", []) if entry.get("catalog_status") == "validated"]
     if not selected:
         fail("model catalogue declares no validated model")

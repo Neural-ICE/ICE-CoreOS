@@ -85,27 +85,86 @@ The raw→archive compression is the build bottleneck (a ~110 GiB raw).
 
 ## Build (on a self-hosted ARM64 runner with the seed staged locally)
 
-```sh
-SEED_RELEASE_MANIFEST=/release/release-manifest.json \
-SEED_RELEASE_CLOSURE=/release/release-closure.json \
-SEED_RELEASE_AUTHORIZATION=/release/release-authorization.json \
-SEED_RELEASE_AUTHORIZATION_SIGNATURE=/release/release-authorization.json.sig \
-SEED_DELEGATION_SNAPSHOT=/release/delegation-snapshot.json \
-SEED_DELEGATION_SIGNATURE=/release/delegation-snapshot.json.sig \
-SEED_OBJECTS=/release/objects/sha256 \
-SEED_HF_CACHE=/cache/huggingface/hub \
-SEED_MODEL_PROFILES=/fabric/config/inference/model-profiles.json \
-SEED_MODEL_CATALOGUE=/fabric/config/inference/model-catalogue.json \
-DEVICE_CHANNEL=lab \
-BASE_IMAGE=registry.example.test/neural-ice/neural-ice-appliance@sha256:<train-digest> \
-SSH_AUTHORIZED_KEYS_FILE=$HOME/.ssh/id_ed25519.pub \
-SSH_AUTHORIZED_KEYS_SHA256=<approved-public-key-file-sha256> \
-LAB_BASELINE_BOM_FILE=/release/train.bom.json \
-LAB_BASELINE_BOM_SHA256=<approved-bom-sha256> \
-LAB_BASELINE_SIGNATURE_FILE=/release/train.bom.sig \
-LAB_BASELINE_SIGNATURE_SHA256=<approved-signature-sha256> \
+The current sealed LAB route is `INSTALL_SOURCE=registry` with a signed preseal
+set and an offline SEED. OS installation still requires the canonical registry
+or its approved LAN mirror. After installation, the verified SEED supplies the
+runtime images and models without that network dependency. This command does
+not qualify an entirely disconnected OS installation.
+
+There are **two separate authorization pairs**, both for the same release:
+
+- `SEED_RELEASE_AUTHORIZATION_FILE` and its signature are Fabric OTA-v2,
+  `purpose=ota`, `installer_medium=null`. The native verifier checks them before
+  the raw exists, using the root delegation key.
+- `RELEASE_AUTHORIZATION_FILE` and its signature are installer-v2 from the
+  premedia/preseal process. The base builder seals their hashes and installs
+  them on the ESP. They cannot be replaced by the SEED pair. The existing
+  OTA-v1 evidence used to compose preseal remains a separate input to that process.
+
+The following Bash template lists the required wrapper and registry/preseal
+inputs. Replace the `/release` and `/signing` paths and bracketed values with
+qualified artifacts; do not generate substitute hashes or keys. The model
+profiles, catalogue and OTA root must be byte-identical to those baked into the
+pinned appliance. `SEED_OBJECT_ROOTS` is a colon-separated list of CAS roots in
+the layout accepted by `build-seed-v2.sh`.
+
+```bash
+export RELEASE_MANIFEST_FILE=/release/release-manifest.json
+export RELEASE_CLOSURE_FILE=/release/release-closure.json
+export SEED_RELEASE_AUTHORIZATION_FILE=/release/seed/ota-release-authorization.json
+export SEED_RELEASE_AUTHORIZATION_SIGNATURE_FILE=/release/seed/ota-release-authorization.sig
+export RELEASE_AUTHORIZATION_FILE=/release/installer/release-authorization.json
+export RELEASE_AUTHORIZATION_SIGNATURE_FILE=/release/installer/release-authorization.sig
+export DELEGATION_SNAPSHOT_FILE=/release/delegation-snapshot.json
+export DELEGATION_SNAPSHOT_SIGNATURE_FILE=/release/delegation-snapshot.sig
+export RELEASE_ROOT_PUBLIC_KEY_FILE=/release/ota-root.pub
+export SEED_OBJECT_ROOTS=/release/objects
+export SEED_HF_CACHE=/cache/huggingface/hub
+export SEED_MODEL_PROFILES=/release/model-profiles.json
+export SEED_MODEL_CATALOGUE=/release/model-catalogue.json
+export SEED_TRUSTED_NOW='<verified-UTC-time-YYYY-MM-DDTHH:MM:SSZ>'
+export NI_OTA_VERIFY=/release/bin/ni-ota-verify
+
+export DEVICE_CHANNEL=lab VARIANT=sealed-lab ACCESS_PROFILE=lab-managed
+export HARDWARE_TARGET=nvidia-gb10-arm64
+export HARDWARE_IDENTITY_FILE=/release/hardware-identity.json
+export TRUST_POLICY_ID='<baked-trust-policy-id>'
+export PCR_POLICY_DIGEST='<policy-digest>'
+export PCR_POLICY_PUBLIC_KEY_FILE=/release/tpm2-pcr-public-key.pem
+export PCR_POLICY_PUBLIC_KEY_SHA256='<public-key-file-sha256>'
+export PCR_POLICY_SIGNATURE_FILE=/release/tpm2-pcr-signature.json
+export PCR_POLICY_SIGNATURE_SHA256='<signature-file-sha256>'
+export PCR_POLICY_SEQ='<signed-policy-sequence>'
+export UKI_SIGNING_KEY=/signing/uki.key
+export UKI_SIGNING_CERT=/signing/uki.crt
+export ALLOW_UNSIGNED_MEDIA=0
+
+# Canonical authority and exact subject from the signed release.
+export RELEASE_AUTHORITY='<canonical-registry-host>'
+export TARGET_IMGREF='<canonical-registry-host>/<repository>@sha256:<train-digest>'
+export OS_IMAGE="$TARGET_IMGREF" INSTALL_SOURCE=registry
+# Build transport may differ, but the root digest must be identical.
+export BASE_IMAGE='<build-registry-host>/<repository>@sha256:<train-digest>'
+export TARGET_PROOF_REF="$BASE_IMAGE"
+export REGISTRY_AUTH_FILE=/release/protected/build-reader.json
+export PRESEAL_SET_DIR=/release/preseal
+export PRESEAL_SET_SHA256='<preseal-set-sha256>'
+export OUT='ice-coreos-installer-preloaded-<unique-build-name>'
 COMPRESS=zstd-fast ./image/build-preloaded.sh
 ```
+
+Rootful Podman
+is used for both base acquisition/inspection and media construction; the build
+reader is a host-only input and is not embedded in the medium. An already cached
+base can be reused without a reader file.
+
+For an approved LAB installation mirror, also export `INSTALL_MIRROR` as its
+bare host and port, `MIRROR_CA_FILE` as its CA file, `MIRROR_READY_SHA256` as
+the verified READY closure hash, `MIRROR_READY_MANIFEST_SHA256` as its manifest
+hash, and `MIRROR_CACHE_GENERATION` as its positive cache generation. These are installer transport inputs; they do
+not configure the installed appliance's registry. Optional LAB SSH provisioning
+uses `SSH_AUTHORIZED_KEYS_FILE` and its exact `SSH_AUTHORIZED_KEYS_SHA256`.
+The legacy optional LAB baseline receipt below is not a substitute for preseal.
 
 Produces `ice-coreos-installer-preloaded-<version>.img.zst` (+ `.sha256`). Flash:
 `zstd -dc <img.zst> | sudo dd of=/dev/sdX bs=64M oflag=direct status=progress`.

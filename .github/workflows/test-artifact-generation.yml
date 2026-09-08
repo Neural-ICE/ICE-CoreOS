@@ -282,6 +282,8 @@ jobs:
               "image/inspect-installer-media.py",
               "image/installer/neural-ice-registry-authorisation.py",
               "image/model-cache-contract.py",
+              "image/lib/preloaded-inputs.py",
+              "image/test-preloaded-inputs.py",
               "image/seed-tree-manifest.py",
               "image/test-lib/unit-graph.py",
               "image/test-seed-tree-manifest.py",
@@ -449,7 +451,9 @@ jobs:
       # Cryptographic and graph mutation coverage lives in the Rust verifier
       # suite, which consumes Fabric's generated canonical fixture.
       - name: Prove the offline seed closure end to end
-        run: ./image/test-seed-closure.sh
+        run: |
+          ./image/test-seed-closure.sh
+          python3 image/test-preloaded-inputs.py
 
       # 🔴 THE SUITES MUST NOT HAVE SUBSTITUTED THEIR OWN CRYPTO. Every suite
       # above reports which stack it used, and a run that fell back to a shim is

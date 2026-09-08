@@ -31,7 +31,7 @@ DATA=$(path /var/lib/neural-ice/data)
 RELEASE="$DATA/release"
 POINTER="$RELEASE/CLOSURE"
 VERIFIER=$(path /usr/bin/ni-ota-verify)
-ROOT_KEY=$(path /usr/lib/neural-ice/keys/release-authorization.pub)
+ROOT_KEY=$(path /etc/neural-ice/keys/ota-root.pub)
 REGISTRY="$RELEASE/AUTHORITY"
 CHANNEL="$RELEASE/CHANNEL"
 TRUSTED_NOW="$RELEASE/TRUSTED-NOW"
@@ -141,18 +141,20 @@ closure_path, objects_path, layouts_path, plan_path = map(pathlib.Path, sys.argv
 closure = json.loads(closure_path.read_bytes())
 records = []
 for number, artifact in enumerate(closure["artifacts"]):
+    # The verified closure distinguishes executable components from OS/content
+    # artifacts. Models and all signature/SBOM attachments stay in the CAS below;
+    # containers-storage cannot import those artifact-specific configurations.
+    if not artifact["artifact_key"].startswith("image:"):
+        continue
+    if artifact["artifact_class"] not in (
+        "portable-multiarch-image", "hardware-targeted-manifest",
+    ):
+        raise SystemExit("component is not an executable image class")
     repository, root_value = artifact["repository"], artifact["root"]
     root = root_value["digest"] if isinstance(root_value, dict) else root_value
     nodes = {node["digest"]: node for node in artifact["nodes"]}
     node = nodes[root]
     imports = [(root, node["media_type"], node["size"], {n["digest"] for n in artifact["nodes"]}, artifact["artifact_key"])]
-    for attachment in artifact["attachments"]:
-        wanted = {attachment["manifest_digest"], *attachment["layer_digests"]}
-        body = json.loads((objects_path / attachment["manifest_digest"].removeprefix("sha256:")).read_bytes())
-        wanted.add(body["config"]["digest"])
-        attachment_size = (objects_path / attachment["manifest_digest"].removeprefix("sha256:")).stat().st_size
-        imports.append((attachment["manifest_digest"], attachment["media_type"], attachment_size, wanted,
-                        artifact["artifact_key"] + "/" + attachment["kind"]))
     for subnumber, (import_root, media_type, size, wanted, label) in enumerate(imports):
         layout = layouts_path / f"{number}-{subnumber}"
         (layout / "blobs/sha256").mkdir(parents=True)
@@ -184,10 +186,15 @@ while IFS= read -r -d '' layout \
   && IFS= read -r -d '' import_root; do
   if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]]; then
     destination="containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot]${repository}:${tag}"
-    skopeo copy --all --preserve-digests "oci:${layout}:seed" \
+    # Import this host's platform. containers-storage rejects --all for an
+    # index; skopeo retains the original index digest as a local repo digest.
+    skopeo copy --preserve-digests "oci:${layout}:seed" \
       "$destination" \
       || die "cannot import signed artifact $artifact_key"
-    observed=$(skopeo inspect "$destination" | python3 -c \
+    # Reading by tag reports the selected child digest. The runtime pulls by
+    # the signed root digest, so prove that exact repository@root is usable.
+    imported_ref="containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot]${repository}@${import_root}"
+    observed=$(skopeo inspect "$imported_ref" | python3 -c \
       'import json,sys; value=json.load(sys.stdin); print(value.get("Digest", ""))') \
       || die "cannot read back imported artifact $artifact_key"
     [[ $observed == "$import_root" ]] || die "imported artifact read-back digest differs for $artifact_key"

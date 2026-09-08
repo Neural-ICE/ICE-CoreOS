@@ -523,7 +523,7 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         .expect("Fabric must carry an accepted beta install vector");
     let mut authorization: serde_json::Value = canonical_value(
         &std::fs::read(vectors.join(install["authorization"].as_str().unwrap())).unwrap(),
-        "Fabric install authorization",
+        "Fabric OTA authorization",
     )
     .unwrap();
 
@@ -810,6 +810,10 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
     }));
     let closure_hash = hex_digest(&closure_bytes);
 
+    // This complete crypto fixture retains the upstream beta identity/receipts,
+    // but SEED carries the OTA pack authority, never the final media authority.
+    authorization["purpose"] = serde_json::json!("ota");
+    authorization["installer_medium"] = serde_json::Value::Null;
     authorization["bundle_seq"] = serde_json::json!(bundle_seq);
     authorization["closure_coverage"] = serde_json::json!({
         "artifacts": 1,
@@ -1079,7 +1083,7 @@ fn production_verifier_ignores_the_cosign_environment_seam() {
 }
 
 #[test]
-fn fabric_install_authorization_profile_and_mutations_are_differential() {
+fn fabric_ota_seed_authorization_profile_and_mutations_are_differential() {
     let Ok(root) = std::env::var("NEURAL_ICE_FABRIC_ROOT") else {
         return;
     };
@@ -1096,18 +1100,21 @@ fn fabric_install_authorization_profile_and_mutations_are_differential() {
             }
             let bytes =
                 std::fs::read(vectors.join(vector["authorization"].as_str().unwrap())).unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["purpose"] == "install"
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["purpose"] == "ota"
         })
-        .expect("Fabric must carry an accepted install-purpose vector");
+        .expect("Fabric must carry an accepted OTA-purpose vector");
     let bytes = std::fs::read(vectors.join(vector["authorization"].as_str().unwrap())).unwrap();
-    let value = canonical_value(&bytes, "Fabric install authorization").unwrap();
+    let value = canonical_value(&bytes, "Fabric OTA authorization").unwrap();
     validate_authorization_contract(value.as_object().unwrap()).unwrap();
 
     for mutate in [
-        |value: &mut serde_json::Value| value["installer_medium"] = serde_json::Value::Null,
+        |value: &mut serde_json::Value| value["installer_medium"] = serde_json::json!({}),
+        |value: &mut serde_json::Value| value["purpose"] = serde_json::json!("install"),
         |value: &mut serde_json::Value| value["security_posture"] = serde_json::json!("debug"),
         |value: &mut serde_json::Value| value["copy_completion_receipts"] = serde_json::json!([]),
-        |value: &mut serde_json::Value| value["qualification_receipt"] = serde_json::Value::Null,
+        |value: &mut serde_json::Value| {
+            value["authorization_format_version"] = serde_json::json!(2)
+        },
     ] {
         let mut changed = value.clone();
         mutate(&mut changed);

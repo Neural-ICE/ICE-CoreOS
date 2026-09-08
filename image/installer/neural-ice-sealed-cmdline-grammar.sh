@@ -610,13 +610,34 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
 
   # ------------------------------------------------------------------------- #
   # THE OFFLINE SEED. A medium either carries one and seals its closure hash, or
-  # carries neither. `neuralice.seed_closure` is meaningful only on a MEDIUM
-  # install: a registry install pulls its bytes, and a seed staged beside it
-  # would be a second, unreconciled source of the same objects.
+  # carries neither.
+  #
+  # 🔴 A SEED MAY NOW SIT BESIDE A REGISTRY INSTALL, UNDER ONE CONDITION. The
+  # rule used to be a flat `seed-closure-with-registry-source`, and its reason
+  # was sound: a registry install pulls its OS bytes, so a seed staged next to it
+  # was a SECOND, UNRECONCILED source of the same release and "which bytes did we
+  # install" stopped having an answer.
+  #
+  # The two are different sources of DIFFERENT objects, though: the registry
+  # supplies the OS root, the seed supplies the runtime containers and models the
+  # appliance needs to reach onboarding with no WAN. What was missing was not a
+  # reason to forbid the pair, it was a way to prove the pair is ONE release. So
+  # the combination is admitted only together with `neuralice.preseal`, which is
+  # the UKI-bound document that names `train`, `bundle_seq`, `hardware_target`
+  # and `target_os_ref` -- exactly the fields ota/neural-ice-autoinstall.sh
+  # reconciles against the seed's own signed release closure BEFORE the target
+  # disk is touched. `neuralice.preseal` in turn already forces a registry source
+  # and a `lab-managed` profile, so this composition is LAB-only and owner-sealed
+  # by construction, and a customer medium cannot express it at all.
+  #
+  # WITHOUT the preseal set there is nothing on the line to reconcile the two
+  # against, which is the original finding again -- so that stays refused.
   # ------------------------------------------------------------------------- #
   if [[ -n "${optional_seen[neuralice.seed_closure]:-}" ]]; then
-    (( registry_source == 0 )) \
-      || { _ni_sealed_refuse seed-closure-with-registry-source; return 1; }
+    if (( registry_source == 1 )); then
+      [[ -n "${optional_seen[neuralice.preseal]:-}" ]] \
+        || { _ni_sealed_refuse seed-closure-without-preseal-on-registry-source; return 1; }
+    fi
     # The seed's release manifest names repositories under the release
     # authority, and the verifier is handed that authority explicitly. A medium
     # that seals a closure and not the authority to read it against is a medium
@@ -627,6 +648,20 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
       || { _ni_sealed_refuse seed-closure-without-manifest-hash; return 1; }
     [[ -n "${optional_seen[neuralice.seed_trusted_now]:-}" ]] \
       || { _ni_sealed_refuse seed-closure-without-trusted-time; return 1; }
+    # 🔴 ONE RELEASE, NOT TWO THAT HAPPEN TO BE ON ONE STICK. `neuralice.mirror_
+    # ready` is the exact release closure the LAN mirror declares it holds, and
+    # `neuralice.seed_closure` is the exact release closure the seed IS. A line
+    # sealing two different values there is a medium whose OS transport and whose
+    # runtime artefacts were cut from different releases -- and it would only be
+    # discovered on the bench, after the disk was gone.
+    if [[ -n "${optional_seen[neuralice.mirror_ready]:-}" ]]; then
+      [[ "$(ni_sealed_argument_value neuralice.mirror_ready "${words[@]}")" \
+         == "$(ni_sealed_argument_value neuralice.seed_closure "${words[@]}")" ]] \
+        || { _ni_sealed_refuse mirror-ready-not-the-sealed-seed-closure; return 1; }
+      [[ "$(ni_sealed_argument_value neuralice.mirror_manifest "${words[@]}")" \
+         == "$(ni_sealed_argument_value neuralice.seed_manifest "${words[@]}")" ]] \
+        || { _ni_sealed_refuse mirror-manifest-not-the-sealed-seed-manifest; return 1; }
+    fi
   else
     [[ -z "${optional_seen[neuralice.seed_manifest]:-}" \
        && -z "${optional_seen[neuralice.seed_trusted_now]:-}" ]] \

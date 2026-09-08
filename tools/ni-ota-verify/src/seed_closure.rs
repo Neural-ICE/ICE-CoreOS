@@ -1643,10 +1643,10 @@ fn validate_authorization_contract(
         "authorization_format_version",
         "release authorization",
     )? != 1
-        || string(auth, "purpose", "release authorization")? != "install"
+        || string(auth, "purpose", "release authorization")? != "ota"
         || string(auth, "security_posture", "release authorization")? != "sealed"
     {
-        return refuse("release authorization version/purpose/posture is not install-v1 sealed");
+        return refuse("release authorization version/purpose/posture is not OTA-v1 sealed");
     }
     for field in [
         "access_policy_sha256",
@@ -1687,44 +1687,10 @@ fn validate_authorization_contract(
         return refuse("release authorization issuance_id is invalid");
     }
 
-    let medium = as_object(
-        &auth["installer_medium"],
-        "release authorization.installer_medium",
-    )?;
-    exact_keys(
-        medium,
-        &[
-            "medium_raw_sha256",
-            "relauth_key_sha256",
-            "rootfs_verity_hash_algorithm",
-            "rootfs_verity_root_hash",
-            "uki_cmdline_sha256",
-            "uki_pe_sha256",
-        ],
-        &[],
-        "release authorization.installer_medium",
-    )?;
-    if string(
-        medium,
-        "rootfs_verity_hash_algorithm",
-        "release authorization.installer_medium",
-    )? != "sha256"
-        || [
-            "medium_raw_sha256",
-            "relauth_key_sha256",
-            "rootfs_verity_root_hash",
-            "uki_cmdline_sha256",
-            "uki_pe_sha256",
-        ]
-        .iter()
-        .any(|field| {
-            medium
-                .get(*field)
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|value| !is_hex64(value) || value.bytes().all(|byte| byte == b'0'))
-        })
-    {
-        return refuse("release authorization installer_medium is invalid");
+    // SEED is authenticated before the installer raw exists. Media authority
+    // belongs to the separately verified installer-v2 envelope, not this pack.
+    if !auth["installer_medium"].is_null() {
+        return refuse("SEED OTA authorization requires installer_medium null");
     }
 
     let ring = string(auth, "ring", "release authorization")?;

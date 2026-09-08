@@ -6,6 +6,25 @@ FAKEBIN="$ROOT/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/skopeo" <<'EOF'
 #!/bin/sh
 [ "${FAIL_SKOPEO:-0}" = 0 ] || exit 42
+if [ "${ASSERT_STORAGE_CONTRACT:-0}" = 1 ]; then
+  case "${1:-}" in
+    copy)
+      for arg in "$@"; do
+        [ "$arg" != --all ] || { echo 'storage transport rejects --all' >&2; exit 43; }
+      done
+      printf copied > "$COPY_MARKER"
+      exit 0 ;;
+    inspect)
+      [ -f "$COPY_MARKER" ] || exit 44
+      case "${2:-}" in
+        *@"$EXPECTED_IMPORT_DIGEST")
+          printf '{"Digest":"%s"}\n' "${RETURN_IMPORT_DIGEST:-$EXPECTED_IMPORT_DIGEST}" ;;
+        *) printf '{"Digest":"sha256:child-digest-not-index"}\n' ;;
+      esac
+      exit 0 ;;
+    *) exit 45 ;;
+  esac
+fi
 if [ "${1:-}" = inspect ]; then
   printf '{"Digest":"%s"}\n' "${EXPECTED_IMPORT_DIGEST:-sha256:missing}"
 fi
@@ -28,10 +47,20 @@ printf '1\n' > "$data/release/PCR-POLICY-SEQ"
 printf '%s\n' nvidia-gb10-arm64 > "$ROOT/usr/lib/neural-ice/hardware-target"
 printf '%s\n' lab-managed > "$ROOT/usr/lib/neural-ice/access-policy"
 printf '%s\n' lab-v1 > "$ROOT/usr/lib/neural-ice/signed-boot-trust-policy-id"
-printf key > "$ROOT/usr/lib/neural-ice/keys/release-authorization.pub"
+printf delegated-key > "$ROOT/usr/lib/neural-ice/keys/release-authorization.pub"
+mkdir -p "$ROOT/etc/neural-ice/keys"
+printf ota-root-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
 cat > "$ROOT/usr/bin/ni-ota-verify" <<'EOF'
 #!/bin/sh
-exit 0
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --pubkey ]; then
+    shift
+    [ "$(cat "$1")" = ota-root-key ] || exit 61
+    exit 0
+  fi
+  shift
+done
+exit 62
 EOF
 chmod 0755 "$ROOT/usr/bin/ni-ota-verify"
 install -m 0755 image/model-cache-contract.py "$ROOT/usr/libexec/neural-ice-model-cache-contract"
@@ -47,7 +76,7 @@ for spec in "acme alpha $rev_a alpha-bytes" "acme beta $rev_b beta-bytes"; do
   ln -s "../../blobs/$digest" "$model/snapshots/$revision/model.safetensors"
 done
 cat > "$ROOT/profiles.json" <<EOF
-{"profiles":{"alpha":{"catalog_status":"validated","model":"acme/alpha"},"beta":{"catalog_status":"validated","model":"acme/beta"}},"serving_roles":{}}
+{"profiles":{"alpha":{"catalog_status":"validated","model":"acme/alpha"}},"serving_roles":{"beta":{"catalog_status":"validated","model":"acme/beta"}}}
 EOF
 cat > "$ROOT/catalogue.json" <<EOF
 {"models":[{"catalog_status":"validated","file_count":1,"hf_revision":"$rev_a","id":"alpha","model":"acme/alpha","size_bytes":11},{"catalog_status":"validated","file_count":1,"hf_revision":"$rev_b","id":"beta","model":"acme/beta","size_bytes":10}]}
@@ -71,7 +100,7 @@ def node(repository, value, kind, media):
     return {"digest":"sha256:"+value,"kind":kind,"media_type":media,"repository":repository,
             "artifact_type":None,"signatures":[],"size":Path(objects,value).stat().st_size}
 primary_repo="registry.example.test/neural-ice/model"
-artifacts=[{"artifact_class":"oci-artifact","artifact_key":"content:model-test","attachments":[],
+artifacts=[{"artifact_class":"hardware-targeted-manifest","artifact_key":"image:runtime-test","attachments":[],
   "nodes":[node(primary_repo,digest,"manifest","application/vnd.oci.image.manifest.v1+json")],
   "repository":primary_repo,"root":{"digest":"sha256:"+digest,"repository":primary_repo}}]
 for card_id, card_digest in (("alpha",card_a),("beta",card_b)):
@@ -95,6 +124,15 @@ document = {"artifacts":artifacts}
 open(path,"w",encoding="ascii").write(json.dumps(document,separators=(",",":"),sort_keys=True)+"\n")
 PY
 
+# A delegated installer key is not the root that authenticates the snapshot.
+printf delegated-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
+if PATH="$FAKEBIN:$PATH" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=1 \
+  image/firstboot/neural-ice-seed-import.sh >/dev/null 2>&1; then
+  echo "substituted delegation root unexpectedly passed" >&2; exit 1
+fi
+test ! -e "$data/offline-current"
+printf ota-root-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
+
 PATH="$FAKEBIN:$PATH" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=1 \
   image/firstboot/neural-ice-seed-import.sh
 test "$(readlink "$data/offline-current")" = "offline-generations/$closure"
@@ -104,6 +142,16 @@ test "$(readlink "$data/models/current")" = '../offline-current/models'
 test "$(readlink "$data/hf-cache/hub")" = '../offline-current/hf-cache/hub'
 test "$(readlink "$data/OFFLINE-READY")" = 'offline-current/READY'
 test -f "$data/offline-generations/$closure/READY"
+# Only executable component images belong in containers-storage. Model cards
+# and their evidence remain in the verified content CAS, never image imports.
+python3 - "$data/offline-generations/$closure/seed-store/import-plan" <<'PLAN_CHECK'
+import pathlib, sys
+fields = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
+assert fields[-1] == b""
+records = [fields[i:i + 5] for i in range(0, len(fields) - 1, 5)]
+assert len(records) == 1, records
+assert records[0][3] == b"image:runtime-test", records
+PLAN_CHECK
 test -f "$data/content/current/sha256/$blob"
 test -f "$data/models/current/sha256/$blob"
 alpha_digest=$(printf %s alpha-bytes | sha256sum | awk '{print $1}')
@@ -200,4 +248,37 @@ if command -v setpriv >/dev/null && setpriv --reuid=0 --regid=0 --clear-groups \
   exit 1
 fi
 
-echo "seed-firstboot-import: 20 cases passed"
+# Exercise the successful storage path, not dry-run: the strict transport fake
+# reproduces the measured --all refusal and index-vs-tag digest distinction.
+# Relabel commands are stubs because this is an unprivileged filesystem fixture;
+# native Skopeo/Podman and SELinux qualification remain separate checks.
+for command in chcon restorecon; do
+  printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/$command"
+  chmod 0755 "$FAKEBIN/$command"
+done
+storage_closure=$(printf storage-success | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$storage_closure"
+printf 'sha256:%s\n' "$storage_closure" > "$data/release/CLOSURE"
+PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
+  EXPECTED_IMPORT_DIGEST="sha256:$blob" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+  image/firstboot/neural-ice-seed-import.sh
+test -f "$ROOT/copied"
+test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
+grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+
+# A transport that returns another digest must not publish its generation.
+wrong_closure=$(printf wrong-import-readback | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$wrong_closure"
+printf 'sha256:%s\n' "$wrong_closure" > "$data/release/CLOSURE"
+rm -- "$ROOT/copied"
+if PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
+    EXPECTED_IMPORT_DIGEST="sha256:$blob" RETURN_IMPORT_DIGEST=sha256:wrong \
+    NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+    image/firstboot/neural-ice-seed-import.sh 2>/dev/null; then
+  echo "wrong storage readback digest unexpectedly passed" >&2
+  exit 1
+fi
+test -f "$ROOT/copied"
+test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
+
+echo "seed-firstboot-import: 23 cases passed"

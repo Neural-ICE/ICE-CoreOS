@@ -9,6 +9,8 @@ ConditionPathExists=!/var/lib/neural-ice/data/OFFLINE-READY
 
 [Service]
 Type=oneshot
+# Full images and model blobs are copied, verified and synced before publication.
+TimeoutStartSec=2h
 ExecStart=/usr/local/bin/neural-ice-seed-import.sh
 RemainAfterExit=yes
 IPAddressDeny=any

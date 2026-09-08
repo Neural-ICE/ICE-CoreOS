@@ -129,6 +129,129 @@ RELEASE_AUTHORIZATION_STAGE_ROOT=""
 sha256_of() { # $1=path -> lowercase hex
   sha256sum -- "$1" | awk '{print tolower($1)}'
 }
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE OFFLINE SEED, SEALED FOR *BOTH* INSTALL SOURCES.
+#
+# The three seed arguments used to be sealed only inside the `medium` arm,
+# because the grammar forbade a seed beside a registry install outright. That
+# rule was really about the absence of a proof: the registry supplies the OS
+# root, the seed supplies the runtime containers and models, and nothing on the
+# line said the two came from ONE release.
+#
+# The proof is `neuralice.preseal`. So the seed tuple is sealed here, once, for
+# either source -- and for a registry medium this function ALSO reconciles the
+# seed's own release manifest against the protected preseal snapshot, before the
+# UKI exists. A medium whose two halves are different releases is refused on the
+# build host rather than on a bench with an already-wiped disk.
+#
+# The tuple is refused in BOTH directions: a closure with no manifest or time,
+# and a manifest or time with no closure. A half-sealed seed is a medium that
+# either cannot verify what it carries or carries what nothing verifies.
+# --------------------------------------------------------------------------- #
+seal_offline_seed_kargs() { # appends to UKI_KARGS; $1=install source
+  local install_source=$1 seed_manifest_sha256
+  if [[ -z "$SEED_CLOSURE" ]]; then
+    [[ -z "$SEED_TRUSTED_NOW" && -z "$RELEASE_MANIFEST_FILE" ]] \
+      || { echo "ERROR: SEED_TRUSTED_NOW/RELEASE_MANIFEST_FILE describe an offline seed and SEED_CLOSURE names none; a medium either carries the seed it was cut with or carries no seed argument at all" >&2; exit 1; }
+    return 0
+  fi
+  [[ "$SEED_CLOSURE" =~ ^[0-9a-f]{64}$ \
+     && "$SEED_TRUSTED_NOW" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    || { echo "ERROR: a preloaded medium requires SEED_CLOSURE=<64-hex> and SEED_TRUSTED_NOW=<RFC3339 UTC second>" >&2; exit 1; }
+  # The manifest is read, hashed and sealed, so it is held to the same shape the
+  # verifier's own bounded reader insists on: a regular non-symlink file, not
+  # empty, and not larger than ni-ota-verify's MAX_DOCUMENT_BYTES.
+  [[ -n "$RELEASE_MANIFEST_FILE" && -f "$RELEASE_MANIFEST_FILE" \
+     && ! -L "$RELEASE_MANIFEST_FILE" && -s "$RELEASE_MANIFEST_FILE" ]] \
+    || { echo "ERROR: a preloaded medium requires RELEASE_MANIFEST_FILE to be a non-empty regular file: $RELEASE_MANIFEST_FILE" >&2; exit 1; }
+  (( "$(stat -c %s -- "$RELEASE_MANIFEST_FILE")" <= 16777216 )) \
+    || { echo "ERROR: RELEASE_MANIFEST_FILE is larger than the 16 MiB document bound the seed verifier reads" >&2; exit 1; }
+  seed_manifest_sha256="$(sha256_of "$RELEASE_MANIFEST_FILE")"
+
+  if [[ "$install_source" == registry ]]; then
+    # 🔴 ONE RELEASE, PROVED BEFORE THE MEDIUM EXISTS. Without the preseal set
+    # there is no signed statement naming the release the registry half installs,
+    # so there is nothing to reconcile the seed against -- which is exactly the
+    # unreconciled-sources finding the flat old refusal was written for. The
+    # sealed grammar refuses this combination too; refusing HERE means the
+    # operator learns before the medium is cut.
+    [[ -n "$PRESEAL_STAGE_ROOT" ]] \
+      || { echo "ERROR: an offline seed beside INSTALL_SOURCE=registry requires the signed preseal set (PRESEAL_SET_DIR/PRESEAL_SET_SHA256); nothing else on the medium can prove the seed and the pulled appliance are one release" >&2; exit 1; }
+    python3 - "$RELEASE_MANIFEST_FILE" "$PRESEAL_STAGE_ROOT/preseal/preseal-set.json" \
+      "$OS_IMAGE" "$HARDWARE_TARGET" <<'SEED_PRESEAL_PY' \
+      || { echo "ERROR: the offline seed's release manifest is not the release this registry medium installs; refusing to cut a medium carrying two unrelated releases" >&2; exit 1; }
+import json
+import pathlib
+import sys
+
+
+def closed_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise SystemExit(f"duplicate field: {key}")
+        result[key] = value
+    return result
+
+
+def bounded(path, maximum):
+    path = pathlib.Path(path)
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"not a regular file: {path}")
+    size = path.stat().st_size
+    if not 0 < size <= maximum:
+        raise SystemExit(f"unbounded or empty document: {path}")
+    return json.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=closed_pairs)
+
+
+manifest_path, set_path, os_image, hardware_target = sys.argv[1:]
+manifest = bounded(manifest_path, 16 * 1024 * 1024)
+preseal = bounded(set_path, 16 * 1024)
+if not isinstance(manifest, dict) or not isinstance(preseal, dict):
+    raise SystemExit("release manifest or preseal set is not a JSON object")
+host = manifest.get("host")
+if not isinstance(host, dict):
+    raise SystemExit("release manifest carries no host payload")
+seed_host_ref = f"{host.get('repository')}@{host.get('digest')}"
+target_os_ref = preseal.get("target_os_ref")
+if seed_host_ref != target_os_ref:
+    raise SystemExit(
+        f"seed host {seed_host_ref} is not the preseal target {target_os_ref}"
+    )
+if target_os_ref != os_image:
+    raise SystemExit(f"preseal target {target_os_ref} is not OS_IMAGE {os_image}")
+if manifest.get("bundle_seq") != preseal.get("bundle_seq"):
+    raise SystemExit(
+        f"seed bundle_seq {manifest.get('bundle_seq')!r} is not the preseal"
+        f" bundle_seq {preseal.get('bundle_seq')!r}"
+    )
+if manifest.get("hardware_target") != preseal.get("hardware_target"):
+    raise SystemExit("seed and preseal disagree about the hardware target")
+if manifest.get("hardware_target") != hardware_target:
+    raise SystemExit(
+        f"seed hardware target {manifest.get('hardware_target')!r} is not this"
+        f" build's {hardware_target!r}"
+    )
+SEED_PRESEAL_PY
+    echo "    offline seed reconciled: bundle_seq/hardware target/appliance root all equal the signed preseal selection"
+  fi
+
+  # A mirror that declares a different release than the seed carries is two
+  # releases on one stick. The sealed grammar states the same rule. Only a medium
+  # that actually seals a mirror seals these two hashes, so only that medium is
+  # held to the agreement.
+  if [[ -n "$INSTALL_MIRROR" && -n "$MIRROR_READY_SHA256" ]]; then
+    [[ "$MIRROR_READY_SHA256" == "$SEED_CLOSURE" ]] \
+      || { echo "ERROR: MIRROR_READY_SHA256 declares release closure ${MIRROR_READY_SHA256} and the seed on this medium is ${SEED_CLOSURE}" >&2; exit 1; }
+    [[ "$MIRROR_READY_MANIFEST_SHA256" == "$seed_manifest_sha256" ]] \
+      || { echo "ERROR: MIRROR_READY_MANIFEST_SHA256 does not equal the sealed seed release-manifest hash" >&2; exit 1; }
+  fi
+
+  UKI_KARGS+=("neuralice.seed_closure=${SEED_CLOSURE}" \
+    "neuralice.seed_manifest=${seed_manifest_sha256}" \
+    "neuralice.seed_trusted_now=${SEED_TRUSTED_NOW}")
+}
 # --------------------------------------------------------------------------- #
 # THE SEALED BOOT PATH. All of these are explicit: a default here would be a
 # silent decision about what a medium is allowed to install.
@@ -701,16 +824,7 @@ case "$MEDIA_MODE" in
           || { echo "ERROR: RELEASE_AUTHORIZATION_FILE/RELEASE_AUTHORIZATION_SIGNATURE_FILE require INSTALL_SOURCE=registry" >&2; exit 1; }
         [[ -z "$MIRROR_CA_FILE" && -z "$MIRROR_READY_SHA256" ]] \
           || { echo "ERROR: MIRROR_CA_FILE/MIRROR_READY_SHA256 require INSTALL_SOURCE=registry and INSTALL_MIRROR" >&2; exit 1; }
-        if [[ -n "$SEED_CLOSURE" ]]; then
-          [[ "$SEED_CLOSURE" =~ ^[0-9a-f]{64}$ \
-             && "$SEED_TRUSTED_NOW" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ \
-             && -f "$RELEASE_MANIFEST_FILE" && ! -L "$RELEASE_MANIFEST_FILE" ]] \
-            || { echo "ERROR: a preloaded medium requires a closure hash and regular release manifest" >&2; exit 1; }
-          _seed_manifest_sha256="$(sha256_of "$RELEASE_MANIFEST_FILE")"
-          UKI_KARGS+=("neuralice.seed_closure=${SEED_CLOSURE}" \
-            "neuralice.seed_manifest=${_seed_manifest_sha256}" \
-            "neuralice.seed_trusted_now=${SEED_TRUSTED_NOW}")
-        fi
+        seal_offline_seed_kargs medium
         ;;
       registry)
         # Every one of these is refused by the SAME grammar the medium enforces
@@ -797,6 +911,9 @@ case "$MEDIA_MODE" in
                       "neuralice.mirror_manifest=${MIRROR_READY_MANIFEST_SHA256}" \
                       "neuralice.mirror_generation=${MIRROR_CACHE_GENERATION}")
         fi
+        # After the mirror: the seed/mirror release-closure agreement is checked
+        # against the values this arm has just established.
+        seal_offline_seed_kargs registry
         assert_registry_install_authorised "$OS_IMAGE"
         ;;
       *)
@@ -822,6 +939,11 @@ case "$MEDIA_MODE" in
       "systemd.unit=neural-ice-live.target" "neuralice.live=1")
     [[ "$INSTALL_SOURCE" == medium && -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
       || { echo "ERROR: a Live medium installs nothing; INSTALL_SOURCE/OS_IMAGE/INSTALL_MIRROR are meaningless on one" >&2; exit 1; }
+    # A Live medium stages nothing either. Refusing here rather than silently
+    # dropping the tuple is what stops an operator receiving a Live stick that
+    # LOOKS preloaded; the sealed grammar refuses a seed argument on a Live line.
+    [[ -z "$SEED_CLOSURE" && -z "$SEED_TRUSTED_NOW" && -z "$RELEASE_MANIFEST_FILE" ]] \
+      || { echo "ERROR: a Live medium installs nothing; an offline seed closure is meaningless on one" >&2; exit 1; }
     ;;
 esac
 echo "==> build the ${MEDIA_MODE} UKI"
