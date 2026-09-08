@@ -546,18 +546,28 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
   else
     [[ -z "${optional_seen[neuralice.osimage]:-}" ]] \
       || { _ni_sealed_refuse osimage-without-registry-source; return 1; }
-    [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" ]] \
-      || { _ni_sealed_refuse release-authorization-without-registry-source; return 1; }
-    [[ -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
-      || { _ni_sealed_refuse release-authorization-without-registry-source; return 1; }
+    if [[ -n "${optional_seen[neuralice.preseal]:-}" ]]; then
+      [[ -n "${optional_seen[neuralice.relauth_sha256]:-}" \
+         && -n "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+        || { _ni_sealed_refuse preseal-without-release-authorization; return 1; }
+      [[ "$(ni_sealed_argument_value neuralice.relauth_sha256 "${words[@]}")" \
+         != "$(ni_sealed_argument_value neuralice.relauth_sig_sha256 "${words[@]}")" ]] \
+        || { _ni_sealed_refuse release-authorization-hashes-identical; return 1; }
+    else
+      [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" \
+         && -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+        || { _ni_sealed_refuse release-authorization-without-preseal; return 1; }
+    fi
   fi
 
-  # A pre-seal set is an install-time byte-closure for the LAB LIGHT registry
-  # path. It is never a customer or Live-media capability, and without the
-  # registry authorization pair its references would have no signed authority.
+  # A pre-seal set authenticates the selected appliance before disk mutation.
+  # Registry media pull that appliance; offline media carry the exact same host
+  # image in the UKI-bound dm-verity store. Both transports require the same
+  # release-authorization pair, and both remain LAB-only.
   if [[ -n "${optional_seen[neuralice.preseal]:-}" ]]; then
-    (( registry_source == 1 )) \
-      || { _ni_sealed_refuse preseal-without-registry-source; return 1; }
+    [[ -n "${optional_seen[neuralice.relauth_sha256]:-}" \
+       && -n "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+      || { _ni_sealed_refuse preseal-without-release-authorization; return 1; }
     [[ "$(ni_sealed_argument_value neuralice.access_profile "${words[@]}")" == lab-managed ]] \
       || { _ni_sealed_refuse preseal-not-permitted-outside-lab-managed; return 1; }
   fi
@@ -626,9 +636,9 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
   # the UKI-bound document that names `train`, `bundle_seq`, `hardware_target`
   # and `target_os_ref` -- exactly the fields ota/neural-ice-autoinstall.sh
   # reconciles against the seed's own signed release closure BEFORE the target
-  # disk is touched. `neuralice.preseal` in turn already forces a registry source
-  # and a `lab-managed` profile, so this composition is LAB-only and owner-sealed
-  # by construction, and a customer medium cannot express it at all.
+  # disk is touched. `neuralice.preseal` in turn forces the release-authorization
+  # pair and a `lab-managed` profile, so this composition is LAB-only and
+  # owner-sealed by construction, and a customer medium cannot express it.
   #
   # WITHOUT the preseal set there is nothing on the line to reconcile the two
   # against, which is the original finding again -- so that stays refused.

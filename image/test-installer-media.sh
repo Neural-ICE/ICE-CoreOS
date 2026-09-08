@@ -263,6 +263,7 @@ compose_reconcile() { # $1=root [ENV=VALUE …] -> 0 when the installer would pr
     SEED_MANIFEST_SHA256="$manifest"
     PRESEAL_SET_SHA256="$preseal"
     OS_IMAGE="$COMPOSE_OS_IMAGE"
+    AUTH_TARGET_REF="$COMPOSE_OS_IMAGE"
     SEALED_HARDWARE_TARGET=nvidia-gb10-arm64
     SEALED_TRUST_POLICY_ID=neural-ice-secureboot-lab-v1
     DEVICE_CHANNEL=lab
@@ -308,7 +309,7 @@ compose_case refuse "a preseal set for another ring than the sealed channel" pre
 compose_case refuse "a preseal set naming another appliance" \
   preseal "{\"target_os_ref\":\"$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)\"}"
 compose_case refuse "an appliance root that is not the one being installed" none '{}' \
-  "OS_IMAGE=$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)"
+  "AUTH_TARGET_REF=$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)"
 compose_case refuse "a mirror declaring a different release than the seed" none '{}' \
   "INSTALL_MIRROR=bench.example.test:5000" \
   "MIRROR_READY_SHA256=$(printf '%064d' 9)"
@@ -364,6 +365,7 @@ compose_seal() { # $1=source $2=root [ENV=VALUE …] -> 0 when the medium would 
     RELEASE_MANIFEST_FILE="$root/seed/release-manifest.json"
     PRESEAL_STAGE_ROOT="$root"
     OS_IMAGE="$COMPOSE_OS_IMAGE"
+    TARGET_IMGREF="$COMPOSE_OS_IMAGE"
     HARDWARE_TARGET=nvidia-gb10-arm64
     INSTALL_MIRROR=""
     MIRROR_READY_SHA256=""
@@ -413,7 +415,9 @@ compose_fixture "$compose_mismatch_root" manifest '{"bundle_seq":14}' \
 compose_seal registry "$compose_mismatch_root" \
   && fail "the producer cut a registry medium whose seed and preseal set are different releases"
 compose_seal medium "$compose_mismatch_root" \
-  || fail "a pure medium install must keep sealing its own seed without a preseal set"
+  && fail "the producer cut an offline medium whose seed and preseal set are different releases"
+compose_seal medium "$compose_mismatch_root" 'PRESEAL_STAGE_ROOT=""' \
+  || fail "a legacy medium install must keep sealing its own seed without a preseal set"
 
 echo "  composed medium: producer and installer both reconcile the seed with the preseal release"
 
@@ -1018,6 +1022,26 @@ inspect >"$TMP/inspect-preseal.out" \
 grep -q "neuralice.preseal=${preseal_sha}" "$TMP/inspect-preseal.out" \
   || fail "the inspector did not surface the UKI-bound preseal set"
 
+# The disconnected Install medium carries the same authenticated original host
+# under its canonical digest in neuralice.imgref.  It has no registry source,
+# OS image transport or mirror; the mutable ESP authorization remains pinned by
+# this distinct signed UKI and binds the store's host index/child pair.
+offline_preseal_kargs="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=medium neuralice.imgref=release.example.test/neural-ice/neural-ice-appliance@${registry_digest} ${registry_relauth} neuralice.preseal=${preseal_sha}"
+build_uki installer-preseal-offline "$offline_preseal_kargs" >/dev/null \
+  || fail "the fully offline preseal UKI failed to build"
+make_preseal_esp installer-preseal-offline
+assemble "$ESP" "$SEALED/payload.img"
+inspect >"$TMP/inspect-preseal-offline.out" \
+  || { cat "$TMP/inspect-preseal-offline.out"; fail "the complete offline original-host preseal medium was refused"; }
+grep -q "neuralice.imgref=release.example.test/neural-ice/neural-ice-appliance@${registry_digest}" \
+  "$TMP/inspect-preseal-offline.out" \
+  || fail "the offline inspector did not retain the canonical original-host reference"
+grep -q 'neuralice.source=medium' "$TMP/inspect-preseal-offline.out" \
+  || fail "the offline UKI does not explicitly seal its medium transport"
+if grep -qE 'neuralice\.(osimage|mirror)=' "$TMP/inspect-preseal-offline.out"; then
+  fail "the offline medium inspection invented a network transport"
+fi
+
 for name in "${preseal_names[@]}"; do
   make_preseal_esp installer-preseal "$name"
   assemble "$ESP" "$SEALED/payload.img"
@@ -1316,6 +1340,8 @@ grep -Fq 'zero_partition "$ESPPART"' "$USB" \
   || fail "the media producer does not overwrite the ESP before remaking it; deleted files leave their bytes"
 grep -Fq 'MEDIA_MODE' "$USB" \
   || fail "the media producer does not build a single-purpose medium"
+grep -Fq 'UKI_KARGS+=("neuralice.source=medium")' "$USB" \
+  || fail "the offline producer relies on an implicit source default instead of sealing its transport"
 grep -Fq 'systemd.unit=neural-ice-installer.target' "$USB" \
   || fail "the media producer does not seal the dedicated fail-closed installer target"
 grep -Fq 'systemd.unit=neural-ice-live.target' "$USB" \

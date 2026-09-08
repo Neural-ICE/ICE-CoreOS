@@ -47,6 +47,8 @@ make_rootfs
 # is what the builder resolves once and uses everywhere; the mock answers with
 # whatever $MOCK_IMAGE_ID says, so a test can make the tag "move".
 IMAGE_ID="$(printf 'installer-image' | sha256sum | awk '{print $1}')"
+HOST_IMAGE_ID="$(printf 'original-host-image' | sha256sum | awk '{print $1}')"
+HOST_MANIFEST="sha256:$(printf 'original-host-manifest' | sha256sum | awk '{print $1}')"
 OTHER_IMAGE_ID="$(printf 'someone-elses-image' | sha256sum | awk '{print $1}')"
 cat > "$TOOLS/podman" <<EOF
 #!/usr/bin/env bash
@@ -54,9 +56,20 @@ printf '%s\n' "\$*" >> "\${MOCK_STATE:-$TMP}/podman.args"
 case "\$1 \$2 \$3" in
   "image inspect --format")
     ref="\${*: -1}"
-    case "\$ref" in
-      localhost/*) printf 'sha256:%s\n' "\${MOCK_NAMED_IMAGE_ID:-$IMAGE_ID}" ;;
-      *) printf 'sha256:%s\n' "\${MOCK_IMAGE_ID:-$IMAGE_ID}" ;;
+    format="\$4"
+    if [[ "\$format" == *Digest* ]]; then
+      printf '%s\n' "\${MOCK_NAMED_MANIFEST:-$HOST_MANIFEST}"
+    else
+      case "\$ref" in
+        localhost/ice-coreos-host:*) printf 'sha256:%s\n' "\${MOCK_NAMED_IMAGE_ID:-$HOST_IMAGE_ID}" ;;
+        sha256:$HOST_IMAGE_ID) printf 'sha256:%s\n' "\${MOCK_STORE_RESOLVED_ID:-$HOST_IMAGE_ID}" ;;
+        *) printf 'sha256:%s\n' "\${MOCK_IMAGE_ID:-$IMAGE_ID}" ;;
+      esac
+    fi ;;
+  "--root "*)
+    case "\$*" in
+      *"image inspect --format {{.Digest}}"*) printf '%s\n' "\${MOCK_STORE_MANIFEST:-$HOST_MANIFEST}" ;;
+      *) exit 2 ;;
     esac ;;
   *)
     case "\$1 \$2" in
@@ -83,7 +96,7 @@ printf '%s
 ' "$*" >> "$MOCK_STATE/skopeo.args"
 src=""
 for arg in "$@"; do
-  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_IMAGE_ID}" ;; esac
+  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}" ;; esac
 done
 dest="${*: -1}"
 name="${dest##*]}"
@@ -102,9 +115,12 @@ export NI_INSTALLER_ROOT_TESTING=1 NI_INSTALLER_ROOT_TEST_TOOLS="$TOOLS"
 build() { # $1=output dir, rest=env overrides
   local out=$1; shift
   mkdir -p "$out"
-  env MOCK_STATE="$out" EXPECTED_IMAGE_ID="$IMAGE_ID" \
+  env MOCK_STATE="$out" EXPECTED_IMAGE_ID="$IMAGE_ID" EXPECTED_STORE_IMAGE_ID="$HOST_IMAGE_ID" \
     INSTALLER_IMG="sha256:$IMAGE_ID" \
+    STORE_IMG="sha256:$HOST_IMAGE_ID" \
     INSTALLER_STORAGE_NAME="localhost/ice-coreos-installer:local" \
+    STORE_STORAGE_NAME="localhost/ice-coreos-host:local" \
+    STORE_MANIFEST_DIGEST="$HOST_MANIFEST" \
     ROOT_IMAGE_OUT="$out/installer-root.img" \
     STORE_IMAGE_OUT="$out/installer-store.img" \
     "$@" bash "$BUILD"
@@ -163,10 +179,10 @@ make_rootfs
 # --------------------------------------------------------------------------- #
 build "$TMP/store-test" >/dev/null || fail "the store build failed"
 [ -s "$TMP/store-test/installer-store.img" ] || fail "the medium image store image was not produced"
-grep -Fq 'containers-storage:localhost/ice-coreos-installer:local' \
+grep -Fq -- '--preserve-digests containers-storage:localhost/ice-coreos-host:local' \
   "$TMP/store-test/skopeo.args" \
-  || fail "the store is not staged from the skopeo-compatible stable local name"
-grep -Fq "image inspect --format {{.Id}} localhost/ice-coreos-installer:local" \
+  || fail "the store is not staged from the original host's stable local name with digest preservation"
+grep -Fq "image inspect --format {{.Id}} localhost/ice-coreos-host:local" \
   "$TMP/store-test/podman.args" \
   || fail "the stable transport name is not resolved immediately before staging"
 grep -Fq 'overlay@' "$TMP/store-test/skopeo.args" \
@@ -226,7 +242,7 @@ cat > "$TOOLS/skopeo" <<'EOF'
 #!/usr/bin/env bash
 src=""
 for arg in "$@"; do
-  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_IMAGE_ID}" ;; esac
+  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}" ;; esac
 done
 dest="${*: -1}"
 name="${dest##*]}"
@@ -242,6 +258,7 @@ chmod +x "$TOOLS/skopeo"
 for mutable in localhost/ice-coreos-installer:local localhost/bootc \
   'registry.example.test/x@sha256:not-a-digest' sha256:deadbeef; do
   out="$(env MOCK_STATE="$TMP/mutable" INSTALLER_IMG="$mutable" \
+    STORE_IMG="sha256:$HOST_IMAGE_ID" STORE_MANIFEST_DIGEST="$HOST_MANIFEST" \
     ROOT_IMAGE_OUT="$TMP/mutable/root.img" STORE_IMAGE_OUT="$TMP/mutable/store.img" \
     bash "$BUILD" 2>&1)" && fail "the mutable reference '$mutable' was sealed"
   grep -Fq 'must be an immutable local image ID' <<<"$out" \
@@ -261,18 +278,35 @@ rm -rf "$TMP/moved"
 # immutable identity contract. A moved name must be refused before skopeo runs.
 out="$(build "$TMP/named-moved" MOCK_NAMED_IMAGE_ID="$OTHER_IMAGE_ID" 2>&1)" \
   && fail "a stable transport name resolving to another image was accepted"
-grep -Fq "resolves to '$OTHER_IMAGE_ID', not immutable image $IMAGE_ID" <<<"$out" \
+grep -Fq "resolves to '$OTHER_IMAGE_ID', not immutable image $HOST_IMAGE_ID" <<<"$out" \
   || fail "a moved transport name was refused for the wrong reason: $out"
 [ ! -s "$TMP/named-moved/skopeo.args" ] \
   || fail "skopeo ran before the transport name's immutable identity was proved"
 rm -rf "$TMP/named-moved"
 
-# THE SEALED ROOT AND THE STAGED STORE MUST BE THE SAME IMAGE. This is the defect
-# itself: a store holding a different image is what a raced build produces, and
-# nothing downstream can see it because both halves hash and sign correctly.
+# The config ID does not authenticate an OCI manifest: the same config can be
+# wrapped by another platform manifest. Refuse a moved source child before copy,
+# then independently refuse a destination store whose readback child changed.
+OTHER_MANIFEST="sha256:$(printf 'someone-elses-manifest' | sha256sum | awk '{print $1}')"
+out="$(build "$TMP/named-manifest-moved" MOCK_NAMED_MANIFEST="$OTHER_MANIFEST" 2>&1)" \
+  && fail "a host transport name resolving to another platform manifest was accepted"
+grep -Fq "not $HOST_MANIFEST" <<<"$out" \
+  || fail "a moved source manifest was refused for the wrong reason: $out"
+[ ! -s "$TMP/named-manifest-moved/skopeo.args" ] \
+  || fail "skopeo ran before the source platform manifest was proved"
+rm -rf "$TMP/named-manifest-moved"
+
+out="$(build "$TMP/store-manifest-moved" MOCK_STORE_MANIFEST="$OTHER_MANIFEST" 2>&1)" \
+  && fail "a destination store that rewrote the platform manifest was accepted"
+grep -Fq "staged store manifest $OTHER_MANIFEST differs" <<<"$out" \
+  || fail "a rewritten destination manifest was refused for the wrong reason: $out"
+rm -rf "$TMP/store-manifest-moved"
+
+# The store must contain exactly the selected original host image. A different
+# ID is a different install target even when the live installer root is valid.
 out="$(build "$TMP/split" MOCK_STORE_IMAGE_ID="$OTHER_IMAGE_ID" 2>&1)" \
   && fail "a medium whose sealed root and staged store are different images was produced"
-grep -Fq 'the medium would install a different image than the one it boots' <<<"$out" \
+grep -Fq 'the staged image store holds image' <<<"$out" \
   || fail "a split root/store build was refused for the wrong reason: $out"
 rm -rf "$TMP/split"
 
@@ -285,7 +319,7 @@ name="\${dest##*]}"
 store="\${dest#*overlay@}"; store="\${store%%+*}"
 mkdir -p "\$store/overlay-images" "\$store/overlay-layers" "\$store/overlay"
 printf '[{"id":"%s","names":["%s:latest"]},{"id":"%s","names":["%s:other"]}]\n' \
-  "$IMAGE_ID" "\$name" "$OTHER_IMAGE_ID" "\$name" > "\$store/overlay-images/images.json"
+  "$HOST_IMAGE_ID" "\$name" "$OTHER_IMAGE_ID" "\$name" > "\$store/overlay-images/images.json"
 printf 'staged\n' > "\$store/overlay-layers/layers.json"
 EOF
 chmod +x "$TOOLS/skopeo"
@@ -333,7 +367,7 @@ cat > "$TOOLS/skopeo" <<'EOF'
 #!/usr/bin/env bash
 src=""
 for arg in "$@"; do
-  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_IMAGE_ID}" ;; esac
+  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}" ;; esac
 done
 dest="${*: -1}"
 name="${dest##*]}"
@@ -346,12 +380,14 @@ EOF
 chmod +x "$TOOLS/skopeo"
 build "$TMP/identity" >/dev/null || fail "the honest build failed after the identity mutations"
 manifest="$TMP/identity/installer-root.img.manifest"
-grep -qx "schema=neural-ice-installer-root-manifest-v3" "$manifest" \
+grep -qx "schema=neural-ice-installer-root-manifest-v4" "$manifest" \
   || fail "the manifest schema did not move with the identity contract"
 grep -qx "installer_image_id=$IMAGE_ID" "$manifest" \
   || fail "the manifest does not record the immutable image the root was sealed from"
-grep -qx "store_image_id=$IMAGE_ID" "$manifest" \
+grep -qx "store_image_id=$HOST_IMAGE_ID" "$manifest" \
   || fail "the manifest does not record the immutable image the store holds"
+grep -qx "store_image_manifest_digest=$HOST_MANIFEST" "$manifest" \
+  || fail "the manifest does not record the original host platform manifest"
 grep -q '^installer_root_marker_sha256=[0-9a-f]\{64\}$' "$manifest" \
   || fail "the manifest does not record the sealed root's immutable markers"
 grep -Fq 'installer_image=' "$manifest" \
@@ -393,6 +429,14 @@ grep -Fq 'INSTALLER_IMG="$INSTALLER_IMAGE_REF"' "$USB" \
   || fail "the sealed root builder is not handed the immutable image identity"
 grep -Fq 'INSTALLER_STORAGE_NAME="$INSTALLER_STORAGE_NAME"' "$USB" \
   || fail "the skopeo-compatible name is not passed through the privileged root-builder environment"
+grep -Fq 'STORE_IMG="$BASE_IMAGE_REF"' "$USB" \
+  || fail "the sealed store builder is not handed the immutable original host identity"
+grep -Fq 'BASE_IMAGE_ID="${_base_image_id_raw#sha256:}"' "$USB" \
+  || fail "the media producer does not normalize Podman's prefixed or bare config identity"
+grep -Fq 'BASE_IMAGE_REF="sha256:${BASE_IMAGE_ID}"' "$USB" \
+  || fail "the media producer does not reconstruct one unambiguous immutable host reference"
+grep -Fq 'STORE_MANIFEST_DIGEST="$BASE_MANIFEST_DIGEST"' "$USB" \
+  || fail "the sealed store builder is not handed the observed original host child digest"
 grep -Fq 'assert_installer_tag_unmoved' "$USB" \
   || fail "the media producer does not refuse a tag that moved mid-build"
 grep -Fq '[[ "$storage_now" == "$INSTALLER_IMAGE_ID" ]]' "$USB" \
@@ -413,10 +457,12 @@ for immutable_step in \
   grep -Fq -e "$immutable_step" "$USB" \
     || fail "a build step does not use its identity-checked image handle: $immutable_step"
 done
-# ...and the two halves the sealed-root builder produced must be read back and
-# required to be the same image, rather than assumed to be.
-grep -Fq '[[ "$sealed_store_image_id" == "$INSTALLER_IMAGE_ID" ]]' "$USB" \
-  || fail "the media producer does not compare the staged store's image with the sealed root's"
+# ...and the two deliberately different halves must each be checked against the
+# immutable identity selected for it.
+grep -Fq '[[ "$sealed_store_image_id" == "$BASE_IMAGE_ID" ]]' "$USB" \
+  || fail "the media producer does not compare the staged store with the original host"
+grep -Fq '[[ "$sealed_store_manifest_digest" == "$BASE_MANIFEST_DIGEST" ]]' "$USB" \
+  || fail "the media producer does not compare the staged store child digest with the original host"
 
 # Pinned BIB rejects filesystem customization for raw builds. The selected
 # config therefore makes no sizing claim; the producer's measured fit refusal
@@ -557,7 +603,7 @@ fi
 exists_line="$(line_of 'podman --cgroup-manager=cgroupfs --events-backend=file image exists "$STORE_IMAGE_NAME"')"
 [ -n "$exists_line" ] \
   || fail "the installer never asks podman to resolve the image in the verified store"
-create_line="$(line_of 'create --network=none --name "$_medium_probe" --entrypoint /usr/bin/true')"
+create_line="$(line_of 'create --pull=never --network=none --name "$_medium_probe" --entrypoint /usr/bin/true')"
 [ -n "$create_line" ] \
   || fail "the installer never creates its sealed-store no-exec preflight container"
 mount_line="$(line_of 'mount "$_medium_probe"')"

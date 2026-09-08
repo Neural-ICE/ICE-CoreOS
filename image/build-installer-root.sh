@@ -37,20 +37,23 @@ set -euo pipefail
 die() { echo "build-installer-root: ERROR: $*" >&2; exit 1; }
 
 # THE IMAGE, AS AN IMMUTABLE ID (review 2026-09-01, P1 #1). This used to take a
-# local TAG. A tag is a mutable pointer: this script resolved it once for the
-# root filesystem and again, later, for the sealed store, and a concurrent build
-# or a `podman tag` between the two produced root A plus store B. Both extents
-# hash correctly and both are covered by the signature, so nothing downstream
-# could see it -- yet bootc installs B while every medium-path check assumes A.
+# local TAG. A tag is a mutable pointer, so resolving either the derived live
+# installer or the original host through a shared name can silently select new
+# bytes during a build. Both extents would still hash correctly and be covered
+# by the eventual signature, but their recorded release identity would be false.
 #
-# The caller therefore supplies the IMAGE ID (the config digest), which cannot be
-# repointed. The root is mounted by that ID; the skopeo-compatible local name is
-# separately re-bound to that same ID immediately before store staging.
+# The caller therefore supplies both immutable IMAGE IDs. The root is mounted by
+# its derived-installer ID; the skopeo-compatible local host name is independently
+# checked against the original-host ID and platform manifest immediately before
+# store staging.
 INSTALLER_IMG="${INSTALLER_IMG:-}"       # the image whose rootfs becomes the sealed root
+STORE_IMG="${STORE_IMG:-}"               # the original host image staged for installation
 ROOT_IMAGE_OUT="${ROOT_IMAGE_OUT:-}"     # where the root squashfs is written
 STORE_IMAGE_OUT="${STORE_IMAGE_OUT:-}"   # where the store squashfs is written
 STORE_IMAGE_NAME="${STORE_IMAGE_NAME:-localhost/bootc}"
 INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-localhost/ice-coreos-installer:local}"
+STORE_STORAGE_NAME="${STORE_STORAGE_NAME:-localhost/ice-coreos-host:local}"
+STORE_MANIFEST_DIGEST="${STORE_MANIFEST_DIGEST:-}"
 MANIFEST_OUT="${MANIFEST_OUT:-${ROOT_IMAGE_OUT}.manifest}"
 
 # Tool overrides exist so the suite can drive every branch without podman, a
@@ -72,13 +75,15 @@ tool() { # $1=name
   command -v -- "$1"
 }
 
-for required in INSTALLER_IMG ROOT_IMAGE_OUT STORE_IMAGE_OUT; do
+for required in INSTALLER_IMG STORE_IMG ROOT_IMAGE_OUT STORE_IMAGE_OUT STORE_MANIFEST_DIGEST; do
   [[ -n "${!required}" ]] || die "$required is required"
 done
 [[ "$STORE_IMAGE_NAME" =~ ^[a-z0-9]([a-z0-9._/-]{0,126}[a-z0-9])?$ ]] \
   || die "STORE_IMAGE_NAME is not a plain local image name: $STORE_IMAGE_NAME"
 [[ "$INSTALLER_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
   || die "INSTALLER_STORAGE_NAME is not a tagged localhost image name: $INSTALLER_STORAGE_NAME"
+[[ "$STORE_STORAGE_NAME" =~ ^localhost/[a-z0-9]+([._/-][a-z0-9]+)*:[a-z0-9]+([._-][a-z0-9]+)*$ ]] \
+  || die "STORE_STORAGE_NAME is not a tagged localhost image name: $STORE_STORAGE_NAME"
 
 # A MUTABLE REFERENCE IS REFUSED OUTRIGHT, not silently resolved. Resolving a tag
 # here would reintroduce exactly the split this script exists to prevent: the
@@ -87,6 +92,12 @@ done
   || die "INSTALLER_IMG must be an immutable local image ID (sha256:<64 hex>), not the mutable reference '$INSTALLER_IMG'; a tag can be repointed between the root and the store and the medium would carry two different images"
 INSTALLER_IMAGE_ID="${INSTALLER_IMG#sha256:}"
 readonly INSTALLER_IMAGE_ID
+[[ "$STORE_IMG" =~ ^(sha256:)?[0-9a-f]{64}$ ]] \
+  || die "STORE_IMG must be an immutable local image ID (sha256:<64 hex>), not the mutable reference '$STORE_IMG'"
+EXPECTED_STORE_IMAGE_ID="${STORE_IMG#sha256:}"
+[[ "$STORE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || die "STORE_MANIFEST_DIGEST must be the observed immutable platform manifest digest"
+readonly EXPECTED_STORE_IMAGE_ID STORE_MANIFEST_DIGEST
 
 PODMAN_BIN="$(tool podman)"
 MOUNTPOINT_BIN="$(tool mountpoint)"
@@ -99,6 +110,11 @@ RESOLVED_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "sha256:$INSTAL
   || die "cannot resolve the installer image ID $INSTALLER_IMAGE_ID in local storage"
 [[ "$RESOLVED_IMAGE_ID" == "$INSTALLER_IMAGE_ID" ]] \
   || die "local storage resolves $INSTALLER_IMAGE_ID to '$RESOLVED_IMAGE_ID'; refusing to seal an image that is not the one this build was given"
+RESOLVED_STORE_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "sha256:$EXPECTED_STORE_IMAGE_ID" 2>/dev/null \
+  | tr -d '[:space:]' | sed 's/^sha256://')" \
+  || die "cannot resolve the store image ID $EXPECTED_STORE_IMAGE_ID in local storage"
+[[ "$RESOLVED_STORE_IMAGE_ID" == "$EXPECTED_STORE_IMAGE_ID" ]] \
+  || die "local storage resolves store image $EXPECTED_STORE_IMAGE_ID to '${RESOLVED_STORE_IMAGE_ID:-nothing}'"
 
 # The exact mksquashfs invocation both images are built with. Every source of
 # build-host state is pinned: timestamps to the epoch, ownership to root, and no
@@ -194,17 +210,23 @@ STORE_TREE="$WORK/store"
 mkdir -p -- "$STORE_TREE" "$WORK/runroot"
 # skopeo 1.13.3 cannot parse a containers-storage source addressed directly by
 # config digest. Use the stable local name only as its transport handle, after
-# independently proving that the name still resolves to the immutable ID from
-# which the sealed root was built.
-NAMED_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "$INSTALLER_STORAGE_NAME" 2>/dev/null \
+# independently proving that the name still resolves to the immutable original
+# host selected for the install store.
+NAMED_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "$STORE_STORAGE_NAME" 2>/dev/null \
   | tr -d '[:space:]' | sed 's/^sha256://')" \
-  || die "cannot resolve the installer storage name $INSTALLER_STORAGE_NAME"
-[[ "$NAMED_IMAGE_ID" == "$INSTALLER_IMAGE_ID" ]] \
-  || die "installer storage name $INSTALLER_STORAGE_NAME resolves to '${NAMED_IMAGE_ID:-nothing}', not immutable image $INSTALLER_IMAGE_ID"
+  || die "cannot resolve the host storage name $STORE_STORAGE_NAME"
+[[ "$NAMED_IMAGE_ID" == "$EXPECTED_STORE_IMAGE_ID" ]] \
+  || die "host storage name $STORE_STORAGE_NAME resolves to '${NAMED_IMAGE_ID:-nothing}', not immutable image $EXPECTED_STORE_IMAGE_ID"
+NAMED_MANIFEST_DIGEST="$(podman_run image inspect --format '{{.Digest}}' "$STORE_STORAGE_NAME" 2>/dev/null \
+  | tr -d '[:space:]')" \
+  || die "cannot resolve the host storage manifest digest for $STORE_STORAGE_NAME"
+[[ "$NAMED_MANIFEST_DIGEST" == "$STORE_MANIFEST_DIGEST" ]] \
+  || die "host storage name $STORE_STORAGE_NAME resolves to manifest '${NAMED_MANIFEST_DIGEST:-nothing}', not $STORE_MANIFEST_DIGEST"
 "$(tool skopeo)" copy \
-  "containers-storage:${INSTALLER_STORAGE_NAME}" \
+  --preserve-digests \
+  "containers-storage:${STORE_STORAGE_NAME}" \
   "containers-storage:[overlay@${STORE_TREE}+${WORK}/runroot]${STORE_IMAGE_NAME}" \
-  || die "cannot stage the installer image into the medium image store"
+  || die "cannot stage the original host image into the medium image store"
 # A store the installer cannot read is a medium that cannot install. Assert the
 # produced LAYOUT rather than the command's exit status: podman consumes this as
 # a read-only additional image store and needs all three overlay directories.
@@ -220,16 +242,13 @@ grep -Fq "\"$STORE_IMAGE_NAME:" "$STORE_TREE/overlay-images/images.json" 2>/dev/
   || die "the staged image store does not name ${STORE_IMAGE_NAME}"
 
 # --------------------------------------------------------------------------- #
-# 🔴 THE SEALED ROOT AND THE STAGED STORE MUST BE THE SAME IMAGE (review
-# 2026-09-01, P1 #1). The whole finding is that these two extents are produced by
-# two separate resolutions, and that a build which produced root A plus store B
-# would be validly hashed and validly signed -- bootc would install B while every
-# medium-path check assumed A.
-#
-# Naming the image ID in both places is necessary and not sufficient: assert the
-# OUTCOME. containers-storage records each image under its own immutable ID (the
-# config digest), so the store's record must carry exactly the ID this script
-# mounted and sealed, and it must carry exactly one image.
+# 🔴 THE STORE MUST HOLD THE EXACT ORIGINAL HOST. The live installer root is a
+# derived image, while preseal/current_os_ref authorize BASE_IMAGE. Staging the
+# derived installer here would produce a verity-valid medium whose local source
+# can never satisfy that authorization. containers-storage records config IDs,
+# but that alone is insufficient because a different manifest can reuse the
+# same config. Require one image with the selected host config ID, then ask the
+# destination store itself for its preserved platform-manifest digest.
 # --------------------------------------------------------------------------- #
 STORE_IMAGE_ID="$("$(tool python3)" -c '
 import json, sys
@@ -244,8 +263,14 @@ print(ids[0])
   || die "the staged image store records no single immutable image ID"
 [[ "$STORE_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] \
   || die "the staged image store records '$STORE_IMAGE_ID', which is not an immutable image ID"
-[[ "$STORE_IMAGE_ID" == "$INSTALLER_IMAGE_ID" ]] \
-  || die "the staged image store holds image $STORE_IMAGE_ID but the sealed installer root was built from $INSTALLER_IMAGE_ID; the medium would install a different image than the one it boots"
+[[ "$STORE_IMAGE_ID" == "$EXPECTED_STORE_IMAGE_ID" ]] \
+  || die "the staged image store holds image $STORE_IMAGE_ID but the build selected $EXPECTED_STORE_IMAGE_ID"
+STORE_IMAGE_MANIFEST_DIGEST="$(podman_run --root "$STORE_TREE" --runroot "$WORK/runroot" \
+  --storage-driver overlay image inspect --format '{{.Digest}}' "$STORE_IMAGE_NAME" 2>/dev/null \
+  | tr -d '[:space:]')" \
+  || die "the staged image store cannot read back the host platform manifest digest"
+[[ "$STORE_IMAGE_MANIFEST_DIGEST" == "$STORE_MANIFEST_DIGEST" ]] \
+  || die "the staged store manifest $STORE_IMAGE_MANIFEST_DIGEST differs from selected host $STORE_MANIFEST_DIGEST"
 
 echo "==> mksquashfs (image store) -> ${STORE_IMAGE_OUT}"
 squash "$STORE_TREE" "$STORE_IMAGE_OUT"
@@ -260,13 +285,14 @@ MOUNTED=""
 #    rather than as several GiB of squashfs.
 # --------------------------------------------------------------------------- #
 {
-  printf 'schema=%s\n' "neural-ice-installer-root-manifest-v3"
+  printf 'schema=%s\n' "neural-ice-installer-root-manifest-v4"
   printf 'installer_image_id=%s\n' "$INSTALLER_IMAGE_ID"
   printf 'installer_root_marker_sha256=%s\n' "$MARKER_DIGEST"
   printf 'root_image_bytes=%s\n' "$ROOT_IMAGE_BYTES"
   printf 'root_image_sha256=%s\n' "$ROOT_IMAGE_SHA256"
   printf 'store_image_bytes=%s\n' "$STORE_IMAGE_BYTES"
   printf 'store_image_id=%s\n' "$STORE_IMAGE_ID"
+  printf 'store_image_manifest_digest=%s\n' "$STORE_IMAGE_MANIFEST_DIGEST"
   printf 'store_image_name=%s\n' "$STORE_IMAGE_NAME"
   printf 'store_image_sha256=%s\n' "$STORE_IMAGE_SHA256"
 } > "$MANIFEST_OUT"

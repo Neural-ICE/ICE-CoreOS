@@ -933,7 +933,9 @@ require_medium_source_profile() { # $1=closed candidate profile token
   case "$1" in
     legacy-unmarked) return 0 ;;
     owner-sealed-ota-state-v1)
-      die "the sealed medium contains an owner-sealed appliance but carries no authenticated preseal transport; use the signed registry preseal source"
+      [[ -n "$PRESEAL_SET_SHA256" ]] \
+        || die "the sealed medium contains an owner-sealed appliance but carries no authenticated preseal transport"
+      return 0
       ;;
     *)
       die "the sealed medium appliance declares an unsupported OTA-state profile"
@@ -1032,7 +1034,7 @@ MEDIUM_IMAGE_DIGEST="$(podman --cgroup-manager=cgroupfs --events-backend=file \
 readonly MEDIUM_IMAGE_DIGEST
 _medium_probe=neural-ice-installer-store-preflight
 podman --cgroup-manager=cgroupfs --events-backend=file \
-  create --network=none --name "$_medium_probe" --entrypoint /usr/bin/true \
+  create --pull=never --network=none --name "$_medium_probe" --entrypoint /usr/bin/true \
   "$STORE_IMAGE_NAME" >/dev/null \
   || die "the verified image store cannot create a no-exec preflight container before the target wipe"
 _medium_mount="$(podman --cgroup-manager=cgroupfs --events-backend=file \
@@ -1549,8 +1551,9 @@ PRESEAL_CONFIG_PY
   sync -f "$destination_dir" || die "cannot fsync the preseal verifier configuration directory"
 }
 
-verify_preseal_candidate() { # $1=input root $2=candidate root $3=current seed $4=config $5=receipt
-  local input_root=$1 candidate_root=$2 current_seed=$3 config=$4 receipt=$5 verdict
+verify_preseal_candidate() { # $1=input $2=candidate $3=seed $4=config $5=receipt $6=os ref $7=manifest
+  local input_root=$1 candidate_root=$2 current_seed=$3 config=$4 receipt=$5
+  local current_os_ref=$6 current_manifest=$7 verdict
   verdict="$(
     "$OTA_VERIFY" verify-preseal-baseline \
       --set "$input_root/preseal-set.json" \
@@ -1564,8 +1567,8 @@ verify_preseal_candidate() { # $1=input root $2=candidate root $3=current seed $
       --sealed-set-sha256 "$PRESEAL_SET_SHA256" \
       --sealed-installer-authorization-sha256 "$RELEASE_AUTH_DOC_SHA256" \
       --sealed-installer-authorization-signature-sha256 "$RELEASE_AUTH_SIG_SHA256" \
-      --current-os-ref "$OS_IMAGE" \
-      --current-os-manifest-digest "$got_manifest" \
+      --current-os-ref "$current_os_ref" \
+      --current-os-manifest-digest "$current_manifest" \
       --current-seed-ref "$current_seed" \
       --candidate-root "$candidate_root" \
       --receipt-out "$receipt" --config "$config"
@@ -1605,12 +1608,12 @@ print(value["bundle_seq"])
 PRESEAL_VERDICT_PY
 }
 
-verify_installed_preseal_candidate() { # $1=input root $2=current seed $3=config $4=receipt
+verify_installed_preseal_candidate() { # $1=input $2=seed $3=config $4=receipt $5=os ref $6=manifest
   # bootc's target mount is an OSTree sysroot. The candidate root consumed by
   # ni-ota-verify is the resolved deployment below it, where usr/lib markers
   # actually live; passing the sysroot makes every valid install fail post-wipe.
   [[ -n "${dep:-}" && -d "$dep/usr" ]] || return 1
-  verify_preseal_candidate "$1" "$dep" "$2" "$3" "$4"
+  verify_preseal_candidate "$1" "$dep" "$2" "$3" "$4" "$5" "$6"
 }
 
 # The TPM slot is authorised by an offline policy key, never by whatever PCR 7
@@ -1768,7 +1771,9 @@ readonly PRESEAL_PREFLIGHT_CONFIG=/run/neural-ice-installer/preseal-verifier.con
 readonly PRESEAL_PREFLIGHT_RECEIPT="$PRESEAL_PREFLIGHT_STATE/preseal/receipt.json"
 PRESEAL_ACTIVE=0
 PRESEAL_BUNDLE_SEQ=""
-if [ "$INSTALL_SOURCE" = registry ]; then
+AUTH_TARGET_REF=""
+AUTH_MANIFEST_DIGEST=""
+if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
   _relauth_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
   [[ -f "$_relauth_key" && ! -L "$_relauth_key" ]] \
     || die "the verified installer root carries no release-authorization public key"
@@ -1831,9 +1836,19 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   SIGNED_IMAGE_INDEX_DIGEST="$(sed -n 's/^image_index_digest=//p' <<<"$RELEASE_AUTH")"
   SIGNED_IMAGE_MANIFEST_DIGEST="$(sed -n 's/^image_manifest_digest=//p' <<<"$RELEASE_AUTH")"
   SIGNED_REGISTRY_AUTHORITY="${SIGNED_IMAGE_REPOSITORY%%/*}"
-  [[ "$SIGNED_IMAGE_REPOSITORY" == "$INSTALL_IMAGE_REPOSITORY" \
-      && "$SIGNED_REGISTRY_AUTHORITY" == "$INSTALL_REGISTRY_AUTHORITY" ]] \
-    || die "raw registry authority '$INSTALL_REGISTRY_AUTHORITY' does not exactly equal the signed authority '$SIGNED_REGISTRY_AUTHORITY'"
+  if [ "$INSTALL_SOURCE" = registry ]; then
+    AUTH_TARGET_REF="$OS_IMAGE"
+    [[ "$SIGNED_IMAGE_REPOSITORY" == "$INSTALL_IMAGE_REPOSITORY" \
+        && "$SIGNED_REGISTRY_AUTHORITY" == "$INSTALL_REGISTRY_AUTHORITY" ]] \
+      || die "raw registry authority '$INSTALL_REGISTRY_AUTHORITY' does not exactly equal the signed authority '$SIGNED_REGISTRY_AUTHORITY'"
+  else
+    AUTH_TARGET_REF="$IMGREF"
+    [[ "$SIGNED_IMAGE_REPOSITORY" == "${IMGREF%@*}" \
+        && "$SIGNED_REGISTRY_AUTHORITY" == "$NEURALICE_RELEASE_AUTHORITY" \
+        && "$SIGNED_IMAGE_INDEX_DIGEST" == "${IMGREF##*@}" \
+        && "$SIGNED_IMAGE_MANIFEST_DIGEST" == "$MEDIUM_IMAGE_DIGEST" ]] \
+      || die "the signed release authorization does not bind the sealed store's original host index/child pair"
+  fi
 
   # 🔴 AUTHENTIC IS NOT CURRENT. `issued_at` and `image_platform` used to be
   # validated for shape and then never used, so one formerly-authorised
@@ -1857,9 +1872,9 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   # unconsumed captured authorization inside its window for ever. The decision is
   # now made from the document's SIGNED MONOTONIC issuance sequence against a TPM
   # counter, and no reading of the clock can move either.
-  RELEASE_AUTH_CONSUMED="$(release_auth_gate_request "$RELEASE_AUTH" "$SEALED_ANCHOR" "$OS_IMAGE" \
+  RELEASE_AUTH_CONSUMED="$(release_auth_gate_request "$RELEASE_AUTH" "$SEALED_ANCHOR" "$AUTH_TARGET_REF" \
     "$RELEASE_AUTH_HIGH_WATER" "$INSTALL_PLATFORM")" \
-    || die "the release authorization does not authorise ${OS_IMAGE} on this medium"
+    || die "the release authorization does not authorise ${AUTH_TARGET_REF} on this medium"
   RELEASE_AUTH_ISSUANCE_SEQ="$(sed -n 's/^consumed_issuance_seq=//p' <<<"$RELEASE_AUTH_CONSUMED")"
   [[ "$RELEASE_AUTH_ISSUANCE_SEQ" =~ ^[1-9][0-9]{0,15}$ ]] \
     || die "the release-authorization gate returned no usable issuance sequence"
@@ -1867,6 +1882,7 @@ if [ "$INSTALL_SOURCE" = registry ]; then
     || die "the release-authorization gate changed Fabric's allocated issuance sequence"
   log "Release authorization verified: $(sed -n 's/^issuance_id=//p' <<<"$RELEASE_AUTH") (profile=$SEALED_ACCESS_PROFILE, target=$SEALED_HARDWARE_TARGET, platform=$INSTALL_PLATFORM, seq=$RELEASE_AUTH_ISSUANCE_SEQ > high-water=$RELEASE_AUTH_HIGH_WATER, issued_at=$(sed -n 's/^issued_at=//p' <<<"$RELEASE_AUTH_CONSUMED") — informational)"
 
+  if [ "$INSTALL_SOURCE" = registry ]; then
   log "Pulling the authorised appliance image: $OS_IMAGE"
   [ -n "$INSTALL_MIRROR" ] && log "  (a LAN mirror is configured: $INSTALL_MIRROR — the reference above is unchanged)"
   heartbeat_start "podman pull $OS_IMAGE"
@@ -1939,6 +1955,15 @@ if [ "$INSTALL_SOURCE" = registry ]; then
     --authenticated-index-digest "$SIGNED_IMAGE_INDEX_DIGEST" \
     --authenticated-manifest-digest "$SIGNED_IMAGE_MANIFEST_DIGEST" \
     || die "this medium's container signature policy does not bind the pulled index/child pair; a policy satisfied by any image in $INSTALL_IMAGE_REPOSITORY cannot prove the recursive signature of this one"
+    _candidate_image_ref="$OS_IMAGE"
+  else
+    # The store is a signed dm-verity extent. Its platform child is observed
+    # from those bytes; its canonical index is the UKI-bound IMGREF, independently
+    # repeated by the signed installer-v2 authorization and preseal set.
+    got_index="${IMGREF##*@}"
+    got_manifest="$MEDIUM_IMAGE_DIGEST"
+    _candidate_image_ref="$STORE_IMAGE_NAME"
+  fi
 
   # Read the image's OWN statements about itself out of the pulled bytes. An
   # authorization is a claim ABOUT an image; it becomes a property OF the image
@@ -1953,7 +1978,7 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   # read with the installer's own tools and not one byte of the candidate is
   # executed.
   # 🔴 A CREATED, NEVER STARTED container, not `image mount`. With the sealed
-  # image store attached as an additional (read-only) store, the pulled image's
+  # image store attached as an additional (read-only) store, the candidate's
   # layers are deduplicated into that store and `podman image mount` refuses
   # with "layer not known" (containers/storage looks the top layer up in the
   # writable store only; measured on the bench, podman 6.0.2, 2026-09-06). A
@@ -1968,13 +1993,13 @@ if [ "$INSTALL_SOURCE" = registry ]; then
     return "$rc"
   }
   podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || true
-  podman --cgroup-manager=cgroupfs --events-backend=file create --name "$_candidate_probe" \
-      --entrypoint /nonexistent "$OS_IMAGE" >/dev/null 2>&1 \
-    || die "cannot stage the pulled image for host-side inspection without executing it"
+  podman --cgroup-manager=cgroupfs --events-backend=file create --pull=never --network=none --name "$_candidate_probe" \
+      --entrypoint /nonexistent "$_candidate_image_ref" >/dev/null 2>&1 \
+    || die "cannot stage the selected image for host-side inspection without executing it"
   _img_root="$(podman --cgroup-manager=cgroupfs --events-backend=file mount "$_candidate_probe" 2>/dev/null)" \
-    || { candidate_probe_release || true; die "cannot inspect the pulled image without executing it"; }
+    || { candidate_probe_release || true; die "cannot inspect the selected image without executing it"; }
   [[ -n "$_img_root" && -d "$_img_root" ]] \
-    || die "the pulled image did not mount to a directory for host-side inspection"
+    || die "the selected image did not mount to a directory for host-side inspection"
   _img_read() { # $1=path relative to the image root — a plain regular file, read by US
     local path="$_img_root/$1"
     [[ -f "$path" && ! -L "$path" ]] || return 0
@@ -1988,22 +2013,22 @@ if [ "$INSTALL_SOURCE" = registry ]; then
   img_target="$(_img_read usr/lib/neural-ice/hardware-target)"
   img_ota_state_profile="$(_img_read usr/lib/neural-ice/ota-state-profile)"
   img_seed_ref="$(_img_read usr/lib/neural-ice/product-payload/PAYLOAD_ID)"
-  img_policy="$(podman image inspect "$OS_IMAGE" \
+  img_policy="$(podman image inspect "$_candidate_image_ref" \
     --format '{{index .Labels "ch.neural-ice.signed-boot-trust-policy-id"}}' 2>/dev/null || true)"
   # The platform the OBJECT reports, from its own config rather than from the
   # request: an index that answered a linux/arm64 request with another
   # architecture's child fails here.
-  img_platform="$(podman image inspect "$OS_IMAGE" \
+  img_platform="$(podman image inspect "$_candidate_image_ref" \
     --format '{{.Os}}/{{.Architecture}}{{with .Variant}}/{{.}}{{end}}' 2>/dev/null || true)"
   if ! release_auth_gate_pulled "$RELEASE_AUTH" "$SEALED_ANCHOR" \
       "$got_index" "$got_manifest" "$img_profile" "$img_variant" "$img_target" "$img_policy" \
       "$img_platform"; then
     candidate_probe_release || true
-    die "the pulled image does not match its release authorization or this medium's sealed profile"
+    die "the selected image does not match its release authorization or this medium's sealed profile"
   fi
   if [[ "$img_platform" != "$INSTALL_PLATFORM" ]]; then
     candidate_probe_release || true
-    die "the pulled image is for platform '$img_platform' but this machine installs '$INSTALL_PLATFORM'"
+    die "the selected image is for platform '$img_platform' but this machine installs '$INSTALL_PLATFORM'"
   fi
 
   case "$img_ota_state_profile" in
@@ -2027,7 +2052,8 @@ if [ "$INSTALL_SOURCE" = registry ]; then
     write_preseal_verifier_config "$PRESEAL_PREFLIGHT_STATE" "$PRESEAL_PREFLIGHT_CONFIG" \
       "$PRESEAL_SNAPSHOT/preseal-set.json"
     PRESEAL_BUNDLE_SEQ="$(verify_preseal_candidate "$PRESEAL_SNAPSHOT" \
-      "$_img_root" "$img_seed_ref" "$PRESEAL_PREFLIGHT_CONFIG" "$PRESEAL_PREFLIGHT_RECEIPT")" \
+      "$_img_root" "$img_seed_ref" "$PRESEAL_PREFLIGHT_CONFIG" "$PRESEAL_PREFLIGHT_RECEIPT" \
+      "$AUTH_TARGET_REF" "$got_manifest")" \
       || { candidate_probe_release || true; die "the UKI-bound preseal inputs do not authenticate the selected appliance before disk mutation"; }
     sync -f "$PRESEAL_PREFLIGHT_RECEIPT" \
       || { candidate_probe_release || true; die "cannot fsync the authenticated pre-wipe preseal receipt"; }
@@ -2039,7 +2065,10 @@ if [ "$INSTALL_SOURCE" = registry ]; then
 
   # From here the object in local storage is the ONLY thing that may be
   # installed. Nothing is re-resolved between this proof and the install.
-  source_imgref="containers-storage:$OS_IMAGE"
+  if [ "$INSTALL_SOURCE" = registry ]; then
+    source_imgref="containers-storage:$OS_IMAGE"
+  fi
+  AUTH_MANIFEST_DIGEST="$got_manifest"
   RELEASE_AUTH_VERIFIED_REF="$source_imgref"
   log "  authorised and verified: index=$got_index manifest=$got_manifest profile=$img_profile variant=$img_variant"
 else
@@ -2049,6 +2078,7 @@ else
   RELEASE_AUTH_VERIFIED_REF="$source_imgref"
 fi
 readonly RELEASE_AUTH_VERIFIED_REF
+readonly AUTH_TARGET_REF AUTH_MANIFEST_DIGEST
 readonly PRESEAL_ACTIVE PRESEAL_BUNDLE_SEQ
 
 # The exact target is now fixed in local containers-storage. On registry
@@ -2178,7 +2208,7 @@ assert_seed_is_the_preseal_release() {
   assert_sealed_document_digest "$preseal_path" "$PRESEAL_SET_SHA256" \
     "protected preseal set snapshot"
   python3 - "$closure_path" "$manifest_path" "$preseal_path" \
-    "$OS_IMAGE" "$SEALED_HARDWARE_TARGET" "$SEALED_TRUST_POLICY_ID" "$DEVICE_CHANNEL" \
+    "$AUTH_TARGET_REF" "$SEALED_HARDWARE_TARGET" "$SEALED_TRUST_POLICY_ID" "$DEVICE_CHANNEL" \
     <<'SEED_PRESEAL_RECONCILE_PY' \
     || die "the offline seed on this medium is not the release the authenticated preseal set installs; nothing has been written to the target disk"
 import json
@@ -2247,8 +2277,8 @@ def require(condition, detail):
 
 
 # 1) THE APPLIANCE ROOT. The seed's closure names the exact OCI root of the
-#    appliance the release was cut around; this install pulls a digest-pinned
-#    reference. They must be the same object.
+#    appliance the release was cut around; this install selects the same
+#    digest-pinned reference from either signed transport.
 os_digest = os_image.rpartition("@")[2]
 require(
     isinstance(closure.get("host_digest"), str)
@@ -2405,11 +2435,11 @@ if [[ -n "$SEED_CLOSURE" ]]; then
     || die "the offline seed is not the signed release closure this medium seals; nothing has been written to the target disk"
   bg_stop
   log "Offline release closure verified in full: sha256:${SEED_CLOSURE} (every manifest, blob, model and evidence object present, reachable and digest-matched; no extra object)"
-  if [[ "$INSTALL_SOURCE" == registry ]]; then
-    (( PRESEAL_ACTIVE == 1 )) \
-      || die "this medium installs from a registry and carries an offline seed, and seals no preseal set; nothing would reconcile the seed with the appliance that is about to be pulled"
+  if (( PRESEAL_ACTIVE == 1 )); then
     assert_seed_is_the_preseal_release
     log "Offline seed reconciled with the authenticated appliance: same train, bundle_seq, hardware target and appliance root — one release on two transports"
+  elif [[ "$INSTALL_SOURCE" == registry ]]; then
+    die "this medium installs from a registry and carries an offline seed, and seals no preseal set; nothing would reconcile the seed with the appliance that is about to be pulled"
   fi
 else
   [[ -z "$_seed_partuuid" ]] \
@@ -2607,7 +2637,7 @@ fi
 # unit, verified after finalize below), and a mask would have been a permanent
 # karg disabling the very root-capable-extension gate the image installs.
 heartbeat_start "bootc install to-filesystem"
-podman --cgroup-manager=cgroupfs --events-backend=file run --rm --privileged \
+podman --cgroup-manager=cgroupfs --events-backend=file run --pull=never --rm --privileged \
   --net=host --log-driver=passthrough-tty --pid=host \
   --security-opt label=type:unconfined_t \
   -e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf \
@@ -3000,7 +3030,7 @@ log "Dedicated TPM device-root provisioned and attested at 0x81010005."
 # anchor, locks its canonical evidence digest in TPM NV, then sets
 # and destroys the random owner auth. No mutable receipt selects either path.
 # --------------------------------------------------------------------------- #
-if [ "$INSTALL_SOURCE" = registry ]; then
+if [ "$INSTALL_SOURCE" = registry ] || (( PRESEAL_ACTIVE == 1 )); then
   _enrolled_profile="$img_profile"
 else
   _enrolled_profile="$ACCESS_POLICY"
@@ -3040,7 +3070,8 @@ if (( PRESEAL_ACTIVE == 1 )); then
     "$PRESEAL_INSTALLED_INPUTS/preseal-set.json" "$INSTALLED_OTA_CONFIG_CANDIDATE" \
     "$INSTALLED_OTA_ROOT_KEY" "$INSTALLED_OTA_ROOT_KEY"
   _installed_preseal_floor="$(verify_installed_preseal_candidate "$PRESEAL_INSTALLED_INPUTS" \
-    "$img_seed_ref" "$PRESEAL_INSTALLED_CONFIG" "$PRESEAL_INSTALLED_RECEIPT")" \
+    "$img_seed_ref" "$PRESEAL_INSTALLED_CONFIG" "$PRESEAL_INSTALLED_RECEIPT" \
+    "$AUTH_TARGET_REF" "$AUTH_MANIFEST_DIGEST")" \
     || die "the installed candidate and persistent preseal inputs failed reauthentication"
   [[ "$_installed_preseal_floor" == "$PRESEAL_BUNDLE_SEQ" ]] \
     || die "the installed preseal verifier changed the authenticated baseline floor"
@@ -3150,7 +3181,7 @@ printf 'access_profile=%s\nhardware_target=%s\nsigned_boot_trust_policy_id=%s\ni
 persist_ceremony_input "$_intent_tmp" owner-ceremony-intent-v1
 rm -f -- "$_intent_tmp"
 _sealed_identity_sha256="$(printf '%s' "$SEALED_ANCHOR" | sha256sum | awk '{print tolower($1)}')"
-if [[ "$INSTALL_SOURCE" == registry ]]; then
+if (( PRESEAL_ACTIVE == 1 )) || [[ "$INSTALL_SOURCE" == registry ]]; then
   _release_identity_sha256="$(sha256sum "$_auth_scratch/release-authorization.json" | awk '{print tolower($1)}')"
 else
   _release_identity_sha256="$(printf '%s\0%s' "$SEALED_ANCHOR" "$SEALED_PAYLOAD_DIGEST" | sha256sum | awk '{print tolower($1)}')"

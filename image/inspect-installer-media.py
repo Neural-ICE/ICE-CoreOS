@@ -1066,13 +1066,21 @@ def classify_sealed_cmdline(cmdline: str) -> str:
     else:
         if "neuralice.osimage" in optional:
             raise SelectorRefusal("osimage-without-registry-source")
-        for key in ("neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"):
-            if key in optional:
-                raise SelectorRefusal("release-authorization-without-registry-source")
+        release_auth_keys = {
+            "neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"
+        }
+        present_auth = release_auth_keys.intersection(optional)
+        if "neuralice.preseal" in optional:
+            if present_auth != release_auth_keys:
+                raise SelectorRefusal("preseal-without-release-authorization")
+            if optional["neuralice.relauth_sha256"] == optional["neuralice.relauth_sig_sha256"]:
+                raise SelectorRefusal("release-authorization-hashes-identical")
+        elif present_auth:
+            raise SelectorRefusal("release-authorization-without-preseal")
 
     if "neuralice.preseal" in optional:
-        if source != "registry":
-            raise SelectorRefusal("preseal-without-registry-source")
+        if "neuralice.relauth_sha256" not in optional or "neuralice.relauth_sig_sha256" not in optional:
+            raise SelectorRefusal("preseal-without-release-authorization")
         if sealed_fields(cmdline)["neuralice.access_profile"] != "lab-managed":
             raise SelectorRefusal("preseal-not-permitted-outside-lab-managed")
 
@@ -1114,7 +1122,7 @@ def classify_sealed_cmdline(cmdline: str) -> str:
     # the same release. `neuralice.preseal` is that document: it names the train,
     # bundle_seq, hardware target and target OS reference the installer
     # reconciles against the seed's own signed closure before the disk is
-    # touched, and it is itself restricted to a lab-managed registry medium.
+    # touched, and it is itself restricted to a lab-managed signed transport.
     # Without it there is nothing to reconcile, which is the original finding.
     if "neuralice.seed_closure" in optional:
         if source == "registry" and "neuralice.preseal" not in optional:
@@ -1447,7 +1455,7 @@ def check_preseal_set(paths: set[str], read_file, cmdline: str, fields: dict[str
         "ring": "lab", "release_signing_role": "release-lab",
         "release_key_id": "release-lab-v1", "delegation_seq": 2,
         "delegation_snapshot_sha256": "3378808da1841f89db7dcc125fa1c7025662e9b3c099cf8f67a69c5f7341dad0",
-        "target_os_ref": sealed.get("neuralice.osimage"),
+        "target_os_ref": sealed.get("neuralice.osimage", sealed.get("neuralice.imgref")),
     }
     for key, value in exact.items():
         if document.get(key) != value:
