@@ -156,6 +156,296 @@ fn canonical_domain_refuses_integers_outside_interoperable_range() {
     assert!(canonical_value(b"{\"n\":9007199254740992}\n", "large integer").is_err());
 }
 
+fn content_cache_artifact_fixture(
+    base: &Path,
+    mutate_config: impl FnOnce(&mut serde_json::Value),
+    mutate_manifest: impl FnOnce(&mut serde_json::Value),
+    mutate_artifact: impl FnOnce(&mut serde_json::Value),
+) -> Artifact {
+    let objects = base.join("objects/sha256");
+    std::fs::create_dir_all(&objects).unwrap();
+    let segment = b"tiny-cache";
+    let segment_digest = hex_digest(segment);
+    std::fs::write(objects.join(&segment_digest), segment).unwrap();
+    let mut config = serde_json::json!({
+        "content_id": "ch-caselaw-seed",
+        "format": "sqlite3",
+        "schema": CONTENT_CACHE_SCHEMA,
+        "segments": [{"digest": format!("sha256:{segment_digest}"), "size": segment.len()}],
+        "sha256": segment_digest,
+        "size_bytes": segment.len()
+    });
+    mutate_config(&mut config);
+    let config_bytes = serde_json::to_vec(&config).unwrap();
+    let config_digest = hex_digest(&config_bytes);
+    std::fs::write(objects.join(&config_digest), &config_bytes).unwrap();
+    let mut manifest = serde_json::json!({
+        "artifactType": CONTENT_CACHE_ARTIFACT_TYPE,
+        "config": {"digest": format!("sha256:{config_digest}"), "mediaType": CONTENT_CACHE_CONFIG_MEDIA_TYPE, "size": config_bytes.len()},
+        "layers": [{"digest": format!("sha256:{segment_digest}"), "mediaType": CONTENT_CACHE_SEGMENT_MEDIA_TYPE, "size": segment.len()}],
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "schemaVersion": 2
+    });
+    mutate_manifest(&mut manifest);
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_digest = hex_digest(&manifest_bytes);
+    std::fs::write(objects.join(&manifest_digest), &manifest_bytes).unwrap();
+    let repository = "registry.example.test/neural-ice/content-cache-ch-caselaw-seed";
+    let mut artifact = serde_json::json!({
+        "artifact_class": "oci-artifact",
+        "artifact_key": "content:ch-caselaw-seed",
+        "assembly": null,
+        "attachments": [],
+        "candidate_repository": "ghcr.io/neural-ice/content-cache-ch-caselaw-seed",
+        "chunked": null,
+        "edges": [],
+        "node_counts": {"config": 1, "index": 0, "layer": 1, "manifest": 1},
+        "nodes": [{
+            "artifact_type": CONTENT_CACHE_ARTIFACT_TYPE,
+            "digest": format!("sha256:{manifest_digest}"),
+            "kind": "manifest",
+            "media_type": "application/vnd.oci.image.manifest.v1+json",
+            "provenance": null,
+            "repository": repository,
+            "sbom": null,
+            "signatures": [],
+            "size": manifest_bytes.len(),
+            "subject": null
+        }, {
+            "artifact_type": null,
+            "digest": format!("sha256:{config_digest}"),
+            "kind": "config",
+            "media_type": CONTENT_CACHE_CONFIG_MEDIA_TYPE,
+            "provenance": null,
+            "repository": repository,
+            "sbom": null,
+            "signatures": [],
+            "size": config_bytes.len(),
+            "subject": null
+        }, {
+            "artifact_type": null,
+            "digest": format!("sha256:{segment_digest}"),
+            "kind": "layer",
+            "media_type": CONTENT_CACHE_SEGMENT_MEDIA_TYPE,
+            "provenance": null,
+            "repository": repository,
+            "sbom": null,
+            "signatures": [],
+            "size": segment.len(),
+            "subject": null
+        }],
+        "repository": repository,
+        "required_entitlement": "ICE-CASELAW-CH",
+        "root": {"digest": format!("sha256:{manifest_digest}"), "repository": repository},
+        "target": null,
+        "vendor": null
+    });
+    mutate_artifact(&mut artifact);
+    serde_json::from_value(artifact).unwrap()
+}
+
+#[test]
+fn content_cache_reader_accepts_exact_no_lf_contract_and_refuses_profile_drift() {
+    let base = std::env::temp_dir().join(format!(
+        "ni-content-cache-reader-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let accepted = content_cache_artifact_fixture(&base, |_| {}, |_| {}, |_| {});
+    validate_content_cache_artifact(&base, &accepted, "registry.example.test").unwrap();
+    assert!(validate_content_cache_artifact(&base, &accepted, "other.example.test").is_err());
+    for (label, root, artifact) in [
+        (
+            "config media",
+            base.join("media"),
+            content_cache_artifact_fixture(
+                &base.join("media"),
+                |_| {},
+                |manifest| {
+                    manifest["config"]["mediaType"] = serde_json::json!("application/octet-stream")
+                },
+                |_| {},
+            ),
+        ),
+        (
+            "whole size",
+            base.join("size"),
+            content_cache_artifact_fixture(
+                &base.join("size"),
+                |config| config["size_bytes"] = serde_json::json!(11),
+                |_| {},
+                |_| {},
+            ),
+        ),
+        (
+            "entitlement",
+            base.join("entitlement"),
+            content_cache_artifact_fixture(
+                &base.join("entitlement"),
+                |_| {},
+                |_| {},
+                |artifact| artifact["required_entitlement"] = serde_json::json!("ICE-CORE"),
+            ),
+        ),
+    ] {
+        assert!(
+            validate_content_cache_artifact(&root, &artifact, "registry.example.test").is_err(),
+            "{label} mutation unexpectedly passed"
+        );
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn content_cache_config_requires_no_terminal_lf() {
+    assert!(canonical_value_no_lf(b"{\"a\":1}", "cache config").is_ok());
+    assert!(canonical_value_no_lf(b"{\"a\":1}\n", "cache config").is_err());
+}
+
+fn content_cache_release_manifest() -> serde_json::Value {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    serde_json::json!({
+        "bundle_seq": 1,
+        "compatibility": {"minimum_reader": 1, "required_contracts": ["content-cache-v1", "host-bootc-v1"]},
+        "components": [],
+        "content": [{
+            "content_id": "ch-caselaw-seed", "contract": "content-cache-v1",
+            "digest": digest, "media_type": CONTENT_CACHE_ARTIFACT_TYPE,
+            "reboot_required": false,
+            "repository": "registry.example.test/neural-ice/content-cache-ch-caselaw-seed",
+            "required_entitlement": "ICE-CASELAW-CH", "restart_scope": []
+        }, {
+            "content_id": "paddlex-cache", "contract": "content-cache-v1",
+            "digest": digest, "media_type": CONTENT_CACHE_ARTIFACT_TYPE,
+            "reboot_required": false,
+            "repository": "registry.example.test/neural-ice/content-cache-paddlex-cache",
+            "required_entitlement": "ICE-CORE", "restart_scope": []
+        }],
+        "evidence": [],
+        "hardware_target": "nvidia-gb10-arm64",
+        "host": {
+            "contract": "host-bootc-v1", "digest": digest, "reboot_required": true,
+            "repository": "registry.example.test/neural-ice/appliance",
+            "required_entitlement": "BASE", "restart_scope": []
+        },
+        "release_id": "appliance-0.60.1",
+        "schema": "neural-ice-release-manifest-v1"
+    })
+}
+
+#[test]
+fn content_cache_manifest_requires_both_fixed_authority_joins() {
+    let manifest = content_cache_release_manifest();
+    let parsed = parse_manifest_roots(&manifest, "registry.example.test").unwrap();
+    assert_eq!(
+        parsed
+            .roots
+            .iter()
+            .filter(|root| root.contract == "content-cache-v1")
+            .count(),
+        2
+    );
+    let mut missing = manifest.clone();
+    missing["content"].as_array_mut().unwrap().pop();
+    assert!(parse_manifest_roots(&missing, "registry.example.test").is_err());
+    let mut entitlement = manifest.clone();
+    entitlement["content"][0]["required_entitlement"] = serde_json::json!("ICE-CORE");
+    assert!(parse_manifest_roots(&entitlement, "registry.example.test").is_err());
+    assert!(parse_manifest_roots(&manifest, "other.example.test").is_err());
+
+    let mut alternate = manifest;
+    for entry in alternate["content"].as_array_mut().unwrap() {
+        let repository = entry["repository"].as_str().unwrap();
+        entry["repository"] = serde_json::json!(repository.replacen(
+            "registry.example.test/",
+            "other.example.test/",
+            1
+        ));
+    }
+    alternate["host"]["repository"] = serde_json::json!("other.example.test/neural-ice/appliance");
+    parse_manifest_roots(&alternate, "other.example.test").unwrap();
+}
+
+#[test]
+fn fabric_content_cache_fixture_reaches_the_core_reader_when_available() {
+    let fixture = std::env::var("NEURAL_ICE_CONTENT_CACHE_FIXTURE")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("NEURAL_ICE_FABRIC_ROOT")
+                .map(|root| Path::new(&root).join("release-manifest/fixtures/content-cache-v1"))
+        });
+    let Ok(fixture) = fixture else { return };
+    if !fixture.join("manifest.json").is_file() {
+        return;
+    }
+    let base = std::env::temp_dir().join(format!(
+        "ni-fabric-content-cache-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let objects = base.join("objects/sha256");
+    std::fs::create_dir_all(&objects).unwrap();
+    let config = std::fs::read(fixture.join("config.json")).unwrap();
+    let manifest = std::fs::read(fixture.join("manifest.json")).unwrap();
+    let segment = std::fs::read(fixture.join("segment.bin")).unwrap();
+    let config_value = canonical_value_no_lf(&config, "Fabric content-cache config").unwrap();
+    let manifest_value = canonical_value_no_lf(&manifest, "Fabric content-cache manifest").unwrap();
+    let config_digest = hex_digest(&config);
+    let manifest_digest = hex_digest(&manifest);
+    let segment_digest = hex_digest(&segment);
+    assert_eq!(
+        manifest_value["config"]["digest"],
+        format!("sha256:{config_digest}")
+    );
+    assert_eq!(
+        config_value["segments"][0]["digest"],
+        format!("sha256:{segment_digest}")
+    );
+    for (digest, body) in [
+        (&config_digest, &config),
+        (&manifest_digest, &manifest),
+        (&segment_digest, &segment),
+    ] {
+        std::fs::write(objects.join(digest), body).unwrap();
+    }
+    let repository = "registry.example.test/neural-ice/content-cache-ch-caselaw-seed";
+    let artifact: Artifact = serde_json::from_value(serde_json::json!({
+        "artifact_class": "oci-artifact",
+        "artifact_key": "content:ch-caselaw-seed",
+        "assembly": null,
+        "attachments": [],
+        "candidate_repository": "ghcr.io/neural-ice/content-cache-ch-caselaw-seed",
+        "chunked": null,
+        "edges": [],
+        "node_counts": {"config": 1, "index": 0, "layer": 1, "manifest": 1},
+        "nodes": [{
+            "artifact_type": CONTENT_CACHE_ARTIFACT_TYPE,
+            "digest": format!("sha256:{manifest_digest}"), "kind": "manifest",
+            "media_type": "application/vnd.oci.image.manifest.v1+json", "provenance": null,
+            "repository": repository, "sbom": null, "signatures": [], "size": manifest.len(),
+            "subject": null
+        }, {
+            "artifact_type": null, "digest": format!("sha256:{config_digest}"), "kind": "config",
+            "media_type": CONTENT_CACHE_CONFIG_MEDIA_TYPE, "provenance": null,
+            "repository": repository, "sbom": null, "signatures": [], "size": config.len(),
+            "subject": null
+        }, {
+            "artifact_type": null, "digest": format!("sha256:{segment_digest}"), "kind": "layer",
+            "media_type": CONTENT_CACHE_SEGMENT_MEDIA_TYPE, "provenance": null,
+            "repository": repository, "sbom": null, "signatures": [], "size": segment.len(),
+            "subject": null
+        }],
+        "repository": repository,
+        "required_entitlement": "ICE-CASELAW-CH",
+        "root": {"digest": format!("sha256:{manifest_digest}"), "repository": repository},
+        "target": null,
+        "vendor": null
+    }))
+    .unwrap();
+    validate_content_cache_artifact(&base, &artifact, "registry.example.test").unwrap();
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn digest_grammar_is_exact() {
     assert!(digest_hex(&format!("sha256:{}", "a".repeat(64))).is_ok());

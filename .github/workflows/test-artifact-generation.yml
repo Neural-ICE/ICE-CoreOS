@@ -281,11 +281,13 @@ jobs:
           files = [
               "image/inspect-installer-media.py",
               "image/installer/neural-ice-registry-authorisation.py",
+              "image/content-cache-contract.py",
               "image/model-cache-contract.py",
               "image/lib/preloaded-inputs.py",
               "image/test-preloaded-inputs.py",
               "image/seed-tree-manifest.py",
               "image/test-lib/unit-graph.py",
+              "image/test-content-cache-contract.py",
               "image/test-seed-tree-manifest.py",
               "image/verify-preloaded-media.py",
               "ota/neural-ice-luks-token-evidence.py",
@@ -433,6 +435,7 @@ jobs:
           # reject contract) is offline; the harness itself runs only on the
           # KVM-capable GB10 host.
           ./image/test-qualify-installer-qemu.sh
+          ./image/test-content-cache-contract.py
           ./image/test-seed-firstboot-import.sh
           ./ota/test-autoinstall-kargs.sh
           ./ota/test-installer-device-root-guard.sh

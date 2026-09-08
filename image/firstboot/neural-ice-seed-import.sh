@@ -19,7 +19,7 @@ fi
 path() { printf '%s%s' "$ROOT_PREFIX" "$1"; }
 
 case ${NI_SEED_IMPORT_FAIL_AFTER:-} in
-  ''|container|content|models|hf-cache|relabel|ready|generation|consumer-links|commit) ;;
+  ''|container|content|models|content-caches|hf-cache|relabel|ready|generation|consumer-links|commit) ;;
   *) die "unknown firstboot fault-injection boundary" ;;
 esac
 durable_boundary() {
@@ -39,6 +39,7 @@ HARDWARE=$(path /usr/lib/neural-ice/hardware-target)
 PROFILE=$(path /usr/lib/neural-ice/access-policy)
 POLICY=$(path /usr/lib/neural-ice/signed-boot-trust-policy-id)
 MODEL_HELPER=$(path /usr/libexec/neural-ice-model-cache-contract)
+CONTENT_CACHE_HELPER=$(path /usr/libexec/neural-ice-content-cache-contract)
 
 [[ -f $POINTER && ! -L $POINTER ]] || exit 0
 IFS= read -r closure < "$POINTER"
@@ -75,6 +76,8 @@ for input in "$ROOT_KEY" "$REGISTRY" "$CHANNEL" "$TRUSTED_NOW" "$HARDWARE" "$PRO
 done
 [[ -x $VERIFIER && ! -L $VERIFIER ]] || die "seed verifier is absent or not executable"
 [[ -x $MODEL_HELPER && ! -L $MODEL_HELPER ]] || die "model-cache contract helper is absent or not executable"
+[[ -x $CONTENT_CACHE_HELPER && ! -L $CONTENT_CACHE_HELPER ]] \
+  || die "content-cache contract helper is absent or not executable"
 [[ $(sha256sum -- "$source_root/release-manifest.json" | awk '{print tolower($1)}') == "$manifest" ]] \
   || die "staged manifest does not match its sealed pointer"
 IFS= read -r pcr_policy < "$RELEASE/PCR-POLICY"
@@ -87,8 +90,9 @@ IFS= read -r pcr_seq < "$RELEASE/PCR-POLICY-SEQ"
 IFS= read -r now < "$TRUSTED_NOW"
 [[ $now =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
   || die "sealed seed trusted time is malformed"
+registry_host=$(<"$REGISTRY")
 "$VERIFIER" verify-seed-closure --seed-root "$source_root" --pubkey "$ROOT_KEY" \
-  --registry-host "$(<"$REGISTRY")" --hardware-target "$(<"$HARDWARE")" \
+  --registry-host "$registry_host" --hardware-target "$(<"$HARDWARE")" \
   --access-profile "$(<"$PROFILE")" --trust-policy-id "$(<"$POLICY")" \
   --device-channel "$(<"$CHANNEL")" \
   --expect-closure "$closure" --expect-manifest "$manifest" --trusted-now "$now" \
@@ -214,11 +218,28 @@ import json, pathlib, shutil, sys
 closure = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
 manifest = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
 objects, destination, selector = pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), sys.argv[5]
+cache_roots = {(entry["repository"], entry["digest"])
+               for entry in manifest.get("content", [])
+               if entry.get("contract") == "content-cache-v1"}
+cache_segments, retained = set(), set()
+for artifact in closure["artifacts"]:
+    root = artifact["root"]["digest"] if isinstance(artifact["root"], dict) else artifact["root"]
+    target = cache_segments if (artifact["repository"], root) in cache_roots else retained
+    target.update(node["digest"] for node in artifact["nodes"] if node["kind"] == "layer")
+    retained.update(node["digest"] for node in artifact["nodes"] if node["kind"] != "layer")
+    for attachment in artifact["attachments"]:
+        retained.add(attachment["manifest_digest"])
+        retained.update(attachment["layer_digests"])
+        attachment_manifest = json.loads((objects / attachment["manifest_digest"].removeprefix("sha256:")).read_bytes())
+        retained.add(attachment_manifest["config"]["digest"])
 if selector == "all":
+    excluded = cache_segments - retained
     for source in objects.iterdir():
-        shutil.copyfile(source, destination / source.name)
+        if "sha256:" + source.name not in excluded:
+            shutil.copyfile(source, destination / source.name)
     raise SystemExit(0)
-content_roots = {(entry["repository"], entry["digest"]) for entry in manifest.get("content", [])}
+content_roots = {(entry["repository"], entry["digest"]) for entry in manifest.get("content", [])
+                 if entry.get("contract") != "content-cache-v1"}
 for artifact in closure["artifacts"]:
     root = artifact["root"]["digest"] if isinstance(artifact["root"], dict) else artifact["root"]
     if selector == "model" and (artifact["repository"], root) not in content_roots:
@@ -242,6 +263,19 @@ PY
   if [[ $selector == all ]]; then durable_boundary content; else durable_boundary models; fi
 done
 
+# Reconstruct the two fixed data caches directly from the verified source CAS.
+# Their segment blobs stay in the retained release pack and are deliberately
+# excluded from the generic candidate CAS above, avoiding a second ~73 GiB
+# copy before whole-file materialization.
+"$CONTENT_CACHE_HELPER" materialize \
+  --closure "$source_root/release-closure.json" \
+  --manifest "$source_root/release-manifest.json" \
+  --objects "$source_root/objects/sha256" \
+  --registry-host "$registry_host" \
+  --destination "$candidate/content-caches" >/dev/null \
+  || die "cannot materialize the signed content caches"
+durable_boundary content-caches
+
 # Reconstruct the exact Hugging Face cache that vLLM mounts. The helper accepts
 # only signed, typed OCI model-card artifacts and links each
 # digest from the already read-back content candidate.
@@ -256,7 +290,8 @@ if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]]; then
   chcon -R -t container_ro_file_t "$candidate/seed-store/graphroot" 2>/dev/null \
     || chcon -R -t container_file_t "$candidate/seed-store/graphroot" \
     || die "cannot label imported container store"
-  restorecon -RF "$candidate/content" "$candidate/models" "$candidate/hf-cache" \
+  restorecon -RF "$candidate/content" "$candidate/models" "$candidate/content-caches" \
+    "$candidate/hf-cache" \
     || die "cannot relabel offline generation"
 fi
 sync -f "$candidate"

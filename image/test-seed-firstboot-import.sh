@@ -64,6 +64,7 @@ exit 62
 EOF
 chmod 0755 "$ROOT/usr/bin/ni-ota-verify"
 install -m 0755 image/model-cache-contract.py "$ROOT/usr/libexec/neural-ice-model-cache-contract"
+install -m 0755 image/content-cache-contract.py "$ROOT/usr/libexec/neural-ice-content-cache-contract"
 
 # Feed the same producer contract two staged HF cards, then embed its output
 # by digest in the signed-closure stand-in consumed by firstboot.
@@ -124,6 +125,56 @@ document = {"artifacts":artifacts}
 open(path,"w",encoding="ascii").write(json.dumps(document,separators=(",",":"),sort_keys=True)+"\n")
 PY
 
+# Add the two fixed content-cache-v1 roots with tiny final segments. This drives
+# the same helper/importer seam as the real 9-segment CH and 1-segment Paddle
+# payloads without allocating appliance-sized test data.
+python3 - "$source/release-closure.json" "$source/release-manifest.json" \
+  "$source/objects/sha256" <<'PY'
+import hashlib, json, pathlib, sys
+closure_path, manifest_path, objects = map(pathlib.Path, sys.argv[1:])
+closure, release = json.loads(closure_path.read_bytes()), json.loads(manifest_path.read_bytes())
+profiles = {
+    "ch-caselaw-seed": ("sqlite3", "content-cache-ch-caselaw-seed", "ICE-CASELAW-CH", b"sqlite-cache"),
+    "paddlex-cache": ("tar+zstd", "content-cache-paddlex-cache", "ICE-CORE", b"paddlex-cache"),
+}
+def put(body):
+    digest=hashlib.sha256(body).hexdigest(); (objects/digest).write_bytes(body); return digest
+def canonical(value): return json.dumps(value,sort_keys=True,separators=(",",":")).encode("ascii")
+for content_id,(format_name,repo_name,entitlement,payload) in profiles.items():
+    repository="registry.example.test/neural-ice/"+repo_name
+    segment=put(payload)
+    config=canonical({"content_id":content_id,"format":format_name,
+      "schema":"neural-ice-content-cache-v1",
+      "segments":[{"digest":"sha256:"+segment,"size":len(payload)}],
+      "sha256":segment,"size_bytes":len(payload)})
+    config_digest=put(config)
+    oci=canonical({"artifactType":"application/vnd.neural-ice.content-cache.v1",
+      "config":{"digest":"sha256:"+config_digest,
+        "mediaType":"application/vnd.neural-ice.content-cache.v1+json","size":len(config)},
+      "layers":[{"digest":"sha256:"+segment,
+        "mediaType":"application/vnd.neural-ice.content-cache.segment.v1","size":len(payload)}],
+      "mediaType":"application/vnd.oci.image.manifest.v1+json","schemaVersion":2})
+    root=put(oci)
+    release["content"].append({"content_id":content_id,"contract":"content-cache-v1",
+      "digest":"sha256:"+root,"media_type":"application/vnd.neural-ice.content-cache.v1",
+      "reboot_required":False,"repository":repository,"required_entitlement":entitlement,
+      "restart_scope":[]})
+    closure["artifacts"].append({"artifact_class":"oci-artifact",
+      "artifact_key":"content:"+content_id,"attachments":[],
+      "candidate_repository":"ghcr.io/neural-ice/"+repo_name,
+      "nodes":[{"digest":"sha256:"+root,"kind":"manifest"},
+               {"digest":"sha256:"+config_digest,"kind":"config"},
+               {"digest":"sha256:"+segment,"kind":"layer"}],
+      "repository":repository,"required_entitlement":entitlement,
+      "root":{"digest":"sha256:"+root,"repository":repository}})
+release["compatibility"]={"minimum_reader":1,
+  "required_contracts":["content-cache-v1","content-model-v1"]}
+closure_path.write_bytes(canonical(closure)+b"\n")
+manifest_path.write_bytes(canonical(release)+b"\n")
+PY
+manifest=$(sha256sum -- "$source/release-manifest.json" | awk '{print $1}')
+printf '%s\n' "$manifest" > "$data/release/MANIFEST"
+
 # A delegated installer key is not the root that authenticates the snapshot.
 printf delegated-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"
 if PATH="$FAKEBIN:$PATH" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=1 \
@@ -154,6 +205,19 @@ assert records[0][3] == b"image:runtime-test", records
 PLAN_CHECK
 test -f "$data/content/current/sha256/$blob"
 test -f "$data/models/current/sha256/$blob"
+test "$(cat "$data/offline-current/content-caches/ch-caselaw-seed/decisions.db")" = sqlite-cache
+test "$(cat "$data/offline-current/content-caches/paddlex-cache/paddlex-cache.tar.zst")" = paddlex-cache
+for cache in ch-caselaw-seed paddlex-cache; do
+  test -f "$data/offline-current/content-caches/.metadata/$cache.json"
+  test "$(tail -c 1 "$data/offline-current/content-caches/.metadata/$cache.json" | od -An -tuC)" = ' 125'
+done
+# Cache segments remain only in the retained verified source CAS; the candidate
+# generic content/model views must not duplicate them.
+for payload in sqlite-cache paddlex-cache; do
+  cache_digest=$(printf %s "$payload" | sha256sum | awk '{print $1}')
+  test ! -e "$data/content/current/sha256/$cache_digest"
+  test ! -e "$data/models/current/sha256/$cache_digest"
+done
 alpha_digest=$(printf %s alpha-bytes | sha256sum | awk '{print $1}')
 test "$(readlink "$data/hf-cache/hub/models--acme--alpha/snapshots/$rev_a/model.safetensors")" = "../../blobs/$alpha_digest"
 test "$(stat -c %i "$data/content/current/sha256/$alpha_digest")" = \
@@ -202,7 +266,7 @@ test "$before_ready" = "$(sha256sum -- "$data/OFFLINE-READY" | awk '{print $1}')
 # Power-fail after every durable boundary. All five public views resolve
 # through one pointer, so observation is exactly old or exactly new.
 active_closure=$closure
-for boundary in container content models hf-cache relabel ready generation consumer-links commit; do
+for boundary in container content models content-caches hf-cache relabel ready generation consumer-links commit; do
   candidate_closure=$(printf 'boundary-%s' "$boundary" | sha256sum | awk '{print $1}')
   cp -a -- "$source" "$data/release/$candidate_closure"
   printf 'sha256:%s\n' "$candidate_closure" > "$data/release/CLOSURE"
