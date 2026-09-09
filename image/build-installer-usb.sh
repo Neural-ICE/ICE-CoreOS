@@ -671,6 +671,7 @@ INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
 sudo podman build --pull=never --platform linux/arm64 \
   --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+  --build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
 # --------------------------------------------------------------------------- #

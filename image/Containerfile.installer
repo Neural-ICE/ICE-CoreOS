@@ -171,6 +171,20 @@ COPY image/installer/neural-ice-installer-failure.target \
      /usr/lib/systemd/system/neural-ice-installer-failure.target
 COPY image/installer/installer-failure-policy \
      /usr/lib/neural-ice/installer-failure-policy
+# A LAB medium may narrate its boot. The appliance base ships
+# kernel.printk = 3 4 1 7 (errors only on the console), which this installer
+# image and the initramfs dracut builds from it inherit -- so dracut's
+# warnings and the initramfs refusals never reach the screen, `quiet` or not
+# (2026-09-09: three media powered off on the bench with nothing to read).
+# The producer sets this from the sealed access profile and the operator's
+# MEDIA_VERBOSE_CONSOLE; a customer medium keeps the base's silence.
+ARG INSTALLER_VERBOSE_CONSOLE=0
+RUN case "$INSTALLER_VERBOSE_CONSOLE" in \
+      0) grep -qx 'kernel.printk = 3 4 1 7' /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf ;; \
+      1) printf 'kernel.printk = 7 4 1 7\n' > /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf \
+         && grep -qx 'kernel.printk = 7 4 1 7' /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf ;; \
+      *) echo "INSTALLER_VERBOSE_CONSOLE must be 0 or 1" >&2; exit 1 ;; \
+    esac
 # 🔴 THE ONE SIGNATURE-POLICY READER (independent review 2026-09-02, P1 #2).
 # image/build-installer-usb.sh runs this same file on the build host before a
 # registry medium is cut, and ota/neural-ice-autoinstall.sh runs it twice at
