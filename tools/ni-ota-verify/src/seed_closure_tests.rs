@@ -868,6 +868,10 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         "Fabric OTA authorization",
     )
     .unwrap();
+    // Keep the two measured LAB policy domains distinct in the end-to-end
+    // fixture: this is the Secure Boot policy executable hash.
+    authorization["boot_trust_policy_sha256"] =
+        serde_json::json!("20f85b92dafc327155b7249f433528efc9f02463900b603c29bfb1d2acf2edf4");
 
     fn put_object(objects: &mut BTreeMap<String, Vec<u8>>, bytes: Vec<u8>) -> String {
         let digest = format!("sha256:{}", hex_digest(&bytes));
@@ -998,10 +1002,6 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
     let release_id = authorization["release_id"].as_str().unwrap().to_owned();
     let bundle_seq = authorization["bundle_seq"].as_u64().unwrap();
     let hardware_target = authorization["hardware_target"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let boot_trust_policy = authorization["boot_trust_policy_sha256"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1226,7 +1226,10 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         expect_closure: closure_hash.clone(),
         expect_manifest: release_manifest_hash.clone(),
         trusted_now: "2026-09-15T12:00:00Z".into(),
-        pcr_policy_digest: boot_trust_policy,
+        // The independently signed PCR 7 policy digest from the same LAB
+        // generation is deliberately not the Secure Boot policy file hash.
+        pcr_policy_digest: "b83b5281ae799009b3efd8604f7ce4005d88e51018b5bcc2bb8f66a037217937"
+            .into(),
         pcr_policy_public_key_sha256: "a".repeat(64),
         pcr_policy_signature_sha256: "b".repeat(64),
         pcr_policy_seq: 1,
@@ -1289,6 +1292,84 @@ fn fabric_delegation_drives_a_complete_verify_seed_with_fixture() {
     let verdict = verify_seed_with(&seed_root, &root_key, &expectation, &mut verify).unwrap();
     assert_eq!(verdict.objects, object_count);
     assert_eq!(verdict.artifacts, 1);
+    let signed_authorization: serde_json::Value =
+        serde_json::from_slice(&authorization_bytes).unwrap();
+    assert_ne!(
+        signed_authorization["boot_trust_policy_sha256"]
+            .as_str()
+            .unwrap(),
+        expectation.pcr_policy_digest,
+        "Secure Boot policy and signed PCR policy must remain separate hash domains"
+    );
+
+    let mut invalid_pcr_expectations = Vec::new();
+    let mut invalid_digest = expectation.clone();
+    invalid_digest.pcr_policy_digest = "g".repeat(64);
+    invalid_pcr_expectations.push(("malformed PCR policy digest", invalid_digest));
+    let mut invalid_key = expectation.clone();
+    invalid_key.pcr_policy_public_key_sha256 = "g".repeat(64);
+    invalid_pcr_expectations.push(("malformed PCR policy public-key hash", invalid_key));
+    let mut invalid_signature = expectation.clone();
+    invalid_signature.pcr_policy_signature_sha256 = "g".repeat(64);
+    invalid_pcr_expectations.push(("malformed PCR policy signature hash", invalid_signature));
+    let mut zero_sequence = expectation.clone();
+    zero_sequence.pcr_policy_seq = 0;
+    invalid_pcr_expectations.push(("zero PCR policy sequence", zero_sequence));
+    for (label, invalid_expectation) in invalid_pcr_expectations {
+        let error = verify_seed_with(&seed_root, &root_key, &invalid_expectation, &mut verify)
+            .expect_err(label);
+        assert!(
+            error
+                .0
+                .contains("sealed PCR policy generation inputs are invalid"),
+            "{label} failed for the wrong reason: {}",
+            error.0
+        );
+    }
+
+    let mut mismatched_authorization = signed_authorization;
+    mismatched_authorization["boot_trust_policy_sha256"] = serde_json::json!("f".repeat(64));
+    let mismatched_authorization_bytes = canonical_json(mismatched_authorization);
+    let mismatched_authorization_message = signing_bytes(
+        RELEASE_AUTHORIZATION_V2_DOMAIN,
+        &mismatched_authorization_bytes,
+    )
+    .unwrap();
+    let mismatched_authorization_signature = sign_low_s(
+        &base,
+        &release_private,
+        "authorization-boot-trust-mismatch",
+        &mismatched_authorization_message,
+    );
+    std::fs::write(
+        seed_root.join("release-authorization.json"),
+        &mismatched_authorization_bytes,
+    )
+    .unwrap();
+    std::fs::write(
+        seed_root.join("release-authorization.json.sig"),
+        mismatched_authorization_signature,
+    )
+    .unwrap();
+    let mismatch = verify_seed_with(&seed_root, &root_key, &expectation, &mut verify)
+        .expect_err("a validly signed authorization must not change the closure trust-policy hash");
+    assert!(
+        mismatch
+            .0
+            .contains("authorization does not bind the exact manifest/closure identity"),
+        "boot trust mismatch failed for the wrong reason: {}",
+        mismatch.0
+    );
+    std::fs::write(
+        seed_root.join("release-authorization.json"),
+        &authorization_bytes,
+    )
+    .unwrap();
+    std::fs::write(
+        seed_root.join("release-authorization.json.sig"),
+        &authorization_signature,
+    )
+    .unwrap();
 
     let raw_signature = sign_low_s(
         &base,
