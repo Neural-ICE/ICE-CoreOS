@@ -636,4 +636,61 @@ grep -Fq -- '-v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro"' 
 grep -Fq '[[ "$_medium_now" == "$MEDIUM_IMAGE_DIGEST" ]]' "$AUTOINSTALL" \
   || fail "the installer does not re-check the medium image digest before installing it"
 
+# --------------------------------------------------------------------------- #
+# 7) THE STORE MAY BE STAGED FROM A REGISTRY SOURCE, BOUND TO THE SAME TWO
+#    IDENTITIES. A containers-storage source cannot always reproduce the
+#    compressed layer streams a manifest names; a registry serves the exact
+#    blobs. The source is admitted only when its reference names the store
+#    manifest digest, its served manifest hashes to that digest and names the
+#    immutable store image as config. Anything else is a refusal, and the copy
+#    still preserves digests.
+# --------------------------------------------------------------------------- #
+SRC_MANIFEST="$TMP/store-source-manifest.json"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":7},"layers":[]}' \
+  "$HOST_IMAGE_ID" > "$SRC_MANIFEST"
+SRC_DIGEST="sha256:$(sha256sum "$SRC_MANIFEST" | awk '{print $1}')"
+OTHER_SRC_MANIFEST="$TMP/store-source-other.json"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":7},"layers":[]}' \
+  "$OTHER_IMAGE_ID" > "$OTHER_SRC_MANIFEST"
+OTHER_SRC_DIGEST="sha256:$(sha256sum "$OTHER_SRC_MANIFEST" | awk '{print $1}')"
+cat > "$TOOLS/skopeo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MOCK_STATE/skopeo.args"
+if [ "$1" = inspect ]; then cat "${MOCK_SOURCE_MANIFEST_FILE:?}"; exit 0; fi
+dest="${*: -1}"
+name="${dest##*]}"
+store="${dest#*overlay@}"; store="${store%%+*}"
+mkdir -p "$store/overlay-images" "$store/overlay-layers" "$store/overlay"
+printf '[{"id":"%s","names":["%s:latest"]}]\n' "$EXPECTED_STORE_IMAGE_ID" "$name" > "$store/overlay-images/images.json"
+printf 'staged\n' > "$store/overlay-layers/layers.json"
+EOF
+chmod +x "$TOOLS/skopeo"
+mkdir -p "$TMP/certs"
+SRC_REF="docker://mirror.test:5055/neural-ice/appliance@$SRC_DIGEST"
+build "$TMP/registry-source" STORE_MANIFEST_DIGEST="$SRC_DIGEST" MOCK_NAMED_MANIFEST="$SRC_DIGEST" MOCK_STORE_MANIFEST="$SRC_DIGEST" \
+  STORE_SOURCE_REF="$SRC_REF" STORE_SOURCE_CERT_DIR="$TMP/certs" MOCK_SOURCE_MANIFEST_FILE="$SRC_MANIFEST" >/dev/null 2>&1 \
+  || fail "a registry source bound to the store manifest and image was refused"
+grep -Fq "inspect --raw --no-creds --cert-dir $TMP/certs $SRC_REF" "$TMP/registry-source/skopeo.args" \
+  || fail "the registry source manifest was not read back with the pinned certificate directory and no credential"
+grep -Fq "copy --preserve-digests --src-cert-dir $TMP/certs --src-no-creds $SRC_REF containers-storage:[overlay@" "$TMP/registry-source/skopeo.args" \
+  || fail "the store was not copied from the registry source with digests preserved"
+out="$(build "$TMP/registry-source-other-ref" STORE_MANIFEST_DIGEST="$SRC_DIGEST" MOCK_NAMED_MANIFEST="$SRC_DIGEST" MOCK_STORE_MANIFEST="$SRC_DIGEST" \
+  STORE_SOURCE_REF="docker://mirror.test:5055/neural-ice/appliance@$HOST_MANIFEST" MOCK_SOURCE_MANIFEST_FILE="$SRC_MANIFEST" 2>&1)" \
+  && fail "a registry source naming another manifest digest was accepted"
+grep -Fq "not the store manifest" <<<"$out" || fail "the other-manifest refusal is not named: $out"
+grep -Fq "copy --preserve-digests" "$TMP/registry-source-other-ref/skopeo.args" 2>/dev/null \
+  && fail "the store was copied despite the other-manifest refusal"
+out="$(build "$TMP/registry-source-other-bytes" STORE_MANIFEST_DIGEST="$SRC_DIGEST" MOCK_NAMED_MANIFEST="$SRC_DIGEST" MOCK_STORE_MANIFEST="$SRC_DIGEST" \
+  STORE_SOURCE_REF="$SRC_REF" MOCK_SOURCE_MANIFEST_FILE="$OTHER_SRC_MANIFEST" 2>&1)" \
+  && fail "a registry serving other manifest bytes than the reference names was accepted"
+grep -Fq "does not hash to" <<<"$out" || fail "the other-bytes refusal is not named: $out"
+out="$(build "$TMP/registry-source-other-config" STORE_MANIFEST_DIGEST="$OTHER_SRC_DIGEST" MOCK_NAMED_MANIFEST="$OTHER_SRC_DIGEST" MOCK_STORE_MANIFEST="$OTHER_SRC_DIGEST" \
+  STORE_SOURCE_REF="docker://mirror.test:5055/neural-ice/appliance@$OTHER_SRC_DIGEST" MOCK_SOURCE_MANIFEST_FILE="$OTHER_SRC_MANIFEST" 2>&1)" \
+  && fail "a registry source whose manifest names another image config was accepted"
+grep -Fq "not the immutable store image" <<<"$out" || fail "the other-config refusal is not named: $out"
+out="$(build "$TMP/registry-source-clear-text" STORE_MANIFEST_DIGEST="$SRC_DIGEST" MOCK_NAMED_MANIFEST="$SRC_DIGEST" MOCK_STORE_MANIFEST="$SRC_DIGEST" \
+  STORE_SOURCE_REF="oci:/tmp/layout:tag" MOCK_SOURCE_MANIFEST_FILE="$SRC_MANIFEST" 2>&1)" \
+  && fail "a non-registry store source was accepted"
+grep -Fq "digest-pinned registry reference" <<<"$out" || fail "the non-registry refusal is not named: $out"
+
 echo "INSTALLER_ROOT_TEST_OK"

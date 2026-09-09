@@ -135,6 +135,13 @@ ESP_HASH_BOUND = (
     ("ice-coreos/tpm2-pcr-public-key.pem", "neuralice.pcr_policy_key"),
     ("ice-coreos/tpm2-pcr-signature.json", "neuralice.pcr_policy_signature"),
 )
+# The two artefacts a preseal set binds by hash (`installer_authorization_sha256`
+# and `installer_authorization_signature_sha256`, checked by check_preseal_set).
+# On a medium sealing `neuralice.preseal` their kargs are absent by grammar
+# (`preseal-restates-relauth`) and the set is the pin.
+PRESEAL_BOUND_ESP_FILES = frozenset(
+    {"ice-coreos/release-authorization.json", "ice-coreos/release-authorization.sig"}
+)
 ESP_MANIFEST_RE = re.compile(r"^EFI/neural-ice/installer-(install|live)\.efi\.manifest$")
 
 READ_CHUNK = 8 << 20
@@ -735,6 +742,7 @@ SEALED_INSTALL_OPTIONAL_KEYS = (
     "neuralice.seed_closure",
     "neuralice.seed_manifest",
     "neuralice.seed_trusted_now",
+    "neuralice.seed_source",
     "neuralice.pcr_policy",
     "neuralice.pcr_policy_key",
     "neuralice.pcr_policy_signature",
@@ -905,6 +913,10 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
         return bool(re.fullmatch(r"[1-9][0-9]{0,18}", value))
     if key == "neuralice.seed_trusted_now":
         return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value))
+    if key == "neuralice.seed_source":
+        # Absent, the seed is the ni-seed partition; `mirror` is the only other
+        # source (docs/SEED-FROM-MIRROR.md). Its company is checked below.
+        return value == "mirror"
     if key == "neuralice.target":
         # This value selects the disk that is about to be destroyed.
         return bool(re.fullmatch(r"/dev/[a-zA-Z0-9][a-zA-Z0-9_-]*", value))
@@ -1049,38 +1061,42 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             raise SelectorRefusal(f"origin-not-the-release-authority:{origin_key}")
 
     source = optional.get("neuralice.source")
+    # THE RELEASE-AUTHORIZATION PAIR IS SEALED ONCE (FAB-0057 P1.1b, rule B).
+    # A preseal set binds `installer_authorization_sha256` and its signature
+    # hash and is itself hashed against `neuralice.preseal`, so a line sealing
+    # a preseal set must NOT restate `neuralice.relauth_*`: the installer derives
+    # the pair from the verified set. Without a preseal set nothing changes.
+    release_auth_keys = {"neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"}
+    present_auth = release_auth_keys.intersection(optional)
+    preseal_seen = "neuralice.preseal" in optional
     if source == "registry":
         if "neuralice.osimage" not in optional:
             raise SelectorRefusal("registry-source-without-osimage")
-        # The ESP is mutable, so the two SHA-256 values that pin the release
-        # authorization document and its detached signature are sealed in the
-        # line the UKI signature covers.
-        if "neuralice.relauth_sha256" not in optional:
-            raise SelectorRefusal("registry-source-without-release-authorization")
-        if "neuralice.relauth_sig_sha256" not in optional:
-            raise SelectorRefusal(
-                "registry-source-without-release-authorization-signature"
-            )
-        if optional["neuralice.relauth_sha256"] == optional["neuralice.relauth_sig_sha256"]:
-            raise SelectorRefusal("release-authorization-hashes-identical")
+        if preseal_seen:
+            if present_auth:
+                raise SelectorRefusal("preseal-restates-relauth")
+        else:
+            # The ESP is mutable, so the two SHA-256 values that pin the release
+            # authorization document and its detached signature are sealed in
+            # the line the UKI signature covers.
+            if "neuralice.relauth_sha256" not in optional:
+                raise SelectorRefusal("registry-source-without-release-authorization")
+            if "neuralice.relauth_sig_sha256" not in optional:
+                raise SelectorRefusal(
+                    "registry-source-without-release-authorization-signature"
+                )
+            if optional["neuralice.relauth_sha256"] == optional["neuralice.relauth_sig_sha256"]:
+                raise SelectorRefusal("release-authorization-hashes-identical")
     else:
         if "neuralice.osimage" in optional:
             raise SelectorRefusal("osimage-without-registry-source")
-        release_auth_keys = {
-            "neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"
-        }
-        present_auth = release_auth_keys.intersection(optional)
-        if "neuralice.preseal" in optional:
-            if present_auth != release_auth_keys:
-                raise SelectorRefusal("preseal-without-release-authorization")
-            if optional["neuralice.relauth_sha256"] == optional["neuralice.relauth_sig_sha256"]:
-                raise SelectorRefusal("release-authorization-hashes-identical")
+        if preseal_seen:
+            if present_auth:
+                raise SelectorRefusal("preseal-restates-relauth")
         elif present_auth:
             raise SelectorRefusal("release-authorization-without-preseal")
 
-    if "neuralice.preseal" in optional:
-        if "neuralice.relauth_sha256" not in optional or "neuralice.relauth_sig_sha256" not in optional:
-            raise SelectorRefusal("preseal-without-release-authorization")
+    if preseal_seen:
         if sealed_fields(cmdline)["neuralice.access_profile"] != "lab-managed":
             raise SelectorRefusal("preseal-not-permitted-outside-lab-managed")
 
@@ -1101,10 +1117,18 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             raise SelectorRefusal("mirror-not-permitted-outside-lab-managed")
         if "neuralice.mirror_ca_sha256" not in optional:
             raise SelectorRefusal("mirror-without-pinned-ca")
-        if "neuralice.mirror_ready" not in optional:
-            raise SelectorRefusal("mirror-without-ready-closure-hash")
-        if "neuralice.mirror_manifest" not in optional:
-            raise SelectorRefusal("mirror-without-ready-manifest-hash")
+        if "neuralice.seed_source" in optional:
+            # THE READY PINS ARE THE SEED TUPLE, STATED ONCE (FAB-0057 P1.1b,
+            # rule A): with seed_source=mirror the installer sets mirror_ready
+            # and mirror_manifest from the sealed closure and runs the same
+            # READY comparison; a line restating either is refused by name.
+            if "neuralice.mirror_ready" in optional or "neuralice.mirror_manifest" in optional:
+                raise SelectorRefusal("seed-source-mirror-restates-mirror-ready")
+        else:
+            if "neuralice.mirror_ready" not in optional:
+                raise SelectorRefusal("mirror-without-ready-closure-hash")
+            if "neuralice.mirror_manifest" not in optional:
+                raise SelectorRefusal("mirror-without-ready-manifest-hash")
         if "neuralice.mirror_generation" not in optional:
             raise SelectorRefusal("mirror-without-cache-generation")
     else:
@@ -1131,21 +1155,40 @@ def classify_sealed_cmdline(cmdline: str) -> str:
         # authority, and the verifier is handed that authority explicitly.
         if release_authority is None:
             raise SelectorRefusal("seed-closure-without-release-authority")
-        if "neuralice.seed_manifest" not in optional:
-            raise SelectorRefusal("seed-closure-without-manifest-hash")
+        # THE MANIFEST HASH IS THE CLOSURE'S TO STATE (FAB-0057 P1.1b, rule C):
+        # the closure the sealed hash proves carries `release_manifest_sha256`,
+        # and the installer derives the expected manifest hash from it. A line
+        # restating it is refused by name.
+        if "neuralice.seed_manifest" in optional:
+            raise SelectorRefusal("seed-closure-restates-manifest")
         if "neuralice.seed_trusted_now" not in optional:
             raise SelectorRefusal("seed-closure-without-trusted-time")
         # One release, not two that happen to be on one stick: the closure the
         # LAN mirror declares READY and the closure the seed IS must be the same
         # value, or the OS transport and the runtime artefacts were cut from
-        # different releases.
+        # different releases. The manifest half is compared by the installer
+        # against the verified closure, and refused by the producer.
         if "neuralice.mirror_ready" in optional:
             if optional["neuralice.mirror_ready"] != optional["neuralice.seed_closure"]:
                 raise SelectorRefusal("mirror-ready-not-the-sealed-seed-closure")
-            if optional.get("neuralice.mirror_manifest") != optional["neuralice.seed_manifest"]:
-                raise SelectorRefusal("mirror-manifest-not-the-sealed-seed-manifest")
     elif "neuralice.seed_manifest" in optional or "neuralice.seed_trusted_now" in optional:
         raise SelectorRefusal("seed-manifest-without-closure")
+
+    # THE SEED THAT ARRIVES OVER THE LAN (FAB-0057 P1.1). The sealed closure's
+    # objects are fetched from the mirror rather than read off an ni-seed
+    # partition, which is only meaningful beside a registry OS root, the mirror
+    # itself, the preseal set and the seed tuple. Checked LAST so every rule
+    # above keeps its precedence; the mirror_ready/seed_closure equality is
+    # already forced by the two blocks above once both are required here.
+    if "neuralice.seed_source" in optional:
+        if source != "registry":
+            raise SelectorRefusal("seed-source-mirror-without-registry-source")
+        if "neuralice.mirror" not in optional:
+            raise SelectorRefusal("seed-source-mirror-without-mirror")
+        if "neuralice.preseal" not in optional:
+            raise SelectorRefusal("seed-source-mirror-without-preseal")
+        if "neuralice.seed_closure" not in optional:
+            raise SelectorRefusal("seed-source-mirror-without-seed-closure")
     return mode
 
 
@@ -1369,6 +1412,13 @@ def check_esp_hash_bound(paths: set[str], read_file, cmdline: str) -> None:
     for path, karg in ESP_HASH_BOUND:
         pinned = sealed_words.get(karg)
         present = path in paths
+        if pinned is None and present and path in PRESEAL_BOUND_ESP_FILES \
+                and "neuralice.preseal" in sealed_words:
+            # The pair is pinned through the preseal set (FAB-0057 P1.1b, rule
+            # B): `check_preseal_set` hashes the set against `neuralice.preseal`
+            # and refuses a set that does not bind these exact bytes. The
+            # grammar has already refused a line that restates the pair.
+            continue
         if pinned is None and present:
             raise InspectionError(
                 f"the ESP carries {path} but the sealed command line pins no {karg}; "

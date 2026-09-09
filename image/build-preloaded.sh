@@ -32,6 +32,16 @@ source "$REPO_ROOT/image/lib/preloaded-sizing.sh"
 # shellcheck source=image/lib/preloaded-output-set.sh
 source "$REPO_ROOT/image/lib/preloaded-output-set.sh"
 
+# 🔴 A PRELOADED MEDIUM IS THE ni-seed TRANSPORT OF THE SEED. `SEED_SOURCE=mirror`
+# is the OTHER transport of the same sealed closure (FAB-0057 P1.1,
+# docs/SEED-FROM-MIRROR.md): the installer fetches every object from the LAN
+# mirror and the medium carries no seed partition. This script exists to append
+# one, so the two cannot be asked for together; image/build-installer-usb.sh
+# cuts the mirror-sourced medium on its own. Refused before any input is read
+# or any output name is reserved.
+[[ -z "${SEED_SOURCE:-}" ]] \
+  || { echo "ERROR: SEED_SOURCE=${SEED_SOURCE} is not a PRELOADED medium; a mirror-sourced seed is cut by image/build-installer-usb.sh alone and carries no ni-seed partition" >&2; exit 1; }
+
 RELEASE_MANIFEST_FILE="${RELEASE_MANIFEST_FILE:-}"
 RELEASE_CLOSURE_FILE="${RELEASE_CLOSURE_FILE:-}"
 # Distinct signing domains: Fabric OTA-v2 proves the SEED before raw construction;
