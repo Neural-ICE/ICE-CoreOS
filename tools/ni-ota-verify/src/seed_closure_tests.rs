@@ -156,6 +156,190 @@ fn canonical_domain_refuses_integers_outside_interoperable_range() {
     assert!(canonical_value(b"{\"n\":9007199254740992}\n", "large integer").is_err());
 }
 
+fn attachment_record(
+    kind: &str,
+    artifact_type: serde_json::Value,
+    predicate_type: serde_json::Value,
+    referrers_api: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "artifact_type": artifact_type,
+        "discovery": {
+            "cosign_tag": format!("sha256-{}.{}", "a".repeat(64), match kind {
+                "signature" => "sig",
+                "sbom" => "sbom",
+                _ => "att",
+            }),
+            "fallback_tag": format!("sha256-{}", "a".repeat(64)),
+            "referrers_api": referrers_api
+        },
+        "kind": kind,
+        "layer_digests": [format!("sha256:{}", "b".repeat(64))],
+        "manifest_digest": format!("sha256:{}", "c".repeat(64)),
+        "media_type": "application/vnd.oci.image.manifest.v1+json",
+        "predicate_type": predicate_type,
+        "subject_digest": format!("sha256:{}", "a".repeat(64)),
+        "subject_repository": "registry.example.test/neural-ice/example"
+    })
+}
+
+fn attachment_manifest(artifact_type: Option<&str>) -> serde_json::Value {
+    let mut manifest = serde_json::json!({
+        "config": {},
+        "layers": [],
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "schemaVersion": 2
+    });
+    if let Some(value) = artifact_type {
+        manifest["artifactType"] = serde_json::json!(value);
+    }
+    manifest
+}
+
+#[test]
+fn attachment_schema_matches_legacy_and_typed_cosign_profiles() {
+    let legacy: Attachment = serde_json::from_value(attachment_record(
+        "signature",
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        false,
+    ))
+    .unwrap();
+    validate_attachment_manifest_profile(attachment_manifest(None).as_object().unwrap(), &legacy)
+        .unwrap();
+
+    let typed: Attachment = serde_json::from_value(attachment_record(
+        "signature",
+        serde_json::json!("application/vnd.dev.cosign.artifact.sig.v1+json"),
+        serde_json::Value::Null,
+        true,
+    ))
+    .unwrap();
+    validate_attachment_manifest_profile(
+        attachment_manifest(Some("application/vnd.dev.cosign.artifact.sig.v1+json"))
+            .as_object()
+            .unwrap(),
+        &typed,
+    )
+    .unwrap();
+
+    let sbom: Attachment = serde_json::from_value(attachment_record(
+        "sbom",
+        serde_json::json!("application/spdx+json"),
+        serde_json::json!("https://spdx.dev/Document"),
+        false,
+    ))
+    .unwrap();
+    let provenance: Attachment = serde_json::from_value(attachment_record(
+        "provenance",
+        serde_json::json!("application/vnd.dev.cosign.artifact.attestation.v1+json"),
+        serde_json::json!("https://slsa.dev/provenance/v1"),
+        false,
+    ))
+    .unwrap();
+    validate_attachment_manifest_profile(
+        attachment_manifest(Some("application/spdx+json"))
+            .as_object()
+            .unwrap(),
+        &sbom,
+    )
+    .unwrap();
+    validate_attachment_manifest_profile(
+        attachment_manifest(Some(
+            "application/vnd.dev.cosign.artifact.attestation.v1+json",
+        ))
+        .as_object()
+        .unwrap(),
+        &provenance,
+    )
+    .unwrap();
+
+    let custom: Attachment = serde_json::from_value(attachment_record(
+        "signature",
+        serde_json::json!("application/vnd.neural-ice.signature"),
+        serde_json::Value::Null,
+        false,
+    ))
+    .unwrap();
+    validate_attachment_manifest_profile(
+        attachment_manifest(Some("application/vnd.neural-ice.signature"))
+            .as_object()
+            .unwrap(),
+        &custom,
+    )
+    .unwrap();
+}
+
+#[test]
+fn attachment_schema_refuses_missing_malformed_or_mismatched_nullable_fields() {
+    let mut missing = attachment_record(
+        "signature",
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        false,
+    );
+    missing.as_object_mut().unwrap().remove("artifact_type");
+    assert!(serde_json::from_value::<Attachment>(missing).is_err());
+
+    let mut missing_predicate = attachment_record(
+        "signature",
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        false,
+    );
+    missing_predicate
+        .as_object_mut()
+        .unwrap()
+        .remove("predicate_type");
+    assert!(serde_json::from_value::<Attachment>(missing_predicate).is_err());
+
+    let malformed: Attachment = serde_json::from_value(attachment_record(
+        "signature",
+        serde_json::json!(7),
+        serde_json::Value::Null,
+        false,
+    ))
+    .unwrap();
+    assert!(validate_attachment_manifest_profile(
+        attachment_manifest(None).as_object().unwrap(),
+        &malformed,
+    )
+    .is_err());
+
+    let malformed_predicate: Attachment = serde_json::from_value(attachment_record(
+        "signature",
+        serde_json::Value::Null,
+        serde_json::json!(7),
+        false,
+    ))
+    .unwrap();
+    assert!(validate_attachment_manifest_profile(
+        attachment_manifest(None).as_object().unwrap(),
+        &malformed_predicate,
+    )
+    .is_err());
+
+    let typed: Attachment = serde_json::from_value(attachment_record(
+        "signature",
+        serde_json::json!("application/vnd.dev.cosign.artifact.sig.v1+json"),
+        serde_json::Value::Null,
+        true,
+    ))
+    .unwrap();
+    assert!(validate_attachment_manifest_profile(
+        attachment_manifest(None).as_object().unwrap(),
+        &typed,
+    )
+    .is_err());
+    let mut malformed_manifest =
+        attachment_manifest(Some("application/vnd.dev.cosign.artifact.sig.v1+json"));
+    malformed_manifest["artifactType"] = serde_json::json!(7);
+    assert!(
+        validate_attachment_manifest_profile(malformed_manifest.as_object().unwrap(), &typed,)
+            .is_err()
+    );
+}
+
 fn empty_model_node() -> Node {
     Node {
         repository: "registry.example.test/neural-ice/model-card-alpha".into(),
@@ -891,23 +1075,46 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         let config_size = objects[config_digest].len();
         let payload_digest = put_object(objects, payload);
         let payload_size = objects[&payload_digest].len();
-        let manifest = canonical_json(serde_json::json!({
+        let artifact_type = match kind {
+            "signature" => serde_json::Value::Null,
+            "sbom" => serde_json::json!("application/spdx+json"),
+            "provenance" => {
+                serde_json::json!("application/vnd.dev.cosign.artifact.attestation.v1+json")
+            }
+            _ => unreachable!(),
+        };
+        let layer_media_type = match kind {
+            "signature" => "application/vnd.dev.cosign.simplesigning.v1+json",
+            "sbom" => "application/spdx+json",
+            "provenance" => "application/vnd.dsse.envelope.v1+json",
+            _ => unreachable!(),
+        };
+        let annotations = if kind == "signature" {
+            serde_json::json!({
+                "dev.cosignproject.cosign/signature": encode_base64(signature)
+            })
+        } else {
+            serde_json::json!({})
+        };
+        let mut manifest_value = serde_json::json!({
             "config": {
                 "digest": config_digest,
                 "mediaType": "application/vnd.oci.empty.v1+json",
                 "size": config_size
             },
             "layers": [{
-                "annotations": {
-                    "dev.cosignproject.cosign/signature": encode_base64(signature)
-                },
+                "annotations": annotations,
                 "digest": payload_digest,
-                "mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                "mediaType": layer_media_type,
                 "size": payload_size
             }],
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "schemaVersion": 2
-        }));
+        });
+        if !artifact_type.is_null() {
+            manifest_value["artifactType"] = artifact_type.clone();
+        }
+        let manifest = canonical_json(manifest_value);
         let manifest_digest = put_object(objects, manifest);
         let suffix = match kind {
             "signature" => "sig",
@@ -917,22 +1124,22 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         };
         let subject_hex = subject.strip_prefix("sha256:").unwrap();
         let record = serde_json::json!({
-            "artifact_type": match kind {
-                "signature" => "application/vnd.dev.cosign.simplesigning.v1+json",
-                "sbom" => "application/spdx+json",
-                "provenance" => "application/vnd.in-toto+json",
-                _ => unreachable!(),
-            },
+            "artifact_type": artifact_type,
             "discovery": {
                 "cosign_tag": format!("sha256-{subject_hex}.{suffix}"),
                 "fallback_tag": format!("sha256-{subject_hex}"),
-                "referrers_api": true
+                "referrers_api": false
             },
             "kind": kind,
             "layer_digests": [payload_digest],
             "manifest_digest": manifest_digest,
             "media_type": "application/vnd.oci.image.manifest.v1+json",
-            "predicate_type": null,
+            "predicate_type": match kind {
+                "signature" => serde_json::Value::Null,
+                "sbom" => serde_json::json!("https://spdx.dev/Document"),
+                "provenance" => serde_json::json!("https://slsa.dev/provenance/v1"),
+                _ => unreachable!(),
+            },
             "subject_digest": subject,
             "subject_repository": repository
         });
