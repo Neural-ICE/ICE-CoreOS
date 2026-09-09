@@ -1422,6 +1422,49 @@ assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null || fail "the restored correct medium was refused"
 
 # --------------------------------------------------------------------------- #
+# 5b) THE OPERATOR KEY HAS ONE TRANSPORT: THE SIGNED UKI. The producer used to
+#     seal `neuralice.sshkey` AND stage the same key at ice-coreos/authorized_keys;
+#     the installer refuses both together at preflight, and the bench medium of
+#     2026-09-09 was refused on hardware exactly so. The inspector now refuses
+#     that medium at the cut, reads the sealed key back against the approved
+#     hash, and refuses a key on a medium that approved none.
+# --------------------------------------------------------------------------- #
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMediaFixtureOperatorKeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAA fixture\n' \
+  > "$TMP/operator.pub"
+operator_b64="$(base64 -w0 < "$TMP/operator.pub")"
+operator_sha="$(sha256sum "$TMP/operator.pub" | awk '{print $1}')"
+build_uki installer-keyed \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.sshkey=$operator_b64" \
+  >/dev/null || fail "the keyed Install UKI failed to build"
+make_esp "$SEALED/installer-keyed.efi" "$SEALED/installer-keyed.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect --expect-sshkey-sha256 "$operator_sha" >/dev/null \
+  || fail "a medium sealing the approved operator key in its UKI alone was refused"
+inspect --expect-no-sshkey >/dev/null 2>&1 \
+  && fail "a medium sealing an operator key was accepted as keyless"
+inspect --expect-sshkey-sha256 "$(printf 'other-key' | sha256sum | awk '{print $1}')" >/dev/null 2>&1 \
+  && fail "a sealed operator key differing from the approved hash was accepted"
+make_esp "$SEALED/installer-keyed.efi" "$SEALED/installer-keyed.efi.manifest" \
+  installer-install.efi.manifest "::/ice-coreos/authorized_keys=$TMP/operator.pub"
+assemble "$ESP" "$SEALED/payload.img"
+inspect --expect-sshkey-sha256 "$operator_sha" >/dev/null 2>&1 \
+  && fail "the bench medium of 2026-09-09 (operator key sealed in the UKI AND staged on the ESP) was accepted"
+inspect >/dev/null 2>&1 \
+  && fail "an operator key on both transports was accepted when no expectation was given"
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest "::/ice-coreos/authorized_keys=$TMP/operator.pub"
+assemble "$ESP" "$SEALED/payload.img"
+inspect --expect-no-sshkey >/dev/null 2>&1 \
+  && fail "an ESP operator key on a medium that approved none was accepted"
+inspect --expect-sshkey-sha256 "$operator_sha" >/dev/null 2>&1 \
+  && fail "an approved key absent from the sealed line was accepted on the strength of an ESP copy"
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect --expect-no-sshkey >/dev/null || fail "the restored keyless medium was refused"
+
+# --------------------------------------------------------------------------- #
 # 6) THE PRODUCER MUST ACTUALLY DO ALL OF THIS. A perfect implementation that
 #    nothing invokes is what the review found the first time.
 # --------------------------------------------------------------------------- #
@@ -1472,6 +1515,12 @@ grep -Fq 'UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")' "$USB" \
 # itself on hardware (bench medium, 2026-09-09).
 grep -Fq 'installer-ssh-key.sh" install' "$USB" \
   && fail "the media producer stages the operator key on the ESP as well as in the sealed UKI"
+grep -Fq -- '--expect-sshkey-sha256 "$SSH_AUTHORIZED_KEYS_SHA256"' "$USB" \
+  || fail "the media producer does not have the inspector read the sealed operator key back against the approved hash"
+grep -Fq -- 'INSPECT_ARGS+=(--expect-no-sshkey)' "$USB" \
+  || fail "the media producer does not have the inspector refuse a key on a medium that approved none"
+grep -Fq 'SSH_AUTHORIZED_KEYS_FILE is an Install medium input' "$USB" \
+  || fail "the media producer silently drops an operator key given to a Live cut"
 grep -Fq 'neuralice.live=1' "$USB" \
   || fail "the media producer does not seal an affirmative Live selector"
 grep -Fq 'PRESEAL_SET_DIR and PRESEAL_SET_SHA256 must be supplied together' "$USB" \
@@ -1561,6 +1610,7 @@ try:
         expect_hardware_target="nvidia-gb10-arm64",
         expect_trust_policy_id=policy_id,
         allow_unsigned=False,
+        installer_ssh_key_sha256=None,
     )
     gate.inspect_sealed_core(descriptor, arguments)
 except gate.GateError as error:

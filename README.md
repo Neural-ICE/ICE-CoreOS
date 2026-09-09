@@ -158,14 +158,20 @@ The local build writes `${OUT:-/var/tmp/ice-coreos-bib}/image/disk.raw`. Then:
    ```sh
    sudo dd if=/var/tmp/ice-coreos-bib/image/disk.raw of=/dev/sdX bs=64M oflag=direct conv=fsync status=progress
    ```
-3. **Inject your SSH key** (the vanilla image has none) — either:
-   - drop your public key onto the USB's EFI partition at `ice-coreos/authorized_keys`
-     after flashing and byte-verifying the raw image; `debug` and `sealed-lab` images are
-     keyless by default, so this per-USB injection is the normal path (the EFI partition
-     is FAT and mounts on any OS), **or**
-   - pass `neuralice.sshkey=<base64-of-your-pubkey>` as a kernel argument.
+3. **Inject your SSH key** (the vanilla image has none) — one transport, never both:
+   - the medium producer seals it: with `SSH_AUTHORIZED_KEYS_FILE` and
+     `SSH_AUTHORIZED_KEYS_SHA256`, `image/build-installer-usb.sh` seals
+     `neuralice.sshkey=<base64-of-your-pubkey>` into the **signed UKI command line** and
+     stages no copy on the EFI partition; the inspector reads the sealed key back against
+     the approved hash before the medium is accepted. This is the lab path.
+   - on a hand-flashed medium whose UKI seals **no** key, you may drop your public key onto
+     the USB's EFI partition at `ice-coreos/authorized_keys` after flashing and
+     byte-verifying the raw image (the EFI partition is FAT and mounts on any OS).
 
-   Either input is honoured **only** if the access profile permits it
+   A medium carrying the key on **both** the sealed command line and the EFI partition
+   is refused by the installer before any disk write (`ota/neural-ice-autoinstall.sh`,
+   step 1b) and by `image/inspect-installer-media.py` at the cut. Either input is
+   honoured **only** if the access profile permits it
    (`lab-managed` or `developer-diagnostic`). A `customer-locked` (`prod`) image
    refuses both, before any disk write and again at first boot — see
    [ADR-0014](docs/ADR-0014-access-policy-lab-vs-customer.md). The profile the

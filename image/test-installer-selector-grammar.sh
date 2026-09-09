@@ -595,6 +595,62 @@ esp_bound "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.auto
   || fail "an ordinary medium install with no pinned ESP artefacts was refused"
 
 # --------------------------------------------------------------------------- #
+# THE OPERATOR KEY HAS ONE TRANSPORT (bench medium refused on hardware,
+# 2026-09-09). The producer sealed `neuralice.sshkey` into the UKI and ALSO
+# staged the key at ice-coreos/authorized_keys; the installer refuses both
+# together, at preflight, on the bench. image/inspect-installer-media.py::
+# check_sshkey_transport is the cut-time refusal of the same state, plus the
+# approved-hash readback the producer asks for. Driven here as a pure function
+# for the same reason as the pins above: the media suite needs veritysetup.
+# --------------------------------------------------------------------------- #
+sshkey_transport() { # $1=cmdline $2=expected sha256 or "" $3=expect-absent 0|1, rest=ESP paths
+  python3 - "$INSPECTOR" "$@" <<'PYEOF'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("inspector", sys.argv[1])
+inspector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(inspector)
+cmdline, expected, absent, *paths = sys.argv[2:]
+try:
+    inspector.check_sshkey_transport(set(paths), cmdline, expected or None, absent == "1")
+except inspector.InspectionError as error:
+    print(f"REFUSED {error}", file=sys.stderr)
+    raise SystemExit(1)
+PYEOF
+}
+operator_key_content='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGrammarFixtureOperatorKeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA fixture'
+operator_key_b64="$(printf '%s\n' "$operator_key_content" | base64 -w0)"
+operator_key_sha="$(printf '%s\n' "$operator_key_content" | sha256sum | awk '{print $1}')"
+keyed_line="$pinned_line neuralice.sshkey=$operator_key_b64"
+uki_only=(EFI/BOOT/BOOTAA64.EFI)
+sshkey_transport "$keyed_line" "$operator_key_sha" 0 "${uki_only[@]}" \
+  || fail "a sealed operator key hashing to the approved value was refused"
+sshkey_transport "$keyed_line" "" 0 "${uki_only[@]}" ice-coreos/authorized_keys \
+  && fail "an operator key on both transports was accepted (the bench medium of 2026-09-09)"
+sshkey_transport "$keyed_line" "$operator_key_sha" 0 "${uki_only[@]}" ice-coreos/authorized_keys \
+  && fail "an APPROVED operator key on both transports was accepted"
+sshkey_transport "$keyed_line" "$(esp_digest other-key)" 0 "${uki_only[@]}" \
+  && fail "a sealed operator key differing from the approved hash was accepted"
+sshkey_transport "$pinned_line" "$operator_key_sha" 0 "${uki_only[@]}" \
+  && fail "an approved operator key absent from the sealed line was accepted"
+sshkey_transport "$pinned_line" "$operator_key_sha" 0 "${uki_only[@]}" ice-coreos/authorized_keys \
+  && fail "an approved key absent from the sealed line was accepted on the strength of an ESP copy"
+sshkey_transport "$keyed_line" "" 1 "${uki_only[@]}" \
+  && fail "a sealed operator key nobody approved was accepted"
+sshkey_transport "$pinned_line" "" 1 "${uki_only[@]}" ice-coreos/authorized_keys \
+  && fail "an ESP operator key nobody approved was accepted"
+sshkey_transport "$pinned_line" "" 1 "${uki_only[@]}" \
+  || fail "a keyless medium was refused when no key was expected"
+sshkey_transport "$pinned_line" "" 0 "${uki_only[@]}" ice-coreos/authorized_keys \
+  || fail "a hand-dropped ESP key on a medium whose UKI seals none was refused by the inspector; the access policy decides that one at install time"
+sshkey_transport "$pinned_line neuralice.sshkey=not*base64" "$operator_key_sha" 0 "${uki_only[@]}" \
+  && fail "a sealed operator key that is not base64 was accepted"
+sshkey_transport "$pinned_line neuralice.sshkey=$(head -c 600 /dev/zero | base64 -w0)" \
+  "$(head -c 600 /dev/zero | sha256sum | awk '{print $1}')" 0 "${uki_only[@]}" \
+  && fail "a sealed operator key over the 512-byte bound was accepted"
+
+# --------------------------------------------------------------------------- #
 # THE INSTALLED APPLIANCE IS UNTOUCHED. No media selector means no masks at all,
 # which is what keeps the mandatory first-boot ceremony in force on first
 # installed boot -- the installer image IS the source deployment.
@@ -603,4 +659,4 @@ run_generator 'quiet rd.luks=1 root=/dev/mapper/system' "$TMP/installed"
 [[ -z "$(find "$TMP/installed/early" -mindepth 1 -print -quit)" ]] \
   || fail "installer-only masks leaked into an installed boot"
 
-echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate and the ESP artefact pins all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes, kernel bound ${KERNEL_CMDLINE_BYTES})"
+echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate, the ESP artefact pins and the operator key's single transport all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes, kernel bound ${KERNEL_CMDLINE_BYTES})"

@@ -101,6 +101,15 @@ PAYLOAD_KEYS = frozenset(
 # removable-media default path the firmware loads with no boot manager and no
 # NVRAM entry; the rest is inert data the installer reads.
 ESP_REQUIRED = ("EFI/BOOT/BOOTAA64.EFI",)
+# The operator key's two POSSIBLE carriers and the rule between them: a medium
+# whose signed command line seals `neuralice.sshkey` carries NO ESP copy. The
+# installer refuses both together (ota/neural-ice-autoinstall.sh, step 1b), so
+# a producer staging both cuts a medium that refuses itself on hardware -- the
+# bench medium of 2026-09-09 did. The bound and the base64 alphabet are the
+# runtime's (image/lib/installer-ssh-key.sh, autoinstall step 1b).
+ESP_OPERATOR_KEY = "ice-coreos/authorized_keys"
+SEALED_OPERATOR_KEY_KARG = "neuralice.sshkey"
+OPERATOR_KEY_MAX_BYTES = 512
 ESP_OPTIONAL = frozenset(
     {
         "ice-coreos/authorized_keys",
@@ -1719,6 +1728,76 @@ def canonical_esp_paths(discovered: list[str]) -> list[str]:
     return result
 
 
+def check_sshkey_transport(
+    paths: set[str],
+    cmdline: str,
+    expected_sha256: str | None = None,
+    expect_absent: bool = False,
+) -> str | None:
+    """The operator SSH key has ONE transport: the signed UKI command line.
+
+    Refuses, in every mode, a medium whose sealed line carries
+    ``neuralice.sshkey`` while its ESP also carries ``ice-coreos/authorized_keys``
+    -- the installer refuses that medium at preflight, so the inspector refuses
+    it at the cut. With ``expected_sha256`` the sealed key must be present,
+    decodable and hash to the approved value (a lab medium approved for a key
+    that does not carry it installs an unreachable appliance). With
+    ``expect_absent`` neither transport may carry a key (a key nobody approved
+    has no business leaving the build host). With neither, an ESP-only key on a
+    medium whose UKI seals none is left to the installed image's access policy,
+    which is the authority that decides it at install time (ADR-0014).
+
+    Returns the SHA-256 of the sealed key when one was expected and found.
+    """
+    if expected_sha256 is not None and expect_absent:
+        raise ValueError("expected_sha256 and expect_absent are exclusive")
+    prefix = SEALED_OPERATOR_KEY_KARG + "="
+    sealed = [word[len(prefix):] for word in cmdline.split() if word.startswith(prefix)]
+    if len(sealed) > 1:
+        raise InspectionError(
+            f"the sealed cmdline carries {len(sealed)} occurrences of {SEALED_OPERATOR_KEY_KARG}"
+        )
+    esp_present = ESP_OPERATOR_KEY in paths
+    if sealed and esp_present:
+        raise InspectionError(
+            f"the ESP carries {ESP_OPERATOR_KEY} while the sealed command line already "
+            f"carries {SEALED_OPERATOR_KEY_KARG}; the installer refuses an operator key on "
+            "both transports, and the producer stages no ESP copy of a sealed key"
+        )
+    if expect_absent:
+        if sealed:
+            raise InspectionError(
+                "the sealed command line carries an operator SSH key nobody approved for this medium"
+            )
+        if esp_present:
+            raise InspectionError(
+                f"the ESP carries {ESP_OPERATOR_KEY}, an operator SSH key nobody approved for this medium"
+            )
+        return None
+    if expected_sha256 is None:
+        return None
+    if not sealed:
+        raise InspectionError(
+            "the approved operator SSH key is absent from the sealed command line; "
+            "this medium would install an unreachable lab appliance"
+        )
+    encoded = sealed[0]
+    if not re.fullmatch(r"[A-Za-z0-9+/=]{1,1024}", encoded):
+        raise InspectionError("the sealed operator SSH key is not plain base64")
+    try:
+        key = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise InspectionError("the sealed operator SSH key is not decodable base64") from error
+    if not 0 < len(key) <= OPERATOR_KEY_MAX_BYTES:
+        raise InspectionError(
+            f"the sealed operator SSH key decodes to {len(key)} bytes, outside 1..{OPERATOR_KEY_MAX_BYTES}"
+        )
+    digest = hashlib.sha256(key).hexdigest()
+    if digest != expected_sha256:
+        raise InspectionError("the sealed operator SSH key differs from the approved hash")
+    return digest
+
+
 def check_esp(
     esp: Fat, arguments: argparse.Namespace
 ) -> tuple[str, dict[str, str], str, str]:
@@ -1796,6 +1875,9 @@ def check_esp(
     check_esp_hash_bound(set(paths), esp.read_file, cmdline)
     check_preseal_set(set(paths), esp.read_file, cmdline, fields)
     check_tpm_policy_document(set(paths), esp.read_file, cmdline)
+    check_sshkey_transport(
+        set(paths), cmdline, arguments.expect_sshkey_sha256, arguments.expect_no_sshkey
+    )
     if not arguments.allow_unsigned and not pe_has_signature(blob):
         raise InspectionError("BOOTAA64.EFI carries no signature")
     return (
@@ -1872,6 +1954,16 @@ def main() -> int:
     parser.add_argument("--expect-hardware-target")
     parser.add_argument("--expect-trust-policy-id")
     parser.add_argument("--allow-unsigned", action="store_true")
+    operator_key = parser.add_mutually_exclusive_group()
+    operator_key.add_argument(
+        "--expect-sshkey-sha256",
+        help="the sealed cmdline must carry neuralice.sshkey decoding to bytes with this SHA-256, and the ESP no copy",
+    )
+    operator_key.add_argument(
+        "--expect-no-sshkey",
+        action="store_true",
+        help="neither the sealed cmdline nor the ESP may carry an operator SSH key",
+    )
     parser.add_argument("--payload-partition-name", default=PAYLOAD_PARTITION_NAME)
     parser.add_argument("--measurements-output", type=Path)
     arguments = parser.parse_args()
@@ -1879,6 +1971,7 @@ def main() -> int:
     for value, label in (
         (arguments.expect_verity_root_hash, "--expect-verity-root-hash"),
         (arguments.expect_payload_digest, "--expect-payload-digest"),
+        (arguments.expect_sshkey_sha256, "--expect-sshkey-sha256"),
     ):
         if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
             print(f"ERROR: {label} must be 64 lowercase hex", file=sys.stderr)

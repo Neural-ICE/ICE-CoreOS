@@ -337,7 +337,7 @@ if [[ -n "$LAB_BASELINE_BOM_SHA256" || -n "$LAB_BASELINE_SIGNATURE_SHA256" ]]; t
 fi
 final_media_ssh_key_args=()
 if [[ -n "$SSH_AUTHORIZED_KEYS_SHA256" ]]; then
-  final_media_ssh_key_args=(--esp-authorized-keys-sha256 "$SSH_AUTHORIZED_KEYS_SHA256")
+  final_media_ssh_key_args=(--installer-ssh-key-sha256 "$SSH_AUTHORIZED_KEYS_SHA256")
 fi
 # THE FULL SEALED-CORE INSPECTION HAPPENS INSIDE THIS GATE, under the exclusive
 # lock it holds on the finished raw and before it publishes anything: the

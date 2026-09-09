@@ -68,6 +68,7 @@ echo "  (using the host's real veritysetup)"
 # --------------------------------------------------------------------------- #
 IN="$TMP/in"; mkdir -p "$IN"
 python3 - "$IN/stub.efi" <<'PYEOF'
+import platform
 import struct, sys
 
 SECTION_ALIGNMENT, FILE_ALIGNMENT = 4096, 512
@@ -82,7 +83,12 @@ struct.pack_into("<I", dos, 0x3C, 0x80)
 # 0x8664 rather than 0xAA64: the GB10 medium is aarch64, but binutils on a CI
 # runner only speaks pei-x86-64, and every property this suite asserts is about
 # PE structure rather than instruction set.
-coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, optional_size, 0x0022 | 0x2000)
+# The machine type follows the HOST so the host's own binutils can parse,
+# extend and sign the stub: x86-64 on the CI runners, AArch64 on the ARM64
+# build host that cuts real media. Everything below is PE structure, not
+# instruction set, so nothing else changes with it.
+machine = 0xAA64 if platform.machine() in ("aarch64", "arm64") else 0x8664
+coff = struct.pack("<HHIIIHH", machine, 1, 0, 0, 0, optional_size, 0x0022 | 0x2000)
 optional = struct.pack(
     "<HBBIIIIIQ", 0x20B, 14, 0, len(text), 0, 0, text_rva, text_rva, 0x140000000
 )
