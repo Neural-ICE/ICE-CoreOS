@@ -57,6 +57,9 @@ INSTALLER_IMG="${INSTALLER_IMG:-localhost/ice-coreos-installer:local}"
 # atomic build result below rather than sharing the mutable build tag.
 INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-}"
 STORE_STORAGE_NAME="${STORE_STORAGE_NAME:-}"
+# Optional registry source for the medium's image store (see build-installer-root.sh).
+STORE_SOURCE_REF="${STORE_SOURCE_REF:-}"
+STORE_SOURCE_CERT_DIR="${STORE_SOURCE_CERT_DIR:-}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
 OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
@@ -759,6 +762,8 @@ sudo env \
   INSTALLER_STORAGE_NAME="$INSTALLER_STORAGE_NAME" \
   STORE_STORAGE_NAME="$STORE_STORAGE_NAME" \
   STORE_MANIFEST_DIGEST="$BASE_MANIFEST_DIGEST" \
+  STORE_SOURCE_REF="$STORE_SOURCE_REF" \
+  STORE_SOURCE_CERT_DIR="$STORE_SOURCE_CERT_DIR" \
   bash "$REPO_ROOT/image/build-installer-root.sh" \
   || { echo "ERROR: cannot build the sealed installer root and store" >&2; exit 1; }
 sudo chown -R "$(id -u):$(id -g)" "$SEALED_DIR" 2>/dev/null || true

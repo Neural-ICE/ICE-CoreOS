@@ -54,6 +54,17 @@ STORE_IMAGE_NAME="${STORE_IMAGE_NAME:-localhost/bootc}"
 INSTALLER_STORAGE_NAME="${INSTALLER_STORAGE_NAME:-localhost/ice-coreos-installer:local}"
 STORE_STORAGE_NAME="${STORE_STORAGE_NAME:-localhost/ice-coreos-host:local}"
 STORE_MANIFEST_DIGEST="${STORE_MANIFEST_DIGEST:-}"
+# Optional explicit SOURCE for the digest-preserving store copy: a registry
+# reference (`docker://host/repo@sha256:<manifest>`) whose manifest digest must
+# equal STORE_MANIFEST_DIGEST and whose config must be the immutable store image
+# ID. A containers-storage source cannot always reproduce the original
+# compressed layer streams the manifest names ("would require changing layer
+# representation", measured 2026-09-09 on the lab builder with skopeo 1.13.3),
+# whereas a registry serves the exact blobs; the local named image is still
+# resolved and checked as before. Certificates for that registry come from
+# STORE_SOURCE_CERT_DIR; no credential is ever passed.
+STORE_SOURCE_REF="${STORE_SOURCE_REF:-}"
+STORE_SOURCE_CERT_DIR="${STORE_SOURCE_CERT_DIR:-}"
 MANIFEST_OUT="${MANIFEST_OUT:-${ROOT_IMAGE_OUT}.manifest}"
 
 # Tool overrides exist so the suite can drive every branch without podman, a
@@ -222,9 +233,40 @@ NAMED_MANIFEST_DIGEST="$(podman_run image inspect --format '{{.Digest}}' "$STORE
   || die "cannot resolve the host storage manifest digest for $STORE_STORAGE_NAME"
 [[ "$NAMED_MANIFEST_DIGEST" == "$STORE_MANIFEST_DIGEST" ]] \
   || die "host storage name $STORE_STORAGE_NAME resolves to manifest '${NAMED_MANIFEST_DIGEST:-nothing}', not $STORE_MANIFEST_DIGEST"
+STORE_COPY_SOURCE="containers-storage:${STORE_STORAGE_NAME}"
+STORE_COPY_SOURCE_ARGS=()
+if [[ -n "$STORE_SOURCE_REF" ]]; then
+  [[ "$STORE_SOURCE_REF" =~ ^docker://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$ ]] \
+    || die "STORE_SOURCE_REF must be a digest-pinned registry reference: $STORE_SOURCE_REF"
+  [[ "${STORE_SOURCE_REF##*@}" == "$STORE_MANIFEST_DIGEST" ]] \
+    || die "STORE_SOURCE_REF names manifest ${STORE_SOURCE_REF##*@}, not the store manifest $STORE_MANIFEST_DIGEST"
+  if [[ -n "$STORE_SOURCE_CERT_DIR" ]]; then
+    [[ -d "$STORE_SOURCE_CERT_DIR" ]] || die "STORE_SOURCE_CERT_DIR is not a directory: $STORE_SOURCE_CERT_DIR"
+    STORE_COPY_SOURCE_ARGS+=(--src-cert-dir "$STORE_SOURCE_CERT_DIR")
+  fi
+  # The registry's answer is bound to the SAME two identities the local store
+  # was: the manifest bytes must hash to STORE_MANIFEST_DIGEST and name the
+  # immutable store image as their config. Bounded read; the reference's
+  # digest is what the registry is asked for, so a substituted answer cannot
+  # pass both checks.
+  SOURCE_MANIFEST_RAW="$WORK/store-source-manifest.json"
+  "$(tool skopeo)" inspect --raw --no-creds "${STORE_COPY_SOURCE_ARGS[@]/--src-cert-dir/--cert-dir}" "$STORE_SOURCE_REF" \
+    | head -c 4194304 > "$SOURCE_MANIFEST_RAW" \
+    || die "cannot read the store source manifest from $STORE_SOURCE_REF"
+  [[ "sha256:$(sha256_of "$SOURCE_MANIFEST_RAW")" == "$STORE_MANIFEST_DIGEST" ]] \
+    || die "the store source at $STORE_SOURCE_REF serves a manifest that does not hash to $STORE_MANIFEST_DIGEST"
+  SOURCE_CONFIG_DIGEST="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("config",{}).get("digest",""))' "$SOURCE_MANIFEST_RAW")" \
+    || die "the store source manifest is not a JSON image manifest"
+  [[ "$SOURCE_CONFIG_DIGEST" == "sha256:${EXPECTED_STORE_IMAGE_ID}" ]] \
+    || die "the store source manifest names config '${SOURCE_CONFIG_DIGEST:-nothing}', not the immutable store image ${EXPECTED_STORE_IMAGE_ID}"
+  STORE_COPY_SOURCE="$STORE_SOURCE_REF"
+  STORE_COPY_SOURCE_ARGS+=(--src-no-creds)
+  echo "    store source: ${STORE_SOURCE_REF} (manifest and config identities verified)"
+fi
 "$(tool skopeo)" copy \
   --preserve-digests \
-  "containers-storage:${STORE_STORAGE_NAME}" \
+  "${STORE_COPY_SOURCE_ARGS[@]}" \
+  "$STORE_COPY_SOURCE" \
   "containers-storage:[overlay@${STORE_TREE}+${WORK}/runroot]${STORE_IMAGE_NAME}" \
   || die "cannot stage the original host image into the medium image store"
 # A store the installer cannot read is a medium that cannot install. Assert the
