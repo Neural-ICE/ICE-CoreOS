@@ -49,6 +49,13 @@ fi
 readonly EVIDENCE_FILE="${NEURALICE_FAILURE_EVIDENCE:-/run/neural-ice-installer-failure/evidence}"
 readonly POLICY_FILE="${NEURALICE_FAILURE_POLICY:-/usr/lib/neural-ice/installer-failure-policy}"
 readonly EFI_EVIDENCE_FILE="${NEURALICE_EFI_FAILURE_EVIDENCE:-/sys/firmware/efi/efivars/NeuralICEInstallerFailure-870a0500-25d2-574e-a1cc-79a69630bf96}"
+# The immutable access policy of the image this medium installs: on a LAB
+# medium the operator standing at the console is ours, and the diagnostic is
+# what they came for (2026-09-09: the bootc error scrolled off the screen
+# before the failure block, and the attempt cost an hour for nothing).
+readonly ACCESS_POLICY_FILE="${NEURALICE_ACCESS_POLICY_FILE:-/usr/lib/neural-ice/access-policy}"
+readonly INSTALLER_UNIT="${NEURALICE_INSTALLER_UNIT:-neural-ice-autoinstall.service}"
+readonly LAB_JOURNAL_LINES=40
 DRY_RUN=0
 case "${1:-}" in
   '')        ;;
@@ -211,10 +218,26 @@ if [[ "$(value pcr7_verified)" != none && "$(value pcr7_verified)" != unclassifi
 fi
 printf '  %-18s %s\n' 'schema'         "$EVIDENCE_SCHEMA"
 printf '\n'
-printf '  The full diagnostic is in this boot'"'"'s journal on the medium only. It\n'
-printf '  is deliberately not printed here: a console is read by whoever is\n'
-printf '  standing at the machine, and this one may hold a customer appliance.\n'
-printf '\n'
+lab_medium() { # -> 0 when the image being installed is lab-managed
+  [ -f "$ACCESS_POLICY_FILE" ] && [ ! -L "$ACCESS_POLICY_FILE" ] \
+    && [ "$(head -c 64 -- "$ACCESS_POLICY_FILE" 2>/dev/null | tr -d '[:space:]')" = lab-managed ]
+}
+if lab_medium && command -v journalctl >/dev/null 2>&1; then
+  # LAB medium: the last lines of the installer's own journal, bounded in
+  # count and width, control characters stripped. Output only; nothing here
+  # reads input or changes state.
+  printf '  Last %s lines of the installer journal (LAB medium):\n' "$LAB_JOURNAL_LINES"
+  printf '  ----------------------------------------------------------------------\n'
+  journalctl -u "$INSTALLER_UNIT" -n "$LAB_JOURNAL_LINES" --no-pager -o cat 2>/dev/null \
+    | tr -cd '\11\12\40-\176' | cut -c1-200 | sed 's/^/  /'
+  printf '  ----------------------------------------------------------------------\n'
+  printf '\n'
+else
+  printf '  The full diagnostic is in this boot'"'"'s journal on the medium only. It\n'
+  printf '  is deliberately not printed here: a console is read by whoever is\n'
+  printf '  standing at the machine, and this one may hold a customer appliance.\n'
+  printf '\n'
+fi
 printf '  Report the failure code and stage above to Neural ICE support. Cut a\n'
 printf '  fresh signed medium rather than re-running this one.\n'
 printf '\n'
