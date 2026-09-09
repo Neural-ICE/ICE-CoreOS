@@ -127,6 +127,9 @@ persist_efi_evidence() {
     "$(value stage)" "$(value detail)" "$(value pcr7)" "$(value pcr7_policy)" \
     "$(value pcr7_verified)" "$(value pcr7_verified_count)"
   if [[ -d "${EFI_EVIDENCE_FILE%/*}" && ! -L "$EFI_EVIDENCE_FILE" ]]; then
+    # efivarfs marks an existing variable immutable (EPERM on rewrite, seen
+    # on every failed install of 2026-09-09); clear it before rewriting.
+    [[ ! -e "$EFI_EVIDENCE_FILE" ]] || chattr -i -- "$EFI_EVIDENCE_FILE" 2>/dev/null || true
     printf '\x07\x00\x00\x00%s' "$payload" > "$EFI_EVIDENCE_FILE" 2>/dev/null || true
   fi
 }
@@ -140,7 +143,12 @@ persist_efi_evidence() {
 readonly DEFAULT_ACTION=poweroff
 readonly DEFAULT_DELAY=60
 readonly DELAY_MIN=5
-readonly DELAY_MAX=300
+# 1800 rather than 300: a LAB bench medium holds the failure screen for half an
+# hour so an operator who stepped away still reads it (2026-09-09: a failure
+# powered off unread and its cause was lost). The value a medium ships is set
+# by its producer from the SEALED access profile (customer media keep 60 s);
+# this is only the ceiling the reader admits.
+readonly DELAY_MAX=1800
 
 read_policy() { # -> "<action> <delay-seconds>"
   local action=$DEFAULT_ACTION delay=$DEFAULT_DELAY line key raw
@@ -153,7 +161,7 @@ read_policy() { # -> "<action> <delay-seconds>"
           case "$raw" in poweroff|reboot) action="$raw" ;; esac
           ;;
         delay_seconds)
-          if [[ "$raw" =~ ^[0-9]{1,3}$ ]] && [ "$raw" -ge "$DELAY_MIN" ] && [ "$raw" -le "$DELAY_MAX" ]; then
+          if [[ "$raw" =~ ^[0-9]{1,4}$ ]] && [ "$raw" -ge "$DELAY_MIN" ] && [ "$raw" -le "$DELAY_MAX" ]; then
             delay="$raw"
           fi
           ;;

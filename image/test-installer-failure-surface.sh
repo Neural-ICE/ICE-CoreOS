@@ -253,7 +253,7 @@ grep -Fq 'would poweroff after 60 seconds' "$TMP/nopolicy" \
 grep -qx 'action=poweroff' "$POLICY" \
   || fail "the shipped failure policy no longer powers the machine off"
 shipped_delay="$(sed -n 's/^delay_seconds=//p' "$POLICY")"
-{ [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 300 ]; } \
+{ [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 1800 ]; } \
   || fail "the shipped failure delay ($shipped_delay) is outside the bounds its own reader enforces"
 
 # --------------------------------------------------------------------------- #

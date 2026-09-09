@@ -160,8 +160,35 @@ write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
   # an existing object here: this is a best-effort evidence write on an already
   # failing path, not authority to mutate an arbitrary filesystem object.
   if [[ -d "${EFI_FAILURE_EVIDENCE%/*}" && ! -L "$EFI_FAILURE_EVIDENCE" ]]; then
+    # efivarfs marks an existing variable immutable; the write of the previous
+    # attempt's evidence was refused with EPERM on every failed install of
+    # 2026-09-09 (four attempts, no evidence kept). Clearing the attribute is
+    # the documented way to rewrite a variable; a variable that was never
+    # written has no file and no attribute.
+    [[ ! -e "$EFI_FAILURE_EVIDENCE" ]] || chattr -i -- "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
     printf '\x07\x00\x00\x00%s' "$evidence" > "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
   fi
+}
+
+# The evidence a PREVIOUS attempt left in NVRAM, said once at the top of this
+# one. The failure screen is gone with the power; this line survives it. Read
+# bounded, keys whitelisted, values shape-checked, and never acted upon.
+log_previous_failure_evidence() {
+  [[ -f "$EFI_FAILURE_EVIDENCE" && ! -L "$EFI_FAILURE_EVIDENCE" ]] || return 0
+  local raw line key value summary=''
+  raw="$(head -c 4096 -- "$EFI_FAILURE_EVIDENCE" 2>/dev/null | tail -c +5 | tr -d '\000')" || return 0
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      code|phase|phase_total|stage|detail|pcr7|pcr7_policy|pcr7_verified_count) ;;
+      *) continue ;;
+    esac
+    [[ "$value" =~ ^[A-Za-z0-9._,-]{1,128}$ ]] || continue
+    summary+="${summary:+ }${key}=${value}"
+  done <<<"$raw"
+  [[ -n "$summary" ]] || return 0
+  log "Previous installer attempt on this machine left failure evidence in NVRAM: ${summary} (informational; this attempt starts clean)"
 }
 
 die()  {
@@ -3614,6 +3641,7 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
 }
 assert_bootc_container_reads_source "$source_imgref"
 
+log_previous_failure_evidence
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 
