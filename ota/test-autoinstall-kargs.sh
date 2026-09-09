@@ -165,6 +165,15 @@ store_preflight_attempt 0 "$store_preflight_boundary" >/dev/null 2>&1 \
   || fail "not every pre-wipe container creation is pinned to the local store"
 grep -Fq 'run --pull=never --rm --privileged' "$AUTOINSTALL" \
   || fail "the bootc installer container may apply a registry pull policy"
+# The pre-wipe bootc container probe must not depend on the console: podman
+# refuses `--log-driver passthrough` on a TTY (hardware, 2026-09-09) and
+# `passthrough-tty` off one. Its verdict travels through a file.
+grep -Eq -- '--log-driver=passthrough([^-]|$)' "$AUTOINSTALL" \
+  && fail "a bootc container invocation uses the non-tty passthrough log driver, which a TTY console refuses"
+grep -Fq -- '--log-driver=none' "$AUTOINSTALL" \
+  || fail "the pre-wipe bootc container probe does not decouple its verdict from the console"
+grep -Fq 'BOOTC-CONTAINER-SOURCE-OK > "$r"' "$AUTOINSTALL" \
+  || fail "the pre-wipe bootc container probe does not write its verdict to a file"
 
 # The post-bootc verifier consumes the resolved deployment root, not the
 # /var/tmp/nitarget OSTree sysroot. Make the distinction executable with the

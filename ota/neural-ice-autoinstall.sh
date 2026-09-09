@@ -3555,18 +3555,30 @@ bootc_container_base_args=(
   -v "$BOOTC_BOUND_IMAGES_MASK:/usr/lib/bootc/bound-images.d:ro"
 )
 readonly -a bootc_container_base_args
+readonly BOOTC_PROBE_DIR=/run/neural-ice-installer/bootc-probe
 assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
-  local source=$1 seen
-  seen="$(podman "${bootc_container_base_args[@]}" --log-driver=passthrough \
+  local source=$1 result
+  # The verdict travels through a FILE on a scratch bind mount, never through
+  # the container's stdio: podman refuses `--log-driver passthrough` when the
+  # console is a TTY (hardware, 2026-09-09, essai 4, refused here as designed)
+  # and `passthrough-tty` is unusable when it is not. `--log-driver=none` keeps
+  # this probe indifferent to what the installer is attached to.
+  rm -rf -- "$BOOTC_PROBE_DIR"
+  install -d -m 0700 "$BOOTC_PROBE_DIR"
+  podman "${bootc_container_base_args[@]}" --log-driver=none \
+    -v "$BOOTC_PROBE_DIR:/run/ni-probe" \
     "$STORE_IMAGE_NAME" sh -c '
-      set -e
-      [ -z "$(ls -A /usr/lib/bootc/bound-images.d)" ] || { echo "bound-images.d is not masked"; exit 1; }
-      /usr/bin/fuse-overlayfs --version >/dev/null 2>&1 || { echo "fuse-overlayfs does not run in the bootc container"; exit 1; }
-      skopeo inspect --raw "$1" >/dev/null || { echo "the source is not readable through the bootc container storage"; exit 1; }
-      echo BOOTC-CONTAINER-SOURCE-OK' sh "$source" 2>&1)" \
-    || die "bootc-container-source-unreadable: the container that will run bootc cannot read ${source} (${seen##*$'\n'}); nothing has been written to the target disk"
-  [[ "$seen" == *BOOTC-CONTAINER-SOURCE-OK* ]] \
-    || die "bootc-container-source-unreadable: the bootc container probe returned no proof for ${source}; nothing has been written to the target disk"
+      r=/run/ni-probe/result
+      [ -z "$(ls -A /usr/lib/bootc/bound-images.d)" ] || { echo "bound-images.d is not masked" > "$r"; exit 1; }
+      /usr/bin/fuse-overlayfs --version >/dev/null 2>&1 || { echo "fuse-overlayfs does not run in the bootc container" > "$r"; exit 1; }
+      if ! skopeo inspect --raw "$1" >/dev/null 2>/run/ni-probe/skopeo.err; then
+        echo "the source is not readable through the bootc container storage: $(head -c 300 /run/ni-probe/skopeo.err | tr "\n" " ")" > "$r"; exit 1
+      fi
+      echo BOOTC-CONTAINER-SOURCE-OK > "$r"' sh "$source" \
+    </dev/null >/dev/null 2>"$BOOTC_PROBE_DIR/podman.err" || true
+  result="$(cat "$BOOTC_PROBE_DIR/result" 2>/dev/null || true)"
+  [[ "$result" == BOOTC-CONTAINER-SOURCE-OK ]] \
+    || die "bootc-container-source-unreadable: the container that will run bootc cannot read ${source} (${result:-$(head -c 300 "$BOOTC_PROBE_DIR/podman.err" 2>/dev/null | tr '\n' ' ')}); nothing has been written to the target disk"
   log "bootc container proved before the wipe: fuse-overlayfs lent, bound images masked (seed store provides them), source ${source} readable"
 }
 assert_bootc_container_reads_source "$source_imgref"
