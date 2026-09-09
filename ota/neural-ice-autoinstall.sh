@@ -166,7 +166,16 @@ write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
     # the documented way to rewrite a variable; a variable that was never
     # written has no file and no attribute.
     [[ ! -e "$EFI_FAILURE_EVIDENCE" ]] || chattr -i -- "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
-    printf '\x07\x00\x00\x00%s' "$evidence" > "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
+    # ONE write(2): efivarfs takes the attributes and the whole value in a
+    # single write and treats a second one as a new (refused) SetVariable
+    # (Documentation/filesystems/efivarfs.rst). printf's buffered pieces left
+    # a 115-byte variable on the bench on 2026-09-09 -- no stage, no PCR7.
+    _efi_staged="$(mktemp -t ni-efi-evidence.XXXXXX 2>/dev/null)" || _efi_staged=""
+    if [[ -n "$_efi_staged" ]]; then
+      { printf '\x07\x00\x00\x00'; printf '%s' "$evidence"; } > "$_efi_staged" 2>/dev/null \
+        && dd if="$_efi_staged" of="$EFI_FAILURE_EVIDENCE" bs=65536 count=1 status=none 2>/dev/null || true
+      rm -f -- "$_efi_staged"
+    fi
   fi
 }
 

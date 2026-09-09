@@ -130,7 +130,14 @@ persist_efi_evidence() {
     # efivarfs marks an existing variable immutable (EPERM on rewrite, seen
     # on every failed install of 2026-09-09); clear it before rewriting.
     [[ ! -e "$EFI_EVIDENCE_FILE" ]] || chattr -i -- "$EFI_EVIDENCE_FILE" 2>/dev/null || true
-    printf '\x07\x00\x00\x00%s' "$payload" > "$EFI_EVIDENCE_FILE" 2>/dev/null || true
+    # ONE write(2), as efivarfs requires (Documentation/filesystems/efivarfs.rst):
+    # the attributes and the whole value go through a single dd of a staged file.
+    _efi_staged="$(mktemp -t ni-efi-evidence.XXXXXX 2>/dev/null)" || _efi_staged=""
+    if [[ -n "$_efi_staged" ]]; then
+      { printf '\x07\x00\x00\x00'; printf '%s' "$payload"; } > "$_efi_staged" 2>/dev/null \
+        && dd if="$_efi_staged" of="$EFI_EVIDENCE_FILE" bs=65536 count=1 status=none 2>/dev/null || true
+      rm -f -- "$_efi_staged"
+    fi
   fi
 }
 

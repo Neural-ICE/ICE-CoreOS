@@ -267,6 +267,15 @@ long_policy="$TMP/long-comment-policy"
 long_read="$(NEURALICE_FAILURE_POLICY="$long_policy" bash -c 'POLICY_FILE="$NEURALICE_FAILURE_POLICY"; source <(sed -n "/^readonly DEFAULT_ACTION/,/^}/p" "$0"); read_policy' "$FAILURE" 2>/dev/null || true)"
 [ "$long_read" = "reboot 1500" ] \
   || fail "a policy whose values follow a long comment block is not honoured (read: '$long_read')"
+# The EFI variable is written in ONE write(2) (efivarfs requirement): a staged
+# file and one bounded dd, never a printf straight into efivarfs, in both the
+# installer and the failure surface (2026-09-09: a printf left 115 bytes).
+for writer in "$FAILURE" "$ROOT/ota/neural-ice-autoinstall.sh"; do
+  grep -Eq "printf '\\\\x07\\\\x00\\\\x00\\\\x00%s' .* > \"\\\$EFI_" "$writer" \
+    && fail "$(basename "$writer") writes the EFI evidence with printf, which efivarfs splits into a refused second write"
+  grep -Fq 'of="$EFI_' "$writer" && grep -Fq 'bs=65536 count=1' "$writer" \
+    || fail "$(basename "$writer") does not write the EFI evidence in one bounded dd"
+done
 shipped_delay="$(sed -n 's/^delay_seconds=//p' "$POLICY")"
 { [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 1800 ]; } \
   || fail "the shipped failure delay ($shipped_delay) is outside the bounds its own reader enforces"
