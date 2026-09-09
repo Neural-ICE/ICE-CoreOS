@@ -1469,6 +1469,11 @@ inspect --expect-no-sshkey >/dev/null || fail "the restored keyless medium was r
 #    nothing invokes is what the review found the first time.
 # --------------------------------------------------------------------------- #
 USB="$ROOT/image/build-installer-usb.sh"
+# The installer's console stays on the firmware framebuffer: the installer image
+# must pin nvidia_drm to modeset=0 fbdev=0 (bench, 2026-09-09: every boot went
+# dark at the nvidia-drm handover and nothing after it could be read).
+grep -Fq "'options nvidia_drm modeset=0 fbdev=0'" "$ROOT/image/Containerfile.installer" \
+  || fail "the installer image lets nvidia-drm take over the console"
 grep -Fq 'image/build-installer-uki.sh' "$USB" || fail "the media producer does not build a UKI"
 grep -Fq 'image/build-installer-root.sh' "$USB" \
   || fail "the media producer does not build the sealed installer root"
