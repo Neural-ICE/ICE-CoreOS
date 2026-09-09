@@ -729,8 +729,9 @@ REUSE_IMG="$TMP/reuse-store.img"
 cp "$TMP/reuse-source/installer-store.img" "$REUSE_IMG"
 REUSE_SHA="$(sed -n 's/^store_image_sha256=//p' "$TMP/reuse-source/installer-root.img.manifest")"
 REUSE_BYTES="$(sed -n 's/^store_image_bytes=//p' "$TMP/reuse-source/installer-root.img.manifest")"
-[ -n "$REUSE_SHA" ] && [ -n "$REUSE_BYTES" ] \
-  || fail "the full build recorded no store size and digest to reuse"
+if [ -z "$REUSE_SHA" ] || [ -z "$REUSE_BYTES" ]; then
+  fail "the full build recorded no store size and digest to reuse"
+fi
 
 reuse_build() { # $1=output dir, rest=env overrides
   local out=$1; shift

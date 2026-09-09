@@ -649,9 +649,9 @@ CACHE_STORE_SHA="$(sha256sum "$CACHE_STORE_IMG" | awk '{print tolower($1)}')"
 CACHE_STORE_BYTES="$(wc -c < "$CACHE_STORE_IMG" | tr -d '[:space:]')"
 CACHE_STORE_VERITY="$(printf '%064d' 4)"
 cache_stage() { cache_run -- medium_cache_stage_store "$cache_key_value" "$CACHE_STORE_IMG"; }
-cache_finalize() { # [override of one recorded fact]
+cache_finalize() { # $1=the store SHA-256 to record (the real one, or a sabotaged fact)
   cache_run -- medium_cache_finalize_store "$cache_key_value" "$cache_key_baseline" \
-    "${1:-$CACHE_STORE_SHA}" "$CACHE_STORE_BYTES" "$BASE_ID_FIXTURE" \
+    "$1" "$CACHE_STORE_BYTES" "$BASE_ID_FIXTURE" \
     "sha256:$(printf '%064d' 3)" localhost/bootc "$CACHE_STORE_VERITY" \
     "$(printf 'f%.0s' {1..64})" 6e657572-616c-4963-9e69-6e7374616c6c
 }
@@ -665,7 +665,7 @@ out="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>&1 >/dev/null)"
   && fail "an unfinished cache entry was reused"
 grep -Fq 'no provenance document' <<<"$out" \
   || fail "the unfinished-entry refusal is not named: $out"
-cache_finalize || fail "finalizing a cache entry failed"
+cache_finalize "$CACHE_STORE_SHA" || fail "finalizing a cache entry failed"
 cache_facts="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>/dev/null)" \
   || fail "a finalized cache entry was refused"
 [ "$(sed -n 's/^store_image_sha256=//p' <<<"$cache_facts")" = "$CACHE_STORE_SHA" ] \
@@ -688,7 +688,7 @@ exec(mutation)  # noqa: S102 - a test fixture, mutating its own fixture document
 open(path, "w", encoding="utf-8").write(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")
 PYEOF
 }
-cache_restore() { cache_finalize || fail "cannot restore the cache entry"; }
+cache_restore() { cache_finalize "$CACHE_STORE_SHA" || fail "cannot restore the cache entry"; }
 cache_refuses() { # $1=expected words in the refusal
   local refusal
   refusal="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>&1 >/dev/null)" \
