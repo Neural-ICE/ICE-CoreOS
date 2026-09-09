@@ -3651,7 +3651,72 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
 }
 assert_bootc_container_reads_source "$source_imgref"
 
+# LAB MEDIUM ONLY: THE PREVIOUS FIRST BOOT'S OWN WORDS, READ BEFORE THE WIPE.
+# The installed appliance holds its network until the TPM ceremony succeeds,
+# so a ceremony that fails on first boot leaves a status screen with a code
+# and nothing reachable (2026-09-09: NI-E02 on the bench appliance, cause
+# unread). The medium that installed it escrowed the SYSTEM volume recovery
+# key on its own ESP (phase 8); a LAB medium finding that escrow for THIS
+# target disk opens the previous system volume READ-ONLY (LUKS --readonly,
+# xfs ro,norecovery), prints the last lines of the ceremony unit's persistent
+# journal and the last errors, closes everything and shreds the key. Never on
+# a customer medium; never a write; never a reason to stop the install.
+log_previous_firstboot_journal() {
+  [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] || return 0
+  local sysp esp mountpoint mounted=0 recfile key keyfile mapper=ni-previous-system mnt journal_dir out line
+  sysp="$(partdev 3)"
+  [[ -b "$sysp" ]] && cryptsetup isLuks "$sysp" 2>/dev/null || return 0
+  esp="$(media_vfat_partition || true)"; [[ -n "$esp" ]] || return 0
+  mountpoint="$(mounted_at "/dev/$esp" || true)"
+  if [[ -z "$mountpoint" ]]; then
+    mountpoint=/run/neural-ice-installer/esp-previous
+    install -d -m 0700 "$mountpoint"
+    mount -o ro,nodev,nosuid,noexec "/dev/$esp" "$mountpoint" 2>/dev/null || return 0
+    mounted=1
+  fi
+  recfile="$mountpoint/NEURAL-ICE-RECOVERY-${target_serial}.txt"
+  if [[ -f "$recfile" && ! -L "$recfile" ]]; then
+    key="$(head -c 4096 -- "$recfile" | tr -d '\r' \
+      | awk '/^\[INTERNAL\] SYSTEM volume recovery key/ { getline; gsub(/^[ \t]+|[ \t]+$/, ""); print; exit }')"
+    if [[ "$key" =~ ^[A-Za-z0-9-]{16,128}$ ]]; then
+      keyfile="$(mktemp -p /run/neural-ice-installer ni-previous-key.XXXXXX)"
+      printf '%s' "$key" > "$keyfile"
+      if cryptsetup open --type luks2 --readonly --key-file "$keyfile" "$sysp" "$mapper" 2>/dev/null; then
+        mnt=/run/neural-ice-installer/previous-system
+        install -d -m 0700 "$mnt"
+        if mount -o ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper" "$mnt" 2>/dev/null; then
+          journal_dir="$(find "$mnt/ostree/deploy" -maxdepth 4 -type d -path '*/var/log/journal' 2>/dev/null | head -1)"
+          if [[ -n "$journal_dir" ]]; then
+            log "Previous first boot on this disk (LAB medium, read before the wipe) — neural-ice-firstboot-tpm-ceremony.service, last 60 lines:"
+            out="$(journalctl -D "$journal_dir" -u neural-ice-firstboot-tpm-ceremony.service -n 60 --no-pager -o short-iso 2>/dev/null \
+              | tr -cd '\11\12\40-\176' | cut -c1-220)"
+            [[ -n "$out" ]] || out="(no entries for that unit)"
+            while IFS= read -r line; do printf '    | %s\n' "$line" > /dev/console 2>/dev/null || true; done <<<"$out"
+            log "Previous first boot on this disk — last 30 error-level entries:"
+            out="$(journalctl -D "$journal_dir" -p err -n 30 --no-pager -o short-iso 2>/dev/null \
+              | tr -cd '\11\12\40-\176' | cut -c1-220)"
+            [[ -n "$out" ]] || out="(none)"
+            while IFS= read -r line; do printf '    | %s\n' "$line" > /dev/console 2>/dev/null || true; done <<<"$out"
+          else
+            log "Previous first boot on this disk: no persistent journal found under the deployed /var"
+          fi
+          umount "$mnt" 2>/dev/null || true
+        else
+          log "Previous first boot on this disk: the system volume opened but did not mount read-only"
+        fi
+        cryptsetup close "$mapper" 2>/dev/null || true
+      else
+        log "Previous first boot on this disk: the escrowed system recovery key does not open ${sysp} (a different install?)"
+      fi
+      shred -u -- "$keyfile" 2>/dev/null || rm -f -- "$keyfile"
+    fi
+  fi
+  (( mounted == 0 )) || umount "$mountpoint" 2>/dev/null || true
+  return 0
+}
+
 log_previous_failure_evidence
+log_previous_firstboot_journal
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 

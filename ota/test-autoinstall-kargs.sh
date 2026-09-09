@@ -181,6 +181,21 @@ grep -Fq -- '-v "$NEURALICE_CONTAINER_POLICY:/etc/containers/policy.json:ro"' "$
   || fail "the bootc container is left with the appliance's strict policy, which rejects the containers-storage source"
 grep -Fq 'would reject the containers-storage source' "$AUTOINSTALL" \
   || fail "the pre-wipe probe does not prove the container's policy admits the source"
+# The previous first boot's journal is read BEFORE the wipe, on a LAB medium
+# only, from the system volume opened read-only with the escrowed key, and the
+# key is shredded; the readout never stops the install.
+grep -Fq '[[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] || return 0' "$AUTOINSTALL" \
+  || fail "the previous-first-boot journal readout is not restricted to a LAB medium"
+grep -Fq 'cryptsetup open --type luks2 --readonly --key-file "$keyfile"' "$AUTOINSTALL" \
+  || fail "the previous system volume is not opened read-only"
+grep -Fq 'mount -o ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper"' "$AUTOINSTALL" \
+  || fail "the previous system volume is not mounted read-only without log replay"
+grep -Fq 'shred -u -- "$keyfile"' "$AUTOINSTALL" \
+  || fail "the escrowed recovery key is not shredded after the readout"
+readout_line="$(grep -n '^log_previous_firstboot_journal$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+readout_wipe_line="$(grep -nE '^[[:space:]]*wipefs -a "\$target"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$readout_line" && -n "$readout_wipe_line" && "$readout_line" -lt "$readout_wipe_line" ]] \
+  || fail "the previous-first-boot readout does not precede the wipe"
 
 # The post-bootc verifier consumes the resolved deployment root, not the
 # /var/tmp/nitarget OSTree sysroot. Make the distinction executable with the
