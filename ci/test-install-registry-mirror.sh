@@ -227,6 +227,75 @@ else
     "${materialize_line:-none}" "${luks_line:-none}" "${staged_verify_line:-none}"; fail=1
 fi
 
+# --------------------------------------------------------------------------- #
+# The three implicit terms (FAB-0057 P1.1b). Each was sealed twice; each is now
+# derived from a value the signed line already fixes, and the checks that used
+# to consume the sealed term are unchanged. What is asserted: the derivation
+# exists, it reads a document ALREADY hashed against the sealed value, the
+# restatement is refused by the installer itself (not only by the grammar), and
+# the order is the one the design needs.
+check "rule C: the manifest hash is derived from the closure, never read"  -F 'seed_manifest_hash_from_closure()'
+check "rule C: a restated seed_manifest is refused by the installer itself" \
+  -F 'this medium restates neuralice.seed_manifest beside the sealed release closure'
+check "rule C: the ni-seed closure is hashed before the manifest hash is read from it" \
+  -F 'assert_sealed_document_digest "$SEED_VERIFIED_ROOT/release-closure.json" "$SEED_CLOSURE"'
+check "rule C: the mirror closure is hashed before the manifest hash is read from it" \
+  -F 'assert_sealed_document_digest "$SEED_PACK_DIR/release-closure.json" "$SEED_CLOSURE"'
+check "rule C: the fetcher proves the closure before it judges the manifest layer" \
+  -F "is not the release manifest the sealed closure names"
+check "rule C: the verifier is still handed the expected manifest"     -F -- '--expect-manifest "sha256:${SEED_MANIFEST_SHA256}"'
+check "rule C: release/MANIFEST is still written"                       -F '> /run/seed-dst/release/MANIFEST'
+check "rule A: with seed_source=mirror the READY pins are the sealed closure" -F 'MIRROR_READY_SHA256="$SEED_CLOSURE"'
+check "rule A: ...and the manifest hash that closure carries"            -F 'MIRROR_READY_MANIFEST_SHA256="$SEED_MANIFEST_SHA256"'
+check "rule A: a restated READY pin is refused by the installer itself" \
+  -F 'restates neuralice.mirror_ready/mirror_manifest'
+check "rule B: the pair is read from the preseal set"                    -F 'release_authorization_pins_from_preseal()'
+check "rule B: the set is staged and hashed against neuralice.preseal FIRST" \
+  -F 'esp_staged_file preseal/preseal-set.json "$PRESEAL_SET_SHA256"'
+check "rule B: a restated pair is refused by the installer itself" \
+  -F 'restates neuralice.relauth_sha256/relauth_sig_sha256'
+# The ESP pair is still staged by the same call, in the same place, for both
+# the derived and the sealed pins.
+if [ "$(grep -cF 'esp_staged_file release-authorization.json "$RELEASE_AUTH_DOC_SHA256"' "$S")" = 1 ] \
+   && [ "$(grep -cF 'esp_staged_file release-authorization.sig "$RELEASE_AUTH_SIG_SHA256"' "$S")" = 1 ]; then
+  printf '  ok    rule B: the pair is staged once, by the same esp_staged_file, whichever way the pins arrived\n'
+else
+  printf '  FAIL  rule B: the pair must be staged exactly once by esp_staged_file\n'; fail=1
+fi
+# ORDER. The seed pack is fetched from the mirror block, after READY is fetched
+# and before READY is judged on all three fields; the pins are derived before
+# the pair is staged; and everything is still before the first disk write.
+fetch_call_line="$(grep -nF 'seed_from_mirror_fetch_documents "$(seed_partition_partuuid)"' "$S" | head -1 | cut -d: -f1)"
+ready_fetch_line="$(grep -nF -- '--output "$_mirror_ready_json" "https://${INSTALL_MIRROR}${MIRROR_READY_PATH}"' "$S" | head -1 | cut -d: -f1)"
+ready_judge_line="$(grep -nF '&& "${_mirror_ready_fields[1]:-}" == "$MIRROR_READY_MANIFEST_SHA256"' "$S" | head -1 | cut -d: -f1)"
+pins_call_line="$(grep -nF 'release_authorization_pins_from_preseal "$_auth_scratch"' "$S" | head -1 | cut -d: -f1)"
+pair_stage_line="$(grep -nF 'esp_staged_file release-authorization.json "$RELEASE_AUTH_DOC_SHA256"' "$S" | head -1 | cut -d: -f1)"
+derive_line="$(grep -nF 'SEED_MANIFEST_SHA256="$(seed_manifest_hash_from_closure "$SEED_VERIFIED_ROOT/release-closure.json")"' "$S" | head -1 | cut -d: -f1)"
+verify_line="$(grep -nF -- '--seed-root "$SEED_VERIFIED_ROOT"' "$S" | head -1 | cut -d: -f1)"
+if [ -n "$fetch_call_line" ] && [ -n "$ready_fetch_line" ] && [ -n "$ready_judge_line" ] \
+   && [ "$ready_fetch_line" -lt "$fetch_call_line" ] && [ "$fetch_call_line" -lt "$ready_judge_line" ] \
+   && [ "$ready_judge_line" -lt "$destructive_line" ]; then
+  printf '  ok    rule A: READY fetched (line %s) < seed pack fetched (line %s) < READY judged on three fields (line %s) < first disk write (line %s)\n' \
+    "$ready_fetch_line" "$fetch_call_line" "$ready_judge_line" "$destructive_line"
+else
+  printf '  FAIL  rule A: the seed pack must be fetched between the READY fetch and the READY judgement, before the first disk write (fetch=%s, pack=%s, judge=%s, write=%s)\n' \
+    "${ready_fetch_line:-none}" "${fetch_call_line:-none}" "${ready_judge_line:-none}" "${destructive_line:-none}"; fail=1
+fi
+if [ -n "$pins_call_line" ] && [ -n "$pair_stage_line" ] && [ "$pins_call_line" -lt "$pair_stage_line" ] \
+   && [ "$pair_stage_line" -lt "$destructive_line" ]; then
+  printf '  ok    rule B: pins derived from the hashed set (line %s) < pair staged (line %s) < first disk write (line %s)\n' \
+    "$pins_call_line" "$pair_stage_line" "$destructive_line"
+else
+  printf '  FAIL  rule B: the pins must be derived before the pair is staged, before the first disk write (pins=%s, stage=%s, write=%s)\n' \
+    "${pins_call_line:-none}" "${pair_stage_line:-none}" "${destructive_line:-none}"; fail=1
+fi
+if [ -n "$derive_line" ] && [ -n "$verify_line" ] && [ "$derive_line" -lt "$verify_line" ]; then
+  printf '  ok    rule C: the ni-seed manifest hash is derived (line %s) before the verifier runs (line %s)\n' "$derive_line" "$verify_line"
+else
+  printf '  FAIL  rule C: the manifest hash must be derived before the verifier is handed it (derive=%s, verify=%s)\n' \
+    "${derive_line:-none}" "${verify_line:-none}"; fail=1
+fi
+
 # The default MUST remain the medium. This is the single property that keeps the
 # USB path -- the one that installs appliances today -- untouched by all of the
 # above.

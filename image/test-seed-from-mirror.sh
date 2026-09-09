@@ -6,6 +6,9 @@
 # a registry medium seal a release seed with no ni-seed partition: the installer
 # fetches the six seed-pack documents before the wipe and every closure object
 # after LUKS/mkfs, each hashed against the name the sealed closure gives it.
+# Since FAB-0057 P1.1b the manifest hash, the mirror READY pins and the
+# authorization pair are DERIVED from documents the sealed line already fixes
+# (rules C, A, B); this suite drives those derivations and their sabotages.
 #
 # WHAT THIS SUITE RUNS. The installer's OWN functions, lifted verbatim the way
 # image/test-installer-media.sh lifts its seed reconciliation: the bounded
@@ -49,14 +52,22 @@ done
 # --------------------------------------------------------------------------- #
 LIFTED="$TMP/lifted.sh"
 {
+  awk '/^karg_count\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_staged_file\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^seed_mirror_helper\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^seed_from_mirror_fetch_documents\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^seed_from_mirror_preflight\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^seed_from_mirror_materialize\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^assert_sealed_document_digest\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^seed_manifest_hash_from_closure\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^preseal_installer_authorization_pins\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^release_authorization_pins_from_preseal\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^assert_seed_is_the_preseal_release\(\) \{/,/^}$/' "$AUTOINSTALL"
 } > "$LIFTED"
-for function in seed_mirror_helper seed_from_mirror_preflight seed_from_mirror_materialize \
-  assert_sealed_document_digest assert_seed_is_the_preseal_release; do
+for function in karg_count esp_staged_file seed_mirror_helper seed_from_mirror_fetch_documents \
+  seed_from_mirror_preflight seed_from_mirror_materialize assert_sealed_document_digest \
+  seed_manifest_hash_from_closure preseal_installer_authorization_pins \
+  release_authorization_pins_from_preseal assert_seed_is_the_preseal_release; do
   grep -q "^${function}()" "$LIFTED" || fail "the installer no longer defines ${function} as an extractable function"
 done
 grep -q "SEED_MIRROR_PY" "$LIFTED" || fail "the installer's mirror fetcher lost its bounded Python helper"
@@ -283,12 +294,19 @@ closure = {
         "required_entitlement": "ICECORE",
     }],
 }
-closure_raw = canonical(closure)
 release_manifest_raw = canonical({
     "schema": "neural-ice-release-manifest-v1", "release_id": "release-1-0-0", "bundle_seq": 13,
     "hardware_target": "nvidia-gb10-arm64",
     "host": {"repository": REPOSITORY, "digest": index_digest},
 })
+# The closure names its release manifest by hash, as Fabric's does; the
+# installer derives the expected manifest hash from the proved closure (rule C).
+closure["release_manifest_sha256"] = digest(release_manifest_raw)[7:]
+if variant == "manifest-mismatch":
+    closure["release_manifest_sha256"] = "0" * 63 + "1"
+if variant == "manifest-unnamed":
+    del closure["release_manifest_sha256"]
+closure_raw = canonical(closure)
 preseal_raw = canonical({
     "schema": "neural-ice-installer-preseal-set-v1", "train": "1.0.0", "bundle_seq": 13,
     "hardware_target": "nvidia-gb10-arm64", "ring": "lab",
@@ -380,6 +398,7 @@ bind_installer() { # sourced inside the driver subshells
   NEURALICE_SEED_VERIFIER=/bin/true
   NEURALICE_RELEASE_AUTHORITY=release.example.test
   SEED_PACK_DIR="$TMP/seed-pack"
+  NEURALICE_CMDLINE_FILE="$TMP/cmdline"
   PRESEAL_SNAPSHOT="$OK/preseal"
   PRESEAL_SET_SHA256="$PRESEAL_SHA256"
   OS_IMAGE="$OS_IMAGE_REF"
@@ -389,6 +408,26 @@ bind_installer() { # sourced inside the driver subshells
   DEVICE_CHANNEL=lab
 }
 declare -f bind_installer > "$TMP/bind.sh"
+# The sealed line the lifted karg_count reads: the composed medium as the
+# producer now cuts it -- no relauth pair, no READY pins, no manifest hash.
+printf 'quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=registry neuralice.preseal=%s neuralice.mirror=%s neuralice.seed_closure=%s neuralice.seed_source=mirror\n' \
+  "$PRESEAL_SHA256" "$MIRROR" "$CLOSURE_HEX" > "$TMP/cmdline"
+
+run_fetch() { # $1=label $2=partuuid [ENV=VALUE …] -> 0 when the six documents landed; prints derived=<manifest hex>
+  local label=$1 partuuid=$2; shift 2
+  printf '%s\n' "$label" > "$TMP/last.case"
+  (
+    set -uo pipefail
+    # shellcheck source=/dev/null
+    . "$TMP/bind.sh"; bind_installer
+    SEED_MANIFEST_SHA256=""
+    for assignment in "$@"; do eval "$assignment"; done
+    # shellcheck source=/dev/null
+    . "$LIFTED"
+    seed_from_mirror_fetch_documents "$partuuid"
+    printf 'derived=%s\n' "$SEED_MANIFEST_SHA256"
+  ) >"$TMP/last.out" 2>"$TMP/last.err"
+}
 
 run_preflight() { # $1=label $2=partuuid [ENV=VALUE …] -> 0 when the installer would proceed
   local label=$1 partuuid=$2; shift 2
@@ -433,7 +472,7 @@ stage_documents() { # $1=fixture root -> SEED_PACK_DIR holds its six documents (
 # --------------------------------------------------------------------------- #
 publish "$OK"
 mark="$(log_mark)"
-run_preflight "supported preflight" "" \
+run_fetch "supported fetch" "" \
   || fail "the installer refused the supported mirror-sourced seed pack: $(tail -n 3 "$TMP/last.err")"
 for document in release-manifest.json release-closure.json release-authorization.json \
   release-authorization.json.sig delegation-snapshot.json delegation-snapshot.json.sig; do
@@ -445,42 +484,92 @@ requests_since "$mark" | grep -q "GET /v2/neural-ice/seed-packs/manifests/$CLOSU
   || fail "the pack manifest was not fetched by the closure-hex tag"
 [[ "$(requests_since "$mark" | grep -c 'GET /v2/neural-ice/seed-packs/blobs/sha256:')" == 6 ]] \
   || fail "the six documents were not fetched as six blobs"
-echo "  preflight: six documents fetched over TLS pinned to the sealed CA, reconciled with the preseal set"
+# 🔴 RULE C, MEASURED. The manifest hash the installer will use is the one the
+# proved closure carries, equal to the hash of the served manifest -- and the
+# closure blob was fetched BEFORE the manifest blob, because the manifest layer
+# can only be judged once the closure has said what the manifest is.
+grep -qx "derived=$MANIFEST_HEX" "$TMP/last.out" \
+  || fail "the fetch did not derive the manifest hash the closure carries: $(grep '^derived=' "$TMP/last.out")"
+closure_request="$(requests_since "$mark" | grep -n "seed-packs/blobs/sha256:$CLOSURE_HEX " | head -1 | cut -d: -f1)"
+manifest_request="$(requests_since "$mark" | grep -n "seed-packs/blobs/sha256:$MANIFEST_HEX " | head -1 | cut -d: -f1)"
+[[ -n "$closure_request" && -n "$manifest_request" && "$closure_request" -lt "$manifest_request" ]] \
+  || fail "the closure blob must be fetched and proved before the manifest blob is asked for (closure=$closure_request, manifest=$manifest_request)"
+echo "  fetch: six documents fetched over TLS pinned to the sealed CA; the closure first, and the manifest hash derived from it (rule C)"
+
+run_preflight "supported preflight" "" \
+  || fail "the installer refused the fetched, supported seed pack at the preflight: $(tail -n 3 "$TMP/last.err")"
+echo "  preflight: the fetched pack reconciled with the preseal set"
 
 mark="$(log_mark)"
-run_preflight "stray ni-seed partition" "0f0f0f0f-0000-4000-8000-000000000001" \
+run_fetch "stray ni-seed partition" "0f0f0f0f-0000-4000-8000-000000000001" \
   && fail "a medium sealing seed_source=mirror AND carrying an ni-seed partition was accepted"
 expect_refusal "stray ni-seed partition" "carries an ni-seed partition"
 [[ -z "$(requests_since "$mark")" ]] || fail "the stray-partition refusal still spoke to the mirror"
+run_preflight "stray ni-seed partition (preflight)" "0f0f0f0f-0000-4000-8000-000000000001" \
+  && fail "the preflight accepted a medium carrying an ni-seed partition beside seed_source=mirror"
+expect_refusal "stray ni-seed partition (preflight)" "carries an ni-seed partition"
 
 run_preflight "no preseal" "" 'PRESEAL_ACTIVE=0' \
   && fail "a mirror-sourced seed with no preseal set was accepted"
 expect_refusal "no preseal" "requires the signed preseal set"
-run_preflight "medium source" "" 'INSTALL_SOURCE=medium' \
+run_fetch "no sealed preseal set" "" 'PRESEAL_SET_SHA256=""' \
+  && fail "a mirror-sourced seed on a medium sealing no preseal set was fetched"
+expect_refusal "no sealed preseal set" "requires the signed preseal set"
+run_fetch "medium source" "" 'INSTALL_SOURCE=medium' \
   && fail "a mirror-sourced seed on a medium install was accepted"
 expect_refusal "medium source" "requires neuralice.source=registry"
-run_preflight "no mirror" "" 'INSTALL_MIRROR=""' \
+run_fetch "no mirror" "" 'INSTALL_MIRROR=""' \
   && fail "a mirror-sourced seed with no mirror was accepted"
 expect_refusal "no mirror" "requires a LAN mirror whose CA this medium pins"
 run_preflight "mirror declares another release" "" "MIRROR_READY_SHA256=$(printf '%064d' 9)" \
   && fail "a mirror declaring another release closure was accepted"
 expect_refusal "mirror declares another release" "a mirror that declares another release cannot serve this one"
-run_preflight "no verifier" "" 'NEURALICE_SEED_VERIFIER=/nonexistent' \
+run_preflight "mirror declares another manifest" "" "MIRROR_READY_MANIFEST_SHA256=$(printf '%064d' 9)" \
+  && fail "a mirror declaring another release manifest than the closure names was accepted"
+expect_refusal "mirror declares another manifest" "a mirror that declares another release cannot serve this one"
+run_preflight "manifest hash never derived" "" 'SEED_MANIFEST_SHA256=""' 'MIRROR_READY_MANIFEST_SHA256=""' \
+  && fail "a preflight with no derived manifest hash proceeded"
+expect_refusal "manifest hash never derived" "incomplete tuple"
+run_fetch "no verifier" "" 'NEURALICE_SEED_VERIFIER=/nonexistent' \
   && fail "a medium with no seed verifier was accepted"
 expect_refusal "no verifier" "carries no seed-closure verifier"
 
 # The pin is the pin: a mirror whose certificate the sealed CA did not issue
 # cannot answer at all, and the refusal names the transport.
 mark="$(log_mark)"
-run_preflight "rogue CA" "" "MIRROR_CA_FILE=$PKI/rogue.crt" \
+run_fetch "rogue CA" "" "MIRROR_CA_FILE=$PKI/rogue.crt" \
   && fail "a mirror not issued by the pinned CA served the seed pack"
 expect_refusal "rogue CA" "did not serve the seed pack"
 [[ -z "$(requests_since "$mark")" ]] || fail "a TLS handshake the pin must refuse reached the request handler"
 
 # A sealed closure the mirror has no pack for.
-run_preflight "unknown closure" "" "SEED_CLOSURE=$(printf '%064d' 5)" "MIRROR_READY_SHA256=$(printf '%064d' 5)" \
+run_fetch "unknown closure" "" "SEED_CLOSURE=$(printf '%064d' 5)" \
   && fail "a closure the mirror does not carry was accepted"
 expect_refusal "unknown closure" "did not serve the seed pack"
+
+# 🔴 SABOTAGE, RULE C (FAB-0057 P1.1b brief, sabotage 2): a closure that hashes
+# to the sealed value but names ANOTHER release manifest than the one the pack
+# serves. The closure is proved first, the manifest layer is judged against
+# what the closure says, and the refusal comes before the manifest blob is
+# asked for. A closure naming no manifest at all is refused the same way.
+MISMATCH="$(make_fixture manifest-mismatch manifest-mismatch)"
+publish "$MISMATCH"
+mark="$(log_mark)"
+run_fetch "closure names another manifest" "" "SEED_CLOSURE=$(cat "$MISMATCH/closure_hex")" \
+  && fail "a closure naming a release manifest the pack does not serve was accepted"
+expect_refusal "closure names another manifest" "did not serve the seed pack"
+grep -q "is not the release manifest the sealed closure names" "$TMP/last.err" \
+  || fail "the closure/manifest mismatch was not the stated refusal: $(grep 'seed-mirror:' "$TMP/last.err" | tail -n 2)"
+[[ "$(requests_since "$mark" | grep -c 'seed-packs/blobs/')" == 1 ]] \
+  || fail "only the closure blob may be fetched before the manifest layer is judged: $(requests_since "$mark" | tr '\n' ' ')"
+[[ ! -e "$TMP/seed-pack/release-manifest.json" ]] || fail "a manifest the closure does not name was published into the seed pack"
+UNNAMED="$(make_fixture manifest-unnamed manifest-unnamed)"
+publish "$UNNAMED"
+run_fetch "closure names no manifest" "" "SEED_CLOSURE=$(cat "$UNNAMED/closure_hex")" \
+  && fail "a closure naming no release manifest was accepted"
+grep -q "carries no well-formed release_manifest_sha256" "$TMP/last.err" \
+  || fail "the unnamed-manifest closure was not the stated refusal: $(grep 'seed-mirror:' "$TMP/last.err" | tail -n 2)"
+echo "  fetch: a closure naming another manifest than the pack serves refuses before the manifest is fetched; a closure naming none refuses (rule C sabotage)"
 
 # The pack manifest is untrusted routing, and every shape rule refuses.
 mutate_pack() { # $1=how -> the mirror's pack manifest for the OK closure is altered
@@ -527,7 +616,7 @@ for how in artifact-type media-type seventh-layer duplicate-title missing-title 
   publish "$OK"
   mutate_pack "$how"
   mark="$(log_mark)"
-  run_preflight "pack $how" "" \
+  run_fetch "pack $how" "" \
     && fail "a seed-pack manifest with $how was accepted"
   expect_refusal "pack $how" "did not serve the seed pack"
   [[ "$(requests_since "$mark" | grep -c 'seed-packs/blobs/')" == 0 ]] \
@@ -541,12 +630,124 @@ publish "$OK"
 sabotage_hex="$(sha256sum -- "$OK/docs/release-authorization.json" | awk '{print tolower($1)}')"
 printf '{"schema":"fixture-authorization","tampered":true}\n' \
   > "$MIRROR_ROOT/v2/neural-ice/seed-packs/blobs/sha256:$sabotage_hex"
-run_preflight "tampered authorization" "" \
+run_fetch "tampered authorization" "" \
   && fail "a seed-pack document whose bytes do not hash to its descriptor was accepted"
 expect_refusal "tampered authorization" "did not serve the seed pack"
 [[ ! -e "$TMP/seed-pack/release-authorization.json" ]] || fail "a tampered document was published into the seed pack"
 [[ -z "$(find "$TMP/seed-pack" -name '.fetch*' -print -quit)" ]] || fail "a temporary file survived the tampered-document refusal"
 echo "  preflight: a document altered on the mirror behind an unchanged descriptor refuses, and nothing of it is kept"
+
+# --------------------------------------------------------------------------- #
+# 6b) RULE B (FAB-0057 P1.1b): the authorization pair is read from the preseal
+#     set the ESP carries, AFTER that set is hashed against neuralice.preseal,
+#     and the pair is then staged by the very same esp_staged_file. The ESP is a
+#     directory here: the lifted esp_staged_file mounts nothing when
+#     `mounted_at` already names a mountpoint, which is how the installer itself
+#     finds an ESP the live root already mounted.
+# --------------------------------------------------------------------------- #
+FAKE_ESP="$TMP/esp"
+make_esp_dir() { # $1=preseal-set.json to stage [$2=authorization bytes file]
+  rm -rf -- "$FAKE_ESP"; mkdir -p "$FAKE_ESP/ice-coreos/preseal"
+  cp -- "$1" "$FAKE_ESP/ice-coreos/preseal/preseal-set.json"
+  cp -- "${2:-$OK/docs/release-authorization.json}" "$FAKE_ESP/ice-coreos/release-authorization.json"
+  cp -- "$OK/docs/release-authorization.json.sig" "$FAKE_ESP/ice-coreos/release-authorization.sig"
+}
+# A preseal set that binds the fixture pair, in the installer's exact shape for
+# the two fields (the other fields are the fixture's; only the pins are read).
+python3 - "$OK/preseal/preseal-set.json" "$OK/docs/release-authorization.json" "$OK/docs/release-authorization.json.sig" "$TMP/preseal-bound.json" "$TMP/preseal-sabotaged.json" <<'PYEOF'
+import hashlib
+import json
+import pathlib
+import sys
+
+set_path, auth, sig, bound, sabotaged = map(pathlib.Path, sys.argv[1:])
+document = json.loads(set_path.read_text(encoding="utf-8"))
+document["installer_authorization_sha256"] = hashlib.sha256(auth.read_bytes()).hexdigest()
+document["installer_authorization_signature_sha256"] = hashlib.sha256(sig.read_bytes()).hexdigest()
+bound.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+document["installer_authorization_sha256"] = "f" * 64
+sabotaged.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+PYEOF
+# Variables and stubs are consumed by the lifted production functions.
+# shellcheck disable=SC2034,SC2329,SC2317
+run_pins() { # $1=label $2=preseal set on the ESP $3=neuralice.preseal value [ENV=VALUE …] -> 0 when the pair was staged; prints the pins
+  local label=$1 set=$2 sealed=$3; shift 3
+  printf '%s\n' "$label" > "$TMP/last.case"
+  make_esp_dir "$set"
+  (
+    set -uo pipefail
+    # shellcheck source=/dev/null
+    . "$TMP/bind.sh"; bind_installer
+    media_vfat_partition() { echo esp; }
+    mounted_at() { echo "$FAKE_ESP"; }
+    PRESEAL_SET_SHA256="$sealed"
+    for assignment in "$@"; do eval "$assignment"; done
+    # shellcheck source=/dev/null
+    . "$LIFTED"
+    scratch="$TMP/auth-scratch"; rm -rf -- "$scratch"; install -d -m 0700 "$scratch"
+    # The installer's own sequence, verbatim: derive, then stage the pair by the
+    # same call the karg path uses.
+    release_authorization_pins_from_preseal "$scratch"
+    esp_staged_file release-authorization.json "$RELEASE_AUTH_DOC_SHA256" "$scratch/release-authorization.json"
+    esp_staged_file release-authorization.sig "$RELEASE_AUTH_SIG_SHA256" "$scratch/release-authorization.sig"
+    printf 'doc=%s\nsig=%s\n' "$RELEASE_AUTH_DOC_SHA256" "$RELEASE_AUTH_SIG_SHA256"
+  ) >"$TMP/last.out" 2>"$TMP/last.err"
+}
+bound_sha="$(sha256sum -- "$TMP/preseal-bound.json" | awk '{print tolower($1)}')"
+sabotaged_sha="$(sha256sum -- "$TMP/preseal-sabotaged.json" | awk '{print tolower($1)}')"
+auth_sha="$(sha256sum -- "$OK/docs/release-authorization.json" | awk '{print tolower($1)}')"
+sig_sha="$(sha256sum -- "$OK/docs/release-authorization.json.sig" | awk '{print tolower($1)}')"
+run_pins "pins from the bound set" "$TMP/preseal-bound.json" "$bound_sha" \
+  || fail "the installer refused a preseal set that binds the pair on the ESP: $(tail -n 3 "$TMP/last.err")"
+{ grep -qx "doc=$auth_sha" "$TMP/last.out" && grep -qx "sig=$sig_sha" "$TMP/last.out"; } \
+  || fail "the pins read from the set are not the ESP pair's hashes: $(cat "$TMP/last.out")"
+cmp -s -- "$OK/docs/release-authorization.json" "$TMP/auth-scratch/release-authorization.json" \
+  || fail "the staged authorization is not the ESP's"
+# 🔴 SABOTAGE, RULE B (brief, sabotage 1): the set on the ESP binds ANOTHER
+# authorization hash, and the sealed neuralice.preseal is that set's hash (the
+# attacker who rewrites the ESP cannot rewrite the UKI, but this is the
+# stronger case). The derived pin does not match the ESP's authorization, and
+# the very esp_staged_file that stages the pair refuses it.
+run_pins "sabotaged set" "$TMP/preseal-sabotaged.json" "$sabotaged_sha" \
+  && fail "a preseal set binding another installer authorization staged the ESP's pair"
+expect_refusal "sabotaged set" "release-authorization.json hashes to $auth_sha, not the $(printf 'f%.0s' {1..64}) this medium's signature seals"
+# esp_staged_file copies first and hashes the copied bytes (its "compare AFTER
+# the copy" rule), so the refused document is in scratch; what proves the
+# install stopped at that refusal is that the NEXT staging never ran.
+[[ ! -e "$TMP/auth-scratch/release-authorization.sig" ]] || fail "the install went on past the refused authorization and staged its signature"
+# ...and the weaker case: the set is the sealed one, the ESP's authorization is not.
+printf '{"schema":"fixture-authorization","swapped":true}\n' > "$TMP/auth-swapped.json"
+rm -rf -- "$FAKE_ESP"
+# Variables and stubs are consumed by the lifted production functions.
+# shellcheck disable=SC2034,SC2329,SC2317
+run_pins_swapped() {
+  make_esp_dir "$TMP/preseal-bound.json" "$TMP/auth-swapped.json"
+  (
+    set -uo pipefail
+    # shellcheck source=/dev/null
+    . "$TMP/bind.sh"; bind_installer
+    media_vfat_partition() { echo esp; }
+    mounted_at() { echo "$FAKE_ESP"; }
+    PRESEAL_SET_SHA256="$bound_sha"
+    # shellcheck source=/dev/null
+    . "$LIFTED"
+    scratch="$TMP/auth-scratch"; rm -rf -- "$scratch"; install -d -m 0700 "$scratch"
+    release_authorization_pins_from_preseal "$scratch"
+    esp_staged_file release-authorization.json "$RELEASE_AUTH_DOC_SHA256" "$scratch/release-authorization.json"
+  ) >"$TMP/last.out" 2>"$TMP/last.err"
+}
+run_pins_swapped && fail "an ESP authorization the sealed set does not bind was staged"
+grep -q "release-authorization.json hashes to" "$TMP/last.err" || fail "the swapped authorization was not refused by its hash"
+# The set itself must hash to the sealed value before a byte of it is read.
+run_pins "set not the sealed one" "$TMP/preseal-bound.json" "$sabotaged_sha" \
+  && fail "a preseal set that does not hash to neuralice.preseal was read for pins"
+expect_refusal "set not the sealed one" "preseal/preseal-set.json hashes to"
+# A line that restates the pair beside the set is refused before the ESP is read.
+printf 'quiet neuralice.preseal=%s neuralice.relauth_sha256=%s neuralice.relauth_sig_sha256=%s\n' "$bound_sha" "$auth_sha" "$sig_sha" > "$TMP/cmdline-restated"
+run_pins "restated pair" "$TMP/preseal-bound.json" "$bound_sha" "NEURALICE_CMDLINE_FILE=$TMP/cmdline-restated" \
+  && fail "a line restating the authorization pair beside its preseal set was accepted"
+expect_refusal "restated pair" "restates neuralice.relauth_sha256/relauth_sig_sha256"
+echo "  rule B: the pair is read from the set only after the set hashes to neuralice.preseal; a set binding another authorization, a swapped ESP authorization, a wrong set and a restated pair all refuse"
 
 # --------------------------------------------------------------------------- #
 # 7) PHASE 5: THE CLOSURE'S OBJECTS, ONTO THE (HERE: A) DATA VOLUME.
@@ -736,6 +937,7 @@ compose_seal() { # $1=source [ENV=VALUE …] -> 0 when the medium would be cut, 
     SEED_CLOSURE="$CLOSURE_HEX"
     SEED_TRUSTED_NOW=2026-09-09T12:00:00Z
     RELEASE_MANIFEST_FILE="$OK/docs/release-manifest.json"
+    RELEASE_CLOSURE_FILE="$OK/docs/release-closure.json"
     PRESEAL_STAGE_ROOT="$OK"
     OS_IMAGE="$OS_IMAGE_REF"
     TARGET_IMGREF="$OS_IMAGE_REF"
@@ -754,7 +956,26 @@ compose_seal() { # $1=source [ENV=VALUE …] -> 0 when the medium would be cut, 
 compose_seal registry || fail "the producer refused the supported mirror-sourced seed: $(cat "$TMP/last.err")"
 grep -qx 'neuralice.seed_source=mirror' "$TMP/last.out" || fail "the producer did not seal neuralice.seed_source=mirror"
 grep -qx "neuralice.seed_closure=$CLOSURE_HEX" "$TMP/last.out" || fail "the producer no longer seals the closure beside the source"
-grep -qx "neuralice.seed_manifest=$MANIFEST_HEX" "$TMP/last.out" || fail "the producer no longer seals the manifest hash beside the source"
+grep -q '^neuralice.seed_manifest=' "$TMP/last.out" && fail "the producer still seals neuralice.seed_manifest; the closure carries it (rule C)"
+grep -q 'neuralice.mirror_ready=\|neuralice.mirror_manifest=' "$TMP/last.out" && fail "the seed function sealed a READY pin"
+# The READY pins are sealed by the mirror arm only when the seed is not the
+# mirror's to serve (rule A): asserted on the producer's source, since the arm
+# is not a function this suite can lift.
+grep -q 'if \[\[ "${SEED_SOURCE:-}" != mirror \]\]; then' "$BUILDER" \
+  || fail "the producer no longer conditions the READY pins on SEED_SOURCE (rule A)"
+awk '/if \[\[ "\$\{SEED_SOURCE:-\}" != mirror \]\]; then/,/fi/' "$BUILDER" | grep -q 'neuralice.mirror_ready=' \
+  || fail "the producer's READY pins are not inside the SEED_SOURCE condition (rule A)"
+# Rule C on the producer: the closure is read, hashed against SEED_CLOSURE, and
+# must name the manifest this medium is cut with.
+compose_seal registry 'RELEASE_CLOSURE_FILE=""' && fail "the producer cut a seed without reading the closure the sealed hash names"
+grep -q 'requires RELEASE_CLOSURE_FILE' "$TMP/last.err" || fail "the missing-closure refusal is not the stated one: $(cat "$TMP/last.err")"
+compose_seal registry "SEED_CLOSURE=$(printf '%064d' 5)" && fail "the producer cut a seed whose sealed closure hash is not the closure's"
+grep -q 'does not hash to SEED_CLOSURE' "$TMP/last.err" || fail "the closure-hash refusal is not the stated one: $(cat "$TMP/last.err")"
+compose_seal registry "RELEASE_CLOSURE_FILE=$MISMATCH/docs/release-closure.json" "SEED_CLOSURE=$(cat "$MISMATCH/closure_hex")" \
+  "MIRROR_READY_SHA256=$(cat "$MISMATCH/closure_hex")" \
+  && fail "the producer cut a seed whose closure names another release manifest than the one beside it (rule C sabotage)"
+grep -q 'refusing to cut a medium whose closure and manifest are two releases' "$TMP/last.err" \
+  || fail "the closure/manifest mismatch is not the stated producer refusal: $(cat "$TMP/last.err")"
 compose_seal registry 'SEED_SOURCE=""' || fail "the producer refused the unchanged ni-seed composition"
 grep -q 'seed_source' "$TMP/last.out" && fail "the producer sealed a seed source nobody asked for"
 compose_seal medium && fail "the producer cut a medium install with a mirror-sourced seed"
@@ -773,7 +994,7 @@ grep -q "SEED_SOURCE must be unset" "$TMP/last.err" || fail "the spelling refusa
 compose_seal registry 'SEED_CLOSURE=""' 'SEED_TRUSTED_NOW=""' 'RELEASE_MANIFEST_FILE=""' \
   && fail "the producer accepted SEED_SOURCE=mirror with no closure to fetch"
 grep -q "SEED_CLOSURE names none" "$TMP/last.err" || fail "the no-closure refusal is not the stated one"
-echo "  producer: SEED_SOURCE=mirror sealed only beside registry + mirror + preseal + a READY mirror; six refusals named"
+echo "  producer: SEED_SOURCE=mirror sealed only beside registry + mirror + preseal + a READY mirror; no seed_manifest, no READY pin; nine refusals named"
 
 # build-preloaded.sh refuses before reading any input. The same invocation
 # WITHOUT the variable must get past that check and fail on something else,
@@ -792,4 +1013,4 @@ grep -q "is not a PRELOADED medium" "$TMP/last.err" \
   && fail "build-preloaded.sh refuses even without SEED_SOURCE; the refusal is not specific"
 echo "  producer: build-preloaded.sh refuses SEED_SOURCE=mirror, and only that"
 
-echo "SEED_FROM_MIRROR_TEST_OK (real TLS mirror on $MIRROR; ${EXPECTED_COUNT}-object closure materialised; sabotaged document, sabotaged object and altered attachment manifest all refused; missing object, wrong size, insufficient space, stray object, resume and stray ni-seed partition proved)"
+echo "SEED_FROM_MIRROR_TEST_OK (real TLS mirror on $MIRROR; ${EXPECTED_COUNT}-object closure materialised; sabotaged document, sabotaged object and altered attachment manifest all refused; missing object, wrong size, insufficient space, stray object, resume and stray ni-seed partition proved; rule C derived and its mismatch refused; rule B pins derived and a sabotaged set refused)"

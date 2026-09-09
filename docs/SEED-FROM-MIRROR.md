@@ -10,11 +10,11 @@ the `ni-seed` path runs before the install is reported successful. First boot
 
 Nothing the mirror says is trusted. The authority is, in order:
 
-1. the sealed `neuralice.seed_closure` and `neuralice.seed_manifest` (the UKI
-   signature covers them) -- they decide which bytes are the closure and the
-   release manifest;
-2. the closure, once its bytes hash to the sealed value -- it names every other
-   object (digest, repository, media type, size);
+1. the sealed `neuralice.seed_closure` (the UKI signature covers it) -- it
+   decides which bytes are the closure;
+2. the closure, once its bytes hash to the sealed value -- it names the release
+   manifest (`release_manifest_sha256`) and every other object (digest,
+   repository, media type, size);
 3. `ni-ota-verify verify-seed-closure`, after the objects land -- it verifies the
    release authorization and delegation snapshot against the root key in the
    dm-verity root, and proves the whole tree (every object present, reachable,
@@ -31,23 +31,52 @@ against a closure whose hash is sealed.
 |---|---|
 | `neuralice.seed_source=mirror` | the only value; absent means "seed on the `ni-seed` partition" |
 | `neuralice.source=registry` | refused otherwise: `seed-source-mirror-without-registry-source` |
-| `neuralice.mirror` (+ `mirror_ca_sha256`, `mirror_ready`, `mirror_manifest`, `mirror_generation`) | refused otherwise: `seed-source-mirror-without-mirror` |
+| `neuralice.mirror` (+ `mirror_ca_sha256`, `mirror_generation`) | refused otherwise: `seed-source-mirror-without-mirror` |
 | `neuralice.preseal` | refused otherwise: `seed-source-mirror-without-preseal` |
-| `neuralice.seed_closure` (+ `seed_manifest`, `seed_trusted_now`) | refused otherwise: `seed-source-mirror-without-seed-closure` |
-| `mirror_ready == seed_closure`, `mirror_manifest == seed_manifest` | already forced by the existing rules (`mirror-ready-not-the-sealed-seed-closure`, `mirror-manifest-not-the-sealed-seed-manifest`) |
+| `neuralice.seed_closure` (+ `seed_trusted_now`) | refused otherwise: `seed-source-mirror-without-seed-closure` |
+| `neuralice.mirror_ready`, `neuralice.mirror_manifest` | **implicit, refused if restated**: `seed-source-mirror-restates-mirror-ready` (rule A) |
+| `neuralice.relauth_sha256`, `neuralice.relauth_sig_sha256` | **implicit beside `neuralice.preseal`, refused if restated**: `preseal-restates-relauth` (rule B; any medium with a preseal set) |
+| `neuralice.seed_manifest` | **implicit beside `neuralice.seed_closure`, refused if restated**: `seed-closure-restates-manifest` (rule C; any medium with a seed) |
 
-Every existing refusal keeps its precedence; the four new refusals are checked
-last. Producer: `SEED_SOURCE=mirror` on `image/build-installer-usb.sh`
-(requires `INSTALL_SOURCE=registry`, `INSTALL_MIRROR`, the preseal set, the six
-seed documents as today, and `MIRROR_READY_SHA256`/`MIRROR_READY_MANIFEST_
-SHA256` equal to the sealed seed hashes). `image/build-preloaded.sh` refuses
-it, and the base producer refuses a raw that carries an `ni-seed` partition.
-Nothing is copied to the medium.
+Every existing refusal keeps its precedence; the four `seed-source-mirror-
+without-*` refusals are checked last. Producer: `SEED_SOURCE=mirror` on
+`image/build-installer-usb.sh` (requires `INSTALL_SOURCE=registry`,
+`INSTALL_MIRROR`, the preseal set, `RELEASE_MANIFEST_FILE` and
+`RELEASE_CLOSURE_FILE`, and `MIRROR_READY_SHA256`/`MIRROR_READY_MANIFEST_
+SHA256` equal to the sealed seed closure and the manifest hash it carries).
+`image/build-preloaded.sh` refuses it, and the base producer refuses a raw
+that carries an `ni-seed` partition. Nothing is copied to the medium.
 
-Byte budget: the full composed line with short fixture names measures 1942 of
-the 1957 bytes the kernel delivers; a long release authority or mirror name
-can exceed it, and the producer's read-back refuses such a medium before it is
-signed.
+### The three implicit terms (FAB-0057 P1.1b)
+
+The kernel's EFI stub delivers at most 1957 bytes of the sealed line
+(`NI_SEALED_CMDLINE_MAX_BYTES`) and silently truncates the rest. The full
+composed line with production-length names measured **2332 bytes**; three
+terms restated a value another sealed term or a hash-sealed document already
+fixed. Each is now implicit under its condition, **refused by name if
+restated**, derived by the installer from the value it already verified, and
+consumed by exactly the same checks as before. No authority moves.
+
+| Rule | Implicit term(s) | Condition | Derived from | Runtime check kept |
+|---|---|---|---|---|
+| A | `mirror_ready`, `mirror_manifest` | `seed_source=mirror` | `seed_closure` and the `release_manifest_sha256` of the closure that hashes to it | the READY receipt is compared on all three fields (closure, manifest, generation) before the transport is written; closure and generation are judged before the seed pack is asked for |
+| B | `relauth_sha256`, `relauth_sig_sha256` | `preseal` sealed | `installer_authorization_sha256` / `installer_authorization_signature_sha256` of the `preseal-set.json` staged from the ESP and hashed against `neuralice.preseal` first (`esp_staged_file preseal/preseal-set.json`) | the pair is staged by the same `esp_staged_file`, the signature is verified with the sealed key, the snapshot re-binds the pair to the set |
+| C | `seed_manifest` | `seed_closure` sealed | `release_manifest_sha256` of the closure after it hashes to `neuralice.seed_closure` (ni-seed: on the mounted partition before `verify-seed-closure`; mirror: on the fetched pack before the READY receipt is judged) | `--expect-manifest` to the verifier, the manifest document re-hashed against it, `release/MANIFEST` written; first boot unchanged |
+
+Producer: it still hashes `RELEASE_MANIFEST_FILE` and now also reads
+`RELEASE_CLOSURE_FILE`, requires it to hash to `SEED_CLOSURE` and requires its
+`release_manifest_sha256` to equal the manifest hash; it still requires
+`MIRROR_READY_*` to equal the seed's values and the preseal set to bind the
+authorization pair (`neural-ice-preseal-handoff.py verify`). Every equality
+that used to be sealed twice is a producer refusal. The mirror-side derivation
+proves the closure first: the fetcher fetches `release-closure.json` alone,
+verifies it by the sealed hash, reads the manifest hash, and only then judges
+and fetches the manifest layer.
+
+Byte budget: the full production line (authority 22 bytes, mirror 30 bytes,
+128-byte operator key, digest-pinned appliance repository, all eight anchor
+terms, `stable` channel) measures **1884 bytes**; the grammar suite carries it
+as the `budget:` corpus vector and fails above 1900.
 
 ## Seed-pack contract (published by ICE-Fabric, consumed before the wipe)
 
@@ -77,16 +106,20 @@ The six seed documents are one OCI artifact on the mirror.
 Refused: a duplicate title, a missing title, an unknown title, a seventh layer,
 a size of 0 or above the bound, a wrong media type, a descriptor with other
 keys. Before any layer is fetched, the `release-closure.json` layer digest must
-equal `sha256:<neuralice.seed_closure>` and the `release-manifest.json` layer
-digest must equal `sha256:<neuralice.seed_manifest>`.
+equal `sha256:<neuralice.seed_closure>`. The closure layer is fetched first and
+proved by that hash; its `release_manifest_sha256` is read from the proved
+bytes, and the `release-manifest.json` layer digest must equal `sha256:<that
+value>` before any other layer is fetched.
 
 Each layer is fetched as `GET /v2/neural-ice/seed-packs/blobs/<digest>` with
 `--max-filesize` equal to the declared size, hashed in flight, and refused
 unless `sha256 == digest` and `bytes == size`. The installer then re-hashes
-`release-closure.json` and `release-manifest.json` against the sealed values and
-runs the existing preseal reconciliation
-(`assert_seed_is_the_preseal_release`) on the fetched documents. The target
-disk is untouched until all of this has passed.
+`release-closure.json` against the sealed value, derives the manifest hash from
+it, re-hashes `release-manifest.json` against that, judges the mirror's READY
+receipt on all three fields, and -- once the preseal set is authenticated --
+runs the existing preseal reconciliation (`assert_seed_is_the_preseal_release`)
+on the fetched documents. The target disk is untouched until all of this has
+passed.
 
 ## Closure objects (fetched after LUKS/mkfs, phase 5)
 
@@ -159,8 +192,14 @@ SELinux labels are written exactly as for an `ni-seed` seed.
   `image/inspect-installer-media.py`, corpus `image/test-lib/sealed-cmdline-corpus.tsv`;
 - producer: `image/build-installer-usb.sh` (`seal_offline_seed_kargs`), `image/build-preloaded.sh`;
 - runtime: `ota/neural-ice-autoinstall.sh` §2d (`seed_mirror_helper`,
-  `seed_from_mirror_preflight`, `seed_from_mirror_materialize`);
+  `seed_from_mirror_fetch_documents` -- called from the mirror block,
+  `seed_from_mirror_preflight`, `seed_from_mirror_materialize`), and the
+  derivations `seed_manifest_hash_from_closure`,
+  `preseal_installer_authorization_pins`,
+  `release_authorization_pins_from_preseal`;
 - tests: `image/test-seed-from-mirror.sh` (real local HTTPS mirror, success,
-  missing, corrupt, wrong size, resume, insufficient space, stray `ni-seed`),
-  `image/test-installer-selector-grammar.sh` (corpus),
+  missing, corrupt, wrong size, resume, insufficient space, stray `ni-seed`,
+  a closure naming another manifest, a preseal set binding another
+  authorization), `image/test-installer-selector-grammar.sh` (corpus and the
+  byte budget), `image/test-installer-media.sh` (composed medium, producer),
   `ci/test-install-registry-mirror.sh` (guards and ordering).

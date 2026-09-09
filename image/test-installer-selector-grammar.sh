@@ -272,10 +272,53 @@ has_media_hint() { # $1=cmdline
 # --------------------------------------------------------------------------- #
 # THE CORPUS. Every vector, every reader, one expected answer.
 # --------------------------------------------------------------------------- #
+# 🔴 THE BYTE BUDGET IS MEASURED, NOT ESTIMATED (FAB-0057 P1.1b). The kernel
+# delivers at most NI_SEALED_CMDLINE_MAX_BYTES (1957) and silently truncates the
+# rest; the full composed registry + mirror + preseal + mirror-sourced-seed line
+# measured 2332 bytes with production-length names before three redundant terms
+# were made implicit. The corpus vector labelled `budget:` is that full line with
+# production-length values, and it must classify as `install` AND fit under an
+# explicit margin. The anchor used for the measurement is the production-shaped
+# one: the longest trust policy id this tree names, not the fixture's.
+BUDGET_MAX_BYTES=1900
+KERNEL_CMDLINE_BYTES="$(sed -n 's/^NI_SEALED_CMDLINE_MAX_BYTES=\([0-9]*\)$/\1/p' "$GRAMMAR")"
+[[ "$KERNEL_CMDLINE_BYTES" =~ ^[0-9]+$ && "$BUDGET_MAX_BYTES" -lt "$KERNEL_CMDLINE_BYTES" ]] \
+  || fail "the grammar no longer states NI_SEALED_CMDLINE_MAX_BYTES as a literal, or the budget is not below it"
+ANCHOR_BUDGET="$(anchor_for lab-managed | sed 's/neural-ice-secureboot-lab-v1/neural-ice-secureboot-prod-v1/')"
+budget_vectors=0 budget_bytes=0
+
 vectors=0 accepted=0 refused=0
 while IFS=$'\t' read -r expected anchor label words; do
   case "$expected" in ''|'#'*) continue ;; esac
   vectors=$(( vectors + 1 ))
+  if [[ "$label" == budget:* ]]; then
+    budget_vectors=$(( budget_vectors + 1 ))
+    budget_line="$ANCHOR_BUDGET $words $PCR_POLICY_FIELDS"
+    budget_bytes=${#budget_line}
+    [[ "$expected" == install ]] \
+      || fail "[$label] the budget vector must be an accepted Install line, it is '$expected'"
+    [[ "$(classify_bash "$budget_line")" == install ]] \
+      || fail "[$label] the production-shaped anchor line is not accepted by the shell grammar"
+    [[ "$(classify_python "$budget_line")" == install ]] \
+      || fail "[$label] the production-shaped anchor line is not accepted by the inspector's grammar"
+    (( budget_bytes <= BUDGET_MAX_BYTES )) \
+      || fail "[$label] the full production line measures ${budget_bytes} bytes, above the ${BUDGET_MAX_BYTES}-byte budget (kernel bound 1957)"
+    # Every term the producer seals on that medium must be on the line, or the
+    # measurement is of a shorter medium than the one that ships.
+    for must in neuralice.imgref= neuralice.sshkey= neuralice.source=registry neuralice.osimage= \
+      neuralice.preseal= neuralice.mirror= neuralice.mirror_ca_sha256= neuralice.mirror_generation= \
+      neuralice.seed_closure= neuralice.seed_trusted_now= neuralice.seed_source=mirror \
+      neuralice.device_channel= neuralice.release_authority= rd.systemd.gpt_auto=0 luks=0 enforcing=0; do
+      [[ "$budget_line" == *" $must"* ]] \
+        || fail "[$label] the budget vector does not carry $must; it measures a shorter medium than the one that ships"
+    done
+    # ...and none of the five implicit terms, or the budget was met by luck.
+    for never in neuralice.relauth_sha256= neuralice.relauth_sig_sha256= neuralice.mirror_ready= \
+      neuralice.mirror_manifest= neuralice.seed_manifest=; do
+      [[ "$budget_line" != *"$never"* ]] \
+        || fail "[$label] the budget vector restates $never"
+    done
+  fi
   case "$anchor" in
     yes)
       cmdline="$ANCHOR ${words:-}"
@@ -374,6 +417,14 @@ done < "$CORPUS"
 (( vectors >= 60 )) || fail "the shared corpus shrank to $vectors vectors"
 (( accepted >= 8 )) || fail "the corpus no longer proves what a VALID medium looks like"
 (( refused >= 45 )) || fail "the corpus no longer covers the hostile mutations"
+(( budget_vectors == 1 )) \
+  || fail "the corpus must carry exactly one budget: vector (found $budget_vectors); the byte budget is otherwise unmeasured"
+# The five restatements must each be refused BY NAME somewhere in the corpus:
+# a generic refusal would let a future edit drop the rule and stay green.
+for named in seed-source-mirror-restates-mirror-ready preseal-restates-relauth seed-closure-restates-manifest; do
+  grep -q "^refuse:${named}	" "$CORPUS" \
+    || fail "the corpus no longer carries a vector refused as ${named}"
+done
 
 # --------------------------------------------------------------------------- #
 # 🔴 THE GENERATOR FAILS CLOSED WHEN ITS GRAMMAR IS GONE.
@@ -552,4 +603,4 @@ run_generator 'quiet rd.luks=1 root=/dev/mapper/system' "$TMP/installed"
 [[ -z "$(find "$TMP/installed/early" -mindepth 1 -print -quit)" ]] \
   || fail "installer-only masks leaked into an installed boot"
 
-echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate and the ESP artefact pins all exercised)"
+echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate and the ESP artefact pins all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes, kernel bound ${KERNEL_CMDLINE_BYTES})"

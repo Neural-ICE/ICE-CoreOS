@@ -264,6 +264,11 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
       # this hash; the installer mounts it read-only and refuses unless the
       # canonical release manifest inside it canonicalises to exactly this value.
       # Without it, a seed partition was simply trusted for carrying a partlabel.
+      #
+      # `neuralice.seed_manifest` keeps its shape so a line restating it is
+      # refused BY NAME (section 4, `seed-closure-restates-manifest`): the
+      # release manifest hash is carried by the closure the sealed hash proves
+      # (`release_manifest_sha256`), and the installer derives it from there.
       [[ "$value" =~ ^[0-9a-f]{64}$ ]]
       ;;
     neuralice.seed_trusted_now)
@@ -535,34 +540,52 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
     [[ "$source_value" == registry ]] && registry_source=1
   fi
 
+  # ------------------------------------------------------------------------- #
+  # 🔴 THE RELEASE-AUTHORIZATION PAIR IS SEALED ONCE, NOT TWICE (FAB-0057
+  # P1.1b, rule B). The preseal set (`preseal-set.json`, hashed against
+  # `neuralice.preseal`) carries `installer_authorization_sha256` and
+  # `installer_authorization_signature_sha256`, and every reader of it refuses a
+  # set that does not bind the pair. On a line that seals a preseal set the two
+  # `neuralice.relauth_*` terms therefore restate a value the signature already
+  # covers -- and the kernel delivers at most NI_SEALED_CMDLINE_MAX_BYTES, so
+  # every restated byte is a byte another pin cannot have. The installer
+  # derives the pair from the hash-verified set and then runs exactly the same
+  # ESP staging and signature verification. A line that restates them is
+  # refused BY NAME; without a preseal set nothing changes.
+  # ------------------------------------------------------------------------- #
+  local preseal_seen="${optional_seen[neuralice.preseal]:-}"
   if (( registry_source == 1 )); then
     [[ -n "${optional_seen[neuralice.osimage]:-}" ]] \
       || { _ni_sealed_refuse registry-source-without-osimage; return 1; }
-    # 🔴 THE AUTHORIZATION IS PART OF THE MEDIUM, NOT AN AFTERTHOUGHT. The
-    # installer refuses a registry install without a Neural-ICE-signed release
-    # authorization on the ESP, and the ESP is mutable -- so the two SHA-256
-    # values that pin those files are sealed HERE, in the line the UKI signature
-    # covers. A medium that seals a registry source and does not seal both is a
-    # medium that would refuse itself on a bench with an already-wiped disk.
-    [[ -n "${optional_seen[neuralice.relauth_sha256]:-}" ]] \
-      || { _ni_sealed_refuse registry-source-without-release-authorization; return 1; }
-    [[ -n "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
-      || { _ni_sealed_refuse registry-source-without-release-authorization-signature; return 1; }
-    # The document and its detached signature are two different objects; a line
-    # that pins one hash twice pins nothing.
-    [[ "$(ni_sealed_argument_value neuralice.relauth_sha256 "${words[@]}")" \
-       != "$(ni_sealed_argument_value neuralice.relauth_sig_sha256 "${words[@]}")" ]] \
-      || { _ni_sealed_refuse release-authorization-hashes-identical; return 1; }
-  else
-    [[ -z "${optional_seen[neuralice.osimage]:-}" ]] \
-      || { _ni_sealed_refuse osimage-without-registry-source; return 1; }
-    if [[ -n "${optional_seen[neuralice.preseal]:-}" ]]; then
-      [[ -n "${optional_seen[neuralice.relauth_sha256]:-}" \
-         && -n "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
-        || { _ni_sealed_refuse preseal-without-release-authorization; return 1; }
+    if [[ -n "$preseal_seen" ]]; then
+      [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" \
+         && -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+        || { _ni_sealed_refuse preseal-restates-relauth; return 1; }
+    else
+      # 🔴 THE AUTHORIZATION IS PART OF THE MEDIUM, NOT AN AFTERTHOUGHT. The
+      # installer refuses a registry install without a Neural-ICE-signed
+      # release authorization on the ESP, and the ESP is mutable -- so the two
+      # SHA-256 values that pin those files are sealed HERE, in the line the
+      # UKI signature covers. A medium that seals a registry source and does
+      # not seal both is a medium that would refuse itself on a bench with an
+      # already-wiped disk.
+      [[ -n "${optional_seen[neuralice.relauth_sha256]:-}" ]] \
+        || { _ni_sealed_refuse registry-source-without-release-authorization; return 1; }
+      [[ -n "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+        || { _ni_sealed_refuse registry-source-without-release-authorization-signature; return 1; }
+      # The document and its detached signature are two different objects; a
+      # line that pins one hash twice pins nothing.
       [[ "$(ni_sealed_argument_value neuralice.relauth_sha256 "${words[@]}")" \
          != "$(ni_sealed_argument_value neuralice.relauth_sig_sha256 "${words[@]}")" ]] \
         || { _ni_sealed_refuse release-authorization-hashes-identical; return 1; }
+    fi
+  else
+    [[ -z "${optional_seen[neuralice.osimage]:-}" ]] \
+      || { _ni_sealed_refuse osimage-without-registry-source; return 1; }
+    if [[ -n "$preseal_seen" ]]; then
+      [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" \
+         && -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+        || { _ni_sealed_refuse preseal-restates-relauth; return 1; }
     else
       [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" \
          && -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
@@ -572,12 +595,10 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
 
   # A pre-seal set authenticates the selected appliance before disk mutation.
   # Registry media pull that appliance; offline media carry the exact same host
-  # image in the UKI-bound dm-verity store. Both transports require the same
-  # release-authorization pair, and both remain LAB-only.
-  if [[ -n "${optional_seen[neuralice.preseal]:-}" ]]; then
-    [[ -n "${optional_seen[neuralice.relauth_sha256]:-}" \
-       && -n "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
-      || { _ni_sealed_refuse preseal-without-release-authorization; return 1; }
+  # image in the UKI-bound dm-verity store. Both transports carry the same
+  # release-authorization pair (bound by the set itself, above), and both
+  # remain LAB-only.
+  if [[ -n "$preseal_seen" ]]; then
     [[ "$(ni_sealed_argument_value neuralice.access_profile "${words[@]}")" == lab-managed ]] \
       || { _ni_sealed_refuse preseal-not-permitted-outside-lab-managed; return 1; }
   fi
@@ -613,10 +634,25 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
       || { _ni_sealed_refuse mirror-not-permitted-outside-lab-managed; return 1; }
     [[ -n "${optional_seen[neuralice.mirror_ca_sha256]:-}" ]] \
       || { _ni_sealed_refuse mirror-without-pinned-ca; return 1; }
-    [[ -n "${optional_seen[neuralice.mirror_ready]:-}" ]] \
-      || { _ni_sealed_refuse mirror-without-ready-closure-hash; return 1; }
-    [[ -n "${optional_seen[neuralice.mirror_manifest]:-}" ]] \
-      || { _ni_sealed_refuse mirror-without-ready-manifest-hash; return 1; }
+    if [[ -n "${optional_seen[neuralice.seed_source]:-}" ]]; then
+      # 🔴 THE READY PINS ARE THE SEED TUPLE, STATED ONCE (FAB-0057 P1.1b,
+      # rule A). With `neuralice.seed_source=mirror` the mirror serves the very
+      # closure the seed IS, so `mirror_ready` could only ever equal
+      # `seed_closure` and `mirror_manifest` could only ever equal the manifest
+      # hash that closure carries -- both were already forced to be equal. The
+      # installer sets them from the sealed closure and performs the same
+      # three-field READY comparison it always did; a line restating either is
+      # refused by name. `mirror_ca_sha256` and `mirror_generation` stay sealed:
+      # nothing else on the line carries them.
+      [[ -z "${optional_seen[neuralice.mirror_ready]:-}" \
+         && -z "${optional_seen[neuralice.mirror_manifest]:-}" ]] \
+        || { _ni_sealed_refuse seed-source-mirror-restates-mirror-ready; return 1; }
+    else
+      [[ -n "${optional_seen[neuralice.mirror_ready]:-}" ]] \
+        || { _ni_sealed_refuse mirror-without-ready-closure-hash; return 1; }
+      [[ -n "${optional_seen[neuralice.mirror_manifest]:-}" ]] \
+        || { _ni_sealed_refuse mirror-without-ready-manifest-hash; return 1; }
+    fi
     [[ -n "${optional_seen[neuralice.mirror_generation]:-}" ]] \
       || { _ni_sealed_refuse mirror-without-cache-generation; return 1; }
   else
@@ -664,8 +700,15 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
     # whose seed verification has no canonical host to insist on.
     [[ -n "$release_authority" ]] \
       || { _ni_sealed_refuse seed-closure-without-release-authority; return 1; }
-    [[ -n "${optional_seen[neuralice.seed_manifest]:-}" ]] \
-      || { _ni_sealed_refuse seed-closure-without-manifest-hash; return 1; }
+    # 🔴 THE MANIFEST HASH IS THE CLOSURE'S TO STATE (FAB-0057 P1.1b, rule C).
+    # `release-closure.json` -- the document `neuralice.seed_closure` is the
+    # hash of, verified before any use -- carries `release_manifest_sha256`,
+    # and the seed verifier already refuses a closure whose value differs from
+    # the manifest it is handed. The installer derives the expected manifest
+    # hash from the verified closure and still passes it to the verifier and
+    # writes it to `release/MANIFEST`; a line restating it is refused by name.
+    [[ -z "${optional_seen[neuralice.seed_manifest]:-}" ]] \
+      || { _ni_sealed_refuse seed-closure-restates-manifest; return 1; }
     [[ -n "${optional_seen[neuralice.seed_trusted_now]:-}" ]] \
       || { _ni_sealed_refuse seed-closure-without-trusted-time; return 1; }
     # 🔴 ONE RELEASE, NOT TWO THAT HAPPEN TO BE ON ONE STICK. `neuralice.mirror_
@@ -673,14 +716,14 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
     # `neuralice.seed_closure` is the exact release closure the seed IS. A line
     # sealing two different values there is a medium whose OS transport and whose
     # runtime artefacts were cut from different releases -- and it would only be
-    # discovered on the bench, after the disk was gone.
+    # discovered on the bench, after the disk was gone. The manifest half of that
+    # agreement is no longer on the line: the installer compares the mirror's
+    # sealed `mirror_manifest` with the hash the verified closure carries, and
+    # the producer refuses to cut a medium where the two differ.
     if [[ -n "${optional_seen[neuralice.mirror_ready]:-}" ]]; then
       [[ "$(ni_sealed_argument_value neuralice.mirror_ready "${words[@]}")" \
          == "$(ni_sealed_argument_value neuralice.seed_closure "${words[@]}")" ]] \
         || { _ni_sealed_refuse mirror-ready-not-the-sealed-seed-closure; return 1; }
-      [[ "$(ni_sealed_argument_value neuralice.mirror_manifest "${words[@]}")" \
-         == "$(ni_sealed_argument_value neuralice.seed_manifest "${words[@]}")" ]] \
-        || { _ni_sealed_refuse mirror-manifest-not-the-sealed-seed-manifest; return 1; }
     fi
   else
     [[ -z "${optional_seen[neuralice.seed_manifest]:-}" \
@@ -701,9 +744,10 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
   # precedence, and a line these refusals reach is one the rest of the grammar
   # already accepts.
   #
-  # `mirror_ready == seed_closure` and `mirror_manifest == seed_manifest` are
-  # not restated: a mirror forces `mirror_ready`, a seed closure beside it
-  # forces the equality, and both are required here.
+  # `mirror_ready` and `mirror_manifest` are not on this line at all (rule A,
+  # mirror block above): with `seed_source=mirror` the installer derives both
+  # from the sealed closure, so the equalities the composed medium used to
+  # state twice are now stated once.
   # ------------------------------------------------------------------------- #
   if [[ -n "${optional_seen[neuralice.seed_source]:-}" ]]; then
     (( registry_source == 1 )) \

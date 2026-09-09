@@ -1663,6 +1663,980 @@ PCR_POLICY_HIGH_WATER="$("$TPM_STATE" pcr-policy-check "$PCR_POLICY_SEQ")" \
 [[ "$PCR_POLICY_HIGH_WATER" =~ ^[0-9]{1,16}$ && "$PCR_POLICY_SEQ" -gt "$PCR_POLICY_HIGH_WATER" ]] \
   || die "TPM PCR policy high-water check returned malformed state"
 
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE THREE IMPLICIT TERMS (FAB-0057 P1.1b). The kernel delivers at most
+# NI_SEALED_CMDLINE_MAX_BYTES of the sealed line and silently drops the rest;
+# the full composed medium (registry + mirror + preseal + mirror-sourced seed)
+# measured 2332 bytes with production-length names. Three terms restated a
+# value another sealed term or a hash-sealed document already fixed, so the
+# grammar REFUSES them by name and this installer derives each from the value it
+# already verified, then performs exactly the checks it always performed:
+#
+#   neuralice.seed_manifest        derived from `release_manifest_sha256` in
+#                                  the closure whose bytes hash to the sealed
+#                                  `neuralice.seed_closure` (rule C);
+#   neuralice.mirror_ready /       with `neuralice.seed_source=mirror`: the
+#   neuralice.mirror_manifest      sealed closure hash and the manifest hash
+#                                  that closure carries (rule A); the READY
+#                                  receipt is still compared on all three
+#                                  fields;
+#   neuralice.relauth_sha256 /     with `neuralice.preseal`: read from the
+#   neuralice.relauth_sig_sha256   preseal set whose bytes hash to the sealed
+#                                  value (rule B); the ESP pair is then staged
+#                                  and verified exactly as before.
+#
+# No authority moves: every derived value comes from bytes hashed against the
+# signed line first, and the grammar revalidated at the top of this script
+# refuses a line that restates any of them. The definitions below sit ahead of
+# the mirror block because rule A needs the seed pack -- and the manifest hash
+# its closure carries -- before the mirror's READY receipt can be judged.
+# --------------------------------------------------------------------------- #
+readonly SEED_MOUNT="$INSTALLER_STATE_DIR/seed"
+SEED_CLOSURE="$(karg_once neuralice.seed_closure)"
+readonly SEED_CLOSURE
+SEED_TRUSTED_NOW="$(karg_once neuralice.seed_trusted_now)"
+readonly SEED_TRUSTED_NOW
+# WHERE the sealed closure's objects come from: the ni-seed partition on this
+# medium (absent -- the byte-identical historical path) or the LAN mirror
+# (`mirror`, §2d below). Read exactly once, and only the one spelling.
+SEED_SOURCE="$(karg_once neuralice.seed_source)"
+readonly SEED_SOURCE
+case "$SEED_SOURCE" in
+  ''|mirror) : ;;
+  *) die "neuralice.seed_source must be absent or 'mirror', got: $SEED_SOURCE" ;;
+esac
+# 🔴 THE MANIFEST HASH IS DERIVED, NEVER READ (FAB-0057 P1.1b, rule C). The
+# closure whose bytes hash to `neuralice.seed_closure` carries
+# `release_manifest_sha256`; the value below is set from that proved document
+# (ni-seed path: once the partition is mounted, before `verify-seed-closure`;
+# mirror path: once the seed pack landed, before the READY receipt is judged)
+# and made readonly after the seed preflight. The grammar refuses a line that
+# restates the term; this restates the refusal against the count THIS script
+# reads, so a grammar edit cannot silently reintroduce a second source.
+[[ "$(karg_count neuralice.seed_manifest)" == 0 ]] \
+  || die "this medium restates neuralice.seed_manifest beside the sealed release closure that already names the manifest; a line that states it twice is refused"
+SEED_MANIFEST_SHA256=""
+
+assert_sealed_document_digest() { # $1=path $2=expected sha256 $3=what
+  local path=$1 expected=$2 what=$3 observed
+  [[ -f "$path" && ! -L "$path" ]] \
+    || die "the $what is not a regular file; refusing to reconcile the offline seed against something that is not a document"
+  observed="$(sha256sum -- "$path" | awk '{print tolower($1)}')" \
+    || die "cannot hash the $what"
+  [[ "$observed" == "$expected" ]] \
+    || die "the $what hashes to ${observed}, not the ${expected} this medium's signature seals"
+}
+
+
+# The release manifest hash the VERIFIED closure carries (FAB-0057 P1.1b, rule
+# C). The caller has already hashed the closure against the sealed
+# `neuralice.seed_closure`: this reads a proved document, it does not choose
+# one. Bounded exactly as the verifier reads a release document (16 MiB), a
+# regular non-symlink file, strict JSON with duplicate fields refused, the field
+# mandatory and 64 lowercase hex. Prints the hex; any other outcome is a
+# non-zero status the caller turns into a `die`.
+seed_manifest_hash_from_closure() { # $1=release-closure.json, already hashed against neuralice.seed_closure
+  python3 - "$1" <<'SEED_MANIFEST_FROM_CLOSURE_PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+MAXIMUM = 16 * 1024 * 1024
+
+
+def closed_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise SystemExit(f"duplicate field: {key}")
+        result[key] = value
+    return result
+
+
+before = os.lstat(path)
+if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAXIMUM:
+    raise SystemExit("release closure is not a bounded regular file")
+descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    opened = os.fstat(descriptor)
+    chunks = []
+    remaining = MAXIMUM + 1
+    while remaining:
+        part = os.read(descriptor, remaining)
+        if not part:
+            break
+        chunks.append(part)
+        remaining -= len(part)
+finally:
+    os.close(descriptor)
+raw = b"".join(chunks)
+if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        or not stat.S_ISREG(opened.st_mode) or not 0 < len(raw) <= MAXIMUM):
+    raise SystemExit("release closure changed while it was read")
+document = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_pairs)
+if not isinstance(document, dict):
+    raise SystemExit("release closure is not a JSON object")
+value = document.get("release_manifest_sha256")
+if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+    raise SystemExit("release closure carries no well-formed release_manifest_sha256")
+print(value)
+SEED_MANIFEST_FROM_CLOSURE_PY
+}
+
+# The installer authorization pair the VERIFIED preseal set binds (FAB-0057
+# P1.1b, rule B). The caller has already hashed the set against the sealed
+# `neuralice.preseal`. Bounded as every reader of the set is (16 KiB), regular
+# non-symlink file, strict JSON with duplicate fields refused, both fields
+# mandatory, 64 lowercase hex, and distinct. Prints two lines: the document
+# hash, then the signature hash.
+preseal_installer_authorization_pins() { # $1=preseal-set.json, already hashed against neuralice.preseal
+  python3 - "$1" <<'PRESEAL_PINS_PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+MAXIMUM = 16 * 1024
+
+
+def closed_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise SystemExit(f"duplicate field: {key}")
+        result[key] = value
+    return result
+
+
+before = os.lstat(path)
+if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAXIMUM:
+    raise SystemExit("preseal set is not a bounded regular file")
+descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    opened = os.fstat(descriptor)
+    raw = os.read(descriptor, MAXIMUM + 1)
+finally:
+    os.close(descriptor)
+if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        or not stat.S_ISREG(opened.st_mode) or not 0 < len(raw) <= MAXIMUM):
+    raise SystemExit("preseal set changed while it was read")
+document = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_pairs)
+if not isinstance(document, dict):
+    raise SystemExit("preseal set is not a JSON object")
+pins = []
+for key in ("installer_authorization_sha256", "installer_authorization_signature_sha256"):
+    value = document.get(key)
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise SystemExit(f"preseal set carries no well-formed {key}")
+    pins.append(value)
+if pins[0] == pins[1]:
+    raise SystemExit("preseal set binds one digest for both the authorization and its signature")
+print(pins[0])
+print(pins[1])
+PRESEAL_PINS_PY
+}
+
+# Rule B, on the installer: the set is staged from the ESP and hashed against
+# the sealed `neuralice.preseal` FIRST -- by the very `esp_staged_file` that
+# stages every other sealed ESP artefact -- and only then are the two pins read
+# from it. The caller then runs exactly the staging and signature verification
+# it always ran on `neuralice.relauth_*`. A line that restates the pair is
+# refused by the grammar; it is refused here again against the count THIS
+# script reads.
+release_authorization_pins_from_preseal() { # $1=scratch dir -> sets RELEASE_AUTH_DOC_SHA256 / RELEASE_AUTH_SIG_SHA256
+  local scratch=$1 pins
+  [[ "$(karg_count neuralice.relauth_sha256)" == 0 && "$(karg_count neuralice.relauth_sig_sha256)" == 0 ]] \
+    || die "this medium seals a preseal set and restates neuralice.relauth_sha256/relauth_sig_sha256; the set binds the authorization pair, and a line that states it twice is refused"
+  esp_staged_file preseal/preseal-set.json "$PRESEAL_SET_SHA256" "$scratch/preseal-set.json"
+  pins="$(preseal_installer_authorization_pins "$scratch/preseal-set.json")" \
+    || die "the preseal set this medium seals does not bind a well-formed installer authorization pair"
+  RELEASE_AUTH_DOC_SHA256="${pins%%$'\n'*}"
+  RELEASE_AUTH_SIG_SHA256="${pins##*$'\n'}"
+}
+
+NEURALICE_SEED_VERIFIER="$(ni_path NEURALICE_SEED_VERIFIER /usr/bin/ni-ota-verify)"
+readonly NEURALICE_SEED_VERIFIER
+
+# --------------------------------------------------------------------------- #
+# 2d) 🔴 THE SEED THAT ARRIVES OVER THE LAN: `neuralice.seed_source=mirror`
+#     (FAB-0057 P1.1, docs/SEED-FROM-MIRROR.md).
+#
+# Same seed, other transport. The medium seals the same closure and trusted-time
+# tuple as a PRELOADED stick and carries NO ni-seed partition: the six seed-pack
+# documents are fetched from the LAN mirror BEFORE the wipe (from the mirror
+# block, before the READY receipt is judged -- rule A needs the manifest hash
+# the closure carries), and
+# every object the closure names is fetched onto the encrypted data volume
+# AFTER LUKS/mkfs (phase 5), each hashed in flight against the name the sealed
+# closure gives it. Then the SAME `verify-seed-closure` that proves a staged
+# ni-seed tree proves this one, and first boot is unchanged.
+#
+# WHAT IS TRUSTED: nothing the mirror says. The tag is routing; the sealed
+# `neuralice.seed_closure` decides which bytes are the closure, the closure's
+# `release_manifest_sha256` which bytes are the manifest (FAB-0057 P1.1b, rule
+# C), and the closure decides every other object's name and size; the authorization and delegation documents are verified by
+# ni-ota-verify against the root key in the dm-verity root. TLS is pinned to
+# the sealed mirror CA so an unpinned host cannot even answer, and no credential
+# is presented: the bench is a controlled lab-managed install LAN.
+#
+# FAILURE MODEL (each is a `die`; no partial success is ever reported):
+#   network cut during the document fetch -- before the wipe: the machine is
+#       exactly as it was;
+#   network cut during the object fetch -- after the wipe: the target disk is
+#       already destroyed and holds no customer data; reinstall from the bench,
+#       there is nothing to recover;
+#   corrupt or substituted object -- a hash that does not equal its name is a
+#       verdict, not a transient: the temp file is discarded and the install
+#       dies at once, no retry (TLS already proves transit integrity);
+#   mirror changes generation between READY and the fetch -- the sealed hashes
+#       protect: an object no longer served is a missing object and the install
+#       dies; one still served under the same name still hashes to it;
+#   disk full -- the declared sizes are summed and checked against the data
+#       volume before the first object byte, and again with exact sizes before
+#       the bulk; a write that still fails is a die, never a truncated object;
+#   power loss -- an install that did not finish was never committed: no READY,
+#       no release/CLOSURE pointer, no ceremony has happened; the next boot is
+#       the installer again.
+#
+# BOUNDS: 3 attempts per object for TRANSPORT failures only, with fixed waits;
+# per-object --max-time proportional to the declared size with a floor; a stall
+# floor (--speed-limit/--speed-time); --max-filesize equal to the declared size
+# AND the helper's own byte count as the real ceiling (curl before 8.4.0 does
+# not apply --max-filesize to a transfer in progress); bounded JSON readers
+# everywhere; one object in flight at a time; at most the verifier's 100 000
+# objects.
+# --------------------------------------------------------------------------- #
+readonly SEED_PACK_DIR="$INSTALLER_STATE_DIR/seed-pack"
+
+# The bounded fetcher. One reviewable component: it derives the object plan from
+# the closure, drives `curl` with the pinned transport, hashes in flight, and
+# publishes each object by atomic rename only when the bytes hash to the name.
+# Positional arguments only; the exit status is the verdict.
+seed_mirror_helper() { # $1=documents|plan|objects $2..=positional arguments -> the fetcher's exit status
+  python3 - "$@" <<'SEED_MIRROR_PY'
+"""Bounded fetcher for the mirror-sourced seed (docs/SEED-FROM-MIRROR.md).
+
+  documents <mirror> <cacert> <closure_hex> <destination>
+  plan      <closure_path> <release_authority>
+  objects   <mirror> <cacert> <closure_path> <release_authority> <destination>
+            <closure_hex> <manifest_hex>
+
+Exit 0 only when every byte asked for landed and hashed to its name.
+"""
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+HEX64 = re.compile(r"[0-9a-f]{64}")
+MIRROR_HOST = re.compile(r"[A-Za-z0-9._-]+(:[0-9]{1,5})?")
+REPOSITORY_PATH = re.compile(r"[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*")
+KIB = 1024
+MIB = 1024 * KIB
+PACK_REPOSITORY = "neural-ice/seed-packs"
+OCI_MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
+PACK_ARTIFACT_TYPE = "application/vnd.neural-ice.seed-pack.v1+json"
+PACK_CONFIG_TYPE = "application/vnd.neural-ice.seed-pack.config.v1+json"
+PACK_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+PACK_CONFIG_SIZE = 2
+PACK_MANIFEST_MAX = 64 * KIB
+TITLE = "org.opencontainers.image.title"
+PACK_LAYERS = dict((
+    ("release-manifest.json", ("application/json", 16 * MIB)),
+    ("release-closure.json", ("application/json", 16 * MIB)),
+    ("release-authorization.json", ("application/json", 64 * KIB)),
+    ("release-authorization.json.sig", ("application/octet-stream", 4 * KIB)),
+    ("delegation-snapshot.json", ("application/json", 64 * KIB)),
+    ("delegation-snapshot.json.sig", ("application/octet-stream", 4 * KIB)),
+))
+CLOSURE_MAX = 16 * MIB          # ni-ota-verify MAX_DOCUMENT_BYTES
+OCI_DOCUMENT_MAX = 4 * MIB      # ni-ota-verify MAX_OCI_DOCUMENT_BYTES
+MAX_OBJECTS = 100_000           # ni-ota-verify MAX_OBJECTS
+SAFE_INTEGER_MAX = 9_007_199_254_740_991
+ATTACHMENT_ALLOWANCE = 3 * OCI_DOCUMENT_MAX   # manifest + config + layers, before they are known
+ATTEMPTS = 3
+RETRY_WAITS = (2, 6)
+CONNECT_TIMEOUT = 15
+STALL_BYTES_PER_SECOND = 64 * KIB
+STALL_SECONDS = 60
+MAX_TIME_FLOOR = 120
+MAX_TIME_BYTES_PER_SECOND = 512 * KIB
+DISK_MARGIN_FRACTION = 0.05
+DISK_MARGIN_BYTES = 256 * MIB
+CHUNK = MIB
+STDERR_KEEP = 4 * KIB
+READY_SCHEMA = "neural-ice-seed-closure-ready-v1"
+NODE_KINDS = ("index", "manifest", "config", "layer")
+
+
+class Refusal(Exception):
+    """A verdict: the install must die, and no retry can change it."""
+
+
+class Transient(Exception):
+    """A transport failure; retried a bounded number of times."""
+
+
+def refuse(reason):
+    raise Refusal(reason)
+
+
+def note(message):
+    print(f"seed-mirror: {message}", file=sys.stderr, flush=True)
+
+
+def closed_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            refuse(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
+def parse_object(raw, what):
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_pairs)
+    except (UnicodeDecodeError, ValueError) as error:
+        refuse(f"{what} is not a JSON document: {error}")
+    if not isinstance(value, dict):
+        refuse(f"{what} is not a JSON object")
+    return value
+
+
+def read_bounded(path, maximum, what):
+    """A bounded, stable, regular non-symlink file, read whole."""
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
+        refuse(f"{what} is not a bounded regular file: {path}")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            part = os.read(descriptor, remaining)
+            if not part:
+                break
+            chunks.append(part)
+            remaining -= len(part)
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not 0 < len(raw) <= maximum):
+        refuse(f"{what} changed while it was read: {path}")
+    return raw
+
+
+def digest_hex(value, what):
+    if not isinstance(value, str) or not value.startswith("sha256:") or not HEX64.fullmatch(value[7:]):
+        refuse(f"{what} is not a sha256 digest")
+    return value[7:]
+
+
+def size_of(value, what, maximum=SAFE_INTEGER_MAX):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= maximum:
+        refuse(f"{what} size is not an integer within 0..{maximum}")
+    return value
+
+
+def text_of(value, what):
+    if not isinstance(value, str) or not value:
+        refuse(f"{what} is not a non-empty string")
+    return value
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def hash_present(path):
+    """(hex, size) of a present regular single-link file, or None when absent."""
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        refuse(f"the object store carries something that is not a single-link regular file: {path}")
+    hasher = hashlib.sha256()
+    count = 0
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK)
+            if not chunk:
+                break
+            count += len(chunk)
+            hasher.update(chunk)
+    return hasher.hexdigest(), count
+
+
+class Transport:
+    def __init__(self, mirror, cacert):
+        if not MIRROR_HOST.fullmatch(mirror):
+            refuse(f"the mirror is not a bare host[:port]: {mirror}")
+        if not os.path.isfile(cacert):
+            refuse(f"the pinned mirror CA is not a file: {cacert}")
+        self.mirror = mirror
+        self.cacert = cacert
+
+    def url(self, path):
+        return f"https://{self.mirror}/v2/{path}"
+
+    def command(self, url, accept, limit):
+        max_time = MAX_TIME_FLOOR + limit // MAX_TIME_BYTES_PER_SECOND
+        return [
+            "curl", "--silent", "--show-error", "--fail",
+            "--proto", "=https", "--tlsv1.2", "--cacert", self.cacert,
+            "--connect-timeout", str(CONNECT_TIMEOUT),
+            "--speed-limit", str(STALL_BYTES_PER_SECOND), "--speed-time", str(STALL_SECONDS),
+            "--max-time", str(max_time), "--max-filesize", str(max(limit, 1)),
+            "--header", f"Accept: {accept}",
+            "--output", "-", url,
+        ]
+
+    def fetch_once(self, url, accept, limit, expected_hex, expected_size, destination):
+        """One transfer to a temporary file, hashed in flight, published by rename.
+
+        Raises Transient for a transport failure, Refusal for a verdict."""
+        directory = os.path.dirname(destination) or "."
+        handle, temporary = tempfile.mkstemp(prefix=".fetch.", dir=directory)
+        errors = tempfile.TemporaryFile(prefix=".fetch-stderr.", dir=directory)
+        try:
+            hasher = hashlib.sha256()
+            count = 0
+            overflow = False
+            with os.fdopen(handle, "wb") as sink:
+                process = subprocess.Popen(
+                    self.command(url, accept, limit), stdout=subprocess.PIPE, stderr=errors,
+                    stdin=subprocess.DEVNULL)
+                try:
+                    while True:
+                        chunk = process.stdout.read(CHUNK)
+                        if not chunk:
+                            break
+                        count += len(chunk)
+                        if count > limit:
+                            overflow = True
+                            break
+                        hasher.update(chunk)
+                        sink.write(chunk)
+                finally:
+                    if overflow:
+                        process.kill()
+                    process.stdout.close()
+                    status = process.wait()
+                sink.flush()
+                os.fsync(sink.fileno())
+            if overflow:
+                refuse(f"{url} served more than the {limit} bytes it may be")
+            if status != 0:
+                errors.seek(0)
+                detail = errors.read(STDERR_KEEP).decode("utf-8", "replace").strip()
+                raise Transient(f"curl exit {status} for {url}: {detail}")
+            if expected_size is not None and count < expected_size:
+                raise Transient(f"{url}: {count} of {expected_size} declared bytes arrived")
+            if expected_size is not None and count != expected_size:
+                refuse(f"{url} is {count} bytes, not the {expected_size} the closure declares")
+            observed = hasher.hexdigest()
+            if expected_hex is not None and observed != expected_hex:
+                refuse(f"{url} hashes to sha256:{observed}, not the sha256:{expected_hex} it is named by")
+            os.chmod(temporary, 0o444)
+            os.replace(temporary, destination)
+            temporary = None
+            fsync_directory(directory)
+            return count
+        finally:
+            errors.close()
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    def fetch(self, what, url, accept, limit, expected_hex, expected_size, destination):
+        for attempt in range(1, ATTEMPTS + 1):
+            try:
+                return self.fetch_once(url, accept, limit, expected_hex, expected_size, destination)
+            except Transient as error:
+                if attempt == ATTEMPTS:
+                    refuse(f"{what}: transport failed {ATTEMPTS} times; last: {error}")
+                wait = RETRY_WAITS[attempt - 1]
+                note(f"{what}: attempt {attempt} failed ({error}); retrying in {wait} s")
+                time.sleep(wait)
+        refuse(f"{what}: unreachable")
+
+
+def require_space(store, needed, phase):
+    vfs = os.statvfs(store)
+    available = vfs.f_bavail * vfs.f_frsize
+    required = needed + int(needed * DISK_MARGIN_FRACTION) + DISK_MARGIN_BYTES
+    if available < required:
+        refuse(f"the data volume has {available} bytes free and the closure needs {required} ({phase})")
+
+
+def clear_temporaries(store):
+    for name in os.listdir(store):
+        if name.startswith(".fetch"):
+            os.unlink(os.path.join(store, name))
+
+
+# ----------------------------------------------------------------------------- #
+# The seed pack: six documents, one OCI artifact, authority = the sealed hashes.
+# ----------------------------------------------------------------------------- #
+def closure_manifest_hex(closure_path):
+    """`release_manifest_sha256` of a closure ALREADY proved by its hash (rule C)."""
+    closure = parse_object(read_bounded(closure_path, CLOSURE_MAX, "release closure"), "release closure")
+    value = closure.get("release_manifest_sha256")
+    if not isinstance(value, str) or not HEX64.fullmatch(value):
+        refuse("the release closure carries no well-formed release_manifest_sha256")
+    return value
+
+
+def documents(mirror, cacert, closure_hex, destination):
+    if not HEX64.fullmatch(closure_hex):
+        refuse("the sealed closure hash is not 64 lowercase hex")
+    transport = Transport(mirror, cacert)
+    os.makedirs(destination, mode=0o700, exist_ok=True)
+    clear_temporaries(destination)
+    manifest_path = os.path.join(destination, ".seed-pack-manifest.json")
+    transport.fetch("seed-pack manifest", transport.url(f"{PACK_REPOSITORY}/manifests/{closure_hex}"),
+                    OCI_MANIFEST_TYPE, PACK_MANIFEST_MAX, None, None, manifest_path)
+    document = parse_object(read_bounded(manifest_path, PACK_MANIFEST_MAX, "seed-pack manifest"),
+                            "seed-pack manifest")
+    os.unlink(manifest_path)
+    allowed = ("schemaVersion", "mediaType", "artifactType", "config", "layers", "annotations")
+    unknown = sorted(set(document) - set(allowed))
+    if unknown:
+        refuse(f"seed-pack manifest carries unknown fields: {unknown}")
+    if document.get("schemaVersion") != 2:
+        refuse("seed-pack manifest schemaVersion is not 2")
+    if document.get("mediaType") != OCI_MANIFEST_TYPE:
+        refuse(f"seed-pack manifest mediaType is not {OCI_MANIFEST_TYPE}")
+    if document.get("artifactType") != PACK_ARTIFACT_TYPE:
+        refuse(f"seed-pack manifest artifactType is not {PACK_ARTIFACT_TYPE}")
+    config = document.get("config")
+    if (not isinstance(config, dict) or set(config) != set(("mediaType", "digest", "size"))
+            or config["mediaType"] != PACK_CONFIG_TYPE or config["digest"] != PACK_CONFIG_DIGEST
+            or config["size"] != PACK_CONFIG_SIZE or isinstance(config["size"], bool)):
+        refuse("seed-pack config descriptor is not the empty seed-pack config")
+    layers = document.get("layers")
+    if not isinstance(layers, list) or len(layers) != len(PACK_LAYERS):
+        refuse(f"seed-pack manifest does not carry exactly {len(PACK_LAYERS)} layers")
+    seen = {}
+    for layer in layers:
+        if not isinstance(layer, dict) or set(layer) != set(("mediaType", "digest", "size", "annotations")):
+            refuse("a seed-pack layer descriptor does not carry exactly mediaType/digest/size/annotations")
+        annotations = layer["annotations"]
+        title = annotations.get(TITLE) if isinstance(annotations, dict) else None
+        if title not in PACK_LAYERS:
+            refuse(f"a seed-pack layer carries a missing or unknown {TITLE}: {title!r}")
+        if title in seen:
+            refuse(f"the seed pack carries {title} twice")
+        media_type, bound = PACK_LAYERS[title]
+        if layer["mediaType"] != media_type:
+            refuse(f"seed-pack layer {title} is not {media_type}")
+        hex_value = digest_hex(layer["digest"], f"seed-pack layer {title} digest")
+        size = size_of(layer["size"], f"seed-pack layer {title}", bound)
+        if size == 0:
+            refuse(f"seed-pack layer {title} is declared empty")
+        seen[title] = (hex_value, size)
+    if seen["release-closure.json"][0] != closure_hex:
+        refuse("the seed pack's release-closure.json is not the closure this medium seals")
+    # THE CLOSURE FIRST (FAB-0057 P1.1b, rule C). It is the one document the
+    # sealed line names directly, and it is the document that names the release
+    # manifest: fetch it, prove it by the sealed hash, read
+    # `release_manifest_sha256` from the proved bytes, and only then may the
+    # manifest layer be judged and fetched. No other blob is asked for before.
+    closure_title = "release-closure.json"
+    closure_size = seen[closure_title][1]
+    transport.fetch(f"seed-pack document {closure_title}",
+                    transport.url(f"{PACK_REPOSITORY}/blobs/sha256:{closure_hex}"), "*/*",
+                    closure_size, closure_hex, closure_size, os.path.join(destination, closure_title))
+    manifest_hex = closure_manifest_hex(os.path.join(destination, closure_title))
+    if seen["release-manifest.json"][0] != manifest_hex:
+        refuse("the seed pack's release-manifest.json is not the release manifest the sealed closure names")
+    for title, (hex_value, size) in seen.items():
+        if title == closure_title:
+            continue
+        transport.fetch(f"seed-pack document {title}",
+                        transport.url(f"{PACK_REPOSITORY}/blobs/sha256:{hex_value}"), "*/*",
+                        size, hex_value, size, os.path.join(destination, title))
+    note(f"seed pack {closure_hex}: {len(seen)} documents fetched, each hashed to its declared digest;"
+         f" the closure names release manifest {manifest_hex}")
+
+
+# ----------------------------------------------------------------------------- #
+# The closure's object set, derived exactly as ni-ota-verify derives it.
+# ----------------------------------------------------------------------------- #
+class Item:
+    __slots__ = ("hex", "url", "accept", "size", "limit", "what")
+
+    def __init__(self, hex_value, url, accept, size, limit, what):
+        self.hex = hex_value
+        self.url = url
+        self.accept = accept
+        self.size = size
+        self.limit = limit
+        self.what = what
+
+
+class Plan:
+    def __init__(self, transport_url, release_authority):
+        self.url = transport_url
+        self.prefix = release_authority + "/"
+        self.items = {}
+        self.attachments = []
+        self.bytes_declared = 0
+
+    def mirror_path(self, repository, what):
+        repository = text_of(repository, f"{what} repository")
+        if not repository.startswith(self.prefix):
+            refuse(f"{what} repository {repository} is not under the sealed release authority")
+        path = repository[len(self.prefix):]
+        if not REPOSITORY_PATH.fullmatch(path):
+            refuse(f"{what} repository path is malformed: {path}")
+        return path
+
+    def add(self, hex_value, url, accept, size, limit, what):
+        item = self.items.get(hex_value)
+        if item is None:
+            if len(self.items) >= MAX_OBJECTS:
+                refuse(f"the closure names more than {MAX_OBJECTS} objects")
+            self.items[hex_value] = Item(hex_value, url, accept, size, limit, what)
+            if size is not None:
+                self.bytes_declared += size
+            return
+        if size is not None and item.size is not None and item.size != size:
+            refuse(f"object sha256:{hex_value} is declared with two sizes")
+        if size is not None and item.size is None:
+            item.size = size
+            item.limit = size
+            self.bytes_declared += size
+
+    def load(self, closure_path):
+        closure = parse_object(read_bounded(closure_path, CLOSURE_MAX, "release closure"), "release closure")
+        artifacts = closure.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            refuse("the release closure names no artifacts")
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                refuse("a closure artifact is not an object")
+            key = artifact.get("artifact_key", "?")
+            path = self.mirror_path(artifact.get("repository"), f"artifact {key}")
+            nodes = artifact.get("nodes")
+            if not isinstance(nodes, list) or not nodes:
+                refuse(f"artifact {key} carries no nodes")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    refuse(f"artifact {key} carries a node that is not an object")
+                if node.get("repository") != artifact.get("repository"):
+                    refuse(f"artifact {key} carries a node from another repository")
+                hex_value = digest_hex(node.get("digest"), f"artifact {key} node digest")
+                kind = node.get("kind")
+                if kind not in NODE_KINDS:
+                    refuse(f"artifact {key} node sha256:{hex_value} has kind {kind!r}")
+                size = size_of(node.get("size"), f"artifact {key} node sha256:{hex_value}")
+                if kind in ("index", "manifest"):
+                    accept = text_of(node.get("media_type"), f"artifact {key} node media_type")
+                    url = self.url(f"{path}/manifests/sha256:{hex_value}")
+                else:
+                    accept = "*/*"
+                    url = self.url(f"{path}/blobs/sha256:{hex_value}")
+                self.add(hex_value, url, accept, size, size, f"{key} {kind} sha256:{hex_value}")
+            attachments = artifact.get("attachments", [])
+            if not isinstance(attachments, list):
+                refuse(f"artifact {key} attachments is not a list")
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    refuse(f"artifact {key} carries an attachment that is not an object")
+                subject_path = self.mirror_path(attachment.get("subject_repository"),
+                                                f"artifact {key} attachment subject")
+                manifest_hex = digest_hex(attachment.get("manifest_digest"),
+                                          f"artifact {key} attachment manifest_digest")
+                media_type = text_of(attachment.get("media_type"), f"artifact {key} attachment media_type")
+                layer_digests = attachment.get("layer_digests")
+                if not isinstance(layer_digests, list) or not layer_digests:
+                    refuse(f"artifact {key} attachment sha256:{manifest_hex} names no layers")
+                layer_hexes = [digest_hex(digest, f"artifact {key} attachment layer digest")
+                               for digest in layer_digests]
+                self.add(manifest_hex, self.url(f"{subject_path}/manifests/sha256:{manifest_hex}"),
+                         media_type, None, OCI_DOCUMENT_MAX,
+                         f"{key} attachment manifest sha256:{manifest_hex}")
+                self.attachments.append((key, subject_path, manifest_hex, layer_hexes))
+        return self
+
+    def attachment_items(self):
+        return [self.items[manifest_hex] for (_, _, manifest_hex, _) in self.attachments]
+
+    def absorb_attachment(self, store, key, subject_path, manifest_hex, layer_hexes):
+        """Read a fetched, digest-named attachment manifest and plan its config and layers."""
+        what = f"{key} attachment manifest sha256:{manifest_hex}"
+        document = parse_object(read_bounded(os.path.join(store, manifest_hex), OCI_DOCUMENT_MAX, what), what)
+        config = document.get("config")
+        if not isinstance(config, dict):
+            refuse(f"{what} lacks a config descriptor")
+        config_hex = digest_hex(config.get("digest"), f"{what} config digest")
+        config_size = size_of(config.get("size"), f"{what} config")
+        self.add(config_hex, self.url(f"{subject_path}/blobs/sha256:{config_hex}"), "*/*",
+                 config_size, config_size, f"{key} attachment config sha256:{config_hex}")
+        layers = document.get("layers")
+        if not isinstance(layers, list):
+            refuse(f"{what} lacks layers")
+        actual = []
+        for layer in layers:
+            if not isinstance(layer, dict):
+                refuse(f"{what} carries a layer that is not a descriptor")
+            layer_hex = digest_hex(layer.get("digest"), f"{what} layer digest")
+            layer_size = size_of(layer.get("size"), f"{what} layer sha256:{layer_hex}")
+            actual.append(layer_hex)
+            self.add(layer_hex, self.url(f"{subject_path}/blobs/sha256:{layer_hex}"), "*/*",
+                     layer_size, layer_size, f"{key} attachment layer sha256:{layer_hex}")
+        if actual != layer_hexes:
+            refuse(f"{what} layers do not equal the closure's declaration")
+
+
+def plan_summary(closure_path, release_authority):
+    plan = Plan(lambda path: path, release_authority).load(closure_path)
+    print(f"object_count_declared={len(plan.items)}")
+    print(f"bytes_declared={plan.bytes_declared}")
+    print(f"attachments={len(plan.attachments)}")
+
+
+def materialise(transport, plan, store, item):
+    destination = os.path.join(store, item.hex)
+    present = hash_present(destination)
+    if present is not None:
+        if present[0] == item.hex and (item.size is None or present[1] == item.size):
+            os.chmod(destination, 0o444)
+            return 0, present[1]
+        os.unlink(destination)
+    return 1, transport.fetch(item.what, item.url, item.accept, item.limit, item.hex, item.size, destination)
+
+
+def objects(mirror, cacert, closure_path, release_authority, destination, closure_hex, manifest_hex):
+    for value, what in ((closure_hex, "sealed closure hash"), (manifest_hex, "sealed manifest hash")):
+        if not HEX64.fullmatch(value):
+            refuse(f"the {what} is not 64 lowercase hex")
+    transport = Transport(mirror, cacert)
+    store = os.path.join(destination, "objects", "sha256")
+    os.makedirs(store, mode=0o755, exist_ok=True)
+    clear_temporaries(store)
+    ready_path = os.path.join(destination, "READY")
+    if os.path.lexists(ready_path):
+        os.unlink(ready_path)
+    if closure_manifest_hex(closure_path) != manifest_hex:
+        refuse("the manifest hash handed to the fetcher is not the one the staged closure carries")
+    plan = Plan(transport.url, release_authority).load(closure_path)
+
+    # 1) Space, from what the closure declares, before the first byte. The
+    #    attachments' configs and layers are not yet known; each is allowed the
+    #    verifier's bound three times over and re-checked exactly below.
+    require_space(store, plan.bytes_declared + len(plan.attachments) * ATTACHMENT_ALLOWANCE,
+                  "declared sizes")
+    fetched = skipped = 0
+    bytes_landed = 0
+    landed = set()
+    # 2) The attachment manifests: small, named by the closure, and the only way
+    #    to learn the config/layer digests and their exact sizes.
+    for (key, subject_path, attachment_hex, layer_hexes), item in zip(plan.attachments, plan.attachment_items()):
+        if item.hex not in landed:
+            new, count = materialise(transport, plan, store, item)
+            fetched += new
+            skipped += 1 - new
+            bytes_landed += count
+            landed.add(item.hex)
+        plan.absorb_attachment(store, key, subject_path, attachment_hex, layer_hexes)
+    # 3) Space again, now exact, before the bulk.
+    remaining = 0
+    for item in plan.items.values():
+        if hash_present(os.path.join(store, item.hex)) is None:
+            remaining += item.size if item.size is not None else item.limit
+    require_space(store, remaining, "exact sizes")
+    # 4) Everything else, one object in flight at a time.
+    for item in plan.items.values():
+        if item.hex in landed:
+            continue
+        new, count = materialise(transport, plan, store, item)
+        fetched += new
+        skipped += 1 - new
+        bytes_landed += count
+        landed.add(item.hex)
+    # 5) Nothing the closure does not name may sit in the store.
+    present = set(os.listdir(store))
+    stray = sorted(present - set(plan.items))
+    if stray:
+        refuse(f"the object store carries {len(stray)} objects the closure does not name, e.g. {stray[0]}")
+    if len(present) != len(plan.items):
+        refuse("the object store does not hold exactly the closure's object set")
+    # 6) READY last: the same receipt image/build-seed-v2.sh writes. Not
+    #    authority -- the verifier re-proves every object above it.
+    body = json.dumps(dict(object_count=len(plan.items), release_closure_sha256=closure_hex,
+                           release_manifest_sha256=manifest_hex, schema=READY_SCHEMA),
+                      sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    handle = os.open(ready_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    try:
+        os.write(handle, body)
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+    fsync_directory(destination)
+    note(f"closure {closure_hex}: {len(plan.items)} objects proved by name "
+         f"({fetched} fetched, {skipped} already present, {bytes_landed} bytes); READY written")
+
+
+def main(argv):
+    if not argv:
+        refuse("no subcommand")
+    command, arguments = argv[0], argv[1:]
+    if command == "documents" and len(arguments) == 4:
+        documents(*arguments)
+    elif command == "plan" and len(arguments) == 2:
+        plan_summary(*arguments)
+    elif command == "objects" and len(arguments) == 7:
+        objects(*arguments)
+    else:
+        refuse(f"unknown subcommand or argument count: {command} ({len(arguments)} arguments)")
+
+
+try:
+    main(sys.argv[1:])
+except Refusal as refusal:
+    note(f"REFUSED: {refusal}")
+    raise SystemExit(1)
+except OSError as error:
+    note(f"REFUSED: {error}")
+    raise SystemExit(1)
+SEED_MIRROR_PY
+}
+
+# The six documents, from the mirror block: after the sealed CA is staged and
+# the READY receipt is fetched, before that receipt is judged on its manifest
+# field (rule A needs the manifest hash the closure carries). Restated against
+# the values the installer itself read: a gate that exists only in the grammar
+# is a gate a grammar edit can remove without anything noticing. Nothing here
+# touches the target disk; nothing of the mirror is consulted while a stray
+# ni-seed partition is on this medium.
+seed_from_mirror_fetch_documents() { # $1=the ni-seed PARTUUID on this medium, or nothing -> SEED_PACK_DIR holds the six documents, SEED_MANIFEST_SHA256 is derived
+  [[ -z "$1" ]] \
+    || die "this medium seals neuralice.seed_source=mirror and carries an ni-seed partition; a seed fetched from the mirror and a seed on the stick are two unreconciled sources of one closure, and neither is installed"
+  [[ "$INSTALL_SOURCE" == registry ]] \
+    || die "neuralice.seed_source=mirror requires neuralice.source=registry; a medium install carries its seed on the stick"
+  [[ -n "$INSTALL_MIRROR" && -n "${MIRROR_CA_FILE:-}" && -f "${MIRROR_CA_FILE:-}" ]] \
+    || die "neuralice.seed_source=mirror requires a LAN mirror whose CA this medium pins; this medium seals none"
+  [[ "$SEED_CLOSURE" =~ ^[0-9a-f]{64}$ && -n "$SEED_TRUSTED_NOW" ]] \
+    || die "neuralice.seed_source=mirror requires the sealed seed closure and trusted time; this medium seals an incomplete tuple"
+  [[ -n "$PRESEAL_SET_SHA256" ]] \
+    || die "neuralice.seed_source=mirror requires the signed preseal set; nothing else reconciles a fetched seed with the appliance about to be pulled"
+  [[ -x "$NEURALICE_SEED_VERIFIER" ]] \
+    || die "this medium carries no seed-closure verifier at ${NEURALICE_SEED_VERIFIER}; refusing to materialise a closure nothing would verify"
+  rm -rf -- "$SEED_PACK_DIR"
+  install -d -m 0700 "$SEED_PACK_DIR"
+  log "Fetching the seed pack for release closure ${SEED_CLOSURE} from the LAN mirror ${INSTALL_MIRROR} (six bounded documents, TLS pinned to the sealed CA)…"
+  heartbeat_start "seed pack fetch from the LAN mirror"
+  seed_mirror_helper documents "$INSTALL_MIRROR" "$MIRROR_CA_FILE" "$SEED_CLOSURE" "$SEED_PACK_DIR" \
+    || die "the LAN mirror ${INSTALL_MIRROR} did not serve the seed pack ${SEED_CLOSURE} as the six bounded documents this medium seals; nothing has been written to the target disk"
+  bg_stop
+  # 🔴 RULE C, ON THE LANDED BYTES. The helper proved the closure by the sealed
+  # hash before it read the manifest hash from it; the same two facts are
+  # re-established HERE, in this shell, on the files that will be used, before
+  # the value reaches the READY comparison, the reconciliation or the verifier.
+  assert_sealed_document_digest "$SEED_PACK_DIR/release-closure.json" "$SEED_CLOSURE" \
+    "fetched release closure"
+  SEED_MANIFEST_SHA256="$(seed_manifest_hash_from_closure "$SEED_PACK_DIR/release-closure.json")" \
+    || die "the sealed release closure names no well-formed release manifest hash; refusing a seed whose manifest nothing fixes"
+  assert_sealed_document_digest "$SEED_PACK_DIR/release-manifest.json" "$SEED_MANIFEST_SHA256" \
+    "fetched release manifest"
+  log "Seed pack fetched: closure sha256:${SEED_CLOSURE} names release manifest sha256:${SEED_MANIFEST_SHA256}; the pack is reconciled with the preseal set once that set is authenticated"
+}
+
+# Before the wipe, once the preseal set is authenticated (§2b). Restated again
+# against the values this script holds by now; then the six fetched documents
+# are reconciled with the preseal set exactly as an ni-seed tree is.
+seed_from_mirror_preflight() { # $1=the ni-seed PARTUUID on this medium, or nothing
+  local document
+  [[ -z "$1" ]] \
+    || die "this medium seals neuralice.seed_source=mirror and carries an ni-seed partition; a seed fetched from the mirror and a seed on the stick are two unreconciled sources of one closure, and neither is installed"
+  (( PRESEAL_ACTIVE == 1 )) \
+    || die "neuralice.seed_source=mirror requires the signed preseal set; nothing else reconciles a fetched seed with the appliance about to be pulled"
+  [[ "$SEED_CLOSURE" =~ ^[0-9a-f]{64}$ && "$SEED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ && -n "$SEED_TRUSTED_NOW" ]] \
+    || die "neuralice.seed_source=mirror requires the sealed seed closure, the manifest hash that closure names and the trusted time; this install holds an incomplete tuple"
+  [[ "${MIRROR_READY_SHA256:-}" == "$SEED_CLOSURE" && "${MIRROR_READY_MANIFEST_SHA256:-}" == "$SEED_MANIFEST_SHA256" ]] \
+    || die "the LAN mirror declares release closure ${MIRROR_READY_SHA256:-none} and this medium seals ${SEED_CLOSURE}; a mirror that declares another release cannot serve this one"
+  for document in release-manifest.json release-closure.json release-authorization.json \
+    release-authorization.json.sig delegation-snapshot.json delegation-snapshot.json.sig; do
+    [[ -f "$SEED_PACK_DIR/$document" && ! -L "$SEED_PACK_DIR/$document" ]] \
+      || die "the fetched seed pack lost ${document} between the fetch and the preflight"
+  done
+  assert_seed_is_the_preseal_release "$SEED_PACK_DIR"
+  log "Seed pack reconciled with the authenticated appliance: same train, bundle_seq, hardware target and appliance root — the closure's objects are fetched once the encrypted data volume exists"
+}
+
+# Phase 5, on the mounted data volume. The six documents land first (the closure
+# staged here is re-hashed against the sealed value, and the plan is derived
+# from THOSE bytes), then every object, then READY. The whole-tree proof is the
+# common re-verification that follows in phase 5.
+seed_from_mirror_materialize() { # $1=destination release/<closure> directory on the mounted data volume
+  local destination=$1 document plan object_count bytes_declared
+  install -d -m 0755 "$destination" "$destination/objects/sha256"
+  for document in release-manifest.json release-closure.json release-authorization.json \
+    release-authorization.json.sig delegation-snapshot.json delegation-snapshot.json.sig; do
+    [[ -f "$SEED_PACK_DIR/$document" && ! -L "$SEED_PACK_DIR/$document" ]] \
+      || die "the fetched seed pack lost ${document} between the preflight and staging"
+    install -m 0444 "$SEED_PACK_DIR/$document" "$destination/$document" \
+      || die "cannot stage ${document} onto the encrypted data volume"
+  done
+  assert_sealed_document_digest "$destination/release-closure.json" "$SEED_CLOSURE" \
+    "staged release closure"
+  assert_sealed_document_digest "$destination/release-manifest.json" "$SEED_MANIFEST_SHA256" \
+    "staged release manifest"
+  plan="$(seed_mirror_helper plan "$destination/release-closure.json" "$NEURALICE_RELEASE_AUTHORITY")" \
+    || die "the sealed release closure does not enumerate a fetchable object set under the release authority ${NEURALICE_RELEASE_AUTHORITY}"
+  object_count="$(sed -n 's/^object_count_declared=//p' <<<"$plan")"
+  bytes_declared="$(sed -n 's/^bytes_declared=//p' <<<"$plan")"
+  [[ "$object_count" =~ ^[0-9]+$ && "$bytes_declared" =~ ^[0-9]+$ ]] \
+    || die "the closure fetch plan is malformed"
+  log "MIRROR: materialising release closure sha256:${SEED_CLOSURE} from ${INSTALL_MIRROR} — ${object_count} declared objects, $(awk -v t="$bytes_declared" 'BEGIN{printf "%.1f", t / 2^30}') GiB declared; each object is hashed against its name before it is named…"
+  copy_progress_start "$bytes_declared" "$destination"
+  seed_mirror_helper objects "$INSTALL_MIRROR" "$MIRROR_CA_FILE" "$destination/release-closure.json" \
+    "$NEURALICE_RELEASE_AUTHORITY" "$destination" "$SEED_CLOSURE" "$SEED_MANIFEST_SHA256" \
+    || die "the release closure could not be materialised from the LAN mirror ${INSTALL_MIRROR} (a missing, corrupt, oversize or unreachable object, or a full data volume); refusing to finish an install whose offline objects cannot be proved"
+  bg_stop
+  heartbeat_start "seed flush to disk (sync)"
+  sync
+  bg_stop
+}
+
+# The seed partition ON THIS MEDIUM, by stable identity. `live_disk` was
+# established from the SEALED PAYLOAD PARTITION, not from `findmnt /`, so this
+# cannot be pointed at a second USB stick that also carries the partlabel -- and
+# the PARTUUID is what is actually mounted, so the answer cannot change between
+# the lookup and the mount.
+seed_partition_partuuid() { # -> the PARTUUID, or nothing
+  local candidates
+  candidates="$(lsblk -rno NAME,PARTLABEL,PARTUUID "/dev/$live_disk" 2>/dev/null \
+    | awk '$2 == "ni-seed" { print $3 }')"
+  [[ -n "$candidates" ]] || return 0
+  (( "$(printf '%s\n' "$candidates" | grep -c .)" == 1 )) \
+    || die "this medium carries more than one ni-seed partition; refusing to choose which offline closure to install"
+  printf '%s' "$candidates"
+}
+
 if [[ -n "$INSTALL_MIRROR" ]]; then
   [ "$INSTALL_SOURCE" = registry ] \
     || die "neuralice.mirror requires neuralice.source=registry and an explicit digest-pinned neuralice.osimage"
@@ -1672,15 +2646,29 @@ if [[ -n "$INSTALL_MIRROR" ]]; then
   [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
     || die "this medium seals access profile '${SEALED_ACCESS_PROFILE}' and names a LAN mirror; a customer appliance never depends on a lab host"
   MIRROR_CA_SHA256="$(karg_once neuralice.mirror_ca_sha256)"
-  MIRROR_READY_SHA256="$(karg_once neuralice.mirror_ready)"
-  MIRROR_READY_MANIFEST_SHA256="$(karg_once neuralice.mirror_manifest)"
   MIRROR_CACHE_GENERATION="$(karg_once neuralice.mirror_generation)"
+  if [[ "$SEED_SOURCE" == mirror ]]; then
+    # 🔴 RULE A (FAB-0057 P1.1b). With `neuralice.seed_source=mirror` the mirror
+    # serves the very closure the seed IS, so the READY closure pin is the
+    # sealed seed closure and the READY manifest pin is the manifest hash that
+    # closure carries. Both used to be sealed a second time and forced equal;
+    # they are now derived, and a line restating either is refused -- by the
+    # grammar, and here against the count THIS script reads. The receipt below
+    # is still compared on all three fields.
+    [[ "$(karg_count neuralice.mirror_ready)" == 0 && "$(karg_count neuralice.mirror_manifest)" == 0 ]] \
+      || die "this medium seals neuralice.seed_source=mirror and restates neuralice.mirror_ready/mirror_manifest; the sealed seed closure fixes both, and a line that states them twice is refused"
+    MIRROR_READY_SHA256="$SEED_CLOSURE"
+    MIRROR_READY_MANIFEST_SHA256=""
+  else
+    MIRROR_READY_SHA256="$(karg_once neuralice.mirror_ready)"
+    MIRROR_READY_MANIFEST_SHA256="$(karg_once neuralice.mirror_manifest)"
+  fi
   [[ "$MIRROR_CA_SHA256" =~ ^[0-9a-f]{64}$ ]] \
     || die "a LAN mirror requires a sealed CA digest; this medium seals none"
   [[ "$MIRROR_READY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
     || die "a LAN mirror requires a sealed READY release-closure hash; this medium seals none"
-  [[ "$MIRROR_READY_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ && "$MIRROR_CACHE_GENERATION" =~ ^[1-9][0-9]{0,18}$ ]] \
-    || die "a LAN mirror requires a sealed READY manifest hash and positive cache generation"
+  [[ "$MIRROR_CACHE_GENERATION" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || die "a LAN mirror requires a sealed positive cache generation"
 
   MIRROR_CA_FILE=/run/neural-ice-installer/mirror-ca.crt
   install -d -m 0700 /run/neural-ice-installer
@@ -1722,6 +2710,19 @@ print(closure, manifest, generation, sep="\n")
 MIRROR_READY_PY
   )" || die "the LAN mirror's READY receipt is not a bounded ${MIRROR_READY_SCHEMA} document"
   mapfile -t _mirror_ready_fields <<<"$_mirror_ready_declared"
+  if [[ "$SEED_SOURCE" == mirror ]]; then
+    # The closure and the generation are judged before the seed pack is asked
+    # for -- a mirror that is not READY for the sealed closure is refused on its
+    # receipt, not on a failed fetch -- and the manifest field is judged below,
+    # once the proved closure has said what the manifest is (rule C).
+    [[ "${_mirror_ready_fields[0]:-}" == "$MIRROR_READY_SHA256" \
+        && "${_mirror_ready_fields[2]:-}" == "$MIRROR_CACHE_GENERATION" ]] \
+      || die "the LAN mirror READY does not equal this medium's sealed closure/manifest/cache generation"
+    seed_from_mirror_fetch_documents "$(seed_partition_partuuid)"
+    MIRROR_READY_MANIFEST_SHA256="$SEED_MANIFEST_SHA256"
+  fi
+  [[ "$MIRROR_READY_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "a LAN mirror requires a sealed READY manifest hash; this medium seals none"
   [[ "${_mirror_ready_fields[0]:-}" == "$MIRROR_READY_SHA256" \
       && "${_mirror_ready_fields[1]:-}" == "$MIRROR_READY_MANIFEST_SHA256" \
       && "${_mirror_ready_fields[2]:-}" == "$MIRROR_CACHE_GENERATION" ]] \
@@ -1796,8 +2797,19 @@ if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
   # registry medium that seals a source and not both digests, so there is no
   # medium on which this check is absent.
   # --------------------------------------------------------------------------- #
-  RELEASE_AUTH_DOC_SHA256="$(karg_once neuralice.relauth_sha256)"
-  RELEASE_AUTH_SIG_SHA256="$(karg_once neuralice.relauth_sig_sha256)"
+  _auth_scratch=/run/neural-ice-installer/release-auth
+  rm -rf -- "$_auth_scratch"; install -d -m 0700 "$_auth_scratch"
+  if [[ -n "$PRESEAL_SET_SHA256" ]]; then
+    # 🔴 RULE B (FAB-0057 P1.1b). The preseal set binds the pair by hash and is
+    # itself hashed against the sealed `neuralice.preseal`, so the two digests
+    # are read from the proved set instead of being sealed a second time. The
+    # set is staged and hashed FIRST; the pair is then staged and verified by
+    # exactly the lines below, unchanged.
+    release_authorization_pins_from_preseal "$_auth_scratch"
+  else
+    RELEASE_AUTH_DOC_SHA256="$(karg_once neuralice.relauth_sha256)"
+    RELEASE_AUTH_SIG_SHA256="$(karg_once neuralice.relauth_sig_sha256)"
+  fi
   [[ "$RELEASE_AUTH_DOC_SHA256" =~ ^[0-9a-f]{64}$ ]] \
     || die "this medium seals no release-authorization document digest; a registry install would then accept any correctly signed authorization the ESP happened to carry"
   [[ "$RELEASE_AUTH_SIG_SHA256" =~ ^[0-9a-f]{64}$ ]] \
@@ -1805,8 +2817,6 @@ if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
   [[ "$RELEASE_AUTH_DOC_SHA256" != "$RELEASE_AUTH_SIG_SHA256" ]] \
     || die "this medium seals one digest for both the release authorization and its detached signature; that pins neither"
 
-  _auth_scratch=/run/neural-ice-installer/release-auth
-  rm -rf -- "$_auth_scratch"; install -d -m 0700 "$_auth_scratch"
   esp_staged_file release-authorization.json "$RELEASE_AUTH_DOC_SHA256" \
     "$_auth_scratch/release-authorization.json"
   esp_staged_file release-authorization.sig "$RELEASE_AUTH_SIG_SHA256" \
@@ -2141,8 +3151,6 @@ readonly SSHKEY_B64
 # refusal in both directions: a medium either carries the seed it was cut with or
 # carries none.
 # --------------------------------------------------------------------------- #
-NEURALICE_SEED_VERIFIER="$(ni_path NEURALICE_SEED_VERIFIER /usr/bin/ni-ota-verify)"
-readonly NEURALICE_SEED_VERIFIER
 
 # --------------------------------------------------------------------------- #
 # 🔴 A VERIFIED SEED IS NOT AUTOMATICALLY *THIS* RELEASE'S SEED.
@@ -2163,9 +3171,10 @@ readonly NEURALICE_SEED_VERIFIER
 #   release-closure.json   its raw bytes hash to `neuralice.seed_closure`, which
 #                          the UKI signature covers (the verifier compares the
 #                          same value, tools/ni-ota-verify/src/seed_closure.rs);
-#   release-manifest.json  its raw bytes hash to `neuralice.seed_manifest`,
-#                          likewise sealed, and Fabric derives the closure's
-#                          host_digest from this file's `host.digest`;
+#   release-manifest.json  its raw bytes hash to the `release_manifest_sha256`
+#                          the verified closure carries (FAB-0057 P1.1b, rule
+#                          C), and Fabric derives the closure's host_digest
+#                          from this file's `host.digest`;
 #   preseal-set.json       the protected snapshot §2b already verified against
 #                          the sealed `neuralice.preseal` digest.
 #
@@ -2187,16 +3196,6 @@ readonly NEURALICE_SEED_VERIFIER
 # signature. It runs BEFORE the first disk mutation, so its refusal leaves the
 # machine exactly as it was.
 # --------------------------------------------------------------------------- #
-assert_sealed_document_digest() { # $1=path $2=expected sha256 $3=what
-  local path=$1 expected=$2 what=$3 observed
-  [[ -f "$path" && ! -L "$path" ]] \
-    || die "the $what is not a regular file; refusing to reconcile the offline seed against something that is not a document"
-  observed="$(sha256sum -- "$path" | awk '{print tolower($1)}')" \
-    || die "cannot hash the $what"
-  [[ "$observed" == "$expected" ]] \
-    || die "the $what hashes to ${observed}, not the ${expected} this medium's signature seals"
-}
-
 assert_seed_is_the_preseal_release() { # [$1=seed document root; default = the verified ni-seed root]
   local root=${1:-$SEED_VERIFIED_ROOT}
   local closure_path="$root/release-closure.json"
@@ -2363,739 +3362,7 @@ SEED_PRESEAL_RECONCILE_PY
       || die "the LAN mirror declares release closure ${MIRROR_READY_SHA256} and the offline seed on this medium is ${SEED_CLOSURE}; refusing to install an OS and a runtime set from two different releases"
   fi
 }
-readonly SEED_MOUNT="$INSTALLER_STATE_DIR/seed"
-SEED_CLOSURE="$(karg_once neuralice.seed_closure)"
-readonly SEED_CLOSURE
-SEED_MANIFEST_SHA256="$(karg_once neuralice.seed_manifest)"
-readonly SEED_MANIFEST_SHA256
-SEED_TRUSTED_NOW="$(karg_once neuralice.seed_trusted_now)"
-readonly SEED_TRUSTED_NOW
-# WHERE the sealed closure's objects come from: the ni-seed partition on this
-# medium (absent -- the byte-identical historical path) or the LAN mirror
-# (`mirror`, §2d below). Read exactly once, and only the one spelling.
-SEED_SOURCE="$(karg_once neuralice.seed_source)"
-readonly SEED_SOURCE
-case "$SEED_SOURCE" in
-  ''|mirror) : ;;
-  *) die "neuralice.seed_source must be absent or 'mirror', got: $SEED_SOURCE" ;;
-esac
 SEED_VERIFIED_ROOT=""
-
-# --------------------------------------------------------------------------- #
-# 2d) 🔴 THE SEED THAT ARRIVES OVER THE LAN: `neuralice.seed_source=mirror`
-#     (FAB-0057 P1.1, docs/SEED-FROM-MIRROR.md).
-#
-# Same seed, other transport. The medium seals the same closure, manifest and
-# trusted-time tuple as a PRELOADED stick and carries NO ni-seed partition: the
-# six seed-pack documents are fetched from the LAN mirror BEFORE the wipe, and
-# every object the closure names is fetched onto the encrypted data volume
-# AFTER LUKS/mkfs (phase 5), each hashed in flight against the name the sealed
-# closure gives it. Then the SAME `verify-seed-closure` that proves a staged
-# ni-seed tree proves this one, and first boot is unchanged.
-#
-# WHAT IS TRUSTED: nothing the mirror says. The tag is routing; the sealed
-# `neuralice.seed_closure` / `neuralice.seed_manifest` decide which bytes are a
-# closure and a manifest; the closure decides every other object's name and
-# size; the authorization and delegation documents are verified by
-# ni-ota-verify against the root key in the dm-verity root. TLS is pinned to
-# the sealed mirror CA so an unpinned host cannot even answer, and no credential
-# is presented: the bench is a controlled lab-managed install LAN.
-#
-# FAILURE MODEL (each is a `die`; no partial success is ever reported):
-#   network cut during the document fetch -- before the wipe: the machine is
-#       exactly as it was;
-#   network cut during the object fetch -- after the wipe: the target disk is
-#       already destroyed and holds no customer data; reinstall from the bench,
-#       there is nothing to recover;
-#   corrupt or substituted object -- a hash that does not equal its name is a
-#       verdict, not a transient: the temp file is discarded and the install
-#       dies at once, no retry (TLS already proves transit integrity);
-#   mirror changes generation between READY and the fetch -- the sealed hashes
-#       protect: an object no longer served is a missing object and the install
-#       dies; one still served under the same name still hashes to it;
-#   disk full -- the declared sizes are summed and checked against the data
-#       volume before the first object byte, and again with exact sizes before
-#       the bulk; a write that still fails is a die, never a truncated object;
-#   power loss -- an install that did not finish was never committed: no READY,
-#       no release/CLOSURE pointer, no ceremony has happened; the next boot is
-#       the installer again.
-#
-# BOUNDS: 3 attempts per object for TRANSPORT failures only, with fixed waits;
-# per-object --max-time proportional to the declared size with a floor; a stall
-# floor (--speed-limit/--speed-time); --max-filesize equal to the declared size
-# AND the helper's own byte count as the real ceiling (curl before 8.4.0 does
-# not apply --max-filesize to a transfer in progress); bounded JSON readers
-# everywhere; one object in flight at a time; at most the verifier's 100 000
-# objects.
-# --------------------------------------------------------------------------- #
-readonly SEED_PACK_DIR="$INSTALLER_STATE_DIR/seed-pack"
-
-# The bounded fetcher. One reviewable component: it derives the object plan from
-# the closure, drives `curl` with the pinned transport, hashes in flight, and
-# publishes each object by atomic rename only when the bytes hash to the name.
-# Positional arguments only; the exit status is the verdict.
-seed_mirror_helper() { # $1=documents|plan|objects $2..=positional arguments -> the fetcher's exit status
-  python3 - "$@" <<'SEED_MIRROR_PY'
-"""Bounded fetcher for the mirror-sourced seed (docs/SEED-FROM-MIRROR.md).
-
-  documents <mirror> <cacert> <closure_hex> <manifest_hex> <destination>
-  plan      <closure_path> <release_authority>
-  objects   <mirror> <cacert> <closure_path> <release_authority> <destination>
-            <closure_hex> <manifest_hex>
-
-Exit 0 only when every byte asked for landed and hashed to its name.
-"""
-import hashlib
-import json
-import os
-import re
-import stat
-import subprocess
-import sys
-import tempfile
-import time
-
-HEX64 = re.compile(r"[0-9a-f]{64}")
-MIRROR_HOST = re.compile(r"[A-Za-z0-9._-]+(:[0-9]{1,5})?")
-REPOSITORY_PATH = re.compile(r"[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*")
-KIB = 1024
-MIB = 1024 * KIB
-PACK_REPOSITORY = "neural-ice/seed-packs"
-OCI_MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
-PACK_ARTIFACT_TYPE = "application/vnd.neural-ice.seed-pack.v1+json"
-PACK_CONFIG_TYPE = "application/vnd.neural-ice.seed-pack.config.v1+json"
-PACK_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
-PACK_CONFIG_SIZE = 2
-PACK_MANIFEST_MAX = 64 * KIB
-TITLE = "org.opencontainers.image.title"
-PACK_LAYERS = dict((
-    ("release-manifest.json", ("application/json", 16 * MIB)),
-    ("release-closure.json", ("application/json", 16 * MIB)),
-    ("release-authorization.json", ("application/json", 64 * KIB)),
-    ("release-authorization.json.sig", ("application/octet-stream", 4 * KIB)),
-    ("delegation-snapshot.json", ("application/json", 64 * KIB)),
-    ("delegation-snapshot.json.sig", ("application/octet-stream", 4 * KIB)),
-))
-CLOSURE_MAX = 16 * MIB          # ni-ota-verify MAX_DOCUMENT_BYTES
-OCI_DOCUMENT_MAX = 4 * MIB      # ni-ota-verify MAX_OCI_DOCUMENT_BYTES
-MAX_OBJECTS = 100_000           # ni-ota-verify MAX_OBJECTS
-SAFE_INTEGER_MAX = 9_007_199_254_740_991
-ATTACHMENT_ALLOWANCE = 3 * OCI_DOCUMENT_MAX   # manifest + config + layers, before they are known
-ATTEMPTS = 3
-RETRY_WAITS = (2, 6)
-CONNECT_TIMEOUT = 15
-STALL_BYTES_PER_SECOND = 64 * KIB
-STALL_SECONDS = 60
-MAX_TIME_FLOOR = 120
-MAX_TIME_BYTES_PER_SECOND = 512 * KIB
-DISK_MARGIN_FRACTION = 0.05
-DISK_MARGIN_BYTES = 256 * MIB
-CHUNK = MIB
-STDERR_KEEP = 4 * KIB
-READY_SCHEMA = "neural-ice-seed-closure-ready-v1"
-NODE_KINDS = ("index", "manifest", "config", "layer")
-
-
-class Refusal(Exception):
-    """A verdict: the install must die, and no retry can change it."""
-
-
-class Transient(Exception):
-    """A transport failure; retried a bounded number of times."""
-
-
-def refuse(reason):
-    raise Refusal(reason)
-
-
-def note(message):
-    print(f"seed-mirror: {message}", file=sys.stderr, flush=True)
-
-
-def closed_pairs(items):
-    result = {}
-    for key, value in items:
-        if key in result:
-            refuse(f"duplicate JSON field: {key}")
-        result[key] = value
-    return result
-
-
-def parse_object(raw, what):
-    try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_pairs)
-    except (UnicodeDecodeError, ValueError) as error:
-        refuse(f"{what} is not a JSON document: {error}")
-    if not isinstance(value, dict):
-        refuse(f"{what} is not a JSON object")
-    return value
-
-
-def read_bounded(path, maximum, what):
-    """A bounded, stable, regular non-symlink file, read whole."""
-    before = os.lstat(path)
-    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
-        refuse(f"{what} is not a bounded regular file: {path}")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        opened = os.fstat(descriptor)
-        chunks = []
-        remaining = maximum + 1
-        while remaining:
-            part = os.read(descriptor, remaining)
-            if not part:
-                break
-            chunks.append(part)
-            remaining -= len(part)
-    finally:
-        os.close(descriptor)
-    raw = b"".join(chunks)
-    if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-            or not 0 < len(raw) <= maximum):
-        refuse(f"{what} changed while it was read: {path}")
-    return raw
-
-
-def digest_hex(value, what):
-    if not isinstance(value, str) or not value.startswith("sha256:") or not HEX64.fullmatch(value[7:]):
-        refuse(f"{what} is not a sha256 digest")
-    return value[7:]
-
-
-def size_of(value, what, maximum=SAFE_INTEGER_MAX):
-    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= maximum:
-        refuse(f"{what} size is not an integer within 0..{maximum}")
-    return value
-
-
-def text_of(value, what):
-    if not isinstance(value, str) or not value:
-        refuse(f"{what} is not a non-empty string")
-    return value
-
-
-def fsync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def hash_present(path):
-    """(hex, size) of a present regular single-link file, or None when absent."""
-    try:
-        before = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        refuse(f"the object store carries something that is not a single-link regular file: {path}")
-    hasher = hashlib.sha256()
-    count = 0
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(CHUNK)
-            if not chunk:
-                break
-            count += len(chunk)
-            hasher.update(chunk)
-    return hasher.hexdigest(), count
-
-
-class Transport:
-    def __init__(self, mirror, cacert):
-        if not MIRROR_HOST.fullmatch(mirror):
-            refuse(f"the mirror is not a bare host[:port]: {mirror}")
-        if not os.path.isfile(cacert):
-            refuse(f"the pinned mirror CA is not a file: {cacert}")
-        self.mirror = mirror
-        self.cacert = cacert
-
-    def url(self, path):
-        return f"https://{self.mirror}/v2/{path}"
-
-    def command(self, url, accept, limit):
-        max_time = MAX_TIME_FLOOR + limit // MAX_TIME_BYTES_PER_SECOND
-        return [
-            "curl", "--silent", "--show-error", "--fail",
-            "--proto", "=https", "--tlsv1.2", "--cacert", self.cacert,
-            "--connect-timeout", str(CONNECT_TIMEOUT),
-            "--speed-limit", str(STALL_BYTES_PER_SECOND), "--speed-time", str(STALL_SECONDS),
-            "--max-time", str(max_time), "--max-filesize", str(max(limit, 1)),
-            "--header", f"Accept: {accept}",
-            "--output", "-", url,
-        ]
-
-    def fetch_once(self, url, accept, limit, expected_hex, expected_size, destination):
-        """One transfer to a temporary file, hashed in flight, published by rename.
-
-        Raises Transient for a transport failure, Refusal for a verdict."""
-        directory = os.path.dirname(destination) or "."
-        handle, temporary = tempfile.mkstemp(prefix=".fetch.", dir=directory)
-        errors = tempfile.TemporaryFile(prefix=".fetch-stderr.", dir=directory)
-        try:
-            hasher = hashlib.sha256()
-            count = 0
-            overflow = False
-            with os.fdopen(handle, "wb") as sink:
-                process = subprocess.Popen(
-                    self.command(url, accept, limit), stdout=subprocess.PIPE, stderr=errors,
-                    stdin=subprocess.DEVNULL)
-                try:
-                    while True:
-                        chunk = process.stdout.read(CHUNK)
-                        if not chunk:
-                            break
-                        count += len(chunk)
-                        if count > limit:
-                            overflow = True
-                            break
-                        hasher.update(chunk)
-                        sink.write(chunk)
-                finally:
-                    if overflow:
-                        process.kill()
-                    process.stdout.close()
-                    status = process.wait()
-                sink.flush()
-                os.fsync(sink.fileno())
-            if overflow:
-                refuse(f"{url} served more than the {limit} bytes it may be")
-            if status != 0:
-                errors.seek(0)
-                detail = errors.read(STDERR_KEEP).decode("utf-8", "replace").strip()
-                raise Transient(f"curl exit {status} for {url}: {detail}")
-            if expected_size is not None and count < expected_size:
-                raise Transient(f"{url}: {count} of {expected_size} declared bytes arrived")
-            if expected_size is not None and count != expected_size:
-                refuse(f"{url} is {count} bytes, not the {expected_size} the closure declares")
-            observed = hasher.hexdigest()
-            if expected_hex is not None and observed != expected_hex:
-                refuse(f"{url} hashes to sha256:{observed}, not the sha256:{expected_hex} it is named by")
-            os.chmod(temporary, 0o444)
-            os.replace(temporary, destination)
-            temporary = None
-            fsync_directory(directory)
-            return count
-        finally:
-            errors.close()
-            if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
-
-    def fetch(self, what, url, accept, limit, expected_hex, expected_size, destination):
-        for attempt in range(1, ATTEMPTS + 1):
-            try:
-                return self.fetch_once(url, accept, limit, expected_hex, expected_size, destination)
-            except Transient as error:
-                if attempt == ATTEMPTS:
-                    refuse(f"{what}: transport failed {ATTEMPTS} times; last: {error}")
-                wait = RETRY_WAITS[attempt - 1]
-                note(f"{what}: attempt {attempt} failed ({error}); retrying in {wait} s")
-                time.sleep(wait)
-        refuse(f"{what}: unreachable")
-
-
-def require_space(store, needed, phase):
-    vfs = os.statvfs(store)
-    available = vfs.f_bavail * vfs.f_frsize
-    required = needed + int(needed * DISK_MARGIN_FRACTION) + DISK_MARGIN_BYTES
-    if available < required:
-        refuse(f"the data volume has {available} bytes free and the closure needs {required} ({phase})")
-
-
-def clear_temporaries(store):
-    for name in os.listdir(store):
-        if name.startswith(".fetch"):
-            os.unlink(os.path.join(store, name))
-
-
-# ----------------------------------------------------------------------------- #
-# The seed pack: six documents, one OCI artifact, authority = the sealed hashes.
-# ----------------------------------------------------------------------------- #
-def documents(mirror, cacert, closure_hex, manifest_hex, destination):
-    for value, what in ((closure_hex, "sealed closure hash"), (manifest_hex, "sealed manifest hash")):
-        if not HEX64.fullmatch(value):
-            refuse(f"the {what} is not 64 lowercase hex")
-    transport = Transport(mirror, cacert)
-    os.makedirs(destination, mode=0o700, exist_ok=True)
-    clear_temporaries(destination)
-    manifest_path = os.path.join(destination, ".seed-pack-manifest.json")
-    transport.fetch("seed-pack manifest", transport.url(f"{PACK_REPOSITORY}/manifests/{closure_hex}"),
-                    OCI_MANIFEST_TYPE, PACK_MANIFEST_MAX, None, None, manifest_path)
-    document = parse_object(read_bounded(manifest_path, PACK_MANIFEST_MAX, "seed-pack manifest"),
-                            "seed-pack manifest")
-    os.unlink(manifest_path)
-    allowed = ("schemaVersion", "mediaType", "artifactType", "config", "layers", "annotations")
-    unknown = sorted(set(document) - set(allowed))
-    if unknown:
-        refuse(f"seed-pack manifest carries unknown fields: {unknown}")
-    if document.get("schemaVersion") != 2:
-        refuse("seed-pack manifest schemaVersion is not 2")
-    if document.get("mediaType") != OCI_MANIFEST_TYPE:
-        refuse(f"seed-pack manifest mediaType is not {OCI_MANIFEST_TYPE}")
-    if document.get("artifactType") != PACK_ARTIFACT_TYPE:
-        refuse(f"seed-pack manifest artifactType is not {PACK_ARTIFACT_TYPE}")
-    config = document.get("config")
-    if (not isinstance(config, dict) or set(config) != set(("mediaType", "digest", "size"))
-            or config["mediaType"] != PACK_CONFIG_TYPE or config["digest"] != PACK_CONFIG_DIGEST
-            or config["size"] != PACK_CONFIG_SIZE or isinstance(config["size"], bool)):
-        refuse("seed-pack config descriptor is not the empty seed-pack config")
-    layers = document.get("layers")
-    if not isinstance(layers, list) or len(layers) != len(PACK_LAYERS):
-        refuse(f"seed-pack manifest does not carry exactly {len(PACK_LAYERS)} layers")
-    seen = {}
-    for layer in layers:
-        if not isinstance(layer, dict) or set(layer) != set(("mediaType", "digest", "size", "annotations")):
-            refuse("a seed-pack layer descriptor does not carry exactly mediaType/digest/size/annotations")
-        annotations = layer["annotations"]
-        title = annotations.get(TITLE) if isinstance(annotations, dict) else None
-        if title not in PACK_LAYERS:
-            refuse(f"a seed-pack layer carries a missing or unknown {TITLE}: {title!r}")
-        if title in seen:
-            refuse(f"the seed pack carries {title} twice")
-        media_type, bound = PACK_LAYERS[title]
-        if layer["mediaType"] != media_type:
-            refuse(f"seed-pack layer {title} is not {media_type}")
-        hex_value = digest_hex(layer["digest"], f"seed-pack layer {title} digest")
-        size = size_of(layer["size"], f"seed-pack layer {title}", bound)
-        if size == 0:
-            refuse(f"seed-pack layer {title} is declared empty")
-        seen[title] = (hex_value, size)
-    if seen["release-closure.json"][0] != closure_hex:
-        refuse("the seed pack's release-closure.json is not the closure this medium seals")
-    if seen["release-manifest.json"][0] != manifest_hex:
-        refuse("the seed pack's release-manifest.json is not the release manifest this medium seals")
-    for title, (hex_value, size) in seen.items():
-        transport.fetch(f"seed-pack document {title}",
-                        transport.url(f"{PACK_REPOSITORY}/blobs/sha256:{hex_value}"), "*/*",
-                        size, hex_value, size, os.path.join(destination, title))
-    note(f"seed pack {closure_hex}: {len(seen)} documents fetched, each hashed to its declared digest")
-
-
-# ----------------------------------------------------------------------------- #
-# The closure's object set, derived exactly as ni-ota-verify derives it.
-# ----------------------------------------------------------------------------- #
-class Item:
-    __slots__ = ("hex", "url", "accept", "size", "limit", "what")
-
-    def __init__(self, hex_value, url, accept, size, limit, what):
-        self.hex = hex_value
-        self.url = url
-        self.accept = accept
-        self.size = size
-        self.limit = limit
-        self.what = what
-
-
-class Plan:
-    def __init__(self, transport_url, release_authority):
-        self.url = transport_url
-        self.prefix = release_authority + "/"
-        self.items = {}
-        self.attachments = []
-        self.bytes_declared = 0
-
-    def mirror_path(self, repository, what):
-        repository = text_of(repository, f"{what} repository")
-        if not repository.startswith(self.prefix):
-            refuse(f"{what} repository {repository} is not under the sealed release authority")
-        path = repository[len(self.prefix):]
-        if not REPOSITORY_PATH.fullmatch(path):
-            refuse(f"{what} repository path is malformed: {path}")
-        return path
-
-    def add(self, hex_value, url, accept, size, limit, what):
-        item = self.items.get(hex_value)
-        if item is None:
-            if len(self.items) >= MAX_OBJECTS:
-                refuse(f"the closure names more than {MAX_OBJECTS} objects")
-            self.items[hex_value] = Item(hex_value, url, accept, size, limit, what)
-            if size is not None:
-                self.bytes_declared += size
-            return
-        if size is not None and item.size is not None and item.size != size:
-            refuse(f"object sha256:{hex_value} is declared with two sizes")
-        if size is not None and item.size is None:
-            item.size = size
-            item.limit = size
-            self.bytes_declared += size
-
-    def load(self, closure_path):
-        closure = parse_object(read_bounded(closure_path, CLOSURE_MAX, "release closure"), "release closure")
-        artifacts = closure.get("artifacts")
-        if not isinstance(artifacts, list) or not artifacts:
-            refuse("the release closure names no artifacts")
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                refuse("a closure artifact is not an object")
-            key = artifact.get("artifact_key", "?")
-            path = self.mirror_path(artifact.get("repository"), f"artifact {key}")
-            nodes = artifact.get("nodes")
-            if not isinstance(nodes, list) or not nodes:
-                refuse(f"artifact {key} carries no nodes")
-            for node in nodes:
-                if not isinstance(node, dict):
-                    refuse(f"artifact {key} carries a node that is not an object")
-                if node.get("repository") != artifact.get("repository"):
-                    refuse(f"artifact {key} carries a node from another repository")
-                hex_value = digest_hex(node.get("digest"), f"artifact {key} node digest")
-                kind = node.get("kind")
-                if kind not in NODE_KINDS:
-                    refuse(f"artifact {key} node sha256:{hex_value} has kind {kind!r}")
-                size = size_of(node.get("size"), f"artifact {key} node sha256:{hex_value}")
-                if kind in ("index", "manifest"):
-                    accept = text_of(node.get("media_type"), f"artifact {key} node media_type")
-                    url = self.url(f"{path}/manifests/sha256:{hex_value}")
-                else:
-                    accept = "*/*"
-                    url = self.url(f"{path}/blobs/sha256:{hex_value}")
-                self.add(hex_value, url, accept, size, size, f"{key} {kind} sha256:{hex_value}")
-            attachments = artifact.get("attachments", [])
-            if not isinstance(attachments, list):
-                refuse(f"artifact {key} attachments is not a list")
-            for attachment in attachments:
-                if not isinstance(attachment, dict):
-                    refuse(f"artifact {key} carries an attachment that is not an object")
-                subject_path = self.mirror_path(attachment.get("subject_repository"),
-                                                f"artifact {key} attachment subject")
-                manifest_hex = digest_hex(attachment.get("manifest_digest"),
-                                          f"artifact {key} attachment manifest_digest")
-                media_type = text_of(attachment.get("media_type"), f"artifact {key} attachment media_type")
-                layer_digests = attachment.get("layer_digests")
-                if not isinstance(layer_digests, list) or not layer_digests:
-                    refuse(f"artifact {key} attachment sha256:{manifest_hex} names no layers")
-                layer_hexes = [digest_hex(digest, f"artifact {key} attachment layer digest")
-                               for digest in layer_digests]
-                self.add(manifest_hex, self.url(f"{subject_path}/manifests/sha256:{manifest_hex}"),
-                         media_type, None, OCI_DOCUMENT_MAX,
-                         f"{key} attachment manifest sha256:{manifest_hex}")
-                self.attachments.append((key, subject_path, manifest_hex, layer_hexes))
-        return self
-
-    def attachment_items(self):
-        return [self.items[manifest_hex] for (_, _, manifest_hex, _) in self.attachments]
-
-    def absorb_attachment(self, store, key, subject_path, manifest_hex, layer_hexes):
-        """Read a fetched, digest-named attachment manifest and plan its config and layers."""
-        what = f"{key} attachment manifest sha256:{manifest_hex}"
-        document = parse_object(read_bounded(os.path.join(store, manifest_hex), OCI_DOCUMENT_MAX, what), what)
-        config = document.get("config")
-        if not isinstance(config, dict):
-            refuse(f"{what} lacks a config descriptor")
-        config_hex = digest_hex(config.get("digest"), f"{what} config digest")
-        config_size = size_of(config.get("size"), f"{what} config")
-        self.add(config_hex, self.url(f"{subject_path}/blobs/sha256:{config_hex}"), "*/*",
-                 config_size, config_size, f"{key} attachment config sha256:{config_hex}")
-        layers = document.get("layers")
-        if not isinstance(layers, list):
-            refuse(f"{what} lacks layers")
-        actual = []
-        for layer in layers:
-            if not isinstance(layer, dict):
-                refuse(f"{what} carries a layer that is not a descriptor")
-            layer_hex = digest_hex(layer.get("digest"), f"{what} layer digest")
-            layer_size = size_of(layer.get("size"), f"{what} layer sha256:{layer_hex}")
-            actual.append(layer_hex)
-            self.add(layer_hex, self.url(f"{subject_path}/blobs/sha256:{layer_hex}"), "*/*",
-                     layer_size, layer_size, f"{key} attachment layer sha256:{layer_hex}")
-        if actual != layer_hexes:
-            refuse(f"{what} layers do not equal the closure's declaration")
-
-
-def plan_summary(closure_path, release_authority):
-    plan = Plan(lambda path: path, release_authority).load(closure_path)
-    print(f"object_count_declared={len(plan.items)}")
-    print(f"bytes_declared={plan.bytes_declared}")
-    print(f"attachments={len(plan.attachments)}")
-
-
-def materialise(transport, plan, store, item):
-    destination = os.path.join(store, item.hex)
-    present = hash_present(destination)
-    if present is not None:
-        if present[0] == item.hex and (item.size is None or present[1] == item.size):
-            os.chmod(destination, 0o444)
-            return 0, present[1]
-        os.unlink(destination)
-    return 1, transport.fetch(item.what, item.url, item.accept, item.limit, item.hex, item.size, destination)
-
-
-def objects(mirror, cacert, closure_path, release_authority, destination, closure_hex, manifest_hex):
-    for value, what in ((closure_hex, "sealed closure hash"), (manifest_hex, "sealed manifest hash")):
-        if not HEX64.fullmatch(value):
-            refuse(f"the {what} is not 64 lowercase hex")
-    transport = Transport(mirror, cacert)
-    store = os.path.join(destination, "objects", "sha256")
-    os.makedirs(store, mode=0o755, exist_ok=True)
-    clear_temporaries(store)
-    ready_path = os.path.join(destination, "READY")
-    if os.path.lexists(ready_path):
-        os.unlink(ready_path)
-    plan = Plan(transport.url, release_authority).load(closure_path)
-
-    # 1) Space, from what the closure declares, before the first byte. The
-    #    attachments' configs and layers are not yet known; each is allowed the
-    #    verifier's bound three times over and re-checked exactly below.
-    require_space(store, plan.bytes_declared + len(plan.attachments) * ATTACHMENT_ALLOWANCE,
-                  "declared sizes")
-    fetched = skipped = 0
-    bytes_landed = 0
-    landed = set()
-    # 2) The attachment manifests: small, named by the closure, and the only way
-    #    to learn the config/layer digests and their exact sizes.
-    for (key, subject_path, attachment_hex, layer_hexes), item in zip(plan.attachments, plan.attachment_items()):
-        if item.hex not in landed:
-            new, count = materialise(transport, plan, store, item)
-            fetched += new
-            skipped += 1 - new
-            bytes_landed += count
-            landed.add(item.hex)
-        plan.absorb_attachment(store, key, subject_path, attachment_hex, layer_hexes)
-    # 3) Space again, now exact, before the bulk.
-    remaining = 0
-    for item in plan.items.values():
-        if hash_present(os.path.join(store, item.hex)) is None:
-            remaining += item.size if item.size is not None else item.limit
-    require_space(store, remaining, "exact sizes")
-    # 4) Everything else, one object in flight at a time.
-    for item in plan.items.values():
-        if item.hex in landed:
-            continue
-        new, count = materialise(transport, plan, store, item)
-        fetched += new
-        skipped += 1 - new
-        bytes_landed += count
-        landed.add(item.hex)
-    # 5) Nothing the closure does not name may sit in the store.
-    present = set(os.listdir(store))
-    stray = sorted(present - set(plan.items))
-    if stray:
-        refuse(f"the object store carries {len(stray)} objects the closure does not name, e.g. {stray[0]}")
-    if len(present) != len(plan.items):
-        refuse("the object store does not hold exactly the closure's object set")
-    # 6) READY last: the same receipt image/build-seed-v2.sh writes. Not
-    #    authority -- the verifier re-proves every object above it.
-    body = json.dumps(dict(object_count=len(plan.items), release_closure_sha256=closure_hex,
-                           release_manifest_sha256=manifest_hex, schema=READY_SCHEMA),
-                      sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-    handle = os.open(ready_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
-    try:
-        os.write(handle, body)
-        os.fsync(handle)
-    finally:
-        os.close(handle)
-    fsync_directory(destination)
-    note(f"closure {closure_hex}: {len(plan.items)} objects proved by name "
-         f"({fetched} fetched, {skipped} already present, {bytes_landed} bytes); READY written")
-
-
-def main(argv):
-    if not argv:
-        refuse("no subcommand")
-    command, arguments = argv[0], argv[1:]
-    if command == "documents" and len(arguments) == 5:
-        documents(*arguments)
-    elif command == "plan" and len(arguments) == 2:
-        plan_summary(*arguments)
-    elif command == "objects" and len(arguments) == 7:
-        objects(*arguments)
-    else:
-        refuse(f"unknown subcommand or argument count: {command} ({len(arguments)} arguments)")
-
-
-try:
-    main(sys.argv[1:])
-except Refusal as refusal:
-    note(f"REFUSED: {refusal}")
-    raise SystemExit(1)
-except OSError as error:
-    note(f"REFUSED: {error}")
-    raise SystemExit(1)
-SEED_MIRROR_PY
-}
-
-# Before the wipe. Restated against the values the installer itself read: a
-# gate that exists only in the grammar is a gate a grammar edit can remove
-# without anything noticing. Nothing here touches the target disk.
-seed_from_mirror_preflight() { # $1=the ni-seed PARTUUID on this medium, or nothing
-  [[ -z "$1" ]] \
-    || die "this medium seals neuralice.seed_source=mirror and carries an ni-seed partition; a seed fetched from the mirror and a seed on the stick are two unreconciled sources of one closure, and neither is installed"
-  [[ "$INSTALL_SOURCE" == registry ]] \
-    || die "neuralice.seed_source=mirror requires neuralice.source=registry; a medium install carries its seed on the stick"
-  [[ -n "$INSTALL_MIRROR" && -n "${MIRROR_CA_FILE:-}" && -f "${MIRROR_CA_FILE:-}" ]] \
-    || die "neuralice.seed_source=mirror requires a LAN mirror whose CA this medium pins; this medium seals none"
-  [[ "$SEED_CLOSURE" =~ ^[0-9a-f]{64}$ && "$SEED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ && -n "$SEED_TRUSTED_NOW" ]] \
-    || die "neuralice.seed_source=mirror requires the sealed seed closure, manifest hash and trusted time; this medium seals an incomplete tuple"
-  (( PRESEAL_ACTIVE == 1 )) \
-    || die "neuralice.seed_source=mirror requires the signed preseal set; nothing else reconciles a fetched seed with the appliance about to be pulled"
-  [[ "${MIRROR_READY_SHA256:-}" == "$SEED_CLOSURE" && "${MIRROR_READY_MANIFEST_SHA256:-}" == "$SEED_MANIFEST_SHA256" ]] \
-    || die "the LAN mirror declares release closure ${MIRROR_READY_SHA256:-none} and this medium seals ${SEED_CLOSURE}; a mirror that declares another release cannot serve this one"
-  [[ -x "$NEURALICE_SEED_VERIFIER" ]] \
-    || die "this medium carries no seed-closure verifier at ${NEURALICE_SEED_VERIFIER}; refusing to materialise a closure nothing would verify"
-  rm -rf -- "$SEED_PACK_DIR"
-  install -d -m 0700 "$SEED_PACK_DIR"
-  log "Fetching the seed pack for release closure ${SEED_CLOSURE} from the LAN mirror ${INSTALL_MIRROR} (six bounded documents, TLS pinned to the sealed CA)…"
-  heartbeat_start "seed pack fetch from the LAN mirror"
-  seed_mirror_helper documents "$INSTALL_MIRROR" "$MIRROR_CA_FILE" "$SEED_CLOSURE" "$SEED_MANIFEST_SHA256" "$SEED_PACK_DIR" \
-    || die "the LAN mirror ${INSTALL_MIRROR} did not serve the seed pack ${SEED_CLOSURE} as the six bounded documents this medium seals; nothing has been written to the target disk"
-  bg_stop
-  assert_seed_is_the_preseal_release "$SEED_PACK_DIR"
-  log "Seed pack reconciled with the authenticated appliance: same train, bundle_seq, hardware target and appliance root — the closure's objects are fetched once the encrypted data volume exists"
-}
-
-# Phase 5, on the mounted data volume. The six documents land first (the closure
-# staged here is re-hashed against the sealed value, and the plan is derived
-# from THOSE bytes), then every object, then READY. The whole-tree proof is the
-# common re-verification that follows in phase 5.
-seed_from_mirror_materialize() { # $1=destination release/<closure> directory on the mounted data volume
-  local destination=$1 document plan object_count bytes_declared
-  install -d -m 0755 "$destination" "$destination/objects/sha256"
-  for document in release-manifest.json release-closure.json release-authorization.json \
-    release-authorization.json.sig delegation-snapshot.json delegation-snapshot.json.sig; do
-    [[ -f "$SEED_PACK_DIR/$document" && ! -L "$SEED_PACK_DIR/$document" ]] \
-      || die "the fetched seed pack lost ${document} between the preflight and staging"
-    install -m 0444 "$SEED_PACK_DIR/$document" "$destination/$document" \
-      || die "cannot stage ${document} onto the encrypted data volume"
-  done
-  assert_sealed_document_digest "$destination/release-closure.json" "$SEED_CLOSURE" \
-    "staged release closure"
-  assert_sealed_document_digest "$destination/release-manifest.json" "$SEED_MANIFEST_SHA256" \
-    "staged release manifest"
-  plan="$(seed_mirror_helper plan "$destination/release-closure.json" "$NEURALICE_RELEASE_AUTHORITY")" \
-    || die "the sealed release closure does not enumerate a fetchable object set under the release authority ${NEURALICE_RELEASE_AUTHORITY}"
-  object_count="$(sed -n 's/^object_count_declared=//p' <<<"$plan")"
-  bytes_declared="$(sed -n 's/^bytes_declared=//p' <<<"$plan")"
-  [[ "$object_count" =~ ^[0-9]+$ && "$bytes_declared" =~ ^[0-9]+$ ]] \
-    || die "the closure fetch plan is malformed"
-  log "MIRROR: materialising release closure sha256:${SEED_CLOSURE} from ${INSTALL_MIRROR} — ${object_count} declared objects, $(awk -v t="$bytes_declared" 'BEGIN{printf "%.1f", t / 2^30}') GiB declared; each object is hashed against its name before it is named…"
-  copy_progress_start "$bytes_declared" "$destination"
-  seed_mirror_helper objects "$INSTALL_MIRROR" "$MIRROR_CA_FILE" "$destination/release-closure.json" \
-    "$NEURALICE_RELEASE_AUTHORITY" "$destination" "$SEED_CLOSURE" "$SEED_MANIFEST_SHA256" \
-    || die "the release closure could not be materialised from the LAN mirror ${INSTALL_MIRROR} (a missing, corrupt, oversize or unreachable object, or a full data volume); refusing to finish an install whose offline objects cannot be proved"
-  bg_stop
-  heartbeat_start "seed flush to disk (sync)"
-  sync
-  bg_stop
-}
-
-# The seed partition ON THIS MEDIUM, by stable identity. `live_disk` was
-# established from the SEALED PAYLOAD PARTITION, not from `findmnt /`, so this
-# cannot be pointed at a second USB stick that also carries the partlabel -- and
-# the PARTUUID is what is actually mounted, so the answer cannot change between
-# the lookup and the mount.
-seed_partition_partuuid() { # -> the PARTUUID, or nothing
-  local candidates
-  candidates="$(lsblk -rno NAME,PARTLABEL,PARTUUID "/dev/$live_disk" 2>/dev/null \
-    | awk '$2 == "ni-seed" { print $3 }')"
-  [[ -n "$candidates" ]] || return 0
-  (( "$(printf '%s\n' "$candidates" | grep -c .)" == 1 )) \
-    || die "this medium carries more than one ni-seed partition; refusing to choose which offline closure to install"
-  printf '%s' "$candidates"
-}
-
 _seed_partuuid="$(seed_partition_partuuid)"
 if [[ "$SEED_SOURCE" == mirror ]]; then
   # §2d: no partition may exist, the six documents come from the mirror, and
@@ -3126,6 +3393,14 @@ elif [[ -n "$SEED_CLOSURE" ]]; then
   done
   [[ -x "$NEURALICE_SEED_VERIFIER" ]] \
     || die "this medium carries no seed-closure verifier at ${NEURALICE_SEED_VERIFIER}; refusing to stage an offline closure nothing would verify"
+  # 🔴 RULE C (FAB-0057 P1.1b). The closure on the partition is hashed against
+  # the sealed value, and the manifest hash the verifier is then handed is the
+  # one that proved closure carries. The verifier still compares it to the
+  # manifest it reads, exactly as it compared the formerly sealed term.
+  assert_sealed_document_digest "$SEED_VERIFIED_ROOT/release-closure.json" "$SEED_CLOSURE" \
+    "offline seed's release closure"
+  SEED_MANIFEST_SHA256="$(seed_manifest_hash_from_closure "$SEED_VERIFIED_ROOT/release-closure.json")" \
+    || die "the sealed release closure on this medium names no well-formed release manifest hash; refusing to verify a seed whose manifest nothing fixes"
   _seed_key="$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub"
   [[ -f "$_seed_key" && ! -L "$_seed_key" ]] \
     || die "the verified installer root carries no release-authorization public key to verify the offline seed with"
@@ -3160,6 +3435,12 @@ else
     || die "this medium carries an ni-seed partition and its signature seals no offline release closure; an unauthorised seed is not staged"
 fi
 readonly SEED_VERIFIED_ROOT
+# A sealed closure whose manifest hash was never derived is not a state this
+# script may continue from: every later use (verifier, release/MANIFEST) is
+# then a use of an empty string.
+[[ -z "$SEED_CLOSURE" || "$SEED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+  || die "the release manifest hash of sealed closure ${SEED_CLOSURE} was never derived from the verified closure; refusing to continue"
+readonly SEED_MANIFEST_SHA256
 
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5

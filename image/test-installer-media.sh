@@ -178,7 +178,10 @@ COMPOSE="$TMP/compose"; mkdir -p "$COMPOSE"
 AUTOINSTALL="$ROOT/ota/neural-ice-autoinstall.sh"
 BUILDER="$ROOT/image/build-installer-usb.sh"
 awk '/^assert_sealed_document_digest\(\) \{/,/^}$/' "$AUTOINSTALL"  > "$COMPOSE/reconcile.sh"
+awk '/^seed_manifest_hash_from_closure\(\) \{/,/^}$/' "$AUTOINSTALL" >> "$COMPOSE/reconcile.sh"
 awk '/^assert_seed_is_the_preseal_release\(\) \{/,/^}$/' "$AUTOINSTALL" >> "$COMPOSE/reconcile.sh"
+grep -q '^seed_manifest_hash_from_closure()' "$COMPOSE/reconcile.sh" \
+  || fail "the installer no longer derives the release manifest hash from the verified closure (FAB-0057 P1.1b, rule C)"
 grep -q '^assert_seed_is_the_preseal_release()' "$COMPOSE/reconcile.sh" \
   || fail "the installer no longer reconciles the offline seed with the preseal release"
 grep -q 'SEED_PRESEAL_RECONCILE_PY' "$COMPOSE/reconcile.sh" \
@@ -212,6 +215,7 @@ COMPOSE_OS_IMAGE="$COMPOSE_OS_REPOSITORY@$COMPOSE_OS_DIGEST"
 # difference and nothing else.
 compose_fixture() { # $1=destination $2=document $3=overrides-json
   python3 - "$1" "$2" "$3" "$COMPOSE_OS_REPOSITORY" "$COMPOSE_OS_DIGEST" <<'PYEOF'
+import hashlib
 import json
 import pathlib
 import sys
@@ -251,10 +255,14 @@ preseal_set = {
 documents = {"closure": closure, "manifest": manifest, "preseal": preseal_set}
 if document != "none":
     documents[document].update(json.loads(overrides))
+manifest_raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+# The closure names its release manifest by hash, as Fabric's does; the
+# installer derives the expected manifest hash from it (rule C). An override
+# that sets the field explicitly is a mismatch case and is kept as stated.
+closure.setdefault("release_manifest_sha256", hashlib.sha256(manifest_raw.encode("utf-8")).hexdigest())
 (seed / "release-closure.json").write_text(
     json.dumps(closure, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-(seed / "release-manifest.json").write_text(
-    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+(seed / "release-manifest.json").write_text(manifest_raw, encoding="utf-8")
 (preseal / "preseal-set.json").write_text(
     json.dumps(preseal_set, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 PYEOF
@@ -271,7 +279,6 @@ compose_reconcile() { # $1=root [ENV=VALUE …] -> 0 when the installer would pr
   # hashes are read tolerantly here and the ASSERTION is left to the lifted
   # installer code rather than to this harness.
   closure="$(sha256sum -- "$root/seed/release-closure.json" 2>/dev/null | awk '{print tolower($1)}')"
-  manifest="$(sha256sum -- "$root/seed/release-manifest.json" 2>/dev/null | awk '{print tolower($1)}')"
   preseal="$(sha256sum -- "$root/preseal/preseal-set.json" 2>/dev/null | awk '{print tolower($1)}')"
   (
     set -uo pipefail
@@ -280,7 +287,6 @@ compose_reconcile() { # $1=root [ENV=VALUE …] -> 0 when the installer would pr
     SEED_VERIFIED_ROOT="$root/seed"
     PRESEAL_SNAPSHOT="$root/preseal"
     SEED_CLOSURE="$closure"
-    SEED_MANIFEST_SHA256="$manifest"
     PRESEAL_SET_SHA256="$preseal"
     OS_IMAGE="$COMPOSE_OS_IMAGE"
     AUTH_TARGET_REF="$COMPOSE_OS_IMAGE"
@@ -293,6 +299,13 @@ compose_reconcile() { # $1=root [ENV=VALUE …] -> 0 when the installer would pr
     for assignment in "$@"; do export "${assignment?}"; eval "$assignment"; done
     # shellcheck source=/dev/null
     . "$COMPOSE/reconcile.sh"
+    # The ni-seed path, in the installer's own order (rule C): the closure is
+    # hashed against the sealed value, the manifest hash is derived from it,
+    # and only then is the seed reconciled -- the manifest document must hash
+    # to what the closure says.
+    assert_sealed_document_digest "$SEED_VERIFIED_ROOT/release-closure.json" "$SEED_CLOSURE" "offline seed's release closure"
+    SEED_MANIFEST_SHA256="$(seed_manifest_hash_from_closure "$SEED_VERIFIED_ROOT/release-closure.json")" \
+      || die "the sealed release closure names no well-formed release manifest hash"
     assert_seed_is_the_preseal_release
   ) >/dev/null 2>&1
 }
@@ -313,6 +326,13 @@ compose_case() { # $1=expect accept|refuse $2=label $3=document $4=overrides [EN
 }
 
 compose_case accept "one release carried by two transports" none '{}'
+# 🔴 SABOTAGE (FAB-0057 P1.1b, rule C): a closure that hashes to the sealed value
+# but names ANOTHER release manifest. The installer derives the manifest hash
+# from the closure, so the manifest on the medium no longer hashes to what the
+# closure says, and the seed is refused before the disk is touched.
+compose_case refuse "a closure naming a release manifest that is not the one beside it" \
+  closure "{\"release_manifest_sha256\":\"$(printf 'f%.0s' {1..64})\"}"
+compose_case refuse "a closure naming no release manifest at all" closure '{"release_manifest_sha256":null}'
 compose_case refuse "a seed from another train" closure '{"train":"1.1.0"}'
 compose_case refuse "a seed from another bundle sequence" closure '{"bundle_seq":14}'
 compose_case refuse "a seed cut around another appliance root" \
@@ -380,9 +400,10 @@ compose_seal() { # $1=source $2=root [ENV=VALUE …] -> 0 when the medium would 
   (
     set -uo pipefail
     sha256_of() { sha256sum -- "$1" | awk '{print tolower($1)}'; }
-    SEED_CLOSURE="$(printf '%064d' 7)"
+    SEED_CLOSURE="$(sha256_of "$root/seed/release-closure.json")"
     SEED_TRUSTED_NOW=2026-09-02T07:00:00Z
     RELEASE_MANIFEST_FILE="$root/seed/release-manifest.json"
+    RELEASE_CLOSURE_FILE="$root/seed/release-closure.json"
     PRESEAL_STAGE_ROOT="$root"
     OS_IMAGE="$COMPOSE_OS_IMAGE"
     TARGET_IMGREF="$COMPOSE_OS_IMAGE"
@@ -400,8 +421,9 @@ compose_seal() { # $1=source $2=root [ENV=VALUE …] -> 0 when the medium would 
     if [ -n "$SEED_CLOSURE" ]; then
       printf '%s\n' "${UKI_KARGS[@]}" | grep -qx "neuralice.seed_closure=$SEED_CLOSURE"
       printf '%s\n' "${UKI_KARGS[@]}" | grep -qx "neuralice.seed_trusted_now=$SEED_TRUSTED_NOW"
-      printf '%s\n' "${UKI_KARGS[@]}" \
-        | grep -qx "neuralice.seed_manifest=$(sha256_of "$RELEASE_MANIFEST_FILE")"
+      # Rule C: the manifest hash is the closure's to state; the producer seals
+      # no `neuralice.seed_manifest` (the sealed grammar would refuse the line).
+      if printf '%s\n' "${UKI_KARGS[@]}" | grep -q '^neuralice.seed_manifest='; then exit 1; fi
     fi
   ) >/dev/null 2>&1
 }
@@ -419,6 +441,18 @@ compose_seal registry "$compose_seal_root" 'SEED_TRUSTED_NOW=""' \
   && fail "the producer cut a medium sealing a closure with no verification time"
 compose_seal medium "$compose_seal_root" 'SEED_CLOSURE=""' \
   && fail "the producer cut a medium carrying a release manifest that nothing seals"
+compose_seal medium "$compose_seal_root" 'RELEASE_CLOSURE_FILE=""' \
+  && fail "the producer cut a medium without reading the closure the sealed hash names (rule C)"
+compose_seal medium "$compose_seal_root" "SEED_CLOSURE=$(printf '%064d' 7)" \
+  && fail "the producer cut a medium whose sealed closure hash is not the hash of the closure it was given"
+compose_closure_mismatch_root="$COMPOSE/seal-closure-mismatch"
+rm -rf -- "$compose_closure_mismatch_root"
+compose_fixture "$compose_closure_mismatch_root" closure "{\"release_manifest_sha256\":\"$(printf 'f%.0s' {1..64})\"}" \
+  || fail "cannot build the closure/manifest mismatch producer fixture"
+compose_seal medium "$compose_closure_mismatch_root" \
+  && fail "the producer cut a medium whose closure names another release manifest than the one beside it (rule C)"
+compose_seal registry "$compose_closure_mismatch_root" \
+  && fail "the producer cut a registry medium whose closure names another release manifest than the one beside it (rule C)"
 compose_seal registry "$compose_seal_root" \
   "OS_IMAGE=$COMPOSE_OS_REPOSITORY@sha256:$(printf '%064d' 43)" \
   && fail "the producer cut a registry medium whose seed is not the appliance it installs"
@@ -1018,7 +1052,10 @@ doc = {
 (root/"preseal-set.json").write_text(json.dumps(doc,sort_keys=True,separators=(",",":"))+"\n")
 PYEOF
 preseal_sha="$(sha256sum "$PRESEAL_DIR/preseal-set.json" | awk '{print $1}')"
-preseal_kargs="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-appliance@${registry_digest} ${registry_relauth} neuralice.preseal=${preseal_sha}"
+# 🔴 A PRESEAL MEDIUM SEALS NO neuralice.relauth_* (FAB-0057 P1.1b, rule B):
+# the set binds the pair by hash and neuralice.preseal binds the set. The ESP
+# still carries the pair, and the inspector's preseal check is what pins it.
+preseal_kargs="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-appliance@${registry_digest} neuralice.preseal=${preseal_sha}"
 build_uki installer-preseal "$preseal_kargs" >/dev/null \
   || fail "the LAB LIGHT preseal UKI failed to build"
 preseal_names=(preseal-set.json delegation-snapshot.json delegation-snapshot.sig \
@@ -1046,7 +1083,7 @@ grep -q "neuralice.preseal=${preseal_sha}" "$TMP/inspect-preseal.out" \
 # under its canonical digest in neuralice.imgref.  It has no registry source,
 # OS image transport or mirror; the mutable ESP authorization remains pinned by
 # this distinct signed UKI and binds the store's host index/child pair.
-offline_preseal_kargs="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=medium neuralice.imgref=release.example.test/neural-ice/neural-ice-appliance@${registry_digest} ${registry_relauth} neuralice.preseal=${preseal_sha}"
+offline_preseal_kargs="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.source=medium neuralice.imgref=release.example.test/neural-ice/neural-ice-appliance@${registry_digest} neuralice.preseal=${preseal_sha}"
 build_uki installer-preseal-offline "$offline_preseal_kargs" >/dev/null \
   || fail "the fully offline preseal UKI failed to build"
 make_preseal_esp installer-preseal-offline
@@ -1125,7 +1162,10 @@ printf 'foreign\n' > "$TMP/preseal-foreign"
 mcopy -i "$ESP" "$TMP/preseal-foreign" ::/ice-coreos/preseal/foreign.json
 assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null 2>&1 && fail "a preseal namespace with an unknown file was accepted"
-build_uki installer-preseal-unbound "${preseal_kargs% neuralice.preseal=*}" >/dev/null \
+# The line without neuralice.preseal must still be a valid registry line (so it
+# seals the pair itself, as a registry medium without a set does); the refusal
+# under test is the ESP carrying a set nothing binds.
+build_uki installer-preseal-unbound "${preseal_kargs% neuralice.preseal=*} ${registry_relauth}" >/dev/null \
   || fail "the unbound preseal mutation UKI failed to build"
 make_preseal_esp installer-preseal-unbound
 assemble "$ESP" "$SEALED/payload.img"
@@ -1168,6 +1208,12 @@ build_uki installer-preseal-wrong-auth "${preseal_kargs%neuralice.preseal=*}neur
 make_preseal_esp installer-preseal-wrong-auth '' "preseal-set.json=$TMP/preseal-wrong-installer-auth.json"
 assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null 2>&1 && fail "a preseal set that does not bind installer authorization bytes was accepted"
+
+build_uki installer-preseal-restated "${preseal_kargs% neuralice.preseal=*} ${registry_relauth} neuralice.preseal=${preseal_sha}" >/dev/null \
+  || fail "the restated-pair preseal mutation UKI failed to build"
+make_preseal_esp installer-preseal-restated
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 && fail "a preseal medium restating the authorization pair its set already binds was accepted (rule B)"
 
 build_uki installer-preseal-customer "$preseal_kargs" VARIANT=prod >/dev/null \
   || fail "the customer-profile preseal mutation UKI failed to build"
