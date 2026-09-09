@@ -693,4 +693,185 @@ out="$(build "$TMP/registry-source-clear-text" STORE_MANIFEST_DIGEST="$SRC_DIGES
   && fail "a non-registry store source was accepted"
 grep -Fq "digest-pinned registry reference" <<<"$out" || fail "the non-registry refusal is not named: $out"
 
+
+# --------------------------------------------------------------------------- #
+# 8) THE ALREADY-BUILT STORE (FAB-0057 P1.7). Two media cut for two edits of the
+#    installer root carry byte-identical stores, because the store is a
+#    containers-storage holding exactly one digest-named image. The caller may
+#    therefore hand the extent back instead of paying `skopeo copy` plus a
+#    single-threaded zstd-19 mksquashfs over ~8 GiB again.
+#
+#    Every assertion below is about the REFUSALS, because a reuse path that
+#    accepts is a reuse path that has replaced a proof with a filename.
+# --------------------------------------------------------------------------- #
+make_rootfs
+ln -sf "$(command -v cp)" "$TOOLS/cp"
+cat > "$TOOLS/skopeo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MOCK_STATE/skopeo.args"
+src=""
+for arg in "$@"; do
+  case "$arg" in containers-storage:localhost/*) src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}" ;; esac
+done
+dest="${*: -1}"
+name="${dest##*]}"
+store="${dest#*overlay@}"; store="${store%%+*}"
+mkdir -p "$store/overlay-images" "$store/overlay-layers" "$store/overlay"
+printf '[{"id":"%s","names":["%s:latest"]}]\n' "${MOCK_STORE_IMAGE_ID:-$src}" "$name" \
+  > "$store/overlay-images/images.json"
+printf 'staged\n' > "$store/overlay-layers/layers.json"
+EOF
+chmod +x "$TOOLS/skopeo"
+
+# The extent a first, full build produced -- and the facts recorded about it.
+build "$TMP/reuse-source" >/dev/null || fail "the reuse source build failed"
+REUSE_IMG="$TMP/reuse-store.img"
+cp "$TMP/reuse-source/installer-store.img" "$REUSE_IMG"
+REUSE_SHA="$(sed -n 's/^store_image_sha256=//p' "$TMP/reuse-source/installer-root.img.manifest")"
+REUSE_BYTES="$(sed -n 's/^store_image_bytes=//p' "$TMP/reuse-source/installer-root.img.manifest")"
+[ -n "$REUSE_SHA" ] && [ -n "$REUSE_BYTES" ] \
+  || fail "the full build recorded no store size and digest to reuse"
+
+reuse_build() { # $1=output dir, rest=env overrides
+  local out=$1; shift
+  build "$out" \
+    STORE_IMAGE_REUSE="$REUSE_IMG" \
+    STORE_IMAGE_REUSE_SHA256="$REUSE_SHA" \
+    STORE_IMAGE_REUSE_BYTES="$REUSE_BYTES" \
+    STORE_IMAGE_REUSE_IMAGE_ID="$HOST_IMAGE_ID" \
+    STORE_IMAGE_REUSE_MANIFEST_DIGEST="$HOST_MANIFEST" \
+    STORE_IMAGE_REUSE_NAME="localhost/bootc" \
+    "$@"
+}
+
+# 🔴 THE SECOND BUILD PRODUCES THE SAME STORE BYTES AND THE SAME MANIFEST LINES.
+# A reuse that changed either would change the sealed payload header digest, and
+# nobody could tell a rebuild from a substitution.
+reuse_build "$TMP/reuse-hit" >/dev/null || fail "a correctly described reusable store was refused"
+cmp -s "$TMP/reuse-source/installer-store.img" "$TMP/reuse-hit/installer-store.img" \
+  || fail "the reused store is not byte-identical to the one the full build produced"
+for line in store_image_sha256 store_image_bytes store_image_id \
+  store_image_manifest_digest store_image_name; do
+  [ "$(sed -n "s/^$line=//p" "$TMP/reuse-hit/installer-root.img.manifest")" \
+    = "$(sed -n "s/^$line=//p" "$TMP/reuse-source/installer-root.img.manifest")" ] \
+    || fail "the reused build's manifest line '$line' differs from the full build's"
+done
+# ...and the expensive half really was skipped: no copy was staged at all.
+[ ! -s "$TMP/reuse-hit/skopeo.args" ] \
+  || fail "the reuse path still ran skopeo; nothing was saved"
+[ "$(grep -c -- '-mkfs-time 0' "$TMP/reuse-hit/mksquashfs.args")" = 1 ] \
+  || fail "the reuse path still ran mksquashfs over the store tree"
+# The installer ROOT is never reused: it is what a change to this tree changes.
+[ "$(sed -n 's/^root_image_sha256=//p' "$TMP/reuse-hit/installer-root.img.manifest")" \
+  = "$(sed -n 's/^root_image_sha256=//p' "$TMP/reuse-source/installer-root.img.manifest")" ] \
+  || fail "the reuse fixture changed the root image; this case would prove nothing"
+printf 'sealed-lab\n' > "$ROOTFS/usr/lib/neural-ice/appliance-variant"
+reuse_build "$TMP/reuse-new-root" >/dev/null || fail "the changed-root reuse build failed"
+[ "$(sed -n 's/^root_image_sha256=//p' "$TMP/reuse-new-root/installer-root.img.manifest")" \
+  != "$(sed -n 's/^root_image_sha256=//p' "$TMP/reuse-hit/installer-root.img.manifest")" ] \
+  || fail "a reused store made the sealed installer root stale"
+cmp -s "$TMP/reuse-new-root/installer-store.img" "$TMP/reuse-source/installer-store.img" \
+  || fail "the changed-root build did not carry the same reused store"
+rm -f "$ROOTFS/usr/lib/neural-ice/appliance-variant"
+
+# 🔴 SABOTAGE 1: ONE BYTE. The recorded digest is the only thing standing
+# between a cached extent and the signature that will cover it.
+TAMPERED="$TMP/reuse-tampered.img"
+python3 - "$REUSE_IMG" "$TAMPERED" <<'PYEOF'
+import sys
+data = bytearray(open(sys.argv[1], "rb").read())
+data[0] ^= 0x01
+open(sys.argv[2], "wb").write(data)
+PYEOF
+cmp -s "$REUSE_IMG" "$TAMPERED" && fail "the sabotage fixture did not change a byte"
+out="$(reuse_build "$TMP/reuse-tamper" STORE_IMAGE_REUSE="$TAMPERED" 2>&1)" \
+  && fail "a reusable store whose bytes were altered was sealed"
+grep -Fq 'refusing to seal an extent nothing accounts for' <<<"$out" \
+  || fail "the altered-bytes refusal is not named: $out"
+grep -Fq "not the recorded $REUSE_SHA" <<<"$out" \
+  || fail "the altered-bytes refusal does not name the digest it expected: $out"
+
+# 🔴 SABOTAGE 2: THE RECORD. Correct bytes, an altered claim about them, and the
+# comparison must still fail -- in the other direction.
+out="$(reuse_build "$TMP/reuse-wrong-sha" \
+  STORE_IMAGE_REUSE_SHA256="$(printf '%064d' 7)" 2>&1)" \
+  && fail "a reusable store described by another digest was sealed"
+grep -Fq 'refusing to seal an extent nothing accounts for' <<<"$out" \
+  || fail "the altered-record refusal is not named: $out"
+out="$(reuse_build "$TMP/reuse-wrong-bytes" STORE_IMAGE_REUSE_BYTES=17 2>&1)" \
+  && fail "a reusable store described by another size was sealed"
+grep -Fq 'not the 17 it is recorded as' <<<"$out" \
+  || fail "the size refusal does not name the size it expected: $out"
+
+# 🔴 THE IDENTITY IS RE-READ, NOT INHERITED. Each of the three identity values
+# is compared against what THIS build resolved live from the digest-pinned base
+# image; a stale entry must not be able to substitute the installed appliance.
+out="$(reuse_build "$TMP/reuse-other-image" \
+  STORE_IMAGE_REUSE_IMAGE_ID="$OTHER_IMAGE_ID" 2>&1)" \
+  && fail "a reusable store recorded around another image was sealed"
+grep -Fq 'but this build selected' <<<"$out" \
+  || fail "the other-image refusal is not named: $out"
+out="$(reuse_build "$TMP/reuse-other-manifest" \
+  STORE_IMAGE_REUSE_MANIFEST_DIGEST="sha256:$(printf '%064d' 8)" 2>&1)" \
+  && fail "a reusable store recorded around another platform manifest was sealed"
+grep -Fq 'records manifest' <<<"$out" \
+  || fail "the other-manifest refusal is not named: $out"
+out="$(reuse_build "$TMP/reuse-other-name" \
+  STORE_IMAGE_REUSE_NAME=localhost/something-else 2>&1)" \
+  && fail "a reusable store offering the image under another name was sealed"
+grep -Fq 'but this build installs from' <<<"$out" \
+  || fail "the other-name refusal is not named: $out"
+
+# A HALF-DESCRIBED EXTENT IS REFUSED IN BOTH DIRECTIONS: a path with no facts is
+# bytes nothing accounts for, and facts with no path describe nothing.
+out="$(reuse_build "$TMP/reuse-half" STORE_IMAGE_REUSE_SHA256= 2>&1)" \
+  && fail "a store reuse with no recorded digest was accepted"
+grep -Fq 'requires all six of' <<<"$out" \
+  || fail "the half-tuple refusal is not named: $out"
+out="$(build "$TMP/reuse-facts-only" \
+  STORE_IMAGE_REUSE_SHA256="$REUSE_SHA" \
+  STORE_IMAGE_REUSE_BYTES="$REUSE_BYTES" 2>&1)" \
+  && fail "recorded facts with no extent were accepted"
+grep -Fq 'requires all six of' <<<"$out" \
+  || fail "the facts-without-extent refusal is not named: $out"
+
+# A SYMLINK IS NOT AN EXTENT. The reuse input is read by a privileged process;
+# a repointable path is exactly what must never be followed.
+ln -sf "$REUSE_IMG" "$TMP/reuse-link.img"
+out="$(reuse_build "$TMP/reuse-symlink" STORE_IMAGE_REUSE="$TMP/reuse-link.img" 2>&1)" \
+  && fail "a symlinked reusable store was accepted"
+grep -Fq 'not a plain file' <<<"$out" \
+  || fail "the symlink refusal is not named: $out"
+out="$(reuse_build "$TMP/reuse-relative" STORE_IMAGE_REUSE=store.img 2>&1)" \
+  && fail "a relative reusable store path was accepted"
+grep -Fq 'must be an absolute path' <<<"$out" \
+  || fail "the relative-path refusal is not named: $out"
+
+# --------------------------------------------------------------------------- #
+# 8b) THE PRODUCER SIDE. The reuse tuple is only ever built from a cache entry
+#     whose recorded key equals the key this build recomputes, and the store's
+#     dm-verity root hash is recomputed by the UNCHANGED payload assembler and
+#     compared against the entry. Asserted on the producer's source, the way
+#     every other producer contract in this suite is.
+# --------------------------------------------------------------------------- #
+grep -Fq 'MEDIUM_BUILD_CACHE_DIR="${MEDIUM_BUILD_CACHE_DIR:-}"' "$USB" \
+  || fail "the media producer's content cache is not opt-in by an explicit directory"
+grep -Fq 'medium_cache_require_dir' "$USB" \
+  || fail "the media producer never validates the cache directory"
+grep -Fq 'STORE_IMAGE_REUSE="$(medium_cache_entry_dir "$MEDIUM_CACHE_STORE_KEY")/installer-store.img"' "$USB" \
+  || fail "the media producer does not hand the sealed root builder the cached extent"
+grep -Fq 'medium_cache_assert_reused_verity "$STORE_VERITY_HASH" "$MEDIUM_CACHE_STORE_VERITY_HASH"' "$USB" \
+  || fail "the media producer does not compare the recomputed store verity root hash with the cache entry"
+grep -Fq 'medium_cache_finalize_store' "$USB" \
+  || fail "the media producer never records what a reuse would be checked against"
+grep -Fq 'medium_cache_prune' "$USB" \
+  || fail "the media producer's cache is unbounded"
+# The cached artefacts are the store and nothing else: the installer root, the
+# initramfs, the UKI and the raw are what a change to this tree changes.
+for never_cached in installer-root.img installer-initramfs.img disk.raw; do
+  if grep -F "medium_cache_stage_store" "$USB" | grep -Fq "$never_cached"; then
+    fail "the media producer caches $never_cached"
+  fi
+done
+
 echo "INSTALLER_ROOT_TEST_OK"

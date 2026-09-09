@@ -144,6 +144,395 @@ sha256_of() { # $1=path -> lowercase hex
 }
 
 # --------------------------------------------------------------------------- #
+# 🔴 THE MEASUREMENT LIVES IN THE ARTEFACT (FAB-0057 P1.7).
+#
+# Four media were cut on the bench on 2026-09-09, each for one edit of
+# ota/neural-ice-autoinstall.sh, and each took 22-35 minutes. Nobody could say
+# WHICH step cost what, because the producer printed `==>` and no clock: every
+# statement about where the time goes was a guess about a log that did not
+# record it. `ni_step` stamps each step with the wall clock and the elapsed
+# build time, closes the previous step with its duration, and `ni_step_summary`
+# prints the whole table at the end -- so the next person measures instead of
+# believing.
+#
+# It is a LOG, never a gate: no branch reads a duration.
+# --------------------------------------------------------------------------- #
+NI_BUILD_EPOCH="$(date -u +%s)"
+NI_STEP_EPOCH="$NI_BUILD_EPOCH"
+NI_STEP_NAME=""
+NI_STEP_DURATIONS=()
+NI_STEP_NAMES=()
+
+ni_step_close() { # closes the open step, if any
+  local now
+  [[ -n "$NI_STEP_NAME" ]] || return 0
+  now="$(date -u +%s)"
+  NI_STEP_NAMES+=("$NI_STEP_NAME")
+  NI_STEP_DURATIONS+=("$(( now - NI_STEP_EPOCH ))")
+  NI_STEP_NAME=""
+}
+
+ni_step() { # $1=step text -> the timestamped `==>` line every step prints
+  local now
+  ni_step_close
+  now="$(date -u +%s)"
+  NI_STEP_EPOCH="$now"
+  NI_STEP_NAME="$1"
+  printf '==> [%s +%5ss] %s\n' "$(date -u -d "@$now" +%H:%M:%SZ)" \
+    "$(( now - NI_BUILD_EPOCH ))" "$1"
+}
+
+ni_step_summary() { # the table a bench run can be read off
+  local index total
+  ni_step_close
+  total=$(( $(date -u +%s) - NI_BUILD_EPOCH ))
+  echo "==> step durations (seconds), total ${total}s"
+  for index in "${!NI_STEP_NAMES[@]}"; do
+    printf '    %6ss  %s\n' "${NI_STEP_DURATIONS[$index]}" "${NI_STEP_NAMES[$index]}"
+  done
+}
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE CONTENT CACHE, AND EXACTLY WHAT IT IS ALLOWED TO SKIP (FAB-0057 P1.7).
+#
+# Between two media cut for one edit of the installer root, the SEALED STORE is
+# byte-identical: it is a containers-storage holding exactly $BASE_IMAGE, and
+# $BASE_IMAGE is a digest. Producing it costs a `skopeo copy` of ~8 GiB plus a
+# single-threaded `mksquashfs -comp zstd -Xcompression-level 19` over the
+# result, and that work is repeated in full for a change it cannot possibly
+# depend on.
+#
+# The cache is OFF unless MEDIUM_BUILD_CACHE_DIR names a directory: with it
+# unset this file behaves byte-for-byte as before, which is the only way a cache
+# can be introduced without asking a reviewer to re-argue every existing proof.
+#
+# WHAT IS CACHED: the sealed store squashfs, exactly as image/build-installer-
+# root.sh wrote it, BEFORE image/build-installer-payload.sh pads it.
+# WHAT IS NEVER CACHED: the installer root, the initramfs, the UKI, the ESP, the
+# raw, and every final measurement. Those are what a change to this tree changes.
+#
+# WHAT REUSE RE-PROVES, IN THIS ORDER, before a cached byte reaches the payload:
+#   1. the cache directory is a real directory, not a symlink, owned by the
+#      build user, not group- or world-writable, and outside the checkout;
+#   2. the entry's recorded key equals the key recomputed from THIS build's
+#      inputs (base image digest, config ID, platform manifest digest, store
+#      name, store source reference, the SHA-256 of the two producer scripts
+#      that make those bytes, and the mksquashfs/skopeo versions);
+#   3. image/build-installer-root.sh copies the entry, then re-hashes the COPY
+#      (never the source: a source hashed and then swapped is a hash of nothing)
+#      and refuses unless it equals the recorded size and SHA-256;
+#   4. the identity the entry records -- config ID, platform manifest digest,
+#      store image name -- must equal the identity THIS build resolved live from
+#      $BASE_IMAGE with podman, moments earlier;
+#   5. image/build-installer-payload.sh then runs UNCHANGED on those bytes, so
+#      `veritysetup format` recomputes the store's dm-verity root hash from
+#      them, and that recomputed hash must equal the one the entry records.
+#
+# WHAT REUSE DOES NOT PROVE, stated so nobody has to infer it: it does not
+# re-derive "these bytes hold that image" from the bytes. That derivation was
+# made by the build that populated the entry (which read images.json out of the
+# staged store and asked podman for its manifest digest); reuse re-establishes
+# that these are those bytes and that their identity is the one this build
+# selected. Anyone who can write into the cache directory can therefore choose
+# the store -- which is why the directory must be the build user's own, and why
+# the cache is opt-in. That user already runs `sudo podman build` in this
+# script, so the cache adds no reachable capability; it does add a place where a
+# mistake persists between builds, and `MEDIUM_BUILD_CACHE_DIR` unset is the
+# supported way to prove a medium from nothing.
+# --------------------------------------------------------------------------- #
+MEDIUM_BUILD_CACHE_DIR="${MEDIUM_BUILD_CACHE_DIR:-}"
+MEDIUM_BUILD_CACHE_MAX_ENTRIES="${MEDIUM_BUILD_CACHE_MAX_ENTRIES:-4}"
+MEDIUM_BUILD_CACHE_SCHEMA="neural-ice-medium-build-cache-entry-v1"
+MEDIUM_BUILD_CACHE_KEY_SCHEMA="neural-ice-medium-build-cache-key-v1"
+# Set by the flow below: the key of this build's sealed store, the entry that
+# was reused (empty when nothing was), and the verity root hash it recorded.
+MEDIUM_CACHE_STORE_KEY=""
+MEDIUM_CACHE_STORE_HIT=""
+MEDIUM_CACHE_STORE_VERITY_HASH=""
+
+medium_cache_die() { echo "ERROR: medium build cache: $*" >&2; exit 1; }
+
+# The directory is validated the same way whether it is about to be read or
+# written. A cache inside the checkout would be committed, shipped or wiped by
+# the next `git clean`; one owned by somebody else is somebody else's choice of
+# store bytes.
+medium_cache_require_dir() {
+  local resolved
+  [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]] || return 0
+  [[ "$MEDIUM_BUILD_CACHE_DIR" = /* ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_DIR must be an absolute path: $MEDIUM_BUILD_CACHE_DIR"
+  [[ ! -L "$MEDIUM_BUILD_CACHE_DIR" ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_DIR is a symlink; a cache that can be repointed is not a cache: $MEDIUM_BUILD_CACHE_DIR"
+  [[ -d "$MEDIUM_BUILD_CACHE_DIR" ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_DIR is not an existing directory: $MEDIUM_BUILD_CACHE_DIR"
+  # WHERE it is, before WHO owns it: a directory in the checkout is refused for
+  # what it is, whatever its mode, and saying so is the useful message.
+  resolved="$(readlink -f -- "$MEDIUM_BUILD_CACHE_DIR")" \
+    || medium_cache_die "cannot resolve MEDIUM_BUILD_CACHE_DIR: $MEDIUM_BUILD_CACHE_DIR"
+  [[ "$resolved" != "$REPO_ROOT" && "$resolved" != "$REPO_ROOT"/* ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_DIR is inside the checkout ($REPO_ROOT); build products do not live in the source tree"
+  [[ "$(stat -c %u -- "$MEDIUM_BUILD_CACHE_DIR")" == "${EUID:-$(id -u)}" ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_DIR is not owned by the build user: $MEDIUM_BUILD_CACHE_DIR"
+  [[ "$(stat -c %a -- "$MEDIUM_BUILD_CACHE_DIR")" =~ ^[0-7]?[0-7]00$ ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_DIR is group- or world-accessible: $MEDIUM_BUILD_CACHE_DIR"
+  [[ "$MEDIUM_BUILD_CACHE_MAX_ENTRIES" =~ ^[1-9][0-9]{0,2}$ ]] \
+    || medium_cache_die "MEDIUM_BUILD_CACHE_MAX_ENTRIES must be an integer between 1 and 999, got: $MEDIUM_BUILD_CACHE_MAX_ENTRIES"
+}
+
+# THE KEY IS A DOCUMENT, not a concatenation. Every input that can change the
+# produced bytes is a named field, the rendering is canonical JSON, and the key
+# is its SHA-256 -- so an added input is a changed key rather than a collision
+# nobody notices. The two producer scripts are hashed rather than their options
+# enumerated: an option list copied here would be a second answer, and only one
+# of them would be the one that ran.
+medium_cache_store_key_document() { # -> canonical JSON on stdout
+  python3 - "$MEDIUM_BUILD_CACHE_KEY_SCHEMA" "$BASE_IMAGE" "$BASE_IMAGE_ID" \
+    "$BASE_MANIFEST_DIGEST" "$STORE_IMAGE_NAME" "$STORE_SOURCE_REF" \
+    "$(sha256_of "$REPO_ROOT/image/build-installer-root.sh")" \
+    "$(sha256_of "$REPO_ROOT/image/build-installer-payload.sh")" \
+    "$(sha256_of "$REPO_ROOT/image/lib/installer-payload.sh")" \
+    "$1" "$2" <<'PY'
+import json
+import sys
+
+(schema, base_image, image_id, manifest_digest, store_name, source_ref,
+ root_script, payload_script, payload_lib, mksquashfs, skopeo) = sys.argv[1:]
+document = {
+    "base_image": base_image,
+    "kind": "sealed-store",
+    "producer_sha256": {
+        "image/build-installer-payload.sh": payload_script,
+        "image/build-installer-root.sh": root_script,
+        "image/lib/installer-payload.sh": payload_lib,
+    },
+    "schema": schema,
+    "store_image_manifest_digest": manifest_digest,
+    "store_image_name": store_name,
+    "store_source_ref": source_ref,
+    "store_image_id": image_id,
+    "tool_versions": {"mksquashfs": mksquashfs, "skopeo": skopeo},
+}
+sys.stdout.write(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+}
+
+# The tool versions come from the SAME privilege the store build runs under
+# (`sudo env … bash image/build-installer-root.sh`), because that is the PATH
+# whose binaries will produce the bytes. A version that cannot be read is not
+# guessed and is not defaulted: the caller is told, and the cache is disabled
+# for this build so the full path runs. `mksquashfs` spells it `-version` and
+# `skopeo` spells it `--version`; both are tried and the first answer wins.
+medium_cache_tool_version() { # $1=tool name -> version string on stdout, or 1
+  local spelling output
+  for spelling in -version --version; do
+    output="$(sudo -n "$1" "$spelling" 2>/dev/null | head -1 | tr -d '\r\n')"
+    [[ -z "$output" ]] || { printf '%s' "$output"; return 0; }
+  done
+  return 1
+}
+
+# 🔴 THE ONE GATE THE CACHE CANNOT SATISFY BY ITSELF. `veritysetup format` in
+# image/build-installer-payload.sh has just recomputed the store's dm-verity
+# root hash over the bytes that are going onto the medium, with the fixed salt
+# and UUID that make the operation a pure function of them. It must equal the
+# value the cache entry recorded, or the reused extent is not the extent the
+# entry describes -- and the refusal lands here, before the UKI seals the
+# header digest that covers it.
+#
+# A function rather than an inline `[[ … ]]` so image/test-installer-media.sh
+# can lift it and RUN it: a comparison asserted only by grep is a comparison
+# whose refusal nobody has ever seen.
+medium_cache_assert_reused_verity() { # $1=recomputed $2=recorded -> 0 or 1
+  [[ "$1" == "$2" ]] && return 0
+  echo "ERROR: the reused sealed store recomputes dm-verity root hash ${1}, not the ${2} its cache entry records; refusing a medium built on bytes the cache cannot account for" >&2
+  return 1
+}
+
+# One entry is one directory, named by the key. `sealed-store/` keeps the kind
+# in the path so a future cached artefact cannot land on the same name.
+medium_cache_entry_dir() { # $1=key
+  printf '%s/sealed-store/%s' "$MEDIUM_BUILD_CACHE_DIR" "$1"
+}
+
+# READ AN ENTRY, OR SAY WHY NOT. Prints `field=value` lines on success; on
+# failure prints one NAMED reason on stderr and returns 1. A miss is never an
+# error: a build with a cold cache must run the full path, not stop.
+medium_cache_read_entry() { # $1=key -> field=value lines
+  local key=$1 entry image_path
+  entry="$(medium_cache_entry_dir "$key")"
+  if [[ ! -e "$entry" ]]; then
+    echo "    cache miss: no entry for key ${key:0:16}…" >&2
+    return 1
+  fi
+  if [[ -L "$entry" || ! -d "$entry" ]]; then
+    echo "    cache refused: entry ${key:0:16}… is not a plain directory" >&2
+    return 1
+  fi
+  if [[ "$(stat -c %u -- "$entry")" != "${EUID:-$(id -u)}" ]]; then
+    echo "    cache refused: entry ${key:0:16}… is not owned by the build user" >&2
+    return 1
+  fi
+  image_path="$entry/installer-store.img"
+  if [[ -L "$image_path" || ! -f "$image_path" || ! -s "$image_path" ]]; then
+    echo "    cache refused: entry ${key:0:16}… holds no plain, non-empty store image" >&2
+    return 1
+  fi
+  if [[ -L "$entry/entry.json" || ! -f "$entry/entry.json" ]]; then
+    echo "    cache refused: entry ${key:0:16}… has no provenance document (an unfinished or interrupted entry is never reused)" >&2
+    return 1
+  fi
+  python3 - "$entry/entry.json" "$key" "$MEDIUM_BUILD_CACHE_SCHEMA" <<'PY' || return 1
+import json
+import re
+import sys
+
+path, key, schema = sys.argv[1:]
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError) as error:
+    print(f"    cache refused: unreadable provenance document: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(document, dict):
+    print("    cache refused: the provenance document is not an object", file=sys.stderr)
+    raise SystemExit(1)
+if document.get("schema") != schema:
+    print(f"    cache refused: provenance schema is {document.get('schema')!r}, not {schema!r}",
+          file=sys.stderr)
+    raise SystemExit(1)
+if document.get("key") != key:
+    print("    cache refused: the entry records a different key than the directory it sits in",
+          file=sys.stderr)
+    raise SystemExit(1)
+required = {
+    "store_image_sha256": HEX64,
+    "store_image_id": HEX64,
+    "store_verity_hash": HEX64,
+    "store_image_manifest_digest": re.compile(r"^sha256:[0-9a-f]{64}$"),
+    "store_image_name": re.compile(r"^[a-z0-9]([a-z0-9._/-]{0,126}[a-z0-9])?$"),
+    "store_image_bytes": re.compile(r"^[1-9][0-9]*$"),
+}
+for field, pattern in required.items():
+    value = document.get(field)
+    if not isinstance(value, str) or not pattern.match(value):
+        print(f"    cache refused: provenance field {field!r} is missing or malformed",
+              file=sys.stderr)
+        raise SystemExit(1)
+    print(f"{field}={value}")
+PY
+}
+
+# STAGE: the produced store image is copied into an entry that is NOT yet
+# reusable. The verity root hash is not known until the payload step, and an
+# entry without it could not be re-verified -- so the directory carries no
+# entry.json until medium_cache_finalize writes one.
+#
+# `cp --reflink=auto` asks the filesystem for a copy-on-write clone and falls
+# back to a full copy when it cannot (cp(1), GNU coreutils). A hard link would
+# be wrong at any speed: image/build-installer-payload.sh pads the store image
+# IN PLACE, which through a shared inode would rewrite the cache entry.
+medium_cache_stage_store() { # $1=key $2=produced store image
+  local key=$1 produced=$2 entry
+  entry="$(medium_cache_entry_dir "$key")"
+  rm -rf -- "$entry"
+  mkdir -p -- "$entry" || medium_cache_die "cannot create the cache entry $entry"
+  chmod 0700 -- "$entry"
+  cp --reflink=auto -- "$produced" "$entry/installer-store.img" \
+    || medium_cache_die "cannot copy the sealed store into the cache entry $entry"
+  chmod 0600 -- "$entry/installer-store.img"
+}
+
+# FINALIZE: the entry becomes reusable only once every value a reuse re-checks
+# is recorded, including the dm-verity root hash the payload step measured.
+medium_cache_finalize_store() { # $1=key $2=key document $3..=facts
+  local key=$1 key_document=$2 entry
+  shift 2
+  entry="$(medium_cache_entry_dir "$key")"
+  [[ -d "$entry" && ! -L "$entry" ]] \
+    || medium_cache_die "the staged cache entry disappeared before it could be finalized: $entry"
+  python3 - "$entry/entry.json.partial" "$MEDIUM_BUILD_CACHE_SCHEMA" "$key" \
+    "$key_document" "${EUID:-$(id -u)}" "$@" <<'PY' \
+    || medium_cache_die "cannot render the cache entry's provenance document"
+import json
+import sys
+import time
+
+(path, schema, key, key_document, uid, image_sha256, image_bytes, image_id,
+ manifest_digest, image_name, verity_hash, verity_salt, verity_uuid) = sys.argv[1:]
+document = {
+    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "created_by_uid": int(uid),
+    "key": key,
+    "key_document": json.loads(key_document),
+    "kind": "sealed-store",
+    "producer": "image/build-installer-usb.sh",
+    "schema": schema,
+    "store_image_bytes": image_bytes,
+    "store_image_id": image_id,
+    "store_image_manifest_digest": manifest_digest,
+    "store_image_name": image_name,
+    "store_image_sha256": image_sha256,
+    "store_verity_hash": verity_hash,
+    "verity_salt": verity_salt,
+    "verity_uuid": verity_uuid,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  chmod 0600 -- "$entry/entry.json.partial"
+  mv -- "$entry/entry.json.partial" "$entry/entry.json" \
+    || medium_cache_die "cannot publish the cache entry's provenance document"
+}
+
+# BOUND THE CACHE. Entries are ~8 GiB each, so an unbounded cache fills the
+# build host's disk and the next build fails on ENOSPC in the middle of a
+# `veritysetup format`. The newest MEDIUM_BUILD_CACHE_MAX_ENTRIES survive,
+# ordered by the mtime of the provenance document -- i.e. by when the entry
+# became reusable, not by when its bytes were copied.
+#
+# An UNFINISHED entry is the residue of an interrupted build and costs ~8 GiB,
+# so it is evicted too -- but only once it is older than six hours. A media
+# build takes 22-35 minutes on the bench (FAB-0057, measured 2026-09-09), so
+# that bound cannot reach the staged entry of a build running beside this one,
+# and the current build's own key is excluded outright.
+medium_cache_prune() { # $1=this build's key
+  local root="$MEDIUM_BUILD_CACHE_DIR/sealed-store" doomed
+  [[ -d "$root" && ! -L "$root" ]] || return 0
+  while IFS= read -r doomed; do
+    [[ -n "$doomed" ]] || continue
+    echo "    cache: evicting entry $(basename -- "$doomed")"
+    rm -rf -- "$doomed"
+  done < <(python3 - "$root" "$MEDIUM_BUILD_CACHE_MAX_ENTRIES" "$1" <<'PY'
+import os
+import sys
+import time
+
+root, keep, current = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+UNFINISHED_GRACE_SECONDS = 6 * 3600
+now = time.time()
+entries = []
+with os.scandir(root) as scan:
+    for item in scan:
+        if not item.is_dir(follow_symlinks=False) or item.name == current:
+            continue
+        try:
+            entries.append((os.stat(os.path.join(item.path, "entry.json")).st_mtime_ns,
+                            item.path))
+        except OSError:
+            try:
+                staged = os.stat(item.path, follow_symlinks=False).st_mtime
+            except OSError:
+                continue
+            if now - staged > UNFINISHED_GRACE_SECONDS:
+                print(item.path)
+for _, path in sorted(entries, reverse=True)[keep:]:
+    print(path)
+PY
+  )
+}
+
+# --------------------------------------------------------------------------- #
 # 🔴 THE OFFLINE SEED, SEALED FOR *BOTH* INSTALL SOURCES.
 #
 # The three seed arguments used to be sealed only inside the `medium` arm,
@@ -438,6 +827,8 @@ cleanup_lab_baseline_stage() {
 trap cleanup_lab_baseline_stage EXIT
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: missing bib config $CONFIG" >&2; exit 1; }
+# The cache directory is judged before the 20-minute image build, not after it.
+medium_cache_require_dir
 [[ "$BASE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] \
   || { echo "ERROR: BASE_IMAGE is required as a digest-pinned OCI reference" >&2; exit 1; }
 [[ "$TARGET_IMGREF" =~ @sha256:[0-9a-f]{64}$ ]] \
@@ -557,7 +948,7 @@ fi
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
-echo "==> build installer image  FROM ${BASE_IMAGE}"
+ni_step "build installer image  FROM ${BASE_IMAGE}"
 if sudo podman image exists "$BASE_IMAGE"; then
   echo "    (using local content-addressed ${BASE_IMAGE})"
 else
@@ -757,7 +1148,48 @@ cmp -s "$SEALED_DIR/image-identity.fingerprints" "$HARDWARE_IDENTITY_FILE" \
 # THE SEALED IMAGES. One immutable squashfs for the installer root, one for the
 # containers-storage the install reads FROM.
 # --------------------------------------------------------------------------- #
-echo "==> build the sealed installer root and image store"
+# 🔴 THE CACHE DECISION IS MADE HERE, AFTER THE IDENTITIES ARE LIVE.
+#
+# $BASE_IMAGE_ID and $BASE_MANIFEST_DIGEST were resolved from podman a few lines
+# above, on this run. They are the key's identity fields AND the values a reused
+# entry is checked against, so a hit can only be an entry whose store is the one
+# THIS build selected. The key is computed only when the cache is enabled;
+# nothing below runs otherwise.
+MEDIUM_CACHE_STORE_KEY_DOCUMENT=""
+MEDIUM_CACHE_STORE_REUSE_ARGS=()
+if [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]]; then
+  medium_cache_mksquashfs_version="$(medium_cache_tool_version mksquashfs)" || medium_cache_mksquashfs_version=""
+  medium_cache_skopeo_version="$(medium_cache_tool_version skopeo)" || medium_cache_skopeo_version=""
+  if [[ -z "$medium_cache_mksquashfs_version" || -z "$medium_cache_skopeo_version" ]]; then
+    # NOT a silent downgrade and NOT a guess: an unreadable toolchain version
+    # means the key cannot state which tools made the bytes, so this build
+    # neither reads nor writes the cache and produces its store in full.
+    echo "    cache disabled for this build: cannot read the privileged mksquashfs/skopeo versions the store build would use" >&2
+    MEDIUM_BUILD_CACHE_DIR=""
+  else
+    MEDIUM_CACHE_STORE_KEY_DOCUMENT="$(medium_cache_store_key_document \
+      "$medium_cache_mksquashfs_version" "$medium_cache_skopeo_version")" \
+      || medium_cache_die "cannot render the sealed store cache key document"
+    MEDIUM_CACHE_STORE_KEY="$(printf '%s' "$MEDIUM_CACHE_STORE_KEY_DOCUMENT" | sha256sum | awk '{print tolower($1)}')"
+    [[ "$MEDIUM_CACHE_STORE_KEY" =~ ^[0-9a-f]{64}$ ]] \
+      || medium_cache_die "cannot compute the sealed store cache key"
+    echo "    sealed store cache key : ${MEDIUM_CACHE_STORE_KEY}"
+    if medium_cache_entry_facts="$(medium_cache_read_entry "$MEDIUM_CACHE_STORE_KEY")"; then
+      MEDIUM_CACHE_STORE_HIT="$MEDIUM_CACHE_STORE_KEY"
+      MEDIUM_CACHE_STORE_VERITY_HASH="$(sed -n 's/^store_verity_hash=//p' <<<"$medium_cache_entry_facts")"
+      MEDIUM_CACHE_STORE_REUSE_ARGS=(
+        STORE_IMAGE_REUSE="$(medium_cache_entry_dir "$MEDIUM_CACHE_STORE_KEY")/installer-store.img"
+        STORE_IMAGE_REUSE_SHA256="$(sed -n 's/^store_image_sha256=//p' <<<"$medium_cache_entry_facts")"
+        STORE_IMAGE_REUSE_BYTES="$(sed -n 's/^store_image_bytes=//p' <<<"$medium_cache_entry_facts")"
+        STORE_IMAGE_REUSE_IMAGE_ID="$(sed -n 's/^store_image_id=//p' <<<"$medium_cache_entry_facts")"
+        STORE_IMAGE_REUSE_MANIFEST_DIGEST="$(sed -n 's/^store_image_manifest_digest=//p' <<<"$medium_cache_entry_facts")"
+        STORE_IMAGE_REUSE_NAME="$(sed -n 's/^store_image_name=//p' <<<"$medium_cache_entry_facts")"
+      )
+      echo "    reusing the cached sealed store (re-hashed and re-identified below; its verity root hash is recomputed from the bytes at the payload step)"
+    fi
+  fi
+fi
+ni_step "build the sealed installer root and image store"
 sudo env \
   INSTALLER_IMG="$INSTALLER_IMAGE_REF" \
   STORE_IMG="$BASE_IMAGE_REF" \
@@ -769,6 +1201,7 @@ sudo env \
   STORE_MANIFEST_DIGEST="$BASE_MANIFEST_DIGEST" \
   STORE_SOURCE_REF="$STORE_SOURCE_REF" \
   STORE_SOURCE_CERT_DIR="$STORE_SOURCE_CERT_DIR" \
+  "${MEDIUM_CACHE_STORE_REUSE_ARGS[@]}" \
   bash "$REPO_ROOT/image/build-installer-root.sh" \
   || { echo "ERROR: cannot build the sealed installer root and store" >&2; exit 1; }
 sudo chown -R "$(id -u):$(id -g)" "$SEALED_DIR" 2>/dev/null || true
@@ -788,6 +1221,23 @@ sealed_store_manifest_digest="$(sed -n 's/^store_image_manifest_digest=//p' "$SE
   || { echo "ERROR: the sealed image store records manifest '${sealed_store_manifest_digest:-nothing}', not original host ${BASE_MANIFEST_DIGEST}" >&2; exit 1; }
 assert_installer_tag_unmoved "the sealed root and store build"
 assert_store_tag_unmoved "the sealed root and store build"
+SEALED_STORE_SHA256="$(sed -n 's/^store_image_sha256=//p' "$SEALED_ROOT_MANIFEST")"
+SEALED_STORE_BYTES="$(sed -n 's/^store_image_bytes=//p' "$SEALED_ROOT_MANIFEST")"
+[[ "$SEALED_STORE_SHA256" =~ ^[0-9a-f]{64}$ && "$SEALED_STORE_BYTES" =~ ^[1-9][0-9]*$ ]] \
+  || { echo "ERROR: the sealed root manifest records no usable store image size and digest" >&2; exit 1; }
+if [[ -n "$MEDIUM_CACHE_STORE_HIT" ]]; then
+  # The reused entry has already been re-hashed by image/build-installer-root.sh
+  # against the value recorded in the entry. Reading the manifest back here says
+  # the same thing about the manifest THIS build will hand downstream, which is
+  # the document every later step and the PRELOADED gate actually consume.
+  echo "    reused sealed store: ${SEALED_STORE_BYTES} bytes, sha256 ${SEALED_STORE_SHA256}"
+elif [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]]; then
+  # Stage BEFORE the payload step: image/build-installer-payload.sh pads the
+  # store image in place, and the entry must hold the bytes the sealed root
+  # manifest describes, not the padded ones.
+  medium_cache_stage_store "$MEDIUM_CACHE_STORE_KEY" "$SEALED_DIR/installer-store.img"
+  echo "    cache: staged the sealed store as entry ${MEDIUM_CACHE_STORE_KEY:0:16}… (not reusable until its verity root hash is measured)"
+fi
 
 # --------------------------------------------------------------------------- #
 # THE INITRAMFS THAT OPENS THEM. Built inside the installer image so it carries
@@ -801,7 +1251,7 @@ assert_store_tag_unmoved "the sealed root and store build"
 # code. A second parser would be a second answer, and only one of them would be
 # the one that was signed.
 # --------------------------------------------------------------------------- #
-echo "==> build the installer initramfs (dracut + neural-ice-installer-verity)"
+ni_step "build the installer initramfs (dracut + neural-ice-installer-verity)"
 DRACUT_VERITY_MODULE="$SEALED_DIR/dracut-module-verity"
 DRACUT_TPM_MODULE="$SEALED_DIR/dracut-module-tpm-policy"
 rm -rf -- "$DRACUT_VERITY_MODULE" "$DRACUT_TPM_MODULE"
@@ -861,7 +1311,7 @@ fi
 # SHA-256 is the single value the signature has to carry for every byte on the
 # medium to be authenticated.
 # --------------------------------------------------------------------------- #
-echo "==> assemble the sealed payload"
+ni_step "assemble the sealed payload"
 env \
   ROOT_IMAGE="$SEALED_DIR/installer-root.img" \
   STORE_IMAGE="$SEALED_DIR/installer-store.img" \
@@ -877,6 +1327,28 @@ PAYLOAD_BYTES="$(sed -n 's/^payload_bytes=//p' "$PAYLOAD_MANIFEST")"
   || { echo "ERROR: the payload build produced no usable manifest" >&2; exit 1; }
 echo "    sealed verity root hash : $ROOT_VERITY_HASH"
 echo "    sealed payload digest   : $PAYLOAD_DIGEST"
+
+# 🔴 THE STORE'S dm-verity ROOT HASH, RECOMPUTED FROM THE BYTES THAT ARE ON THE
+# MEDIUM. image/build-installer-payload.sh ran unchanged on the reused extent,
+# so this value comes out of a real `veritysetup format` over those exact bytes
+# -- not out of the cache. A cached store whose hash tree does not reproduce is
+# a refusal, and it is a refusal HERE, before the UKI seals the header digest.
+STORE_VERITY_HASH="$(sed -n 's/^store_verity_hash=//p' "$PAYLOAD_MANIFEST")"
+[[ "$STORE_VERITY_HASH" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: the payload build recorded no usable store verity root hash" >&2; exit 1; }
+if [[ -n "$MEDIUM_CACHE_STORE_HIT" ]]; then
+  medium_cache_assert_reused_verity "$STORE_VERITY_HASH" "$MEDIUM_CACHE_STORE_VERITY_HASH" \
+    || exit 1
+  echo "    cached store verity     : $STORE_VERITY_HASH (recomputed from the reused bytes, equals the entry)"
+elif [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]]; then
+  medium_cache_finalize_store "$MEDIUM_CACHE_STORE_KEY" "$MEDIUM_CACHE_STORE_KEY_DOCUMENT" \
+    "$SEALED_STORE_SHA256" "$SEALED_STORE_BYTES" "$BASE_IMAGE_ID" \
+    "$BASE_MANIFEST_DIGEST" "$STORE_IMAGE_NAME" "$STORE_VERITY_HASH" \
+    "$(sed -n 's/^verity_salt=//p' "$PAYLOAD_MANIFEST")" \
+    "$(sed -n 's/^verity_uuid=//p' "$PAYLOAD_MANIFEST")"
+  medium_cache_prune "$MEDIUM_CACHE_STORE_KEY"
+  echo "    cache: entry ${MEDIUM_CACHE_STORE_KEY:0:16}… is now reusable (store verity ${STORE_VERITY_HASH})"
+fi
 
 # --------------------------------------------------------------------------- #
 # ONE SIGNED UKI. `neuralice.autoinstall=1` is a property of a signature, not of
@@ -1118,7 +1590,7 @@ case "$MEDIA_MODE" in
       || { echo "ERROR: a Live medium installs nothing; an offline seed closure is meaningless on one" >&2; exit 1; }
     ;;
 esac
-echo "==> build the ${MEDIA_MODE} UKI"
+ni_step "build the ${MEDIA_MODE} UKI"
 env \
   KERNEL="$SEALED_DIR/vmlinuz" \
   INITRD="$SEALED_DIR/installer-initramfs.img" \
@@ -1158,7 +1630,7 @@ SEALED_MODE="$(ni_sealed_cmdline_classify "$SEALED_CMDLINE")" \
 [[ "$SEALED_MODE" == "$MEDIA_MODE" ]] \
   || { echo "ERROR: the sealed command line is a '${SEALED_MODE}' medium but this build was asked for '${MEDIA_MODE}'" >&2; exit 1; }
 echo "    sealed selector grammar : ${SEALED_MODE} (accepted by the same reader the medium boots with)"
-echo "==> bootc-image-builder --type raw  (${INSTALLER_IMAGE_REF})  config=${CONFIG}"
+ni_step "bootc-image-builder --type raw  (${INSTALLER_IMAGE_REF})  config=${CONFIG}"
 assert_installer_tag_unmoved "the immediate pre-bootc-image-builder binding"
 sudo podman run --rm --privileged --security-opt label=type:unconfined_t \
   -v /var/lib/containers/storage:/var/lib/containers/storage \
@@ -1180,7 +1652,7 @@ RAW="$OUT/image/disk.raw"
 # must not carry, and deleting FILES would leave their bytes on the medium.
 # Every one of the three partitions is therefore OVERWRITTEN, not edited.
 # --------------------------------------------------------------------------- #
-echo "==> replace the produced raw's boot content with the sealed medium"
+ni_step "replace the produced raw's boot content with the sealed medium"
 LOOP="$(sudo losetup --find --show -P "$RAW")"; sudo udevadm settle
 MNT=/mnt/ni-postproc
 cleanup(){
@@ -1332,6 +1804,7 @@ sudo umount "$MNT"; sudo losetup -d "$LOOP"
 cleanup_lab_baseline_stage
 trap - EXIT
 
+ni_step_summary
 echo "==> Sealed single-purpose medium (${MEDIA_MODE}):"
 echo "    EFI/BOOT/BOOTAA64.EFI  = ${UKI_NAME}.efi (signed UKI, the ONLY EFI authority)"
 echo "    verity root hash       : ${ROOT_VERITY_HASH}"
