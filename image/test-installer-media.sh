@@ -1466,6 +1466,12 @@ grep -Fq '"luks=0"' "$USB" \
   || fail "the media producer lets the inherited appliance crypttab race target encryption"
 grep -Fq 'UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")' "$USB" \
   || fail "the installer SSH key remains replaceable on mutable vfat instead of sealed in the UKI"
+# ...and sealed ONLY there. The runtime refuses a key carried on both the sealed
+# command line and the ESP (ota/neural-ice-autoinstall.sh step 1b); a producer
+# that stages the ESP copy next to the sealed karg cuts a medium that refuses
+# itself on hardware (bench medium, 2026-09-09).
+grep -Fq 'installer-ssh-key.sh" install' "$USB" \
+  && fail "the media producer stages the operator key on the ESP as well as in the sealed UKI"
 grep -Fq 'neuralice.live=1' "$USB" \
   || fail "the media producer does not seal an affirmative Live selector"
 grep -Fq 'PRESEAL_SET_DIR and PRESEAL_SET_SHA256 must be supplied together' "$USB" \

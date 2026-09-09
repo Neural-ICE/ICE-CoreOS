@@ -984,9 +984,14 @@ case "$MEDIA_MODE" in
       "neuralice.release_authority=${RELEASE_AUTHORITY}" \
       "neuralice.imgref=${TARGET_IMGREF}")
     if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
-      # The ESP copy is operator-visible convenience, not authority. Seal the
-      # already validated public key into the signed UKI so replacing mutable
-      # vfat bytes cannot choose who gains access to the installed appliance.
+      # THE ONE TRANSPORT OF THE OPERATOR KEY. The already validated public key
+      # is sealed into the signed UKI so replacing mutable vfat bytes cannot
+      # choose who gains access to the installed appliance -- and it is sealed
+      # ONLY there. The installer refuses a medium that also carries the key on
+      # the ESP (ota/neural-ice-autoinstall.sh, step 1b, "both the kernel
+      # command line and ESP"): two carriers of one secret-selecting input are
+      # two places to disagree, so the producer stages no ESP copy at all. A
+      # bench medium cut with both was refused on hardware on 2026-09-09.
       _sshkey_b64="$(base64 -w0 < "$SSH_AUTHORIZED_KEYS_FILE")"
       UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")
     fi
@@ -1269,10 +1274,6 @@ sudo install -m 0444 "$SEALED_DIR/$UKI_NAME.efi.manifest" \
   "$MNT/EFI/neural-ice/$UKI_NAME.efi.manifest"
 sudo cmp -s "$SEALED_DIR/$UKI_NAME.efi" "$MNT/EFI/BOOT/BOOTAA64.EFI" \
   || { echo "ERROR: the staged UKI differs from the one that was built" >&2; exit 1; }
-if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
-  sudo bash "$REPO_ROOT/image/lib/installer-ssh-key.sh" install \
-    "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" "$MNT"
-fi
 # 🔴 THE TWO FILES A REGISTRY MEDIUM CANNOT BOOT WITHOUT. Staged, then READ BACK
 # and re-hashed off the mounted ESP: the value sealed in the signature must be
 # the value of the bytes that ended up on the medium, not of the bytes this
