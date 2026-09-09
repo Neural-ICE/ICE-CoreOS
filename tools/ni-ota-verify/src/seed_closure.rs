@@ -401,9 +401,9 @@ struct Attachment {
     manifest_digest: String,
     media_type: String,
     layer_digests: Vec<String>,
-    artifact_type: String,
+    artifact_type: serde_json::Value,
     discovery: Discovery,
-    predicate_type: Option<String>,
+    predicate_type: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,7 +411,8 @@ struct Attachment {
 struct Discovery {
     cosign_tag: String,
     fallback_tag: String,
-    referrers_api: bool,
+    #[serde(rename = "referrers_api")]
+    _recorded_by_referrers_api: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,6 +453,17 @@ pub(crate) type VerifyBlob<'a> =
 fn decode_base64(value: &str) -> Result<Vec<u8>, Refusal> {
     // Reuse the audited codec/profile from the delegation verifier.
     crate::delegated::contract::decode_base64(value).map_err(Refusal)
+}
+
+fn decode_cosign_base64(value: &str) -> Result<Vec<u8>, Refusal> {
+    // Go's base64 decoder, used by Cosign, ignores CR/LF anywhere in the
+    // annotation. Fabric applies exactly that normalization before its strict
+    // decoder. Keep delegation and signed-document base64 canonical.
+    let normalized: String = value
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect();
+    decode_base64(&normalized)
 }
 
 fn signature_bytes(path: &Path) -> Result<Vec<u8>, Refusal> {
@@ -1334,8 +1346,8 @@ fn validate_simple_signing_payload(
     {
         return refuse("attestation payload type/identity/subject is not its closure claim");
     }
-    let facts = as_object(&root["optional"], "attestation optional")?;
     if let Some(expected) = optional {
+        let facts = as_object(&root["optional"], "attestation optional")?;
         if facts.len() != expected.len()
             || expected.iter().any(|(key, value)| {
                 facts.get(*key).and_then(serde_json::Value::as_str) != Some(*value)
@@ -1343,6 +1355,8 @@ fn validate_simple_signing_payload(
         {
             return refuse("attestation optional facts are not the exact vendor ingest facts");
         }
+    } else if !root["optional"].is_null() && !root["optional"].is_object() {
+        return refuse("attestation optional is neither null nor an object");
     }
     Ok(())
 }
@@ -1366,9 +1380,44 @@ fn attachment_payload(
         .pointer("/layers/0/annotations/dev.cosignproject.cosign~1signature")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| Refusal("attestation lacks cosign signature annotation".into()))?;
-    let der = decode_base64(annotation)?;
+    let der = decode_cosign_base64(annotation)?;
     crate::delegated::contract::validate_der_signature(&der).map_err(Refusal)?;
     Ok((payload, bytes, der))
+}
+
+fn validate_attachment_manifest_profile(
+    document: &serde_json::Map<String, serde_json::Value>,
+    attachment: &Attachment,
+) -> Result<(), Refusal> {
+    let closure_artifact_type = match &attachment.artifact_type {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.as_str()),
+        _ => return refuse("attachment artifact_type is not null or a string"),
+    };
+    if !matches!(
+        attachment.predicate_type,
+        serde_json::Value::Null | serde_json::Value::String(_)
+    ) {
+        return refuse("attachment predicate_type is not null or a string");
+    }
+    let manifest_artifact_type = match document.get("artifactType") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.as_str()),
+        Some(_) => return refuse("attachment manifest artifactType is invalid"),
+    };
+    if document
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+        || document
+            .get("mediaType")
+            .and_then(serde_json::Value::as_str)
+            != Some("application/vnd.oci.image.manifest.v1+json")
+        || manifest_artifact_type != closure_artifact_type
+    {
+        return refuse("attachment manifest profile differs from closure");
+    }
+    Ok(())
 }
 
 fn list_object_store(root: &Path) -> Result<BTreeSet<String>, Refusal> {
@@ -1792,7 +1841,6 @@ fn validate_closure(
             if attachment.discovery.cosign_tag != expected_tag
                 || attachment.discovery.fallback_tag
                     != format!("sha256-{}", digest_hex(&attachment.subject_digest)?)
-                || !attachment.discovery.referrers_api
             {
                 return refuse("attachment tag is not derived from its subject");
             }
@@ -1807,6 +1855,7 @@ fn validate_closure(
             let value: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| Refusal(format!("attachment manifest is not JSON: {e}")))?;
             let document = as_object(&value, "attachment manifest")?;
+            validate_attachment_manifest_profile(document, attachment)?;
             let config = as_object(
                 document
                     .get("config")
