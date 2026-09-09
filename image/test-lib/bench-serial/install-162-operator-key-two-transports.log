@@ -1,0 +1,7 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+[neural-ice-autoinstall] [1/8] Preflight — TPM2 OK; detecting live media, options and target disk (t+0s)
+[neural-ice-autoinstall] Live medium: /dev/vda (virtio) — sealed trust fields validated
+[neural-ice-autoinstall] FAILED in phase 1/8 (Preflight — TPM2 OK; detecting live media, options and target disk) [install-failed-preflight-and-trust-gate]: the installer carries operator SSH keys in both the kernel command line and ESP

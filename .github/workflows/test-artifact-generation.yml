@@ -36,6 +36,10 @@ on:
       - "ci/**"
       - "tools/ni-ota-verify/**"
       - "image/test-installer-systemd-lifecycle.sh"
+      # The bench rehearsal driver matches none of the globs above (it is neither
+      # build-* nor test-*), so a change touching only it would not run its own
+      # parser suite. Named here on purpose.
+      - "image/bench-rehearse-medium.sh"
       - "image/build-installer-usb.sh"
       - "image/lib/installer-ssh-key.sh"
       - "image/lib/access-policy.sh"
@@ -250,6 +254,7 @@ jobs:
             image/test-installer-ssh-key.sh image/test-installer-systemd-lifecycle.sh image/test-installer-trust.sh \
             image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
             image/test-preloaded-sizing.sh image/qualify-installer-qemu.sh image/test-qualify-installer-qemu.sh \
+            image/bench-rehearse-medium.sh image/test-bench-rehearse-medium.sh \
             image/test-registry-authorisation.sh image/test-release-authorization.sh \
             image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-signing-trust.sh image/test-status-screen.sh image/test-tpm-ceremony-systemd.sh \
             image/test-tpm-policy-initramfs.sh \
@@ -440,6 +445,11 @@ jobs:
           # reject contract) is offline; the harness itself runs only on the
           # KVM-capable GB10 host.
           ./image/test-qualify-installer-qemu.sh
+          # The bench rehearsal's serial-log parsers, over fixtures of the four
+          # real 2026-09-09 .67 failures and one success. The rehearsal itself
+          # boots a VM and runs only on the GB10 bench; this is the part of it
+          # that decides what the evidence MEANS, so it is proved here.
+          ./image/test-bench-rehearse-medium.sh
           ./image/test-content-cache-contract.py
           ./image/test-seed-firstboot-import.sh
           ./ota/test-autoinstall-kargs.sh

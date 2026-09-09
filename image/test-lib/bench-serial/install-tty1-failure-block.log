@@ -1,0 +1,24 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+[neural-ice-autoinstall] [1/8] Preflight — TPM2 OK; detecting live media, options and target disk (t+0s)
+
+  Neural ICE CoreOS — INSTALL FAILED
+  ----------------------------------------------------------------------
+  Nothing further will be attempted on this machine. There is no login,
+  no shell and no recovery console on a Neural ICE installation medium.
+  ----------------------------------------------------------------------
+
+  failure code       install-failed-preflight-and-trust-gate
+  stage              1 / 8
+  stage name         preflight-and-trust-gate
+  evidence           4b1d9a70c3e2
+  live PCR7          b7f0f2a4c1d6e8093a5b2c7d4e1f8a6b0c3d9e2f5a8b1c4d7e0f3a6b9c2d5e81
+  computed policy    f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4
+  verified count     2
+  verified policy    f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4
+  verified policy    0d1c2b3a49586776859493a2b1c0dfee0d1c2b3a49586776859493a2b1c0dfee
+  schema             neural-ice-installer-failure-evidence-v1
+
+  This machine will poweroff in 60 seconds.

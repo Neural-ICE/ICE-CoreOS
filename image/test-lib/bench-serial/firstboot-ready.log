@@ -1,0 +1,15 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+[    3.902001] systemd[1]: Starting Neural ICE mandatory TPM owner ceremony...
+neural-ice-status: Neural ICE CoreOS | OS 0.9.7 | image 4a1c9e02b7d3 | channel beta
+neural-ice-status: model NVIDIA_DGX_Spark | serial 1234567890
+neural-ice-status: [    ] Storage: waiting for the data volume
+neural-ice-status: [ .. ] Device trust: TPM owner ceremony running (12s)
+neural-ice-status: [ OK ] Storage: system + data unlocked (TPM2)
+neural-ice-status: [ OK ] Device trust: device trust: sealed
+neural-ice-status: [ OK ] Network: enP1s1 up 192.168.178.201 (rx 4.2 MiB)
+neural-ice-status: [ OK ] Images: 6/6 present
+neural-ice-status: [ OK ] Core services: 4/4 done
+neural-ice-status: READY -- login available

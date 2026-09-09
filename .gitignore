@@ -62,3 +62,6 @@ __pycache__/
 
 # Rust build artifacts (ni-ota-verify — Cargo.lock IS committed, the build must be hermetic)
 tools/ni-ota-verify/target/
+
+# Serial-console fixtures of the bench rehearsal parser are test inputs, not logs.
+!image/test-lib/bench-serial/*.log

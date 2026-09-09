@@ -1,0 +1,11 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+neural-ice-status: [ OK ] Storage: system + data unlocked (TPM2)
+neural-ice-status: [ .. ] Device trust: TPM owner ceremony running (29m58s)
+neural-ice-status: [FAIL] Device trust: ceremony did not complete
+neural-ice-status: [ OK ] Network: enP1s1 up 192.168.178.201 (rx 1.1 MiB)
+neural-ice-status: [    ] Images: 0/6 present
+neural-ice-status: [    ] Core services: 1/4 done
+neural-ice-status: FAILURE NI-E02 (TPM ceremony) unit=neural-ice-firstboot-tpm-ceremony.service serial=1234567890 -- contact Neural ICE support with this code and serial
