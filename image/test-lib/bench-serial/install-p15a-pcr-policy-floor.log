@@ -1,0 +1,12 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+[neural-ice-autoinstall] [1/8] Preflight — TPM2 OK; detecting live media, options and target disk (t+0s)
+[neural-ice-autoinstall] Live SHA-256 PCR7 = b7f0f2a4c1d6e8093a5b2c7d4e1f8a6b0c3d9e2f5a8b1c4d7e0f3a6b9c2d5e81
+[neural-ice-autoinstall] Live PCR7 PolicyPCR digest = f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4
+[neural-ice-autoinstall] Available signed PolicyPCR digests = f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4,0d1c2b3a49586776859493a2b1c0dfee0d1c2b3a49586776859493a2b1c0dfee
+[neural-ice-autoinstall] [1/8] done in 47s
+[neural-ice-autoinstall] [2/8] Partition + encrypt (GPT, 2× LUKS2, TPM2/PCR7 enroll) (t+47s)
+[neural-ice-autoinstall] Internal target disk = /dev/nvme0n1 (serial NIBENCHTARGET) — WIPING + ENCRYPTING in 5s…
+[neural-ice-autoinstall] FAILED in phase 2/8 (Partition + encrypt (GPT, 2× LUKS2, TPM2/PCR7 enroll)) [install-failed-partition-and-encrypt]: TPM refused to commit the activated PCR policy generation

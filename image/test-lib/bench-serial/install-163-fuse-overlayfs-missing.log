@@ -1,0 +1,7 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+[neural-ice-autoinstall] [1/8] Preflight — TPM2 OK; detecting live media, options and target disk (t+0s)
+[neural-ice-autoinstall] Live SHA-256 PCR7 = b7f0f2a4c1d6e8093a5b2c7d4e1f8a6b0c3d9e2f5a8b1c4d7e0f3a6b9c2d5e81
+[neural-ice-autoinstall] FAILED in phase 1/8 (Preflight — TPM2 OK; detecting live media, options and target disk) [install-failed-preflight-and-trust-gate]: bootc-container-source-unreadable: the container that will run bootc cannot read containers-storage:localhost/neural-ice-store:latest (fuse-overlayfs does not run in the bootc container); nothing has been written to the target disk

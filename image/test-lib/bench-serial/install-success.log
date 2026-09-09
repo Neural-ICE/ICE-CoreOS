@@ -1,0 +1,23 @@
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x000f0510]
+[    0.000000] Linux version 6.12.0-249.gb10.aarch64 (mockbuild@build)
+[    2.114003] systemd[1]: Detected virtualization qemu.
+[    2.882110] systemd[1]: Reached target neural-ice-installer.target.
+[neural-ice-autoinstall] [1/8] Preflight — TPM2 OK; detecting live media, options and target disk (t+0s)
+[neural-ice-autoinstall] Live SHA-256 PCR7 = b7f0f2a4c1d6e8093a5b2c7d4e1f8a6b0c3d9e2f5a8b1c4d7e0f3a6b9c2d5e81
+[neural-ice-autoinstall] Live PCR7 PolicyPCR digest = f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4
+[neural-ice-autoinstall] Available signed PolicyPCR digests = f064008d40a05956e631f57623a476b6be7a52ff9afe647cc5fc11d790f2a6f4,0d1c2b3a49586776859493a2b1c0dfee0d1c2b3a49586776859493a2b1c0dfee
+[neural-ice-autoinstall] [1/8] done in 51s
+[neural-ice-autoinstall] [2/8] Partition + encrypt (GPT, 2× LUKS2, TPM2/PCR7 enroll) (t+51s)
+[neural-ice-autoinstall] [2/8] done in 1m12s
+[neural-ice-autoinstall] [3/8] Prepare the target filesystem for the deployment (t+2m03s)
+[neural-ice-autoinstall] [3/8] done in 9s
+[neural-ice-autoinstall] [4/8] bootc install to-filesystem (encrypted root, source: containers-storage:localhost/neural-ice-store:latest, OTA origin: registry.neural-ice.local:5055/neural-ice/coreos) (t+2m12s)
+[neural-ice-autoinstall] [4/8] done in 6m40s
+[neural-ice-autoinstall] [5/8] Seed staging (verified offline release closure -> encrypted data volume) (t+8m52s)
+[neural-ice-autoinstall] [5/8] done in 4m02s
+[neural-ice-autoinstall] [6/8] Deployment prep + TPM device-root provisioning (t+12m54s)
+[neural-ice-autoinstall] [6/8] done in 38s
+[neural-ice-autoinstall] [7/8] SELinux labels (deployment /etc,/var,/boot + data volume, target policy) (t+13m32s)
+[neural-ice-autoinstall] [7/8] done in 1m47s
+[neural-ice-autoinstall] [8/8] Finalize — flush, close volumes, escrow recovery keys (t+15m19s)
+[neural-ice-autoinstall] [8/8] done — install completed in 15m41s total
