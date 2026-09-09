@@ -997,6 +997,11 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             if counts.get("quiet", 0) != 1:
                 raise SelectorRefusal("duplicate-word")
             continue
+        if word == "console=tty0":
+            # The one console word a LAB medium may seal; see the shell twin.
+            if counts.get("console", 0) != 1:
+                raise SelectorRefusal("duplicate-word")
+            continue
         if word == "rd.systemd.gpt_auto=0":
             # The signed initramfs supplies the one verified overlay root.
             if counts.get("rd.systemd.gpt_auto", 0) != 1:

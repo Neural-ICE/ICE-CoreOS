@@ -1507,6 +1507,16 @@ grep -Fq 'rd.systemd.gpt_auto=0' "$USB" \
   || fail "the media producer lets systemd-gpt-auto compete with its verified overlay root"
 grep -Fq '"luks=0"' "$USB" \
   || fail "the media producer lets the inherited appliance crypttab race target encryption"
+grep -Fq 'UKI_KARGS=("${CONSOLE_KARGS[@]}" "rd.systemd.gpt_auto=0"' "$USB" \
+  || fail "the media producer hardcodes quiet instead of taking the console words from MEDIA_VERBOSE_CONSOLE"
+grep -Fq 'MEDIA_VERBOSE_CONSOLE=1 is a LAB medium input' "$USB" \
+  || fail "the media producer lets a non-lab medium seal a verbose console"
+grep -Fq -- '--build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}"' "$USB" \
+  || fail "the media producer does not carry the verbose console into the installer image and its initramfs"
+grep -Fq 'CONSOLE_KARGS=("console=tty0")' "$USB" \
+  || fail "a verbose lab medium does not make the screen the kernel console"
+grep -Fq "kernel.printk = 7 4 1 7" "$ROOT/image/Containerfile.installer" \
+  || fail "the installer image does not raise the console printk level on a verbose lab medium"
 grep -Fq 'UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")' "$USB" \
   || fail "the installer SSH key remains replaceable on mutable vfat instead of sealed in the UKI"
 # ...and sealed ONLY there. The runtime refuses a key carried on both the sealed

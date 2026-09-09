@@ -73,6 +73,12 @@ BIB="${BIB:-quay.io/centos-bootc/bootc-image-builder:latest@sha256:2b52843ea2bfd
 # image's own immutable access policy, checked below and re-checked at install
 # time and at first boot — this staging step is a convenience, not the gate.
 SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
+# MEDIA_VERBOSE_CONSOLE=1 seals the line WITHOUT `quiet` so the kernel, dracut
+# and systemd narrate the boot on the console. A LAB bench input only: the
+# grammar accepts either form (`quiet` is optional), and a customer medium
+# keeps the quiet line. Introduced 2026-09-09 after a bench medium powered off
+# on hardware with nothing on the screen and nothing to read.
+MEDIA_VERBOSE_CONSOLE="${MEDIA_VERBOSE_CONSOLE:-0}"
 SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
 LAB_BASELINE_BOM_FILE="${LAB_BASELINE_BOM_FILE:-}"
 LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
@@ -495,6 +501,20 @@ case "$MEDIA_MODE" in
 esac
 SEALED_ACCESS_PROFILE="$(access_policy_for_variant "$VARIANT")" \
   || { echo "ERROR: no access policy is defined for VARIANT '$VARIANT'" >&2; exit 1; }
+[[ "$MEDIA_VERBOSE_CONSOLE" =~ ^[01]$ ]] \
+  || { echo "ERROR: MEDIA_VERBOSE_CONSOLE must be 0 or 1" >&2; exit 1; }
+[[ "$MEDIA_VERBOSE_CONSOLE" == 0 || "$SEALED_ACCESS_PROFILE" == lab-managed ]] \
+  || { echo "ERROR: MEDIA_VERBOSE_CONSOLE=1 is a LAB medium input; a ${SEALED_ACCESS_PROFILE} medium seals a quiet console" >&2; exit 1; }
+readonly MEDIA_VERBOSE_CONSOLE
+# The console words the sealed line opens with: `quiet` unless a LAB medium
+# asked to narrate its boot.
+# Verbose: no `quiet`, and the screen becomes the kernel console (console=tty0)
+# -- on the GB10 firmware the default console is the serial port named by the
+# ACPI SPCR table, so kernel, dracut and initramfs-gate output never reached the
+# screen (bench, 2026-09-09, four silent boots).
+CONSOLE_KARGS=()
+if [[ "$MEDIA_VERBOSE_CONSOLE" == 0 ]]; then CONSOLE_KARGS=("quiet"); else CONSOLE_KARGS=("console=tty0"); fi
+readonly -a CONSOLE_KARGS
 installer_trust_value_is_valid neuralice.hardware_target "$HARDWARE_TARGET" \
   || { echo "ERROR: HARDWARE_TARGET is required and must be a valid hardware target" >&2; exit 1; }
 [[ -f "$HARDWARE_IDENTITY_FILE" && ! -L "$HARDWARE_IDENTITY_FILE" ]] \
@@ -655,6 +675,7 @@ INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
 sudo podman build --pull=never --platform linux/arm64 \
   --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+  --build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
 # --------------------------------------------------------------------------- #
@@ -983,7 +1004,7 @@ case "$MEDIA_MODE" in
     DEVICE_CHANNEL="${DEVICE_CHANNEL:-lab}"
     [[ "$DEVICE_CHANNEL" =~ ^(lab|beta|stable)$ ]] \
       || { echo "ERROR: DEVICE_CHANNEL must be lab, beta or stable" >&2; exit 1; }
-    UKI_KARGS=("quiet" "rd.systemd.gpt_auto=0" "luks=0" "systemd.unit=neural-ice-installer.target" \
+    UKI_KARGS=("${CONSOLE_KARGS[@]}" "rd.systemd.gpt_auto=0" "luks=0" "systemd.unit=neural-ice-installer.target" \
       "neuralice.autoinstall=1" "enforcing=0" \
       "neuralice.device_channel=${DEVICE_CHANNEL}" \
       "neuralice.release_authority=${RELEASE_AUTHORITY}" \
@@ -1106,7 +1127,7 @@ case "$MEDIA_MODE" in
     # and its only permitted target. The early generator uses this closed pair
     # to suppress inherited installed-appliance lifecycles without inventing a
     # mutable menu/default path or opening a root login.
-    UKI_KARGS=("quiet" "rd.systemd.gpt_auto=0" "luks=0" \
+    UKI_KARGS=("${CONSOLE_KARGS[@]}" "rd.systemd.gpt_auto=0" "luks=0" \
       "systemd.unit=neural-ice-live.target" "neuralice.live=1")
     [[ "$INSTALL_SOURCE" == medium && -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
       || { echo "ERROR: a Live medium installs nothing; INSTALL_SOURCE/OS_IMAGE/INSTALL_MIRROR are meaningless on one" >&2; exit 1; }
