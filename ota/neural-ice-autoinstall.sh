@@ -3442,6 +3442,67 @@ readonly SEED_VERIFIED_ROOT
   || die "the release manifest hash of sealed closure ${SEED_CLOSURE} was never derived from the verified closure; refusing to continue"
 readonly SEED_MANIFEST_SHA256
 
+# --------------------------------------------------------------------------- #
+# 🔴 THE CONTAINER THAT RUNS bootc MUST BE ABLE TO READ ITS SOURCE — PROVED
+# HERE, BEFORE THE WIPE. Hardware, 2026-09-09: phase 4 died AFTER the wipe on
+# `resolving bound image …: OpenImage: overlay: can't stat program
+# "/usr/bin/fuse-overlayfs"`, and the machine was left without an OS.
+#
+# Two facts behind it. (1) The sealed store and the writable runtime store are
+# fuse-overlayfs stores (§1a, `.has-mount-program`), and the appliance image
+# that runs bootc ships libfuse3 but not the helper: the installer lends its
+# own helper to that one container, read-only. (2) bootc 1.16 resolves the
+# image's logically bound images at install time and no longer offers a skip
+# mode, while this appliance receives those images from the seed store on the
+# data volume (phase 5, `additionalimagestores`): the container therefore sees
+# an EMPTY bound-images.d, mounted over the image's own, which the installed
+# deployment keeps untouched.
+#
+# The same flags, mounts and image are then exercised once, non-destructively:
+# the helper runs, the bound-images view is empty, and the source reference is
+# readable through the container's storage — the exact three things phase 4
+# needs. A refusal here costs nothing.
+# --------------------------------------------------------------------------- #
+readonly BOOTC_HELPER_FUSE_OVERLAYFS=/usr/bin/fuse-overlayfs
+readonly BOOTC_BOUND_IMAGES_MASK=/run/neural-ice-installer/bootc-bound-images-masked
+[[ -x "$BOOTC_HELPER_FUSE_OVERLAYFS" && ! -L "$BOOTC_HELPER_FUSE_OVERLAYFS" ]] \
+  || die "bootc-container-source-unreadable: the installer has no $BOOTC_HELPER_FUSE_OVERLAYFS to lend the bootc container"
+rm -rf -- "$BOOTC_BOUND_IMAGES_MASK"
+install -d -m 0555 "$BOOTC_BOUND_IMAGES_MASK"
+[[ -z "$(ls -A -- "$BOOTC_BOUND_IMAGES_MASK")" ]] \
+  || die "bootc-container-source-unreadable: the bound-images mask directory is not empty"
+# `run --pull=never --rm --privileged` is audited verbatim by
+# ota/test-autoinstall-kargs.sh: the container is never a registry pull.
+bootc_container_base_args=(
+  --cgroup-manager=cgroupfs --events-backend=file run --pull=never --rm --privileged
+  --net=host --pid=host
+  --security-opt label=type:unconfined_t
+  -e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf
+  -v /dev:/dev -v /var/lib/containers:/var/lib/containers
+  -v "$STORE_MOUNT:$STORE_MOUNT:ro"
+  -v "$INSTALLER_STORAGE_ROOT:$INSTALLER_STORAGE_ROOT"
+  -v "$INSTALLER_STORAGE_CONF:/etc/containers/storage.conf:ro"
+  -v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro"
+  -v "$BOOTC_HELPER_FUSE_OVERLAYFS:$BOOTC_HELPER_FUSE_OVERLAYFS:ro"
+  -v "$BOOTC_BOUND_IMAGES_MASK:/usr/lib/bootc/bound-images.d:ro"
+)
+readonly -a bootc_container_base_args
+assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
+  local source=$1 seen
+  seen="$(podman "${bootc_container_base_args[@]}" --log-driver=passthrough \
+    "$STORE_IMAGE_NAME" sh -c '
+      set -e
+      [ -z "$(ls -A /usr/lib/bootc/bound-images.d)" ] || { echo "bound-images.d is not masked"; exit 1; }
+      /usr/bin/fuse-overlayfs --version >/dev/null 2>&1 || { echo "fuse-overlayfs does not run in the bootc container"; exit 1; }
+      skopeo inspect --raw "$1" >/dev/null || { echo "the source is not readable through the bootc container storage"; exit 1; }
+      echo BOOTC-CONTAINER-SOURCE-OK' sh "$source" 2>&1)" \
+    || die "bootc-container-source-unreadable: the container that will run bootc cannot read ${source} (${seen##*$'\n'}); nothing has been written to the target disk"
+  [[ "$seen" == *BOOTC-CONTAINER-SOURCE-OK* ]] \
+    || die "bootc-container-source-unreadable: the bootc container probe returned no proof for ${source}; nothing has been written to the target disk"
+  log "bootc container proved before the wipe: fuse-overlayfs lent, bound images masked (seed store provides them), source ${source} readable"
+}
+assert_bootc_container_reads_source "$source_imgref"
+
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 
@@ -3632,15 +3693,9 @@ fi
 # unit, verified after finalize below), and a mask would have been a permanent
 # karg disabling the very root-capable-extension gate the image installs.
 heartbeat_start "bootc install to-filesystem"
-podman --cgroup-manager=cgroupfs --events-backend=file run --pull=never --rm --privileged \
-  --net=host --log-driver=passthrough-tty --pid=host \
-  --security-opt label=type:unconfined_t \
-  -e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf \
-  -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
-  -v "$STORE_MOUNT:$STORE_MOUNT:ro" \
-  -v "$INSTALLER_STORAGE_ROOT:$INSTALLER_STORAGE_ROOT" \
-  -v "$INSTALLER_STORAGE_CONF:/etc/containers/storage.conf:ro" \
-  -v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro" \
+# The SAME container the pre-wipe proof exercised (bootc_container_base_args:
+# store, storage config, lent fuse-overlayfs helper, masked bound images).
+podman "${bootc_container_base_args[@]}" --log-driver=passthrough-tty \
   --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
   "$STORE_IMAGE_NAME" \
   bootc install to-filesystem \
