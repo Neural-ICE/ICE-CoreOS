@@ -35,11 +35,27 @@ if [[ -n "${NI_INSTALLER_GENERATOR_TESTING:-}" ]]; then
     || die "test overrides are forbidden in a privileged process"
   readonly CMDLINE_FILE="${NI_INSTALLER_GENERATOR_TEST_CMDLINE:?}"
   readonly GRAMMAR_FILE="${NI_INSTALLER_GENERATOR_TEST_GRAMMAR:?}"
+  # The two inputs of the mDNS branch are required only where that branch is
+  # reached: a suite that never seals a `.local` mirror need not provide them,
+  # and one that does and forgets them fails THERE, loudly, with avahi masked.
+  readonly NM_CONN_DIR="${NI_INSTALLER_GENERATOR_TEST_NM_CONN_DIR:-}"
+  readonly MDNS_RUN_DIR="${NI_INSTALLER_GENERATOR_TEST_MDNS_RUN_DIR:-}"
 else
   readonly CMDLINE_FILE=/proc/cmdline
   # Staged by image/Containerfile.installer next to the access policy it is a
   # sibling of: one immutable /usr, one definition of the sealed grammar.
   readonly GRAMMAR_FILE=/usr/lib/neural-ice/sealed-cmdline-grammar.sh
+  # The appliance's NetworkManager profiles, inherited by the installer image
+  # from its base and served from the dm-verity root at generator time (the
+  # overlay's tmpfs upper is still empty: nothing has run yet that could write
+  # to it). `mgmt-*.nmconnection` names the management port, by the same rule
+  # image/mdns/neural-ice-hostname-init.sh pins the appliance's own avahi to.
+  readonly NM_CONN_DIR=/etc/NetworkManager/system-connections
+  # Where the resolve-only avahi configuration is generated. Under /run, like
+  # everything else this generator writes; a directory of its own because
+  # /run/neural-ice-installer is created 0700 by the installer for material a
+  # daemon that drops to the `avahi` user must never be able to read.
+  readonly MDNS_RUN_DIR=/run/neural-ice-installer-mdns
 fi
 
 count_key() { # $1=kernel-command-line key
@@ -49,6 +65,12 @@ count_key() { # $1=kernel-command-line key
 
 count_word() { # $1=exact kernel-command-line word
   awk -v wanted="$1" 'BEGIN{n=0}{for(i=1;i<=NF;i++) if($i==wanted)n++}END{print n+0}' \
+    "$CMDLINE_FILE"
+}
+
+value_once() { # $1=key -> the value when the key occurs exactly once, else nothing
+  (( $(count_key "$1") == 1 )) || return 0
+  awk -v prefix="$1=" '{for(i=1;i<=NF;i++) if(index($i,prefix)==1) print substr($i, length(prefix)+1)}' \
     "$CMDLINE_FILE"
 }
 
@@ -328,6 +350,154 @@ After=NetworkManager.service network-online.target
 DROPIN
 }
 
+# --------------------------------------------------------------------------- #
+# 🔴 A MIRROR SEALED BY `.local` NAME MUST BE RESOLVABLE, AND ONLY RESOLVABLE
+# (FAB-0057 P1.1c, Owner decision 2026-09-09: media seal the LAN mirror by NAME,
+# `registry.neural-ice.local:5055`, and the bench announces that name in mDNS).
+#
+# WHAT THIS CLOSES. Measured 2026-09-09: the bench LAN's DNS answers NXDOMAIN for
+# the name, this generator masks avahi on every medium boot, and the installer
+# image carries no NSS module for mDNS at all -- so the READY fetch and the seed
+# pack fetch died on name resolution, and a medium sealed by IP had to be cut
+# for the day's hardware test. Neither systemd-resolved (not in the image: the
+# local systemd rebuild ships systemd/-libs/-pam/-udev only) nor nss-mdns (the
+# .67 journal: "No NSS support for mDNS detected") was available to fix it.
+#
+# THE DESIGN (variant A of the brief). image/Containerfile.installer adds
+# nss-mdns to the INSTALLER image only and routes `.local` names through
+# `mdns4_minimal`, which talks to avahi over its unix socket. This generator
+# takes avahi's two units back off the mask list, shadows the appliance ceremony
+# drop-in on them exactly as it does for NetworkManager, and starts the daemon
+# on a configuration IT writes under /run: `disable-publishing=yes` (no record
+# of any kind, not even the host's address), no HINFO, no workstation, no IPv6,
+# no D-Bus, no reflector, pinned to the management port. The installer image
+# never ANNOUNCES anything on a customer's LAN: it only asks one question.
+#
+# THE CONDITION is read off the sealed command line -- exactly one
+# `neuralice.mirror=` whose host ends in `.local` -- on a line the grammar has
+# already accepted as the exact Install grammar with `neuralice.source=registry`.
+# An IP or a non-`.local` name changes nothing: avahi stays masked, nothing is
+# written. The installer restates the condition against the same karg and
+# PROVES the resolution (getent under a timeout) before the READY fetch and
+# before the first disk write; a name that does not resolve is the named refusal
+# `mirror-name-unresolvable`, with the target disk untouched.
+#
+# The installed system is not touched by any of this: the installer image is a
+# derivation the appliance never inherits from, and nothing here outlives /run.
+# --------------------------------------------------------------------------- #
+readonly MIRROR_MDNS_DROPIN=20-neural-ice-mirror-mdns-resolve.conf
+readonly AVAHI_RESOLVE_ONLY_DROPIN=10-neural-ice-mirror-mdns-resolve-only.conf
+readonly -a MDNS_RESOLVER_UNITS=(
+  avahi-daemon.socket
+  avahi-daemon.service
+)
+
+mirror_host_is_mdns_name() { # $1=host[:port] -> 0 when the host is a `.local` mDNS name
+  local host=${1%%:*}
+  # The grammar has already bounded the value to lowercase labels; this is the
+  # `.local` suffix test and nothing looser, so `foo.local.example` is not it.
+  [[ "$host" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+local$ ]]
+}
+
+management_interfaces() { # -> comma-joined interface names of mgmt-*.nmconnection, or 1
+  local profile name
+  local -a names=()
+  shopt -s nullglob
+  for profile in "$NM_CONN_DIR"/mgmt-*.nmconnection; do
+    name="$(sed -n 's/^interface-name=//p' "$profile" | head -1)"
+    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || continue
+    names+=("$name")
+  done
+  shopt -u nullglob
+  (( ${#names[@]} > 0 )) || return 1
+  local IFS=,
+  printf '%s' "${names[*]}"
+}
+
+request_mirror_mdns_resolution() { # $1=sealed mirror host[:port]
+  local mirror=$1 interfaces
+  [[ -n "$NM_CONN_DIR" && -n "$MDNS_RUN_DIR" ]] \
+    || die "the sealed mirror ${mirror} is an mDNS name but the resolver inputs are unset (test overrides missing); avahi stays masked"
+  interfaces="$(management_interfaces)" \
+    || die "the sealed mirror ${mirror} is an mDNS name but no mgmt-*.nmconnection profile names a management port to resolve it on; avahi stays masked"
+  install -d -m 0755 "$MDNS_RUN_DIR"
+  # Every value below is a directive avahi-daemon.conf(5) documents. The daemon
+  # reads this file as root before dropping to `avahi`; it holds no secret.
+  cat > "$MDNS_RUN_DIR/avahi-daemon.conf" <<CONF
+# Neural ICE installer medium, generated into /run only.
+#
+# RESOLUTION ONLY. This boot's SIGNED command line seals the LAN mirror as the
+# mDNS name ${mirror}; nss-mdns asks this daemon for it and nothing else.
+# Publishing is disabled outright, so the medium announces no record of any
+# kind on the LAN -- not a host name, not an address, not a service.
+[server]
+use-ipv4=yes
+use-ipv6=no
+enable-dbus=no
+allow-interfaces=${interfaces}
+disallow-other-stacks=no
+ratelimit-interval-usec=1000000
+ratelimit-burst=1000
+
+[wide-area]
+enable-wide-area=no
+
+[publish]
+disable-publishing=yes
+disable-user-service-publishing=yes
+publish-addresses=no
+publish-hinfo=no
+publish-workstation=no
+publish-domain=no
+publish-aaaa-on-ipv4=no
+publish-a-on-ipv6=no
+
+[reflector]
+enable-reflector=no
+
+[rlimits]
+rlimit-nproc=3
+CONF
+  chmod 0644 "$MDNS_RUN_DIR/avahi-daemon.conf"
+  # The appliance's ceremony drop-in sits on both avahi units too
+  # (image/Containerfile.bootc); unmasked but not shadowed, they would fail their
+  # start transaction on the masked ceremony exactly as NetworkManager did.
+  neutralise_ceremony_dropin "${MDNS_RESOLVER_UNITS[@]}"
+  install -d -m 0755 "$EARLY_DIR/avahi-daemon.service.d"
+  cat > "$EARLY_DIR/avahi-daemon.service.d/$AVAHI_RESOLVE_ONLY_DROPIN" <<DROPIN
+# Neural ICE installer medium, generated into /run only.
+#
+# The vendor unit starts avahi on /etc/avahi/avahi-daemon.conf, which publishes
+# this host's address record: that is the appliance's job, never a medium's.
+# ExecStart= is reset and pointed at the resolve-only configuration this
+# generator wrote; Type=dbus is replaced because that configuration turns the
+# D-Bus interface off (nss-mdns uses the unix socket, not the bus).
+[Service]
+Type=simple
+BusName=
+ExecStart=
+ExecStart=/usr/sbin/avahi-daemon --syslog --file=${MDNS_RUN_DIR}/avahi-daemon.conf
+ExecReload=
+DROPIN
+  # ...and the installer asks for it, on this boot only.
+  install -d -m 0755 "$EARLY_DIR/neural-ice-autoinstall.service.d"
+  cat > "$EARLY_DIR/neural-ice-autoinstall.service.d/$MIRROR_MDNS_DROPIN" <<DROPIN
+# Neural ICE installer medium, generated into /run only.
+#
+# This boot's SIGNED command line seals a LAN mirror by mDNS name, so the
+# installer needs a resolver for it before its READY fetch. Wants=, not
+# Requires=: a resolver that fails to start must produce the installer's own
+# named refusal (mirror-name-unresolvable) with the target disk untouched, not
+# a systemd dependency failure before the installer has said anything.
+[Unit]
+Wants=avahi-daemon.socket avahi-daemon.service
+After=avahi-daemon.socket avahi-daemon.service
+DROPIN
+  # Last, and only now that everything the units need is in place: take the two
+  # masks this generator placed back off, and nothing else.
+  unmask_units "${MDNS_RESOLVER_UNITS[@]}"
+}
+
 neutralise_ceremony_dropin() {
   local unit
   for unit in "$@"; do
@@ -374,6 +544,12 @@ case "$MODE" in
     # fire on a line the grammar refused.
     if (( $(count_word "$REGISTRY_SOURCE_WORD") == 1 )); then
       request_registry_network
+      # ...and only a mirror sealed by `.local` NAME gets a resolver for it. The
+      # value is read back off the accepted line, exactly once or not at all.
+      sealed_mirror="$(value_once neuralice.mirror)"
+      if [[ -n "$sealed_mirror" ]] && mirror_host_is_mdns_name "$sealed_mirror"; then
+        request_mirror_mdns_resolution "$sealed_mirror"
+      fi
     fi
     ;;
   live)

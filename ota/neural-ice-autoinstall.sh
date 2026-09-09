@@ -1390,6 +1390,66 @@ readonly MIRROR_READY_PATH=/v2/_neural-ice/ready
 readonly MIRROR_READY_SCHEMA=neural-ice-mirror-ready-v1
 readonly MIRROR_READY_MAX_BYTES=4096
 
+# --------------------------------------------------------------------------- #
+# 🔴 A MIRROR SEALED BY `.local` NAME IS PROVED RESOLVABLE BEFORE IT IS USED
+# (FAB-0057 P1.1c, Owner decision 2026-09-09: media seal the mirror by NAME,
+# `registry.neural-ice.local:5055`, announced in mDNS by the bench).
+#
+# Measured 2026-09-09: the bench LAN's DNS answers NXDOMAIN for that name, the
+# medium's generator masked avahi, and the installer image had no NSS module for
+# mDNS -- so the READY fetch below and the seed-pack fetch died on resolution.
+# The installer image now carries nss-mdns and routes `.local` through a
+# resolve-only avahi the runtime generator starts for exactly this boot
+# (image/installer/neural-ice-installer-runtime-generator.sh); this block
+# restates the condition against the karg THIS script read, and PROVES the name
+# resolves -- bounded, before the READY fetch, before the first disk write --
+# instead of discovering it as a transport error. A name that does not resolve
+# is the named refusal `mirror-name-unresolvable`, with the machine as it was.
+#
+# The answer is unauthenticated (mDNS is): it decides only WHERE the medium
+# asks, never WHAT it accepts. Every byte that follows is still TLS-pinned to
+# the sealed CA, digest-pinned and signature-verified, so a spoofed answer can
+# only produce the refusals below.
+#
+# Bound: at most ATTEMPTS x TIMEOUT + (ATTEMPTS - 1) x PAUSE seconds (40 s).
+# --------------------------------------------------------------------------- #
+readonly MIRROR_NAME_UNRESOLVABLE=mirror-name-unresolvable
+readonly MIRROR_MDNS_RESOLVE_ATTEMPTS=6
+readonly MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS=5
+readonly MIRROR_MDNS_RESOLVE_PAUSE_SECONDS=2
+# nss-mdns talks to avahi on this unix socket (avahi-daemon.socket owns it). Its
+# absence is the most diagnostic failure: the resolver was never started.
+NEURALICE_AVAHI_SOCKET="$(ni_path NEURALICE_AVAHI_SOCKET /run/avahi-daemon/socket)"
+readonly NEURALICE_AVAHI_SOCKET
+
+mirror_host_is_mdns_name() { # $1=host[:port] -> 0 when the host is a `.local` mDNS name
+  local host=${1%%:*}
+  # The same test the runtime generator applies to the same sealed value: the
+  # `.local` suffix on lowercase labels, and nothing looser.
+  [[ "$host" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+local$ ]]
+}
+
+assert_mirror_name_resolves() { # $1=host[:port] -> logs the address, or dies by name
+  local host=${1%%:*} attempt answer address
+  [[ -S "$NEURALICE_AVAHI_SOCKET" ]] \
+    || die "${MIRROR_NAME_UNRESOLVABLE}: the LAN mirror ${host} is an mDNS name and the resolve-only avahi-daemon this medium's generator requests offers no socket at ${NEURALICE_AVAHI_SOCKET}; nothing has been written to the target disk"
+  for (( attempt = 1; attempt <= MIRROR_MDNS_RESOLVE_ATTEMPTS; attempt++ )); do
+    # `getent ahostsv4` is the NSS path curl, podman and skopeo take, so what is
+    # proved here is what they will get. A hung resolver is bounded, not waited on.
+    if answer="$(timeout --kill-after=2 "$MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS" getent ahostsv4 "$host" 2>/dev/null)"; then
+      address="$(awk 'NF >= 1 { print $1; exit }' <<<"$answer")"
+      if [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && "$address" != 0.0.0.0 ]]; then
+        log "LAN mirror ${host} resolves by mDNS (nss-mdns, resolve-only avahi on the management port) to ${address} on attempt ${attempt}/${MIRROR_MDNS_RESOLVE_ATTEMPTS}"
+        return 0
+      fi
+    fi
+    if (( attempt < MIRROR_MDNS_RESOLVE_ATTEMPTS )); then
+      sleep "$MIRROR_MDNS_RESOLVE_PAUSE_SECONDS"
+    fi
+  done
+  die "${MIRROR_NAME_UNRESOLVABLE}: the LAN mirror ${host} did not resolve by mDNS (nss-mdns via the resolve-only avahi-daemon on the management port) in ${MIRROR_MDNS_RESOLVE_ATTEMPTS} attempts of ${MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS}s; the bench must announce this name on the management LAN (lan-mirror-mdns.service) or the medium must seal an address; nothing has been written to the target disk"
+}
+
 esp_staged_file() { # $1=basename $2=expected sha256 $3=destination -> stages it or fails
   local name=$1 expected=$2 destination=$3 esp mountpoint mounted=0 observed
   esp="$(media_vfat_partition || true)"
@@ -2680,6 +2740,14 @@ if [[ -n "$INSTALL_MIRROR" ]]; then
   # the disk was gone. `--cacert` with no CA bundle fallback means an unpinned
   # host cannot answer, and the bounded read means a hostile one cannot answer at
   # length.
+  # 🔴 THE NAME IS PROVED BEFORE IT IS USED. A `.local` mirror is resolved by
+  # mDNS through the resolver this medium's generator started for this boot;
+  # an address or a unicast-DNS name changes nothing here. This is the first
+  # use of the mirror in this script, and it precedes the first disk write.
+  if mirror_host_is_mdns_name "$INSTALL_MIRROR"; then
+    assert_mirror_name_resolves "$INSTALL_MIRROR"
+  fi
+
   _mirror_ready_json=/run/neural-ice-installer/mirror-ready.json
   rm -f -- "$_mirror_ready_json"
   curl --silent --show-error --fail --max-time 30 --max-filesize "$MIRROR_READY_MAX_BYTES" \
