@@ -304,6 +304,23 @@ RUN set -euxo pipefail; \
 # closed by making the medium install the APPLIANCE image rather than its own --
 # which needs that image staged on the medium, and is the next change here.
 RUN rm -rf /usr/lib/bootc/bound-images.d
+# THE INSTALLER NEVER HANDS ITS CONSOLE TO THE GPU. The appliance base loads
+# nvidia_drm with KMS and its fbdev console so the installed system's TUI runs on
+# the GPU; an installation medium has no use for the GPU at all, and on the GB10
+# the handover from the firmware framebuffer (simpledrm) to nvidia-drm is exactly
+# where every line stopped on the bench on 2026-09-09 (console dead from t+10 s,
+# then a silent power-off). This file is the one the appliance's dracut
+# configuration also carries into the initramfs (91-neural-ice-nvidia-gsp.conf
+# install_items), so overwriting it here keeps BOTH the installer root and the
+# installer initramfs on the firmware framebuffer, readable on a KVM or a screen
+# from the first line to the last. The appliance image is this image's base and
+# is not touched.
+RUN printf '%s\n' \
+      '# Installer medium: keep the console on the firmware framebuffer (simpledrm).' \
+      '# The GPU driver may load; it must not take over KMS or the fbdev console.' \
+      'options nvidia_drm modeset=0 fbdev=0' \
+      > /usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf \
+    && grep -qx 'options nvidia_drm modeset=0 fbdev=0' /usr/lib/modprobe.d/90-neural-ice-nvidia-drm.conf
 
 # The grafted container signature policy is fail-closed and, by design, emits
 # only the `docker` transport (image/policy/render-container-policy.sh: it
