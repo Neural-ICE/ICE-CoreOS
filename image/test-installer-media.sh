@@ -1513,6 +1513,8 @@ grep -Fq 'MEDIA_VERBOSE_CONSOLE=1 is a LAB medium input' "$USB" \
   || fail "the media producer lets a non-lab medium seal a verbose console"
 grep -Fq -- '--build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}"' "$USB" \
   || fail "the media producer does not carry the verbose console into the installer image and its initramfs"
+grep -Fq 'CONSOLE_KARGS=("console=tty0")' "$USB" \
+  || fail "a verbose lab medium does not make the screen the kernel console"
 grep -Fq "kernel.printk = 7 4 1 7" "$ROOT/image/Containerfile.installer" \
   || fail "the installer image does not raise the console printk level on a verbose lab medium"
 grep -Fq 'UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")' "$USB" \

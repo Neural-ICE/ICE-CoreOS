@@ -508,8 +508,12 @@ SEALED_ACCESS_PROFILE="$(access_policy_for_variant "$VARIANT")" \
 readonly MEDIA_VERBOSE_CONSOLE
 # The console words the sealed line opens with: `quiet` unless a LAB medium
 # asked to narrate its boot.
+# Verbose: no `quiet`, and the screen becomes the kernel console (console=tty0)
+# -- on the GB10 firmware the default console is the serial port named by the
+# ACPI SPCR table, so kernel, dracut and initramfs-gate output never reached the
+# screen (bench, 2026-09-09, four silent boots).
 CONSOLE_KARGS=()
-if [[ "$MEDIA_VERBOSE_CONSOLE" == 0 ]]; then CONSOLE_KARGS=("quiet"); fi
+if [[ "$MEDIA_VERBOSE_CONSOLE" == 0 ]]; then CONSOLE_KARGS=("quiet"); else CONSOLE_KARGS=("console=tty0"); fi
 readonly -a CONSOLE_KARGS
 installer_trust_value_is_valid neuralice.hardware_target "$HARDWARE_TARGET" \
   || { echo "ERROR: HARDWARE_TARGET is required and must be a valid hardware target" >&2; exit 1; }

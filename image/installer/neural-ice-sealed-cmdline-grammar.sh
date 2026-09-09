@@ -437,6 +437,15 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
         (( ${seen[quiet]:-0} == 1 )) || { _ni_sealed_refuse duplicate-word; return 1; }
         continue
         ;;
+      console=tty0)
+        # The ONE console word a LAB medium may seal (MEDIA_VERBOSE_CONSOLE=1):
+        # the kernel, dracut and the initramfs gates then write on the screen,
+        # which on the GB10 firmware is otherwise not the kernel console (its
+        # ACPI SPCR names the serial port). Exactly this value: no other device,
+        # no baud rate, nothing a serial or network console could be steered to.
+        (( ${seen[console]:-0} == 1 )) || { _ni_sealed_refuse duplicate-word; return 1; }
+        continue
+        ;;
       rd.systemd.gpt_auto=0)
         # The signed initramfs mounts its own dm-verity-backed overlay at
         # /sysroot. systemd-gpt-auto must not race it or wait for a second root.
