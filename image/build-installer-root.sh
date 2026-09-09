@@ -67,6 +67,43 @@ STORE_SOURCE_REF="${STORE_SOURCE_REF:-}"
 STORE_SOURCE_CERT_DIR="${STORE_SOURCE_CERT_DIR:-}"
 MANIFEST_OUT="${MANIFEST_OUT:-${ROOT_IMAGE_OUT}.manifest}"
 
+# --------------------------------------------------------------------------- #
+# 🔴 THE ALREADY-BUILT STORE (FAB-0057 P1.7). The store is a containers-storage
+# holding exactly ONE image, named by a digest. Two media cut for two edits of
+# the installer root therefore carry byte-identical stores, and producing it
+# twice costs a `skopeo copy` of ~8 GiB plus a single-threaded zstd-19
+# `mksquashfs` over the result.
+#
+# The caller (image/build-installer-usb.sh) may hand that extent back instead,
+# with the facts a previous build recorded about it. It is a SIX-VALUE TUPLE and
+# it is refused in both directions: a path with no facts is bytes nothing
+# describes, and facts with no path describe nothing. The installer ROOT is
+# never reusable and has no equivalent -- it is what a change to this tree
+# changes.
+#
+# What is re-proved before a reused byte reaches the payload:
+#   * the input is a plain, non-empty, non-symlink file;
+#   * it is COPIED to $STORE_IMAGE_OUT and the COPY is re-hashed. Hashing the
+#     source and then copying it would hash bytes that no longer have to be the
+#     bytes that landed;
+#   * the copy's size and SHA-256 equal the recorded ones;
+#   * the recorded identity -- config ID, platform manifest digest, store image
+#     name -- equals the identity THIS invocation was independently given, which
+#     the caller resolved live from the digest-pinned base image with podman.
+#
+# What it does NOT re-prove: that these bytes contain that image. That was
+# derived by the build that produced them, from the staged store's images.json
+# and podman's own readback, and is carried forward by the SHA-256. The cache
+# is therefore only ever as trustworthy as its directory, which the caller
+# requires to be the build user's own, unshared and outside the checkout.
+# --------------------------------------------------------------------------- #
+STORE_IMAGE_REUSE="${STORE_IMAGE_REUSE:-}"
+STORE_IMAGE_REUSE_SHA256="${STORE_IMAGE_REUSE_SHA256:-}"
+STORE_IMAGE_REUSE_BYTES="${STORE_IMAGE_REUSE_BYTES:-}"
+STORE_IMAGE_REUSE_IMAGE_ID="${STORE_IMAGE_REUSE_IMAGE_ID:-}"
+STORE_IMAGE_REUSE_MANIFEST_DIGEST="${STORE_IMAGE_REUSE_MANIFEST_DIGEST:-}"
+STORE_IMAGE_REUSE_NAME="${STORE_IMAGE_REUSE_NAME:-}"
+
 # Tool overrides exist so the suite can drive every branch without podman, a
 # 10 GiB image or 4 GiB of scratch. Refused under a privileged process, exactly
 # as in build-installer-uki.sh and the device-root helper.
@@ -109,6 +146,43 @@ EXPECTED_STORE_IMAGE_ID="${STORE_IMG#sha256:}"
 [[ "$STORE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || die "STORE_MANIFEST_DIGEST must be the observed immutable platform manifest digest"
 readonly EXPECTED_STORE_IMAGE_ID STORE_MANIFEST_DIGEST
+
+# The reuse tuple is validated HERE, before podman is asked for anything: a
+# half-supplied tuple must never reach the point where it could be interpreted.
+store_reuse_supplied=0
+for reuse_value in "$STORE_IMAGE_REUSE" "$STORE_IMAGE_REUSE_SHA256" \
+  "$STORE_IMAGE_REUSE_BYTES" "$STORE_IMAGE_REUSE_IMAGE_ID" \
+  "$STORE_IMAGE_REUSE_MANIFEST_DIGEST" "$STORE_IMAGE_REUSE_NAME"; do
+  [[ -z "$reuse_value" ]] || store_reuse_supplied=$((store_reuse_supplied + 1))
+done
+case "$store_reuse_supplied" in
+  0) ;;
+  6)
+    [[ "$STORE_IMAGE_REUSE" = /* ]] \
+      || die "STORE_IMAGE_REUSE must be an absolute path: $STORE_IMAGE_REUSE"
+    [[ -f "$STORE_IMAGE_REUSE" && ! -L "$STORE_IMAGE_REUSE" && -s "$STORE_IMAGE_REUSE" ]] \
+      || die "STORE_IMAGE_REUSE is missing, empty, or not a plain file: $STORE_IMAGE_REUSE"
+    [[ "$STORE_IMAGE_REUSE_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+      || die "STORE_IMAGE_REUSE_SHA256 must be a lowercase SHA-256: $STORE_IMAGE_REUSE_SHA256"
+    [[ "$STORE_IMAGE_REUSE_BYTES" =~ ^[1-9][0-9]*$ ]] \
+      || die "STORE_IMAGE_REUSE_BYTES must be a positive byte count: $STORE_IMAGE_REUSE_BYTES"
+    # 🔴 THE REUSED STORE MUST BE THE STORE THIS BUILD SELECTED. The three
+    # identity values below were resolved live from the digest-pinned base image
+    # by the caller; an entry recorded around any other image is refused before
+    # a byte is copied, so a stale cache cannot substitute the appliance a
+    # medium installs.
+    [[ "$STORE_IMAGE_REUSE_IMAGE_ID" == "$EXPECTED_STORE_IMAGE_ID" ]] \
+      || die "the reusable store records image $STORE_IMAGE_REUSE_IMAGE_ID, but this build selected $EXPECTED_STORE_IMAGE_ID"
+    [[ "$STORE_IMAGE_REUSE_MANIFEST_DIGEST" == "$STORE_MANIFEST_DIGEST" ]] \
+      || die "the reusable store records manifest $STORE_IMAGE_REUSE_MANIFEST_DIGEST, but this build selected $STORE_MANIFEST_DIGEST"
+    [[ "$STORE_IMAGE_REUSE_NAME" == "$STORE_IMAGE_NAME" ]] \
+      || die "the reusable store offers the image as '$STORE_IMAGE_REUSE_NAME', but this build installs from '$STORE_IMAGE_NAME'"
+    ;;
+  *)
+    die "reusing a store requires all six of STORE_IMAGE_REUSE, _SHA256, _BYTES, _IMAGE_ID, _MANIFEST_DIGEST and _NAME; a half-described extent is bytes nothing accounts for"
+    ;;
+esac
+readonly STORE_IMAGE_REUSE STORE_IMAGE_REUSE_SHA256 STORE_IMAGE_REUSE_BYTES
 
 PODMAN_BIN="$(tool podman)"
 MOUNTPOINT_BIN="$(tool mountpoint)"
@@ -216,6 +290,36 @@ ROOT_IMAGE_BYTES="$(wc -c < "$ROOT_IMAGE_OUT" | tr -d '[:space:]')"
 # 2) The store the install reads FROM, staged as a containers-storage and then
 #    frozen into its own squashfs.
 # --------------------------------------------------------------------------- #
+if [[ -n "$STORE_IMAGE_REUSE" ]]; then
+  echo "==> reusing an already-built ${STORE_IMAGE_NAME} store image"
+  rm -f -- "$STORE_IMAGE_OUT"
+  # --reflink=auto: a copy-on-write clone where the filesystem supports one, a
+  # full copy otherwise (cp(1), GNU coreutils). Never a hard link: the payload
+  # assembler pads this file in place, which through a shared inode would
+  # rewrite the cache entry it was reused from.
+  "$(tool cp)" --reflink=auto -- "$STORE_IMAGE_REUSE" "$STORE_IMAGE_OUT" \
+    || die "cannot place the reusable store image at $STORE_IMAGE_OUT"
+  [[ -f "$STORE_IMAGE_OUT" && ! -L "$STORE_IMAGE_OUT" ]] \
+    || die "the reusable store image did not land as a plain file at $STORE_IMAGE_OUT"
+  # 🔴 THE COPY IS WHAT IS HASHED. Hashing $STORE_IMAGE_REUSE and then copying
+  # it would prove something about bytes that no longer have to be the bytes
+  # the payload will seal; these two lines measure the extent this build uses.
+  STORE_IMAGE_SHA256="$(sha256_of "$STORE_IMAGE_OUT")"
+  STORE_IMAGE_BYTES="$(wc -c < "$STORE_IMAGE_OUT" | tr -d '[:space:]')"
+  [[ "$STORE_IMAGE_BYTES" == "$STORE_IMAGE_REUSE_BYTES" ]] \
+    || die "the reused store image is $STORE_IMAGE_BYTES bytes, not the $STORE_IMAGE_REUSE_BYTES it is recorded as; refusing to seal an extent nothing accounts for"
+  [[ "$STORE_IMAGE_SHA256" == "$STORE_IMAGE_REUSE_SHA256" ]] \
+    || die "the reused store image hashes to $STORE_IMAGE_SHA256, not the recorded $STORE_IMAGE_REUSE_SHA256; refusing to seal an extent nothing accounts for"
+  STORE_IMAGE_ID="$STORE_IMAGE_REUSE_IMAGE_ID"
+  STORE_IMAGE_MANIFEST_DIGEST="$STORE_IMAGE_REUSE_MANIFEST_DIGEST"
+  echo "    reused store image: $STORE_IMAGE_BYTES bytes, sha256 $STORE_IMAGE_SHA256"
+  echo "    reused store holds: image $STORE_IMAGE_ID, manifest $STORE_IMAGE_MANIFEST_DIGEST, offered as $STORE_IMAGE_NAME"
+  podman_run image umount "sha256:$INSTALLER_IMAGE_ID" >/dev/null 2>&1 || true
+  MOUNTED=""
+else
+# The staging arm below is deliberately NOT re-indented under this `else`: it is
+# unchanged code, and re-indenting it would turn a reviewable 30-line addition
+# into a 70-line diff in which the one line that matters is hard to find.
 echo "==> staging ${STORE_IMAGE_NAME} into a containers-storage"
 STORE_TREE="$WORK/store"
 mkdir -p -- "$STORE_TREE" "$WORK/runroot"
@@ -321,6 +425,7 @@ STORE_IMAGE_BYTES="$(wc -c < "$STORE_IMAGE_OUT" | tr -d '[:space:]')"
 
 podman_run image umount "sha256:$INSTALLER_IMAGE_ID" >/dev/null 2>&1 || true
 MOUNTED=""
+fi
 
 # --------------------------------------------------------------------------- #
 # 3) The manifest CI diffs. A changed image must show up as a one-line diff

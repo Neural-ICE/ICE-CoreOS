@@ -475,6 +475,307 @@ compose_seal medium "$compose_mismatch_root" 'PRESEAL_STAGE_ROOT=""' \
 
 echo "  composed medium: producer and installer both reconcile the seed with the preseal release"
 
+# --------------------------------------------------------------------------- #
+# 🔴 THE OPT-IN CONTENT CACHE (FAB-0057 P1.7), DRIVEN AGAINST THE PRODUCER'S OWN
+# FUNCTIONS.
+#
+# Four media were cut on the bench on 2026-09-09, each for one edit of
+# ota/neural-ice-autoinstall.sh, and each rebuilt the sealed store: a `skopeo
+# copy` of ~8 GiB plus a single-threaded zstd-19 `mksquashfs` over the result,
+# for a change the store cannot depend on. The producer may now hand that extent
+# back -- and the whole question is whether it can do so without weakening a
+# proof.
+#
+# The functions are LIFTED from image/build-installer-usb.sh, the way the
+# composed-medium section above lifts `seal_offline_seed_kargs`: this suite runs
+# the code the build host runs, not a paraphrase of it. It needs bash, python3
+# and sha256sum only, so it lives ABOVE the sealed-medium fixture, which `exit
+# 0`s on a host without veritysetup -- a cache control that disappeared with a
+# fixture would be a control nobody notices the loss of.
+#
+# WHERE THE BYTE-LEVEL SABOTAGE IS PROVED: image/test-build-installer-root.sh
+# section 8. The re-hash of a reused extent happens inside
+# image/build-installer-root.sh, on the COPY it makes, and that suite drives the
+# real script. What is proved HERE is everything the producer decides on its own
+# side: which entries it will read at all, and the one comparison a cache can
+# never satisfy by itself.
+# --------------------------------------------------------------------------- #
+CACHE="$TMP/cache-lift"; mkdir -p "$CACHE"
+# The lift cannot be the `awk '/^name() {/,/^}$/'` this file uses elsewhere:
+# these functions embed python heredocs whose dict literals close with a `}` in
+# the first column, and that range would cut each function in half and produce a
+# file that only LOOKS like the producer. The extractor below tracks the
+# heredocs, so what is sourced is the whole function or nothing.
+CACHE_FUNCTIONS=(sha256_of medium_cache_die medium_cache_require_dir
+  medium_cache_store_key_document medium_cache_assert_reused_verity
+  medium_cache_entry_dir medium_cache_read_entry medium_cache_stage_store
+  medium_cache_finalize_store medium_cache_prune)
+python3 - "$BUILDER" "$CACHE/cache.sh" "${CACHE_FUNCTIONS[@]}" <<'PYEOF' \
+  || fail "cannot lift the media producer's content-cache functions"
+import re
+import sys
+
+source = open(sys.argv[1], encoding="utf-8").read().splitlines()
+extracted = []
+for name in sys.argv[3:]:
+    opening = f"{name}() {{"
+    starts = [index for index, line in enumerate(source) if line.startswith(opening)]
+    if len(starts) != 1:
+        raise SystemExit(f"the media producer defines {name} {len(starts)} times")
+    start = starts[0]
+    heredoc = None
+    for index in range(start, len(source)):
+        line = source[index]
+        extracted.append(line)
+        if heredoc is not None:
+            if line.strip() == heredoc:
+                heredoc = None
+            continue
+        opened = re.search(r"<<-?'([A-Za-z_][A-Za-z0-9_]*)'", line)
+        if opened:
+            heredoc = opened.group(1)
+            continue
+        if index > start and line == "}":
+            break
+    else:
+        raise SystemExit(f"{name} has no closing brace in the media producer")
+    extracted.append("")
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(extracted) + "\n")
+PYEOF
+for cache_function in "${CACHE_FUNCTIONS[@]}"; do
+  grep -q "^${cache_function}()" "$CACHE/cache.sh" \
+    || fail "the media producer no longer defines ${cache_function}; the cache would be untested"
+done
+bash -n "$CACHE/cache.sh" \
+  || fail "the lifted content-cache functions do not parse; the cases below would prove nothing"
+
+# Variables are consumed by the exact production functions sourced below.
+# shellcheck disable=SC2034
+cache_run() { # [ENV=VALUE …] -- function args…   -> runs one lifted function
+  local -a assignments=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do assignments+=("$1"); shift; done
+  shift
+  (
+    set -uo pipefail
+    REPO_ROOT="$ROOT"
+    MEDIUM_BUILD_CACHE_DIR="$CACHE/store"
+    MEDIUM_BUILD_CACHE_MAX_ENTRIES=4
+    MEDIUM_BUILD_CACHE_SCHEMA="neural-ice-medium-build-cache-entry-v1"
+    MEDIUM_BUILD_CACHE_KEY_SCHEMA="neural-ice-medium-build-cache-key-v1"
+    BASE_IMAGE="registry.example.test/neural-ice/appliance@sha256:$(printf '%064d' 1)"
+    BASE_IMAGE_ID="$(printf '%064d' 2)"
+    BASE_MANIFEST_DIGEST="sha256:$(printf '%064d' 3)"
+    STORE_IMAGE_NAME=localhost/bootc
+    STORE_SOURCE_REF=""
+    for assignment in "${assignments[@]+"${assignments[@]}"}"; do eval "$assignment"; done
+    # shellcheck source=/dev/null
+    . "$CACHE/cache.sh"
+    "$@"
+  )
+}
+
+mkdir -p "$CACHE/store"; chmod 0700 "$CACHE/store"
+
+# 1) THE KEY IS A DOCUMENT, AND EVERY INPUT THAT CAN CHANGE THE BYTES IS IN IT.
+cache_key() { cache_run "$@" -- medium_cache_store_key_document mksquashfs-4.6 skopeo-1.13.3; }
+cache_key_baseline="$(cache_key)" || fail "the cache key document could not be rendered"
+python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["schema"]=="neural-ice-medium-build-cache-key-v1" and d["kind"]=="sealed-store" else 1)' \
+  <<<"$cache_key_baseline" || fail "the cache key document is not the declared schema"
+[ "$cache_key_baseline" = "$(cache_key)" ] \
+  || fail "two renderings of the same inputs produced different cache keys"
+for cache_changed_input in \
+  "BASE_IMAGE=registry.example.test/neural-ice/appliance@sha256:$(printf '%064d' 9)" \
+  "BASE_IMAGE_ID=$(printf '%064d' 9)" \
+  "BASE_MANIFEST_DIGEST=sha256:$(printf '%064d' 9)" \
+  "STORE_IMAGE_NAME=localhost/something-else" \
+  "STORE_SOURCE_REF=docker://mirror.test:5055/x@sha256:$(printf '%064d' 9)"; do
+  [ "$(cache_key "$cache_changed_input")" != "$cache_key_baseline" ] \
+    || fail "changing '$cache_changed_input' did not change the cache key"
+done
+# ...including the tool versions and the producer scripts themselves. The three
+# scripts are HASHED rather than their mksquashfs/veritysetup options copied
+# here: an option list copied into a key would be a second answer, and only one
+# of them would be the one that ran.
+[ "$(cache_run -- medium_cache_store_key_document mksquashfs-4.7 skopeo-1.13.3)" \
+  != "$cache_key_baseline" ] \
+  || fail "a different mksquashfs version did not change the cache key"
+[ "$(cache_run -- medium_cache_store_key_document mksquashfs-4.6 skopeo-1.21.0)" \
+  != "$cache_key_baseline" ] \
+  || fail "a different skopeo version did not change the cache key"
+for cache_producer in image/build-installer-root.sh image/build-installer-payload.sh \
+  image/lib/installer-payload.sh; do
+  grep -Fq "\"$cache_producer\":" <<<"$cache_key_baseline" \
+    || fail "the cache key does not pin $cache_producer, whose code decides the cached bytes"
+  cache_recorded="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["producer_sha256"][sys.argv[1]])' \
+    "$cache_producer" <<<"$cache_key_baseline")"
+  [ "$cache_recorded" = "$(sha256sum "$ROOT/$cache_producer" | awk '{print tolower($1)}')" ] \
+    || fail "the cache key records a stale hash for $cache_producer"
+done
+
+# 2) THE DIRECTORY. A cache that can be repointed, that somebody else owns, that
+#    anybody can write, or that lives in the checkout is not a cache.
+cache_dir_case() { # $1=label $2=directory [MAX=…]
+  cache_run "MEDIUM_BUILD_CACHE_DIR=$2" "${3:-MEDIUM_BUILD_CACHE_MAX_ENTRIES=4}" \
+    -- medium_cache_require_dir
+}
+cache_dir_case ok "$CACHE/store" >/dev/null 2>&1 \
+  || fail "a private, build-user-owned cache directory was refused"
+mkdir -p "$CACHE/group-writable"; chmod 0770 "$CACHE/group-writable"
+out="$(cache_dir_case group "$CACHE/group-writable" 2>&1)" \
+  && fail "a group-writable cache directory was accepted"
+grep -Fq 'group- or world-accessible' <<<"$out" || fail "the permissive-mode refusal is not named: $out"
+ln -sfn "$CACHE/store" "$CACHE/link"
+out="$(cache_dir_case symlink "$CACHE/link" 2>&1)" \
+  && fail "a symlinked cache directory was accepted"
+grep -Fq 'is a symlink' <<<"$out" || fail "the symlink refusal is not named: $out"
+out="$(cache_dir_case relative "relative/path" 2>&1)" \
+  && fail "a relative cache directory was accepted"
+grep -Fq 'must be an absolute path' <<<"$out" || fail "the relative-path refusal is not named: $out"
+out="$(cache_dir_case absent "$CACHE/does-not-exist" 2>&1)" \
+  && fail "a cache directory that does not exist was accepted"
+grep -Fq 'not an existing directory' <<<"$out" || fail "the absent-directory refusal is not named: $out"
+out="$(cache_dir_case inrepo "$ROOT/image" 2>&1)" \
+  && fail "a cache directory inside the checkout was accepted"
+grep -Fq 'inside the checkout' <<<"$out" || fail "the in-checkout refusal is not named: $out"
+out="$(cache_dir_case bound "$CACHE/store" 'MEDIUM_BUILD_CACHE_MAX_ENTRIES=0' 2>&1)" \
+  && fail "an unbounded cache was accepted"
+grep -Fq 'between 1 and 999' <<<"$out" || fail "the bound refusal is not named: $out"
+
+# 3) AN ENTRY IS NOT REUSABLE UNTIL EVERY VALUE A REUSE RE-CHECKS IS RECORDED.
+cache_key_value="$(printf '%s' "$cache_key_baseline" | sha256sum | awk '{print tolower($1)}')"
+CACHE_STORE_IMG="$TMP/cache-store.img"
+printf 'a sealed store, for the purposes of this suite\n' > "$CACHE_STORE_IMG"
+CACHE_STORE_SHA="$(sha256sum "$CACHE_STORE_IMG" | awk '{print tolower($1)}')"
+CACHE_STORE_BYTES="$(wc -c < "$CACHE_STORE_IMG" | tr -d '[:space:]')"
+CACHE_STORE_VERITY="$(printf '%064d' 4)"
+cache_stage() { cache_run -- medium_cache_stage_store "$cache_key_value" "$CACHE_STORE_IMG"; }
+cache_finalize() { # $1=the store SHA-256 to record (the real one, or a sabotaged fact)
+  cache_run -- medium_cache_finalize_store "$cache_key_value" "$cache_key_baseline" \
+    "$1" "$CACHE_STORE_BYTES" "$BASE_ID_FIXTURE" \
+    "sha256:$(printf '%064d' 3)" localhost/bootc "$CACHE_STORE_VERITY" \
+    "$(printf 'f%.0s' {1..64})" 6e657572-616c-4963-9e69-6e7374616c6c
+}
+BASE_ID_FIXTURE="$(printf '%064d' 2)"
+cache_stage || fail "staging a cache entry failed"
+cache_entry="$CACHE/store/sealed-store/$cache_key_value"
+[ -f "$cache_entry/installer-store.img" ] || fail "staging did not copy the store extent"
+[ ! -e "$cache_entry/entry.json" ] \
+  || fail "a staged entry is already reusable before its verity root hash is known"
+out="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>&1 >/dev/null)" \
+  && fail "an unfinished cache entry was reused"
+grep -Fq 'no provenance document' <<<"$out" \
+  || fail "the unfinished-entry refusal is not named: $out"
+cache_finalize "$CACHE_STORE_SHA" || fail "finalizing a cache entry failed"
+cache_facts="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>/dev/null)" \
+  || fail "a finalized cache entry was refused"
+[ "$(sed -n 's/^store_image_sha256=//p' <<<"$cache_facts")" = "$CACHE_STORE_SHA" ] \
+  || fail "the entry does not hand back the digest a reuse is checked against"
+[ "$(sed -n 's/^store_verity_hash=//p' <<<"$cache_facts")" = "$CACHE_STORE_VERITY" ] \
+  || fail "the entry does not hand back the verity root hash a reuse is checked against"
+[ "$(sed -n 's/^store_image_id=//p' <<<"$cache_facts")" = "$BASE_ID_FIXTURE" ] \
+  || fail "the entry does not hand back the store image identity"
+
+# 🔴 SABOTAGE A -- THE RECORD. An entry whose provenance document is altered is
+# refused, and it is refused BY NAME. This is the half of the cache the producer
+# itself decides; the byte-level half is proved in
+# image/test-build-installer-root.sh section 8, which drives the real re-hash.
+cache_sabotage() { # $1=python expression mutating `document`
+  python3 - "$cache_entry/entry.json" "$1" <<'PYEOF'
+import json, sys
+path, mutation = sys.argv[1:]
+document = json.load(open(path, encoding="utf-8"))
+exec(mutation)  # noqa: S102 - a test fixture, mutating its own fixture document
+open(path, "w", encoding="utf-8").write(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")
+PYEOF
+}
+cache_restore() { cache_finalize "$CACHE_STORE_SHA" || fail "cannot restore the cache entry"; }
+cache_refuses() { # $1=expected words in the refusal
+  local refusal
+  refusal="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>&1 >/dev/null)" \
+    && fail "a sabotaged cache entry was reused (expected: $1)"
+  grep -Fq "$1" <<<"$refusal" || fail "the refusal is not named '$1': $refusal"
+}
+cache_sabotage 'document["store_image_sha256"] = "0" * 64'
+cache_facts_altered="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>/dev/null)" \
+  || fail "an entry whose recorded digest was changed could not be read at all"
+[ "$(sed -n 's/^store_image_sha256=//p' <<<"$cache_facts_altered")" != "$CACHE_STORE_SHA" ] \
+  || fail "the altered record did not reach the value a reuse is checked against"
+# ...and that altered value is exactly what image/build-installer-root.sh
+# re-hashes the copied extent against, which is why THAT comparison is the
+# refusal and this one is only the transport. Asserted on the source, executed
+# in image/test-build-installer-root.sh.
+grep -Fq 'die "the reused store image hashes to $STORE_IMAGE_SHA256, not the recorded $STORE_IMAGE_REUSE_SHA256' \
+  "$ROOT/image/build-installer-root.sh" \
+  || fail "the sealed root builder no longer re-hashes a reused extent against the recorded digest"
+cache_restore
+cache_sabotage 'document["schema"] = "neural-ice-medium-build-cache-entry-v0"'
+cache_refuses 'provenance schema is'
+cache_restore
+cache_sabotage 'document["key"] = "f" * 64'
+cache_refuses 'records a different key than the directory it sits in'
+cache_restore
+cache_sabotage 'del document["store_verity_hash"]'
+cache_refuses "field 'store_verity_hash' is missing or malformed"
+cache_restore
+cache_sabotage 'document["store_image_manifest_digest"] = "not-a-digest"'
+cache_refuses "field 'store_image_manifest_digest' is missing or malformed"
+cache_restore
+cache_sabotage 'document["store_image_bytes"] = 12'
+cache_refuses "field 'store_image_bytes' is missing or malformed"
+cache_restore
+printf 'not json at all\n' > "$cache_entry/entry.json"
+cache_refuses 'unreadable provenance document'
+cache_restore
+mv "$cache_entry/installer-store.img" "$cache_entry/installer-store.img.moved"
+ln -s /etc/hostname "$cache_entry/installer-store.img"
+cache_refuses 'holds no plain, non-empty store image'
+rm -f "$cache_entry/installer-store.img"
+mv "$cache_entry/installer-store.img.moved" "$cache_entry/installer-store.img"
+cache_run -- medium_cache_read_entry "$cache_key_value" >/dev/null 2>&1 \
+  || fail "the restored entry is no longer readable; the sabotage cases would prove nothing"
+out="$(cache_run -- medium_cache_read_entry "$(printf 'e%.0s' {1..64})" 2>&1 >/dev/null)" \
+  && fail "an absent cache entry was reported as a hit"
+grep -Fq 'cache miss' <<<"$out" || fail "a cold cache is not reported as a miss: $out"
+
+# 🔴 SABOTAGE B -- THE BYTES, AT THE ONE GATE A CACHE CANNOT SATISFY. The store's
+# dm-verity root hash is recomputed by the UNCHANGED payload assembler over the
+# extent that is going onto the medium; a cached entry that does not reproduce it
+# is refused before the UKI seals the header digest that covers it.
+cache_run -- medium_cache_assert_reused_verity "$CACHE_STORE_VERITY" "$CACHE_STORE_VERITY" \
+  || fail "a reused store whose verity root hash reproduces was refused"
+out="$(cache_run -- medium_cache_assert_reused_verity "$(printf '%064d' 5)" "$CACHE_STORE_VERITY" 2>&1)" \
+  && fail "a reused store whose verity root hash did not reproduce was accepted"
+grep -Fq 'refusing a medium built on bytes the cache cannot account for' <<<"$out" \
+  || fail "the verity mismatch refusal is not named: $out"
+
+# 4) THE CACHE IS BOUNDED. Entries are ~8 GiB; an unbounded cache fills the build
+#    host and the next build dies on ENOSPC inside a `veritysetup format`.
+for cache_extra in 1 2 3 4 5; do
+  cache_extra_key="$(printf '%s%063d' c "$cache_extra")"
+  cache_run -- medium_cache_stage_store "$cache_extra_key" "$CACHE_STORE_IMG" \
+    || fail "staging filler entry $cache_extra failed"
+  cache_run -- medium_cache_finalize_store "$cache_extra_key" "$cache_key_baseline" \
+    "$CACHE_STORE_SHA" "$CACHE_STORE_BYTES" "$BASE_ID_FIXTURE" \
+    "sha256:$(printf '%064d' 3)" localhost/bootc "$CACHE_STORE_VERITY" \
+    "$(printf 'f%.0s' {1..64})" 6e657572-616c-4963-9e69-6e7374616c6c \
+    || fail "finalizing filler entry $cache_extra failed"
+  # `entry.json` mtime orders the eviction, so the fillers must not share one.
+  touch -d "2026-09-0${cache_extra}T00:00:00Z" "$CACHE/store/sealed-store/$cache_extra_key/entry.json"
+done
+cache_run -- medium_cache_prune "$cache_key_value" >/dev/null \
+  || fail "pruning the cache failed"
+cache_kept="$(find "$CACHE/store/sealed-store" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+[ "$cache_kept" = 5 ] \
+  || fail "the cache kept $cache_kept entries; the bound is 4 plus the build's own key"
+[ -d "$cache_entry" ] || fail "pruning evicted the entry of the build that was running"
+[ ! -d "$CACHE/store/sealed-store/$(printf '%s%063d' c 1)" ] \
+  || fail "the oldest entry survived the bound"
+[ -d "$CACHE/store/sealed-store/$(printf '%s%063d' c 5)" ] \
+  || fail "the newest entry was evicted"
+
+echo "  incremental build: the sealed store cache is opt-in, keyed by document, bounded, and re-proved on every reuse"
+
+
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
 
