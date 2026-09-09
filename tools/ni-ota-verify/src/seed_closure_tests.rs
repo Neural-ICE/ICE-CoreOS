@@ -156,6 +156,16 @@ fn canonical_domain_refuses_integers_outside_interoperable_range() {
     assert!(canonical_value(b"{\"n\":9007199254740992}\n", "large integer").is_err());
 }
 
+#[test]
+fn cosign_annotation_base64_matches_go_crlf_tolerance_only() {
+    assert_eq!(decode_cosign_base64("YQ==").unwrap(), b"a");
+    assert_eq!(decode_cosign_base64("YQ==\n").unwrap(), b"a");
+    assert_eq!(decode_cosign_base64("Y\r\nQ==").unwrap(), b"a");
+    for value in ["Y Q==", "Y\tQ==", "-Q==", "YQ", "YR==", "\r\n"] {
+        assert!(decode_cosign_base64(value).is_err(), "{value:?}");
+    }
+}
+
 fn attachment_record(
     kind: &str,
     artifact_type: serde_json::Value,
@@ -1091,7 +1101,7 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         };
         let annotations = if kind == "signature" {
             serde_json::json!({
-                "dev.cosignproject.cosign/signature": encode_base64(signature)
+                "dev.cosignproject.cosign/signature": format!("{}\n", encode_base64(signature))
             })
         } else {
             serde_json::json!({})

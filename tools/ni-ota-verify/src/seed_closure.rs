@@ -455,6 +455,17 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, Refusal> {
     crate::delegated::contract::decode_base64(value).map_err(Refusal)
 }
 
+fn decode_cosign_base64(value: &str) -> Result<Vec<u8>, Refusal> {
+    // Go's base64 decoder, used by Cosign, ignores CR/LF anywhere in the
+    // annotation. Fabric applies exactly that normalization before its strict
+    // decoder. Keep delegation and signed-document base64 canonical.
+    let normalized: String = value
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect();
+    decode_base64(&normalized)
+}
+
 fn signature_bytes(path: &Path) -> Result<Vec<u8>, Refusal> {
     let der = read_bounded(path, 4096)?;
     crate::delegated::contract::validate_der_signature(&der).map_err(Refusal)?;
@@ -1367,7 +1378,7 @@ fn attachment_payload(
         .pointer("/layers/0/annotations/dev.cosignproject.cosign~1signature")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| Refusal("attestation lacks cosign signature annotation".into()))?;
-    let der = decode_base64(annotation)?;
+    let der = decode_cosign_base64(annotation)?;
     crate::delegated::contract::validate_der_signature(&der).map_err(Refusal)?;
     Ok((payload, bytes, der))
 }
