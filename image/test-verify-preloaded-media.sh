@@ -60,14 +60,17 @@ baseline_args=(
   --lab-baseline-signature-sha256 "$signature_sha256"
 )
 
-# A LAB-MANAGED medium may carry exactly one approved operator public key. The
-# gate must accept precisely that key and refuse every other state: a key nobody
-# approved, a key that drifted, and an approved key that never made it onto the
-# medium.
+# A LAB-MANAGED medium may carry exactly one approved operator public key, and
+# it carries it in ONE place: sealed as `neuralice.sshkey` in the signed UKI.
+# The gate must accept precisely that key and refuse every other state: a key
+# nobody approved, a key that drifted, and -- the bench medium of 2026-09-09 --
+# the key sealed in the UKI AND staged again on the mutable ESP, which the
+# installer refuses at preflight on hardware.
 ssh-keygen -q -t ed25519 -N '' -f "$work/operator" </dev/null
 operator_key="$work/operator.pub"
 operator_sha256="$(sha256sum "$operator_key" | cut -d' ' -f1)"
-esp_key_args=(--esp-authorized-keys-sha256 "$operator_sha256")
+operator_b64="$(base64 -w0 < "$operator_key")"
+esp_key_args=(--installer-ssh-key-sha256 "$operator_sha256")
 
 expect_baseline_refusal() {
   local name="$1"
@@ -108,6 +111,14 @@ TMP="$work/fixture"; mkdir -p "$TMP"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
+# The medium under test is a LAB medium cut with an approved operator key: the
+# library's Install UKI is rebuilt with the key sealed, and nothing else changes.
+build_uki installer-install \
+  "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.sshkey=$operator_b64" \
+  >/dev/null || fail "the keyed Install UKI failed to build"
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
 sealed_core_args=(
   --expect-verity-root-hash "$ROOT_HASH"
   --expect-payload-digest "$PAYLOAD_DIGEST"
@@ -130,8 +141,6 @@ mount "${loop}p1" "$mountpoint"
 "$ROOT/ota/neural-ice-lab-baseline-handoff.sh" stage-media \
   "$work/ota-lab-baseline.json" "$bom_sha256" \
   "$work/ota-lab-baseline.sig" "$signature_sha256" "$mountpoint"
-"$ROOT/image/lib/installer-ssh-key.sh" install \
-  "$operator_key" "$operator_sha256" "$mountpoint"
 sync
 umount "$mountpoint"
 mkfs.xfs -q -L ni-seed "${loop}p${seed_number}"
@@ -182,7 +191,7 @@ import sys
 ) = sys.argv[1:]
 with open(receipt_path, encoding="ascii") as stream:
     receipt = json.load(stream)
-assert receipt["schema"] == "neural-ice-preloaded-final-media-receipt-v2"
+assert receipt["schema"] == "neural-ice-preloaded-final-media-receipt-v3"
 assert receipt["raw"]["size"] == int(raw_bytes)
 # The receipt now RECORDS what the sealed-core inspection established, so a
 # medium blessed without one is visible in the receipt rather than only in the
@@ -191,6 +200,7 @@ assert receipt["sealed_core"] == {
     "access_profile": "lab-managed",
     "hardware_target": "nvidia-gb10-arm64",
     "inspected": "after-final-write",
+    "installer_ssh_key_sha256": operator_sha256,
     "media_mode": "install",
     "payload_digest": payload_digest,
     "signed": True,
@@ -210,8 +220,7 @@ assert receipt["lab_baseline"]["signature"] == {
     "sha256": signature_sha256,
     "size": 29,
 }
-assert receipt["esp_authorized_keys"]["path"] == "ice-coreos/authorized_keys"
-assert receipt["esp_authorized_keys"]["sha256"] == operator_sha256
+assert receipt["installer_ssh_key"] == {"sha256": operator_sha256, "transport": "uki-cmdline"}
 assert receipt["lab_baseline"]["esp"]["fstype"] == "vfat"
 assert receipt["lab_baseline"]["esp"]["partuuid"]
 for path, expected in ((artifact_path, receipt["artifact"]), (raw_path, receipt["raw"])):
@@ -267,9 +276,10 @@ umount "$mountpoint"
 losetup --detach "$loop"
 loop=''
 
-# --- the installer SSH key on the ESP -------------------------------------- #
-# An approved key that is present must still be REFUSED when the caller approved
-# nothing: media that carries a key nobody signed off on must not be published.
+# --- the operator SSH key: ONE transport, the signed UKI ------------------- #
+# The sealed key is judged by the full sealed-core inspector this gate runs:
+# present and approved, or absent when nothing was approved. A key nobody
+# approved, a key that drifted and a malformed approval are all refusals.
 expect_media_refusal() { # <name> <message> [extra args...]
   local name="$1" message="$2"
   shift 2
@@ -288,57 +298,41 @@ expect_media_refusal() { # <name> <message> [extra args...]
   test ! -e "$work/$name.json"
 }
 
-expect_media_refusal esp-key-unapproved \
-  "gate published a medium carrying an unapproved installer SSH key" \
+expect_media_refusal sshkey-unapproved \
+  "gate published a medium sealing an operator SSH key nobody approved" \
   "${baseline_args[@]}"
 
 wrong_sha256="$(printf 'not-the-operator-key' | sha256sum | cut -d' ' -f1)"
-expect_media_refusal esp-key-drift \
-  "gate accepted an installer SSH key that differs from the approved hash" \
-  "${baseline_args[@]}" --esp-authorized-keys-sha256 "$wrong_sha256"
+expect_media_refusal sshkey-drift \
+  "gate accepted a sealed operator SSH key that differs from the approved hash" \
+  "${baseline_args[@]}" --installer-ssh-key-sha256 "$wrong_sha256"
 
-expect_media_refusal esp-key-malformed-hash \
+expect_media_refusal sshkey-malformed-hash \
   "gate accepted a malformed approved-key hash" \
-  "${baseline_args[@]}" --esp-authorized-keys-sha256 deadbeef
+  "${baseline_args[@]}" --installer-ssh-key-sha256 deadbeef
 
-# A key that was approved but never staged: the medium is unreachable in the lab
-# and the operator would only find out on hardware.
+# BOTH TRANSPORTS (the bench medium of 2026-09-09): the approved key sealed in
+# the UKI and staged again at ice-coreos/authorized_keys. The installer refuses
+# that medium at preflight on hardware; the gate refuses it before it ships.
 loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
 mount "${loop}p1" "$mountpoint"
-mv "$mountpoint/ice-coreos/authorized_keys" "$work/removed-key"
+"$ROOT/image/lib/installer-ssh-key.sh" install \
+  "$operator_key" "$operator_sha256" "$mountpoint"
 sync
 umount "$mountpoint"
 losetup --detach "$loop"
 loop=''
-expect_media_refusal esp-key-absent \
-  "gate accepted a medium missing its approved installer SSH key" \
-  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"
+expect_media_refusal sshkey-both-transports \
+  "gate accepted a medium carrying the operator key on the ESP as well as sealed in the UKI" \
+  "${baseline_args[@]}" "${esp_key_args[@]}"
 
-# A MODIFIED ESP. vfat cannot hold a symlink, so the modification an attacker
-# actually has on this filesystem is a padded/appended payload -- and the gate
-# bounds the read at the same 512 bytes the key validator does.
-loop="$(losetup --find --show --partscan "$raw")"
-udevadm settle
-mount "${loop}p1" "$mountpoint"
-{ cat "$work/removed-key"; head -c 4096 /dev/zero | tr '\0' 'A'; } \
-  > "$mountpoint/ice-coreos/authorized_keys"
-sync
-umount "$mountpoint"
-losetup --detach "$loop"
-loop=''
-expect_media_refusal esp-key-oversized \
-  "gate accepted an oversized installer SSH key on the ESP" \
-  "${sealed_core_args[@]}" "${baseline_args[@]}" "${esp_key_args[@]}"
-
-# Restore the approved key so every refusal below stays attributable to the
+# Restore the single transport so every refusal below stays attributable to the
 # state it is actually testing rather than to a leftover modified ESP.
 loop="$(losetup --find --show --partscan "$raw")"
 udevadm settle
 mount "${loop}p1" "$mountpoint"
 rm -f "$mountpoint/ice-coreos/authorized_keys"
-"$ROOT/image/lib/installer-ssh-key.sh" install \
-  "$operator_key" "$operator_sha256" "$mountpoint"
 sync
 umount "$mountpoint"
 losetup --detach "$loop"

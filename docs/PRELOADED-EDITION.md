@@ -45,7 +45,7 @@ an already-trusted containers-storage graphroot:
    and "every other partition is entirely zero". Its expectations come from
    `<name>.img.sealed-core.json`, written by the build that sealed them, and they are REQUIRED
    arguments: a final gate that can be invoked without inspecting what the medium boots is not a
-   gate. The receipt (now `neural-ice-preloaded-final-media-receipt-v2`) records the result under
+   gate. The receipt (now `neural-ice-preloaded-final-media-receipt-v3`) records the result under
    `sealed_core`.
 5. Before destructive installation, the autoinstaller verifies the complete pack from the mounted
    seed. It copies the still-non-authoritative bytes to encrypted persistent storage and re-verifies
@@ -200,20 +200,25 @@ product payload. The sum receives 10% proportional headroom plus 4 GiB fixed hea
 up to 1 MiB. This keeps large (~70 GiB) payloads from exhausting the partition. First-boot payload
 application is bounded to two hours instead of systemd's default 90 seconds.
 
-For LAB-MANAGED media, the optional SSH public-key file is validated, hash-bound and written to
-`EFI:/ice-coreos/authorized_keys` before final-media acceptance. Staging is refused unless the base
-image is lab-anchored, its immutable `/usr/lib/neural-ice/access-policy` permits installer SSH
-provisioning, and the installed target is that same digest-pinned reference. The input must be one
-plain OpenSSH public-key record (never a private key or an `authorized_keys` record with options)
-and at most 512 bytes so its base64 form fits the supported ARM64 kernel command line with
-headroom.
+For LAB-MANAGED media, the optional SSH public-key file is validated, hash-bound and sealed as
+`neuralice.sshkey=<base64>` in the **signed UKI command line** — its one transport. The producer
+stages no copy on the ESP: the installer refuses a medium carrying the key on both the sealed
+command line and `EFI:/ice-coreos/authorized_keys` (`ota/neural-ice-autoinstall.sh`, step 1b), which
+is exactly how a bench medium cut with both was refused on hardware on 2026-09-09. Sealing is
+refused unless the base image is lab-anchored, its immutable `/usr/lib/neural-ice/access-policy`
+permits installer SSH provisioning, and the installed target is that same digest-pinned reference.
+The input must be one plain OpenSSH public-key record (never a private key or an `authorized_keys`
+record with options) and at most 512 bytes so its base64 form fits the supported ARM64 kernel
+command line with headroom.
 
-The final-media gate then closes the loop: pass `--esp-authorized-keys-sha256 <approved>` to
-`image/verify-preloaded-media.py` and it refuses a medium whose ESP key is absent, drifted,
-oversized or — with the flag omitted — present at all. The delivered USB therefore remains
-byte-for-byte covered by the raw and artifact digests in the final receipt (which now carries an
-`esp_authorized_keys` entry, `null` when no key was approved); do not modify its ESP after
-acceptance.
+The final-media gate then closes the loop: pass `--installer-ssh-key-sha256 <approved>` to
+`image/verify-preloaded-media.py` and the sealed-core inspector it runs refuses a medium whose
+sealed key is absent, drifted, not base64 or over the bound, and — with the flag omitted — a
+medium sealing any key at all; a key file on the ESP is refused in every case. The delivered USB
+therefore remains byte-for-byte covered by the raw and artifact digests in the final receipt
+(schema `neural-ice-preloaded-final-media-receipt-v3`, which carries an `installer_ssh_key` entry
+`{"sha256", "transport": "uki-cmdline"}`, `null` when no key was approved); do not modify its ESP
+after acceptance.
 
 🔴 **The medium is a convenience, not the authority.** Whether a provisioned key is ever honoured
 is decided twice on the appliance itself, against the immutable access policy in the signed image:

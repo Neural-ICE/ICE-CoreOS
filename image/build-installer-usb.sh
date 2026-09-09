@@ -508,6 +508,11 @@ elif [[ "$ALLOW_UNSIGNED_MEDIA" != 1 ]]; then
   echo "ERROR: no UKI signing key supplied. An unsigned medium boots nowhere with Secure Boot on, but it looks finished — and a medium that looks finished gets flashed. Set ALLOW_UNSIGNED_MEDIA=1 to build one deliberately." >&2
   exit 1
 fi
+# An operator key is an INSTALL input: it is sealed into the Install UKI and
+# consumed by the autoinstaller. A Live medium seals none and nothing on it
+# reads one, so a key given to a Live cut would be silently dropped -- refuse.
+[[ -z "$SSH_AUTHORIZED_KEYS_FILE" || "$MEDIA_MODE" == install ]] \
+  || { echo "ERROR: SSH_AUTHORIZED_KEYS_FILE is an Install medium input; a Live medium carries no operator key" >&2; exit 1; }
 installer_ssh_key_validate "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" \
   || { echo "ERROR: invalid installer SSH key input" >&2; exit 1; }
 installer_ssh_key_require_matching_target "$SSH_AUTHORIZED_KEYS_FILE" "$BASE_IMAGE" "$TARGET_IMGREF" \
@@ -984,9 +989,14 @@ case "$MEDIA_MODE" in
       "neuralice.release_authority=${RELEASE_AUTHORITY}" \
       "neuralice.imgref=${TARGET_IMGREF}")
     if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
-      # The ESP copy is operator-visible convenience, not authority. Seal the
-      # already validated public key into the signed UKI so replacing mutable
-      # vfat bytes cannot choose who gains access to the installed appliance.
+      # THE ONE TRANSPORT OF THE OPERATOR KEY. The already validated public key
+      # is sealed into the signed UKI so replacing mutable vfat bytes cannot
+      # choose who gains access to the installed appliance -- and it is sealed
+      # ONLY there. The installer refuses a medium that also carries the key on
+      # the ESP (ota/neural-ice-autoinstall.sh, step 1b, "both the kernel
+      # command line and ESP"): two carriers of one secret-selecting input are
+      # two places to disagree, so the producer stages no ESP copy at all. A
+      # bench medium cut with both was refused on hardware on 2026-09-09.
       _sshkey_b64="$(base64 -w0 < "$SSH_AUTHORIZED_KEYS_FILE")"
       UKI_KARGS+=("neuralice.sshkey=${_sshkey_b64}")
     fi
@@ -1269,10 +1279,6 @@ sudo install -m 0444 "$SEALED_DIR/$UKI_NAME.efi.manifest" \
   "$MNT/EFI/neural-ice/$UKI_NAME.efi.manifest"
 sudo cmp -s "$SEALED_DIR/$UKI_NAME.efi" "$MNT/EFI/BOOT/BOOTAA64.EFI" \
   || { echo "ERROR: the staged UKI differs from the one that was built" >&2; exit 1; }
-if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
-  sudo bash "$REPO_ROOT/image/lib/installer-ssh-key.sh" install \
-    "$SSH_AUTHORIZED_KEYS_FILE" "$SSH_AUTHORIZED_KEYS_SHA256" "$MNT"
-fi
 # 🔴 THE TWO FILES A REGISTRY MEDIUM CANNOT BOOT WITHOUT. Staged, then READ BACK
 # and re-hashed off the mounted ESP: the value sealed in the signature must be
 # the value of the bytes that ended up on the medium, not of the bytes this
@@ -1349,6 +1355,14 @@ INSPECT_ARGS=(
   --expect-hardware-target "$HARDWARE_TARGET"
 )
 if [[ -z "$UKI_SIGNING_KEY" ]]; then INSPECT_ARGS+=(--allow-unsigned); fi
+# THE OPERATOR KEY'S ONE TRANSPORT, READ BACK OFF THE MEDIUM. With a key, the
+# inspector must find it sealed in the UKI, hashing to the approved value, and
+# find NO copy on the ESP; without one, it must find no key on either carrier.
+if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
+  INSPECT_ARGS+=(--expect-sshkey-sha256 "$SSH_AUTHORIZED_KEYS_SHA256")
+else
+  INSPECT_ARGS+=(--expect-no-sshkey)
+fi
 # Only the registry Install path has the signed release authorization needed by
 # the final Fabric reprojection. Keep the measurement beside the exact raw the
 # inspector reads. SEALED_DIR is caller-owned while BIB's image directory is

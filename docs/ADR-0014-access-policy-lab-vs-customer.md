@@ -232,3 +232,21 @@ of the source tree wearing the costume of a control.
   and its functions with it. The old name described a `debug` facility that had
   not been one since the first-boot service learned to serve a key on a sealed
   image. No compatibility shim: nothing is in production.
+
+## Addendum 2026-09-09 — the operator key has one transport
+
+The producer had sealed the approved key into the signed UKI (`neuralice.sshkey`,
+#127) **and** kept staging the same key at `ice-coreos/authorized_keys` on the
+ESP, while the installer refuses a key carried on both transports (#149). Every
+lab medium cut with `SSH_AUTHORIZED_KEYS_FILE` since #149 refused itself at
+preflight; the installation-bench medium of 2026-09-09 did so on hardware.
+
+Ruling: the **signed UKI command line is the one transport** of a producer-
+approved operator key. `image/build-installer-usb.sh` stages no ESP copy;
+`image/inspect-installer-media.py` refuses, at the cut, a medium carrying the
+key on both carriers, reads the sealed key back against the approved hash
+(`--expect-sshkey-sha256`) or demands that no key travel at all
+(`--expect-no-sshkey`); `image/verify-preloaded-media.py` (`--installer-ssh-key-sha256`,
+receipt v3 `installer_ssh_key`) refuses any ESP key file. The hand-dropped ESP
+key on a medium whose UKI seals none remains, as above, the immutable access
+policy's decision at install time. The runtime gates of this ADR are unchanged.

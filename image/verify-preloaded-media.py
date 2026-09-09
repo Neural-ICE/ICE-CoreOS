@@ -296,8 +296,8 @@ def verify_lab_baseline(
     }
 
 
-def expected_esp_authorized_keys(arguments: argparse.Namespace) -> str | None:
-    value = arguments.esp_authorized_keys_sha256
+def expected_installer_ssh_key(arguments: argparse.Namespace) -> str | None:
+    value = arguments.installer_ssh_key_sha256
     if value is None:
         return None
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
@@ -305,40 +305,25 @@ def expected_esp_authorized_keys(arguments: argparse.Namespace) -> str | None:
     return value
 
 
-def verify_esp_authorized_keys(
-    mountpoint: Path, expected: str | None
-) -> dict[str, Any] | None:
-    """An operator SSH key may only ship on media that explicitly approved it.
+def verify_no_esp_authorized_keys(mountpoint: Path) -> None:
+    """The operator SSH key travels in the signed UKI command line and nowhere
+    else.
 
-    The installed system refuses an unauthorised key twice over (the immutable
-    access policy is checked by the autoinstaller and again at first boot), but
-    a key nobody approved has no business leaving the build host at all: it is
-    either a staging mistake or a modified ESP, and both are things a release
-    gate exists to catch. Absence when one was approved is equally a refusal --
-    silently shipping unreachable lab media wastes a hardware trip.
+    The producer seals an approved key as ``neuralice.sshkey`` and stages NO
+    copy on the ESP: the installer refuses a medium carrying the key on both
+    transports (ota/neural-ice-autoinstall.sh, step 1b), which is exactly what
+    a bench medium did on hardware on 2026-09-09. So a key file on this ESP is
+    either a modified ESP or a stale producer, and both are things a release
+    gate exists to catch. Whether the SEALED key is present, absent, approved
+    or drifted is established by the full sealed-core inspector, which this
+    gate runs with the approved hash (or the demand that there be none).
     """
     path = mountpoint / "ice-coreos" / "authorized_keys"
-    present = path.exists() or path.is_symlink()
-    if not present:
-        if expected is not None:
-            raise GateError("the approved installer SSH key is absent from the installer ESP")
-        return None
-    if expected is None:
-        raise GateError("installer ESP carries an unapproved SSH authorized_keys file")
-    # read_regular opens with O_NOFOLLOW and bounds the size, so a symlinked or
-    # padded authorized_keys is refused before its content is considered. The
-    # bound matches INSTALLER_SSH_PUBLIC_KEY_MAX_BYTES in image/lib/installer-ssh-key.sh.
-    content = read_regular(path, 512)
-    if not content:
-        raise GateError("installer ESP SSH authorized_keys file must be non-empty")
-    sha256 = hashlib.sha256(content).hexdigest()
-    if sha256 != expected:
-        raise GateError("installer ESP SSH key differs from the approved hash")
-    return {
-        "path": "ice-coreos/authorized_keys",
-        "sha256": sha256,
-        "size": len(content),
-    }
+    if path.exists() or path.is_symlink():
+        raise GateError(
+            "installer ESP carries ice-coreos/authorized_keys; the operator key is sealed "
+            "in the signed UKI command line only and the producer stages no ESP copy"
+        )
 
 
 def validate_filename(filename: str) -> None:
@@ -616,11 +601,18 @@ def inspect_sealed_core(descriptor: int, arguments: argparse.Namespace) -> dict[
     ]
     if arguments.allow_unsigned:
         command.append("--allow-unsigned")
+    # The operator key's one transport is read back by the inspector: sealed
+    # and hashing to the approved value, or absent from both carriers.
+    if arguments.installer_ssh_key_sha256 is not None:
+        command.extend(("--expect-sshkey-sha256", arguments.installer_ssh_key_sha256))
+    else:
+        command.append("--expect-no-sshkey")
     run(*command, capture=False, pass_fds=(descriptor,))
     return {
         "access_profile": arguments.expect_access_profile,
         "hardware_target": arguments.expect_hardware_target,
         "inspected": "after-final-write",
+        "installer_ssh_key_sha256": arguments.installer_ssh_key_sha256,
         "media_mode": arguments.expect_mode,
         "payload_digest": arguments.expect_payload_digest,
         "signed": not arguments.allow_unsigned,
@@ -662,7 +654,7 @@ def verify(arguments: argparse.Namespace) -> None:
     if not re.fullmatch(r"[0-9a-f]{64}", arguments.release_manifest_sha256):
         raise GateError("expected release manifest is not 64 lowercase hex")
     expected_baseline = expected_lab_baseline(arguments)
-    expected_esp_key = expected_esp_authorized_keys(arguments)
+    expected_ssh_key = expected_installer_ssh_key(arguments)
 
     descriptor = os.open(raw, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     loop = ""
@@ -755,7 +747,7 @@ def verify(arguments: argparse.Namespace) -> None:
         mounted = True
         verify_mount(esp_partition, "vfat", mountpoint_path)
         lab_baseline = verify_lab_baseline(mountpoint_path, expected_baseline)
-        esp_authorized_keys = verify_esp_authorized_keys(mountpoint_path, expected_esp_key)
+        verify_no_esp_authorized_keys(mountpoint_path)
         if lab_baseline is not None:
             lab_baseline["esp"] = {
                 "fstype": "vfat",
@@ -809,10 +801,14 @@ def verify(arguments: argparse.Namespace) -> None:
                 "release_closure_sha256": arguments.release_closure_sha256,
                 "release_manifest_sha256": arguments.release_manifest_sha256,
             },
-            "esp_authorized_keys": esp_authorized_keys,
+            "installer_ssh_key": (
+                {"sha256": expected_ssh_key, "transport": "uki-cmdline"}
+                if expected_ssh_key is not None
+                else None
+            ),
             "lab_baseline": lab_baseline,
             "raw": {"sha256": before_digest, "size": metadata.st_size},
-            "schema": "neural-ice-preloaded-final-media-receipt-v2",
+            "schema": "neural-ice-preloaded-final-media-receipt-v3",
             "sealed_core": sealed_core,
         }
         receipt_bytes = (
@@ -866,7 +862,10 @@ def main() -> int:
     )
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--receipt-checksum", required=True, type=Path)
-    parser.add_argument("--esp-authorized-keys-sha256")
+    parser.add_argument(
+        "--installer-ssh-key-sha256",
+        help="SHA-256 of the approved operator public key the signed UKI must seal (neuralice.sshkey); omitted, no key may travel on the medium",
+    )
     parser.add_argument("--lab-baseline-bom-sha256")
     parser.add_argument("--lab-baseline-signature-sha256")
     # THE SEALED CORE. Required, not optional: a final gate that can be invoked
