@@ -175,10 +175,50 @@ Rules for every object:
 `verify-seed-closure` on the staged tree, and the `release/*` pointers and the
 SELinux labels are written exactly as for an `ni-seed` seed.
 
+## Mirror name resolution (`.local`, FAB-0057 P1.1c)
+
+Owner decision 2026-09-09: media seal the mirror by **name**
+(`neuralice.mirror=registry.neural-ice.local:5055`), never by address; the
+bench announces that name in mDNS (ICE-Fabric
+`quadlets/registry/lan-mirror-mdns.service`). Measured the same day: the bench
+LAN's unicast DNS answers NXDOMAIN for it, the installer's runtime generator
+masked `avahi-daemon.service/.socket` on every medium boot, and the installer
+image had no NSS module for mDNS (the appliance's own journal on `.67`:
+`avahi-daemon: No NSS support for mDNS detected`), so the READY fetch and the
+seed-pack fetch died on resolution.
+
+Facts that fixed the variant: `systemd-resolved` is **not** in the image (the
+local systemd rebuild in `image/systemd-srk/build-rpms.sh` ships only
+`systemd`, `systemd-libs`, `systemd-pam`, `systemd-udev`; neither Containerfile
+installs it); `avahi` + `avahi-tools` are (`image/Containerfile.bootc`,
+inherited by the installer image). So the resolver is avahi, **resolution
+only**, and the NSS module is `nss-mdns` -- a **new package, installer image
+only** (`image/Containerfile.installer`): the appliance is the installer's
+*base*, never its derivative, so nothing here reaches an installed system (the
+site mirror for OTA is P3.3).
+
+| Where | What |
+|---|---|
+| `image/Containerfile.installer` | installs `nss-mdns`; `hosts: files myhostname mdns4_minimal [NOTFOUND=return] dns` (one line, asserted). Only `.local` names are asked of avahi; a `.local` name avahi does not know is not leaked to unicast DNS; other names are untouched. When avahi is masked the module answers UNAVAIL on its absent socket and the line is inert. |
+| `image/installer/neural-ice-installer-runtime-generator.sh` | on the exact Install grammar with `neuralice.source=registry` and exactly one `neuralice.mirror=` whose host ends in `.local` (`mirror_host_is_mdns_name`, read off the sealed line): writes `/run/neural-ice-installer-mdns/avahi-daemon.conf` -- `disable-publishing=yes`, `publish-addresses=no`, `publish-hinfo=no`, `publish-workstation=no`, `use-ipv6=no`, `enable-dbus=no`, `enable-reflector=no`, `allow-interfaces=<management port>` (the `interface-name` of `mgmt-*.nmconnection`, the same rule `neural-ice-hostname-init.sh` pins the appliance's avahi with; no profile = no unmask, and a named refusal later) -- shadows the appliance's ceremony drop-in on both avahi units, points `ExecStart=` at that file (`Type=simple`, no D-Bus), adds `Wants=/After=avahi-daemon.socket avahi-daemon.service` to `neural-ice-autoinstall.service`, and only then takes the two avahi masks back off. Everything is under `/run`. An IP or a non-`.local` name: nothing is written, avahi stays masked. |
+| `ota/neural-ice-autoinstall.sh` | restates the condition against the same `karg_once neuralice.mirror`; before the READY fetch -- the first use of the mirror, before the first disk write -- `assert_mirror_name_resolves` requires the avahi socket and proves `getent ahostsv4 <host>` (the NSS path curl/podman/skopeo take) under `timeout`, at most 6 attempts of 5 s with 2 s pauses (40 s bound), then logs the address. Failure is the named refusal **`mirror-name-unresolvable`**, naming the name and the mechanism, with the target disk untouched. |
+
+The mDNS answer is unauthenticated and decides only *where* the medium asks:
+every byte that follows is still TLS-pinned to the sealed CA, digest-pinned and
+signature-verified, so a spoofed answer can only produce one of the refusals
+below. The medium never announces a record of any kind (`disable-publishing=yes`
+is asserted by `image/test-installer-systemd-lifecycle.sh`, which also runs a
+sabotaged generator that would enable publishing and requires the suite to
+catch it). `ci/test-install-registry-mirror.sh` extracts the two installer
+functions and drives them with a mocked `getent` (answer, not found, hang,
+garbage) and asserts the proof precedes the READY fetch and the first write.
+
 ## Failure model
 
 | Event | Behaviour |
 |---|---|
+| `.local` mirror name does not resolve (no announcement on the LAN, wrong port pinned, resolver not started) | `mirror-name-unresolvable` before the READY fetch and before the wipe; the machine is exactly as it was |
+| `.local` name resolved by a host that is not the mirror | the READY fetch fails the sealed-CA pin: `die` before the wipe |
 | network cut during the document fetch | `die` before the wipe; the machine is exactly as it was |
 | network cut during the object fetch | `die`; the target disk is already wiped and holds no customer data; reinstall from the bench |
 | corrupt or substituted object | hash differs from name: temp file discarded, `die`, no retry |
@@ -193,13 +233,20 @@ SELinux labels are written exactly as for an `ni-seed` seed.
 - producer: `image/build-installer-usb.sh` (`seal_offline_seed_kargs`), `image/build-preloaded.sh`;
 - runtime: `ota/neural-ice-autoinstall.sh` §2d (`seed_mirror_helper`,
   `seed_from_mirror_fetch_documents` -- called from the mirror block,
-  `seed_from_mirror_preflight`, `seed_from_mirror_materialize`), and the
+  `seed_from_mirror_preflight`, `seed_from_mirror_materialize`), the
   derivations `seed_manifest_hash_from_closure`,
   `preseal_installer_authorization_pins`,
-  `release_authorization_pins_from_preseal`;
+  `release_authorization_pins_from_preseal`, and the name proof
+  `mirror_host_is_mdns_name` / `assert_mirror_name_resolves`;
+- installer runtime: `image/installer/neural-ice-installer-runtime-generator.sh`
+  (`request_mirror_mdns_resolution`), `image/Containerfile.installer`
+  (`nss-mdns`, `hosts:` line);
 - tests: `image/test-seed-from-mirror.sh` (real local HTTPS mirror, success,
   missing, corrupt, wrong size, resume, insufficient space, stray `ni-seed`,
   a closure naming another manifest, a preseal set binding another
   authorization), `image/test-installer-selector-grammar.sh` (corpus and the
   byte budget), `image/test-installer-media.sh` (composed medium, producer),
-  `ci/test-install-registry-mirror.sh` (guards and ordering).
+  `ci/test-install-registry-mirror.sh` (guards and ordering, the name proof
+  with a mocked `getent`), `image/test-installer-systemd-lifecycle.sh` (the
+  generator driven for real on a `.local`, an IP and a unicast-DNS mirror; no
+  announcement; the sabotaged generator).

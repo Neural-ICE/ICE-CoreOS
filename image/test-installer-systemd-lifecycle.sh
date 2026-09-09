@@ -43,14 +43,24 @@ ANCHOR="$ANCHOR neuralice.relauth_schema=neural-ice-installer-release-authorizat
 ANCHOR="$ANCHOR neuralice.rootverity=$(printf '%064d' 3)"
 ANCHOR="$ANCHOR neuralice.trust_policy_id=neural-ice-secureboot-lab-v1"
 
-run_generator() { # $1=cmdline $2=output-root [--check]
+# The appliance's REAL NetworkManager profiles: the generator pins the resolve-
+# only avahi to the management port named by mgmt-*.nmconnection, so the fixture
+# is the overlay the image ships, not a stand-in.
+NM_CONN_FIXTURE="$ROOT/image/bootc-overlay/etc/NetworkManager/system-connections"
+MGMT_INTERFACE="$(sed -n 's/^interface-name=//p' "$NM_CONN_FIXTURE"/mgmt-*.nmconnection | head -1)"
+[[ -n "$MGMT_INTERFACE" ]] || fail "the appliance overlay names no management interface in mgmt-*.nmconnection"
+
+run_generator() { # $1=cmdline $2=output-root [--check]   (RUN_GENERATOR_BINARY / RUN_GENERATOR_NM_CONN_DIR: sabotage and fixtures only)
   local cmdline=$1 output=$2 mode=${3:-generate}
   install -d -m 0755 "$output/normal" "$output/early" "$output/late"
   printf '%s\n' "$cmdline" > "$output/cmdline"
   chmod -R a+rX "$output"
   local -a command=(env NI_INSTALLER_GENERATOR_TESTING=1
     NI_INSTALLER_GENERATOR_TEST_CMDLINE="$output/cmdline"
-    NI_INSTALLER_GENERATOR_TEST_GRAMMAR="$GRAMMAR" "$GENERATOR")
+    NI_INSTALLER_GENERATOR_TEST_GRAMMAR="$GRAMMAR"
+    NI_INSTALLER_GENERATOR_TEST_NM_CONN_DIR="${RUN_GENERATOR_NM_CONN_DIR:-$NM_CONN_FIXTURE}"
+    NI_INSTALLER_GENERATOR_TEST_MDNS_RUN_DIR="$output/mdns-run"
+    "${RUN_GENERATOR_BINARY:-$GENERATOR}")
   if [[ "$mode" == --check ]]; then
     command+=(--check)
   else
@@ -240,6 +250,12 @@ build_unit_tree() { # $1=mode  -> prints "<early>:<usr>"
     basic.target sysinit.target dbus.service; do
     printf '[Unit]\nDescription=%s\n' "$unit" > "$tree/usr/$unit"
   done
+  # avahi's vendor units, reduced to the edges that matter: the service requires
+  # its socket, and the appliance drops the ceremony requirement on BOTH.
+  printf '[Unit]\nDescription=Avahi mDNS/DNS-SD Stack\nRequires=avahi-daemon.socket\nAfter=avahi-daemon.socket\n[Service]\nType=dbus\nBusName=org.freedesktop.Avahi\nExecStart=/usr/sbin/avahi-daemon -s\n' \
+    > "$tree/usr/avahi-daemon.service"
+  printf '[Unit]\nDescription=Avahi mDNS/DNS-SD Stack Activation Socket\n[Socket]\nListenStream=/run/avahi-daemon/socket\n' \
+    > "$tree/usr/avahi-daemon.socket"
   # ...and the ones it DOES own, verbatim.
   cp "$CEREMONY_UNIT" "$tree/usr/neural-ice-firstboot-tpm-ceremony.service"
   cp "$TARGET" "$tree/usr/neural-ice-installer.target"
@@ -249,7 +265,8 @@ build_unit_tree() { # $1=mode  -> prints "<early>:<usr>"
   # The appliance's own ceremony drop-in, in exactly the five places
   # image/Containerfile.bootc puts it and under exactly the name it uses there.
   for unit in NetworkManager.service NetworkManager-wait-online.service \
-    network-pre.target network.target network-online.target; do
+    network-pre.target network.target network-online.target \
+    avahi-daemon.service avahi-daemon.socket; do
     mkdir -p "$tree/usr/$unit.d"
     cp "$CEREMONY_DROPIN" "$tree/usr/$unit.d/50-neural-ice-tpm-ceremony.conf"
     grep -Fq "COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/$unit.d/50-neural-ice-tpm-ceremony.conf" \
@@ -337,6 +354,178 @@ python3 "$UNIT_GRAPH" --wants neural-ice-autoinstall.service "$mutated_registry_
 [[ -f "$TMP/registry/early/neural-ice-autoinstall.service.d/10-neural-ice-registry-network.conf" ]] \
   || fail "the registry network request is not a real file the generator emitted"
 
+# --------------------------------------------------------------------------- #
+# 🔴 A MIRROR SEALED BY `.local` NAME GETS A RESOLVER, AND ONLY A RESOLVER
+# (FAB-0057 P1.1c). Three registry lines that differ in one sealed word: the
+# mirror as an mDNS name, as an address, as a unicast-DNS name. The first must
+# take avahi's two units back off the mask list, start the daemon on a
+# configuration that PUBLISHES NOTHING, and make the installer ask for it; the
+# other two must change nothing at all. Then the generator is sabotaged, one
+# directive at a time, and the same assertion must catch every one -- a green
+# that never saw a red proves only that it runs.
+# --------------------------------------------------------------------------- #
+mirror_pins="neuralice.mirror_ca_sha256=$(printf 'c%.0s' {1..64}) neuralice.mirror_ready=$(printf 'd%.0s' {1..64})"
+mirror_pins="$mirror_pins neuralice.mirror_manifest=$(printf 'e%.0s' {1..64}) neuralice.mirror_generation=7"
+mdns_cmdline="$registry_cmdline neuralice.mirror=registry.neural-ice.local:5055 $mirror_pins"
+ip_mirror_cmdline="$registry_cmdline neuralice.mirror=192.168.178.63:5055 $mirror_pins"
+dns_mirror_cmdline="$registry_cmdline neuralice.mirror=bench.example.test:5000 $mirror_pins"
+run_generator "$mdns_cmdline" "$TMP/mdns"
+run_generator "$mdns_cmdline" "$TMP/mdns-check" --check
+run_generator "$ip_mirror_cmdline" "$TMP/ip-mirror"
+run_generator "$dns_mirror_cmdline" "$TMP/dns-mirror"
+
+MDNS_RESOLVE_ONLY_DROPIN=avahi-daemon.service.d/10-neural-ice-mirror-mdns-resolve-only.conf
+MDNS_REQUEST_DROPIN=neural-ice-autoinstall.service.d/20-neural-ice-mirror-mdns-resolve.conf
+
+# What "resolve-only" is, stated once and asked of every output below. Every
+# (section, key) the design fixes must be present EXACTLY once with EXACTLY the
+# expected value -- avahi honours the last occurrence, so a second [publish]
+# block appended by anyone would otherwise win silently -- and the daemon must
+# be started on that file rather than on the appliance's publishing one.
+assert_mdns_resolve_only() { # $1=output-root -> 0, or a reason on stdout and 1
+  local output=$1 conf="$1/mdns-run/avahi-daemon.conf" key value count observed
+  local dropin="$1/early/$MDNS_RESOLVE_ONLY_DROPIN"
+  [[ -f "$conf" ]] || { echo "no resolve-only avahi configuration was written"; return 1; }
+  local -A expected=(
+    [server/use-ipv4]=yes [server/use-ipv6]=no [server/enable-dbus]=no
+    [server/allow-interfaces]="$MGMT_INTERFACE"
+    [wide-area/enable-wide-area]=no
+    [publish/disable-publishing]=yes [publish/publish-addresses]=no
+    [publish/publish-hinfo]=no [publish/publish-workstation]=no [publish/publish-domain]=no
+    [reflector/enable-reflector]=no
+  )
+  observed="$(awk -F= '/^\[/ { section = substr($0, 2, length($0) - 2); next }
+                       /^[a-z0-9-]+=/ { print section "/" $1 "=" $2 }' "$conf")"
+  for key in "${!expected[@]}"; do
+    count="$(grep -c "^${key}=" <<<"$observed" || true)"
+    [[ "$count" == 1 ]] || { echo "$key is stated $count times"; return 1; }
+    value="$(sed -n "s#^${key}=##p" <<<"$observed")"
+    [[ "$value" == "${expected[$key]}" ]] || { echo "$key=$value, expected ${expected[$key]}"; return 1; }
+  done
+  [[ -f "$dropin" ]] || { echo "no drop-in points avahi at the resolve-only configuration"; return 1; }
+  grep -qx 'ExecStart=' "$dropin" || { echo "the vendor ExecStart= is not reset"; return 1; }
+  [[ "$(grep -c '^ExecStart=/usr/sbin/avahi-daemon ' "$dropin")" == 1 ]] \
+    || { echo "avahi is started by other than exactly one command"; return 1; }
+  grep -qx "ExecStart=/usr/sbin/avahi-daemon --syslog --file=${conf}" "$dropin" \
+    || { echo "avahi is not started on the resolve-only configuration"; return 1; }
+  grep -qx 'Type=simple' "$dropin" || { echo "avahi keeps its D-Bus service type"; return 1; }
+  return 0
+}
+
+reason="$(assert_mdns_resolve_only "$TMP/mdns")" \
+  || fail "the .local mirror's resolver is not resolve-only: $reason"
+for unit in avahi-daemon.service avahi-daemon.socket; do
+  [[ ! -e "$TMP/mdns/early/$unit" ]] \
+    || fail "a .local mirror install left $unit masked; nothing could resolve the sealed name"
+  [[ -f "$TMP/mdns/early/$unit.d/50-neural-ice-tpm-ceremony.conf" ]] \
+    || fail "a .local mirror install did not shadow the appliance ceremony drop-in on $unit"
+done
+[[ -f "$TMP/mdns/early/$MDNS_REQUEST_DROPIN" ]] \
+  || fail "a .local mirror install emitted no request for its resolver"
+grep -qx 'Wants=avahi-daemon.socket avahi-daemon.service' "$TMP/mdns/early/$MDNS_REQUEST_DROPIN" \
+  || fail "the resolver request is not a Wants= (a resolver that fails must yield the installer's own named refusal, not a dependency failure)"
+grep -Eq '^Requires=' "$TMP/mdns/early/$MDNS_REQUEST_DROPIN" \
+  && fail "the resolver request hard-requires avahi"
+# The production path is the one the generator names when it is not under test.
+grep -qx '  readonly MDNS_RUN_DIR=/run/neural-ice-installer-mdns' "$GENERATOR" \
+  || fail "the generator's production resolve-only configuration is not under /run"
+# ...and the graph: avahi is STARTABLE (its closure holds no masked unit), the
+# Install target still is, and the installer's effective Wants= names both
+# avahi units beside the network it already asked for.
+mdns_search="$(build_unit_tree mdns)"
+for unit in avahi-daemon.service avahi-daemon.socket neural-ice-installer.target; do
+  mdns_masked="$(graph_masked_members "$mdns_search" "$unit")"
+  [[ -z "$mdns_masked" ]] \
+    || fail "a .local mirror install cannot start $unit: masked required units: $mdns_masked"
+done
+mdns_wants="$(python3 "$UNIT_GRAPH" --wants neural-ice-autoinstall.service "$mdns_search")"
+for requested in NetworkManager.service network-online.target avahi-daemon.socket avahi-daemon.service; do
+  grep -qx "present $requested" <<<"$mdns_wants" \
+    || fail "a .local mirror install does not request $requested; effective Wants= was:"$'\n'"$mdns_wants"
+done
+# THE MUTATION PROOF for the shadow: without it, avahi's closure holds the
+# masked ceremony again, exactly as NetworkManager's did.
+rm -rf "$TMP/mdns-mutation"; mkdir -p "$TMP/mdns-mutation"
+cp -a "$TMP/mdns/early" "$TMP/mdns-mutation/early"
+rm -f "$TMP/mdns-mutation/early/avahi-daemon.service.d/50-neural-ice-tpm-ceremony.conf"
+[[ "$(graph_state "$TMP/mdns-mutation/early:${mdns_search#*:}" avahi-daemon.service neural-ice-firstboot-tpm-ceremony.service)" == masked ]] \
+  || fail "the mutation proof did not reproduce the defect: without the generator's shadow, avahi's closure must contain the masked ceremony"
+
+# AN ADDRESS OR A UNICAST-DNS NAME CHANGES NOTHING. Same masks as a plain
+# registry install, no request, no configuration, no directory.
+for other in ip-mirror dns-mirror registry install live; do
+  for unit in avahi-daemon.service avahi-daemon.socket; do
+    [[ -L "$TMP/$other/early/$unit" && "$(readlink "$TMP/$other/early/$unit")" == /dev/null ]] \
+      || fail "$other left $unit unmasked; only a .local mirror may start a resolver"
+  done
+  [[ ! -e "$TMP/$other/early/$MDNS_REQUEST_DROPIN" ]] \
+    || fail "$other requests an mDNS resolver it has no name to resolve"
+  [[ ! -e "$TMP/$other/early/$MDNS_RESOLVE_ONLY_DROPIN" ]] \
+    || fail "$other carries the resolve-only avahi drop-in"
+  [[ ! -e "$TMP/$other/mdns-run" ]] \
+    || fail "$other wrote a resolve-only avahi configuration"
+  grep -q avahi <<<"$(python3 "$UNIT_GRAPH" --wants neural-ice-autoinstall.service "$TMP/$other/early:${mdns_search#*:}")" \
+    && fail "$other's installer requests avahi"
+done
+# NO MANAGEMENT PROFILE, NO RESOLVER. A .local mirror on an image whose overlay
+# names no management port has nowhere to pin the daemon: the generator fails
+# loudly, avahi stays masked, nothing is written -- and the Install path it had
+# already taken back stays reachable, so the installer produces its own named
+# refusal instead of a boot that reaches nothing.
+mkdir -p "$TMP/no-mgmt-profiles"
+RUN_GENERATOR_NM_CONN_DIR="$TMP/no-mgmt-profiles" run_generator "$mdns_cmdline" "$TMP/mdns-no-mgmt" >/dev/null 2>&1 \
+  && fail "a .local mirror with no management profile to pin the resolver to was accepted silently"
+for unit in avahi-daemon.service avahi-daemon.socket; do
+  [[ -L "$TMP/mdns-no-mgmt/early/$unit" && "$(readlink "$TMP/mdns-no-mgmt/early/$unit")" == /dev/null ]] \
+    || fail "with no management profile the generator still unmasked $unit"
+done
+[[ ! -e "$TMP/mdns-no-mgmt/mdns-run/avahi-daemon.conf" && ! -e "$TMP/mdns-no-mgmt/early/$MDNS_REQUEST_DROPIN" ]] \
+  || fail "with no management profile the generator still wrote resolver material"
+for unit in neural-ice-installer.target neural-ice-autoinstall.service; do
+  [[ ! -e "$TMP/mdns-no-mgmt/early/$unit" ]] \
+    || fail "with no management profile the Install path was masked; the installer's named refusal would be unreachable"
+done
+
+# Directives only: the generator may name the publishing switches in prose, but
+# no directive it emits may turn one on, and no systemd-resolved switch exists.
+grep -v '^[[:space:]]*#' "$GENERATOR" \
+  | grep -Eq 'disable-publishing=no|publish-addresses=yes|publish-hinfo=yes|publish-workstation=yes|use-ipv6=yes|enable-dbus=yes|enable-reflector=yes|MulticastDNS=(yes|true)' \
+  && fail "the generator carries a directive that would announce the medium on the LAN"
+
+# 🔴 SABOTAGE. Each copy below is the generator with ONE directive turned into
+# an announcement, an extra listener, or the appliance's own publishing
+# configuration. It runs for real, on the same .local line, and the same
+# assertion that just accepted the genuine output must refuse every one of
+# them. A copy that is byte-identical to the original is a vacuous proof and
+# fails on its own.
+sabotage_generator() { # $1=label  $2=sed expression (BRE)
+  local label=$1 expression=$2 dir="$TMP/sabotage-${1//[^a-z0-9]/-}" reason
+  rm -rf "$dir"; mkdir -p "$dir"
+  sed "$expression" "$GENERATOR" > "$dir/generator.sh"
+  chmod 0755 "$dir/generator.sh"
+  cmp -s "$dir/generator.sh" "$GENERATOR" \
+    && fail "sabotage '$label' did not change the generator; the proof would be vacuous"
+  RUN_GENERATOR_BINARY="$dir/generator.sh" run_generator "$mdns_cmdline" "$dir/out" >/dev/null 2>&1 || true
+  if reason="$(assert_mdns_resolve_only "$dir/out")"; then
+    fail "a generator that would $label passed the resolve-only assertion"
+  fi
+  printf '  sabotage refused: %s (%s)\n' "$label" "$reason"
+}
+sabotage_generator "publish the medium's records" 's/^disable-publishing=yes$/disable-publishing=no/'
+sabotage_generator "publish address records" 's/^publish-addresses=no$/publish-addresses=yes/'
+sabotage_generator "publish an HINFO record" 's/^publish-hinfo=no$/publish-hinfo=yes/'
+sabotage_generator "join IPv6 multicast" 's/^use-ipv6=no$/use-ipv6=yes/'
+sabotage_generator "expose avahi on D-Bus" 's/^enable-dbus=no$/enable-dbus=yes/'
+sabotage_generator "reflect between interfaces" 's/^enable-reflector=no$/enable-reflector=yes/'
+sabotage_generator "listen on every interface" 's/^allow-interfaces=\${interfaces}$/allow-interfaces=/'
+sabotage_generator "restate the publishing switch in a later block" \
+  's/^rlimit-nproc=3$/rlimit-nproc=3\n\n[publish]\ndisable-publishing=no/'
+sabotage_generator "start avahi on the appliance's publishing configuration" \
+  's# --file=\${MDNS_RUN_DIR}/avahi-daemon.conf##'
+sabotage_generator "keep the vendor ExecStart beside the resolve-only one" '/^ExecStart=$/d'
+sabotage_generator "write no resolve-only configuration at all" \
+  '/^  cat > "\$MDNS_RUN_DIR\/avahi-daemon.conf" <<CONF$/,/^CONF$/d'
+
 # 🔴 THE MUTATION PROOF. Remove exactly the shadow the generator writes, and the
 # closure must go back to containing the masked ceremony. Without this, the
 # assertion above would pass just as happily against a graph that never had the
@@ -411,6 +600,8 @@ done
 run_generator 'quiet rd.luks=1 root=/dev/mapper/system' "$TMP/installed"
 [[ -z "$(find "$TMP/installed/early" -mindepth 1 -print -quit)" ]] \
   || fail "installer-only masks leaked into the installed boot"
+[[ ! -e "$TMP/installed/mdns-run" ]] \
+  || fail "the installed boot received a resolve-only avahi configuration"
 run_generator "$ANCHOR quiet neuralice.autoinstall=1" "$TMP/partial" >/dev/null 2>&1 || true
 for target in default.target multi-user.target graphical.target \
   neural-ice-installer.target neural-ice-autoinstall.service; do
@@ -610,4 +801,4 @@ bash "$GATE_TEST" >/dev/null
 bash "$GRAMMAR_TEST" >/dev/null
 bash "$LIVE_DIAG_TEST" >/dev/null
 
-echo "INSTALLER_SYSTEMD_LIFECYCLE_TEST_OK (${#consumer_units[@]} consumers suppressed; ${#masked_units[@]} transient masks; installed boot emits none; a registry install both requests NetworkManager and resolves its closure, a medium install requests neither)"
+echo "INSTALLER_SYSTEMD_LIFECYCLE_TEST_OK (${#consumer_units[@]} consumers suppressed; ${#masked_units[@]} transient masks; installed boot emits none; a registry install both requests NetworkManager and resolves its closure, a medium install requests neither; a .local mirror gets a resolve-only avahi, an image without a management profile gets none, and eleven sabotaged generators are refused)"

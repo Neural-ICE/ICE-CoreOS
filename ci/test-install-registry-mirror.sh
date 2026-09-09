@@ -296,6 +296,188 @@ else
     "${derive_line:-none}" "${verify_line:-none}"; fail=1
 fi
 
+# --------------------------------------------------------------------------- #
+# The mirror sealed by `.local` NAME (FAB-0057 P1.1c). The name is proved
+# resolvable -- by the NSS path curl/podman/skopeo take, under a timeout --
+# before the READY fetch, which is the mirror's first use, and before the first
+# disk write; a name that does not resolve is refused BY NAME. The proof is a
+# function; the function is also executed below, against a mocked getent.
+# --------------------------------------------------------------------------- #
+check "the .local test is a function the generator's rule is mirrored by" -F 'mirror_host_is_mdns_name() {'
+check "the name proof is a function"                              -F 'assert_mirror_name_resolves() {'
+check "the proof goes through NSS, as curl/podman/skopeo do"      -F 'getent ahostsv4 "$host"'
+check "the proof is bounded by a timeout"                         -F 'timeout --kill-after=2 "$MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS" getent ahostsv4'
+check "a name that does not resolve is refused by name"           -F 'readonly MIRROR_NAME_UNRESOLVABLE=mirror-name-unresolvable'
+check "the refusal names the mechanism"                           -F 'did not resolve by mDNS (nss-mdns via the resolve-only avahi-daemon'
+check "the resolver's absence is the same named refusal"          -F 'offers no socket at ${NEURALICE_AVAHI_SOCKET}'
+check "the proof is only asked of a .local mirror"                -F 'if mirror_host_is_mdns_name "$INSTALL_MIRROR"; then'
+check "the proof is asked of the sealed mirror karg itself"       -F '    assert_mirror_name_resolves "$INSTALL_MIRROR"'
+# The installer image carries the NSS module and the hosts line; the appliance
+# never inherits either (docs/SEED-FROM-MIRROR.md). The generator publishes
+# nothing.
+if grep -qF "dnf --disablerepo='nvidia*' -y install nss-mdns" image/Containerfile.installer \
+   && grep -qF "hosts: files myhostname mdns4_minimal [NOTFOUND=return] dns/' /etc/nsswitch.conf" image/Containerfile.installer; then
+  printf '  ok    the installer image carries nss-mdns and routes .local through mdns4_minimal\n'
+else
+  printf '  FAIL  the installer image must carry nss-mdns and route .local through mdns4_minimal [NOTFOUND=return]\n'; fail=1
+fi
+if grep -qF nss-mdns image/Containerfile.bootc; then
+  printf '  FAIL  nss-mdns reached the appliance image; it is an installer-image dependency only\n'; fail=1
+else
+  printf '  ok    nss-mdns is not in the appliance image\n'
+fi
+G=image/installer/neural-ice-installer-runtime-generator.sh
+if grep -qx 'disable-publishing=yes' "$G" && grep -qx 'enable-dbus=no' "$G" \
+   && ! grep -v '^[[:space:]]*#' "$G" | grep -Eq 'disable-publishing=no|publish-addresses=yes|MulticastDNS=(yes|true)'; then
+  printf '  ok    the generator starts avahi resolve-only and never announces\n'
+else
+  printf '  FAIL  the generator must start avahi with disable-publishing=yes and enable-dbus=no, and no directive may announce\n'; fail=1
+fi
+# THE ORDERING PROPERTY. The proof precedes the READY fetch (the first use of
+# the name) and the first disk write.
+proof_line="$(grep -nF '    assert_mirror_name_resolves "$INSTALL_MIRROR"' "$S" | head -1 | cut -d: -f1)"
+if [ -n "$proof_line" ] && [ -n "$ready_fetch_line" ] && [ -n "$destructive_line" ] \
+   && [ "$proof_line" -lt "$ready_fetch_line" ] && [ "$ready_fetch_line" -lt "$destructive_line" ]; then
+  printf '  ok    the name is proved (line %s) before the READY fetch (line %s) and the first disk write (line %s)\n' \
+    "$proof_line" "$ready_fetch_line" "$destructive_line"
+else
+  printf '  FAIL  the name must be proved before the READY fetch and the first disk write (proof=%s, ready=%s, write=%s)\n' \
+    "${proof_line:-none}" "${ready_fetch_line:-none}" "${destructive_line:-none}"; fail=1
+fi
+
+# THE FUNCTIONS, EXECUTED. Lifted verbatim, as ota/test-autoinstall-kargs.sh
+# lifts the argument reader; `getent` is a script on PATH whose behaviour each
+# case chooses, and `timeout` is the real one -- a hung resolver is the case
+# that matters most.
+MDNS_TMP="$(mktemp -d "${TMPDIR:-/tmp}/ni-mirror-mdns.XXXXXX")"
+trap 'rm -rf "$MDNS_TMP"' EXIT
+{
+  awk '/^mirror_host_is_mdns_name\(\) \{/,/^}$/' "$S"
+  awk '/^assert_mirror_name_resolves\(\) \{/,/^}$/' "$S"
+} > "$MDNS_TMP/proof.sh"
+if ! { grep -q '^mirror_host_is_mdns_name()' "$MDNS_TMP/proof.sh" \
+       && grep -q '^assert_mirror_name_resolves()' "$MDNS_TMP/proof.sh"; }; then
+  printf '  FAIL  cannot extract the name proof from the installer\n'; fail=1
+fi
+mkdir -p "$MDNS_TMP/bin"
+cat > "$MDNS_TMP/bin/getent" <<'GETENT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${NI_TEST_GETENT_LOG:?}"
+case "${NI_TEST_GETENT_MODE:?}" in
+  answer)   printf '192.168.178.63  STREAM registry.neural-ice.local\n192.168.178.63  DGRAM  \n192.168.178.63  RAW    \n'; exit 0 ;;
+  notfound) exit 2 ;;
+  hang)     sleep 60; exit 0 ;;
+  garbage)  printf 'not-an-address STREAM registry.neural-ice.local\n'; exit 0 ;;
+  zero)     printf '0.0.0.0 STREAM registry.neural-ice.local\n'; exit 0 ;;
+  empty)    exit 0 ;;
+esac
+exit 3
+GETENT
+chmod 0755 "$MDNS_TMP/bin/getent"
+python3 - "$MDNS_TMP/avahi.socket" <<'PYSOCK'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PYSOCK
+run_proof() { # $1=getent mode  $2=socket path  $3=host[:port] -> installer rc; stdout+stderr in $MDNS_TMP/out
+  local mode=$1 socket=$2 host=$3
+  rm -f "$MDNS_TMP/getent.log"
+  (
+    set -uo pipefail
+    # The installer's own `die`/`log`; the bounds are set short here because the
+    # extracted functions read them from the installer's readonly constants,
+    # which the extraction deliberately leaves behind.
+    # shellcheck disable=SC2329,SC2317,SC2034
+    die() { echo "die: $*" >&2; exit 1; }
+    # shellcheck disable=SC2329,SC2317
+    log() { echo "log: $*"; }
+    # shellcheck disable=SC2034
+    MIRROR_NAME_UNRESOLVABLE=mirror-name-unresolvable
+    # shellcheck disable=SC2034
+    MIRROR_MDNS_RESOLVE_ATTEMPTS=2
+    # shellcheck disable=SC2034
+    MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS=1
+    # shellcheck disable=SC2034
+    MIRROR_MDNS_RESOLVE_PAUSE_SECONDS=0
+    # shellcheck disable=SC2034
+    NEURALICE_AVAHI_SOCKET="$socket"
+    export PATH="$MDNS_TMP/bin:$PATH" NI_TEST_GETENT_MODE="$mode" NI_TEST_GETENT_LOG="$MDNS_TMP/getent.log"
+    # shellcheck source=/dev/null
+    . "$MDNS_TMP/proof.sh"
+    assert_mirror_name_resolves "$host"
+  ) > "$MDNS_TMP/out" 2>&1
+}
+verdict() { # $1=description $2=0|1 (ok when 0)
+  if [ "$2" = 0 ]; then printf '  ok    %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fail=1; fi
+}
+# A refusal is: a non-zero status, the named code on stderr, and -- when given
+# -- one more pattern that says WHICH refusal it was.
+expect_refusal() { # $1=description $2=getent mode $3=socket [$4=extra pattern]
+  local rc=0
+  run_proof "$2" "$3" registry.neural-ice.local:5055 || rc=$?
+  if [ "$rc" != 0 ] && grep -q 'die: mirror-name-unresolvable' "$MDNS_TMP/out" \
+     && { [ -z "${4:-}" ] || grep -q -- "$4" "$MDNS_TMP/out"; }; then
+    verdict "$1" 0
+  else
+    verdict "$1" 1
+  fi
+}
+# The .local rule, on both sides of the line it draws.
+if (
+  # shellcheck source=/dev/null
+  . "$MDNS_TMP/proof.sh"
+  for yes in registry.neural-ice.local:5055 registry.neural-ice.local ni-coreos-93b9.local; do
+    mirror_host_is_mdns_name "$yes" || exit 1
+  done
+  for no in 192.168.178.63:5055 bench.example.test:5000 localhost local .local foo.local.example \
+    Registry.Neural-ICE.LOCAL registry.neural-ice.local. -bad.local; do
+    mirror_host_is_mdns_name "$no" && exit 1
+  done
+  exit 0
+); then
+  verdict "the .local rule accepts exactly the mDNS names the grammar can seal" 0
+else
+  verdict "the .local rule accepts exactly the mDNS names the grammar can seal" 1
+fi
+# A name that resolves: accepted, the port stripped, the address logged.
+rc=0; run_proof answer "$MDNS_TMP/avahi.socket" registry.neural-ice.local:5055 || rc=$?
+if [ "$rc" = 0 ] && grep -q 'log: LAN mirror registry.neural-ice.local resolves by mDNS' "$MDNS_TMP/out" \
+   && grep -q ' to 192.168.178.63 ' "$MDNS_TMP/out" && grep -qx 'ahostsv4 registry.neural-ice.local' "$MDNS_TMP/getent.log"; then
+  verdict "a resolving .local mirror is accepted and its address logged" 0
+else
+  verdict "a resolving .local mirror is accepted and its address logged" 1
+fi
+# A name nothing announces: the named refusal, after exactly the bounded attempts.
+expect_refusal "an unannounced .local mirror is refused by name (mirror-name-unresolvable)" \
+  notfound "$MDNS_TMP/avahi.socket" 'the LAN mirror registry.neural-ice.local did not resolve by mDNS'
+if [ "$(grep -c . "$MDNS_TMP/getent.log")" = 2 ]; then
+  verdict "the unannounced name was asked exactly the bounded number of times" 0
+else
+  verdict "the unannounced name was asked exactly the bounded number of times" 1
+fi
+# A resolver that hangs: bounded by the timeout, then the same named refusal.
+started=$SECONDS
+expect_refusal "a hung resolver is refused by name" hang "$MDNS_TMP/avahi.socket"
+elapsed=$(( SECONDS - started ))
+if [ "$elapsed" -lt 12 ]; then
+  verdict "the hung resolver was bounded by the timeout (${elapsed}s for two 1s attempts)" 0
+else
+  verdict "the hung resolver was NOT bounded by the timeout (${elapsed}s)" 1
+fi
+# An answer that is not an IPv4 address, the unspecified one, or nothing at all.
+for bad in garbage zero empty; do
+  expect_refusal "a resolver answering '$bad' is refused by name" "$bad" "$MDNS_TMP/avahi.socket"
+done
+# No resolver at all (the generator never started avahi): refused by name
+# BEFORE getent is asked, so the message says which mechanism is missing.
+expect_refusal "an absent avahi socket is refused by name, naming the socket" \
+  answer "$MDNS_TMP/no-such.socket" 'offers no socket at '
+if [ ! -e "$MDNS_TMP/getent.log" ]; then
+  verdict "an absent avahi socket is refused without asking NSS" 0
+else
+  verdict "an absent avahi socket is refused without asking NSS" 1
+fi
+
 # The default MUST remain the medium. This is the single property that keeps the
 # USB path -- the one that installs appliances today -- untouched by all of the
 # above.
