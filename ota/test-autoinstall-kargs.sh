@@ -174,6 +174,13 @@ grep -Fq -- '--log-driver=none' "$AUTOINSTALL" \
   || fail "the pre-wipe bootc container probe does not decouple its verdict from the console"
 grep -Fq 'BOOTC-CONTAINER-SOURCE-OK > "$r"' "$AUTOINSTALL" \
   || fail "the pre-wipe bootc container probe does not write its verdict to a file"
+# The bootc container reads its source under the INSTALLER's signature policy,
+# not the appliance's strict one (which rejects containers-storage), and the
+# pre-wipe probe proves that policy admits the transport.
+grep -Fq -- '-v "$NEURALICE_CONTAINER_POLICY:/etc/containers/policy.json:ro"' "$AUTOINSTALL" \
+  || fail "the bootc container is left with the appliance's strict policy, which rejects the containers-storage source"
+grep -Fq 'would reject the containers-storage source' "$AUTOINSTALL" \
+  || fail "the pre-wipe probe does not prove the container's policy admits the source"
 
 # The post-bootc verifier consumes the resolved deployment root, not the
 # /var/tmp/nitarget OSTree sysroot. Make the distinction executable with the

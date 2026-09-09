@@ -3572,6 +3572,17 @@ bootc_container_base_args=(
   -v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro"
   -v "$BOOTC_HELPER_FUSE_OVERLAYFS:$BOOTC_HELPER_FUSE_OVERLAYFS:ro"
   -v "$BOOTC_BOUND_IMAGES_MASK:/usr/lib/bootc/bound-images.d:ro"
+  # THE INSTALLER'S SIGNATURE POLICY, NOT THE APPLIANCE'S. bootc fetches its
+  # source through a skopeo proxy INSIDE this container, under the container's
+  # /etc/containers/policy.json -- the appliance's strict one (default reject,
+  # docker scopes only), which refuses the containers-storage transport:
+  # "Running image containers-storage:[...] is rejected by policy" (hardware
+  # 2026-09-09, then reproduced on the bench in 30 s). The source is a
+  # digest-pinned object this installer authorised before the wipe (release
+  # authorization + signature, section 2b); the policy lent here decides
+  # nothing about it. The installed system keeps the strict policy the
+  # installer restores from /usr/lib/neural-ice-policy-strict.json.
+  -v "$NEURALICE_CONTAINER_POLICY:/etc/containers/policy.json:ro"
 )
 readonly -a bootc_container_base_args
 readonly BOOTC_PROBE_DIR=/run/neural-ice-installer/bootc-probe
@@ -3590,6 +3601,7 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
       r=/run/ni-probe/result
       [ -z "$(ls -A /usr/lib/bootc/bound-images.d)" ] || { echo "bound-images.d is not masked" > "$r"; exit 1; }
       /usr/bin/fuse-overlayfs --version >/dev/null 2>&1 || { echo "fuse-overlayfs does not run in the bootc container" > "$r"; exit 1; }
+      grep -q "insecureAcceptAnything" /etc/containers/policy.json || { echo "the policy inside the bootc container is the appliance strict one and would reject the containers-storage source" > "$r"; exit 1; }
       if ! skopeo inspect --raw "$1" >/dev/null 2>/run/ni-probe/skopeo.err; then
         echo "the source is not readable through the bootc container storage: $(head -c 300 /run/ni-probe/skopeo.err | tr "\n" " ")" > "$r"; exit 1
       fi
