@@ -252,6 +252,21 @@ grep -Fq 'would poweroff after 60 seconds' "$TMP/nopolicy" \
 # medium's default is not silently replaced by the fallback.
 grep -qx 'action=poweroff' "$POLICY" \
   || fail "the shipped failure policy no longer powers the machine off"
+# The shipped policy is read WHOLE. Its comment block alone exceeds 256 bytes;
+# a reader bounded at 256 bytes never saw the values and silently used the
+# defaults (measured 2026-09-09). The shipped file must be within the bound
+# the reader applies, and a policy whose values sit after a long comment
+# must still be honoured.
+policy_bytes="$(wc -c < "$POLICY")"
+[ "$policy_bytes" -le 4096 ] || fail "the shipped failure policy ($policy_bytes bytes) exceeds the reader's 4096-byte bound"
+grep -qF 'head -c 4096 -- "$POLICY_FILE"' "$FAILURE" \
+  || fail "the failure surface no longer reads the whole shipped policy (4096-byte bound)"
+long_policy="$TMP/long-comment-policy"
+{ for _ in $(seq 1 12); do printf '# %s\n' "$(printf 'x%.0s' $(seq 1 60))"; done; printf 'action=reboot\ndelay_seconds=1500\n'; } > "$long_policy"
+[ "$(wc -c < "$long_policy")" -gt 600 ] || fail "the long-comment fixture is not long"
+long_read="$(NEURALICE_FAILURE_POLICY="$long_policy" bash -c 'POLICY_FILE="$NEURALICE_FAILURE_POLICY"; source <(sed -n "/^readonly DEFAULT_ACTION/,/^}/p" "$0"); read_policy' "$FAILURE" 2>/dev/null || true)"
+[ "$long_read" = "reboot 1500" ] \
+  || fail "a policy whose values follow a long comment block is not honoured (read: '$long_read')"
 shipped_delay="$(sed -n 's/^delay_seconds=//p' "$POLICY")"
 { [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 1800 ]; } \
   || fail "the shipped failure delay ($shipped_delay) is outside the bounds its own reader enforces"

@@ -166,7 +166,12 @@ read_policy() { # -> "<action> <delay-seconds>"
           fi
           ;;
       esac
-    done < <(head -c 256 -- "$POLICY_FILE" 2>/dev/null | tr -d '\000')
+    # 4096, not 256: the shipped policy opens with a comment block longer
+    # than 256 bytes, so a 256-byte read never reached the two values and the
+    # defaults ruled every failure screen (2026-09-09, the 1800 s lab hold
+    # measured as 60 s). The bound still keeps a hostile file from being read
+    # at length; the values are validated below regardless of where they sit.
+    done < <(head -c 4096 -- "$POLICY_FILE" 2>/dev/null | tr -d '\000')
   fi
   printf '%s %s' "$action" "$delay"
 }
