@@ -40,6 +40,7 @@ on:
       # build-* nor test-*), so a change touching only it would not run its own
       # parser suite. Named here on purpose.
       - "image/bench-rehearse-medium.sh"
+      - "image/bench-rehearse-phase4.sh"
       - "image/build-installer-usb.sh"
       - "image/lib/installer-ssh-key.sh"
       - "image/lib/access-policy.sh"
@@ -254,7 +255,7 @@ jobs:
             image/test-installer-ssh-key.sh image/test-installer-systemd-lifecycle.sh image/test-installer-trust.sh \
             image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
             image/test-preloaded-sizing.sh image/qualify-installer-qemu.sh image/test-qualify-installer-qemu.sh \
-            image/bench-rehearse-medium.sh image/test-bench-rehearse-medium.sh \
+            image/bench-rehearse-medium.sh image/bench-rehearse-phase4.sh image/test-bench-rehearse-medium.sh \
             image/test-registry-authorisation.sh image/test-release-authorization.sh \
             image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-signing-trust.sh image/test-status-screen.sh image/test-tpm-ceremony-systemd.sh \
             image/test-tpm-policy-initramfs.sh \
