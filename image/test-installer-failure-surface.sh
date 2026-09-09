@@ -271,8 +271,9 @@ long_read="$(NEURALICE_FAILURE_POLICY="$long_policy" bash -c 'POLICY_FILE="$NEUR
 # file and one bounded dd, never a printf straight into efivarfs, in both the
 # installer and the failure surface (2026-09-09: a printf left 115 bytes).
 for writer in "$FAILURE" "$ROOT/ota/neural-ice-autoinstall.sh"; do
-  grep -Eq "printf '\\\\x07\\\\x00\\\\x00\\\\x00%s' .* > \"\\\$EFI_" "$writer" \
-    && fail "$(basename "$writer") writes the EFI evidence with printf, which efivarfs splits into a refused second write"
+  if grep -Eq "printf '\\\\x07\\\\x00\\\\x00\\\\x00%s' .* > \"\\\$EFI_" "$writer"; then
+    fail "$(basename "$writer") writes the EFI evidence with printf, which efivarfs splits into a refused second write"
+  fi
   grep -Fq 'of="$EFI_' "$writer" && grep -Fq 'bs=65536 count=1' "$writer" \
     || fail "$(basename "$writer") does not write the EFI evidence in one bounded dd"
 done

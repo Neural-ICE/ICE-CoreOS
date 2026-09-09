@@ -172,8 +172,9 @@ write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
     # a 115-byte variable on the bench on 2026-09-09 -- no stage, no PCR7.
     _efi_staged="$(mktemp -t ni-efi-evidence.XXXXXX 2>/dev/null)" || _efi_staged=""
     if [[ -n "$_efi_staged" ]]; then
-      { printf '\x07\x00\x00\x00'; printf '%s' "$evidence"; } > "$_efi_staged" 2>/dev/null \
-        && dd if="$_efi_staged" of="$EFI_FAILURE_EVIDENCE" bs=65536 count=1 status=none 2>/dev/null || true
+      if { printf '\x07\x00\x00\x00'; printf '%s' "$evidence"; } > "$_efi_staged" 2>/dev/null; then
+        dd if="$_efi_staged" of="$EFI_FAILURE_EVIDENCE" bs=65536 count=1 status=none 2>/dev/null || true
+      fi
       rm -f -- "$_efi_staged"
     fi
   fi
