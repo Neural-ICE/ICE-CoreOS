@@ -1346,8 +1346,8 @@ fn validate_simple_signing_payload(
     {
         return refuse("attestation payload type/identity/subject is not its closure claim");
     }
-    let facts = as_object(&root["optional"], "attestation optional")?;
     if let Some(expected) = optional {
+        let facts = as_object(&root["optional"], "attestation optional")?;
         if facts.len() != expected.len()
             || expected.iter().any(|(key, value)| {
                 facts.get(*key).and_then(serde_json::Value::as_str) != Some(*value)
@@ -1355,6 +1355,8 @@ fn validate_simple_signing_payload(
         {
             return refuse("attestation optional facts are not the exact vendor ingest facts");
         }
+    } else if !root["optional"].is_null() && !root["optional"].is_object() {
+        return refuse("attestation optional is neither null nor an object");
     }
     Ok(())
 }

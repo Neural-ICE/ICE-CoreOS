@@ -1185,7 +1185,7 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
             "image": {"docker-manifest-digest": host_digest},
             "type": "cosign container image signature"
         },
-        "optional": {}
+        "optional": null
     }));
     let image_signature = sign_low_s(base, &image_private, "image", &signing_payload);
     let (signature_manifest, signature_payload, signature_attachment) = attachment(
@@ -1465,6 +1465,84 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         release_manifest_hash,
         object_count: objects.len(),
     })
+}
+
+#[test]
+fn simple_signing_optional_is_nullable_only_without_expected_facts() {
+    let repository = "registry.example.test/neural-ice/component";
+    let subject = format!("sha256:{}", "a".repeat(64));
+    let payload = |optional: serde_json::Value| {
+        canonical_json(serde_json::json!({
+            "critical": {
+                "identity": {"docker-reference": repository},
+                "image": {"docker-manifest-digest": subject},
+                "type": "cosign container image signature"
+            },
+            "optional": optional
+        }))
+    };
+
+    for optional in [serde_json::Value::Null, serde_json::json!({})] {
+        validate_simple_signing_payload(
+            &payload(optional),
+            "cosign container image signature",
+            repository,
+            &subject,
+            None,
+        )
+        .unwrap();
+    }
+    for optional in [serde_json::json!("facts"), serde_json::json!([])] {
+        assert!(validate_simple_signing_payload(
+            &payload(optional),
+            "cosign container image signature",
+            repository,
+            &subject,
+            None,
+        )
+        .is_err());
+    }
+
+    let missing_optional = canonical_json(serde_json::json!({
+        "critical": {
+            "identity": {"docker-reference": repository},
+            "image": {"docker-manifest-digest": subject},
+            "type": "cosign container image signature"
+        }
+    }));
+    assert!(validate_simple_signing_payload(
+        &missing_optional,
+        "cosign container image signature",
+        repository,
+        &subject,
+        None,
+    )
+    .is_err());
+
+    let expected = BTreeMap::from([("source", "vendor-index")]);
+    validate_simple_signing_payload(
+        &payload(serde_json::json!({"source": "vendor-index"})),
+        "cosign container image signature",
+        repository,
+        &subject,
+        Some(&expected),
+    )
+    .unwrap();
+    for optional in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!({"source": "other"}),
+        serde_json::json!({"source": "vendor-index", "extra": "value"}),
+    ] {
+        assert!(validate_simple_signing_payload(
+            &payload(optional),
+            "cosign container image signature",
+            repository,
+            &subject,
+            Some(&expected),
+        )
+        .is_err());
+    }
 }
 
 #[test]
