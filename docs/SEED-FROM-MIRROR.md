@@ -192,14 +192,14 @@ local systemd rebuild in `image/systemd-srk/build-rpms.sh` ships only
 `systemd`, `systemd-libs`, `systemd-pam`, `systemd-udev`; neither Containerfile
 installs it); `avahi` + `avahi-tools` are (`image/Containerfile.bootc`,
 inherited by the installer image). So the resolver is avahi, **resolution
-only**, and the NSS module is `nss-mdns` -- a **new package, installer image
+only**, and no NSS module is added: `nss-mdns` is absent from the EL10 repositories (build refused 2026-09-09), so the installer asks avahi with `avahi-resolve` and pins the answer in the live root's hosts file -- **no new package, installer image
 only** (`image/Containerfile.installer`): the appliance is the installer's
 *base*, never its derivative, so nothing here reaches an installed system (the
 site mirror for OTA is P3.3).
 
 | Where | What |
 |---|---|
-| `image/Containerfile.installer` | installs `nss-mdns`; `hosts: files myhostname mdns4_minimal [NOTFOUND=return] dns` (one line, asserted). Only `.local` names are asked of avahi; a `.local` name avahi does not know is not leaked to unicast DNS; other names are untouched. When avahi is masked the module answers UNAVAIL on its absent socket and the line is inert. |
+| `image/Containerfile.installer` | installs nothing for mDNS (nss-mdns is absent from EL10); the base's `hosts:` line is untouched. Only `.local` names are asked of avahi; a `.local` name avahi does not know is not leaked to unicast DNS; other names are untouched. When avahi is masked the module answers UNAVAIL on its absent socket and the line is inert. |
 | `image/installer/neural-ice-installer-runtime-generator.sh` | on the exact Install grammar with `neuralice.source=registry` and exactly one `neuralice.mirror=` whose host ends in `.local` (`mirror_host_is_mdns_name`, read off the sealed line): writes `/run/neural-ice-installer-mdns/avahi-daemon.conf` -- `disable-publishing=yes`, `publish-addresses=no`, `publish-hinfo=no`, `publish-workstation=no`, `use-ipv6=no`, `enable-dbus=no`, `enable-reflector=no`, `allow-interfaces=<management port>` (the `interface-name` of `mgmt-*.nmconnection`, the same rule `neural-ice-hostname-init.sh` pins the appliance's avahi with; no profile = no unmask, and a named refusal later) -- shadows the appliance's ceremony drop-in on both avahi units, points `ExecStart=` at that file (`Type=simple`, no D-Bus), adds `Wants=/After=avahi-daemon.socket avahi-daemon.service` to `neural-ice-autoinstall.service`, and only then takes the two avahi masks back off. Everything is under `/run`. An IP or a non-`.local` name: nothing is written, avahi stays masked. |
 | `ota/neural-ice-autoinstall.sh` | restates the condition against the same `karg_once neuralice.mirror`; before the READY fetch -- the first use of the mirror, before the first disk write -- `assert_mirror_name_resolves` requires the avahi socket and proves `getent ahostsv4 <host>` (the NSS path curl/podman/skopeo take) under `timeout`, at most 6 attempts of 5 s with 2 s pauses (40 s bound), then logs the address. Failure is the named refusal **`mirror-name-unresolvable`**, naming the name and the mechanism, with the target disk untouched. |
 
@@ -240,7 +240,7 @@ garbage) and asserts the proof precedes the READY fetch and the first write.
   `mirror_host_is_mdns_name` / `assert_mirror_name_resolves`;
 - installer runtime: `image/installer/neural-ice-installer-runtime-generator.sh`
   (`request_mirror_mdns_resolution`), `image/Containerfile.installer`
-  (`nss-mdns`, `hosts:` line);
+  (`avahi-resolve` + a pinned line in the live installer's hosts file, never the installed system's);
 - tests: `image/test-seed-from-mirror.sh` (real local HTTPS mirror, success,
   missing, corrupt, wrong size, resume, insufficient space, stray `ni-seed`,
   a closure naming another manifest, a preseal set binding another

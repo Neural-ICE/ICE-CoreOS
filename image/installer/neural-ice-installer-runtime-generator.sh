@@ -427,7 +427,7 @@ request_mirror_mdns_resolution() { # $1=sealed mirror host[:port]
 # Neural ICE installer medium, generated into /run only.
 #
 # RESOLUTION ONLY. This boot's SIGNED command line seals the LAN mirror as the
-# mDNS name ${mirror}; nss-mdns asks this daemon for it and nothing else.
+# mDNS name ${mirror}; avahi-resolve asks this daemon for it and nothing else.
 # Publishing is disabled outright, so the medium announces no record of any
 # kind on the LAN -- not a host name, not an address, not a service.
 [server]
@@ -471,7 +471,7 @@ CONF
 # this host's address record: that is the appliance's job, never a medium's.
 # ExecStart= is reset and pointed at the resolve-only configuration this
 # generator wrote; Type=dbus is replaced because that configuration turns the
-# D-Bus interface off (nss-mdns uses the unix socket, not the bus).
+# D-Bus interface off (avahi-resolve uses the unix socket, not the bus).
 [Service]
 Type=simple
 BusName=

@@ -308,18 +308,19 @@ check "the name proof is a function"                              -F 'assert_mir
 check "the proof goes through NSS, as curl/podman/skopeo do"      -F 'getent ahostsv4 "$host"'
 check "the proof is bounded by a timeout"                         -F 'timeout --kill-after=2 "$MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS" getent ahostsv4'
 check "a name that does not resolve is refused by name"           -F 'readonly MIRROR_NAME_UNRESOLVABLE=mirror-name-unresolvable'
-check "the refusal names the mechanism"                           -F 'did not resolve by mDNS (nss-mdns via the resolve-only avahi-daemon'
+check "the refusal names the mechanism"                           -F 'did not resolve by mDNS (avahi-resolve via the resolve-only avahi-daemon'
+check "resolution asks the resolve-only avahi directly"           -F 'avahi-resolve -4 -n "$host"'
+check "the answer is pinned in the live hosts file for NSS users" -F '> "$NEURALICE_LIVE_HOSTS"'
 check "the resolver's absence is the same named refusal"          -F 'offers no socket at ${NEURALICE_AVAHI_SOCKET}'
 check "the proof is only asked of a .local mirror"                -F 'if mirror_host_is_mdns_name "$INSTALL_MIRROR"; then'
 check "the proof is asked of the sealed mirror karg itself"       -F '    assert_mirror_name_resolves "$INSTALL_MIRROR"'
-# The installer image carries the NSS module and the hosts line; the appliance
-# never inherits either (docs/SEED-FROM-MIRROR.md). The generator publishes
-# nothing.
-if grep -qF "dnf --disablerepo='nvidia*' -y install nss-mdns" image/Containerfile.installer \
-   && grep -qF "hosts: files myhostname mdns4_minimal [NOTFOUND=return] dns/' /etc/nsswitch.conf" image/Containerfile.installer; then
-  printf '  ok    the installer image carries nss-mdns and routes .local through mdns4_minimal\n'
+# No NSS module: nss-mdns is not in the EL10 repositories (build refused,
+# 2026-09-09). The installer image must not try to install it, and the
+# appliance never inherits any of this (docs/SEED-FROM-MIRROR.md).
+if grep -qE "install[[:space:]]+nss-mdns" image/Containerfile.installer; then
+  printf '  FAIL  the installer image must not install nss-mdns (absent from the EL10 repositories)\n'; fail=1
 else
-  printf '  FAIL  the installer image must carry nss-mdns and route .local through mdns4_minimal [NOTFOUND=return]\n'; fail=1
+  printf '  ok    the installer image installs no NSS module for mDNS\n'
 fi
 if grep -qF nss-mdns image/Containerfile.bootc; then
   printf '  FAIL  nss-mdns reached the appliance image; it is an installer-image dependency only\n'; fail=1
@@ -374,6 +375,21 @@ esac
 exit 3
 GETENT
 chmod 0755 "$MDNS_TMP/bin/getent"
+# avahi-resolve is the mechanism; getent is the proof of the pin. Same modes.
+cat > "$MDNS_TMP/bin/avahi-resolve" <<'AVAHI'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${NI_TEST_AVAHI_LOG:?}"
+case "${NI_TEST_GETENT_MODE:?}" in
+  answer)   printf 'registry.neural-ice.local\t192.168.178.63\n'; exit 0 ;;
+  notfound) echo "Failed to resolve host name 'registry.neural-ice.local': Timeout reached" >&2; exit 1 ;;
+  hang)     sleep 60; exit 0 ;;
+  garbage)  printf 'registry.neural-ice.local\tnot-an-address\n'; exit 0 ;;
+  zero)     printf 'registry.neural-ice.local\t0.0.0.0\n'; exit 0 ;;
+  empty)    exit 0 ;;
+esac
+exit 3
+AVAHI
+chmod 0755 "$MDNS_TMP/bin/avahi-resolve"
 python3 - "$MDNS_TMP/avahi.socket" <<'PYSOCK'
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -381,7 +397,8 @@ s.bind(sys.argv[1])
 PYSOCK
 run_proof() { # $1=getent mode  $2=socket path  $3=host[:port] -> installer rc; stdout+stderr in $MDNS_TMP/out
   local mode=$1 socket=$2 host=$3
-  rm -f "$MDNS_TMP/getent.log"
+  rm -f "$MDNS_TMP/getent.log" "$MDNS_TMP/avahi.log" "$MDNS_TMP/hosts"
+  printf '127.0.0.1 localhost\n' > "$MDNS_TMP/hosts"
   (
     set -uo pipefail
     # The installer's own `die`/`log`; the bounds are set short here because the
@@ -401,7 +418,9 @@ run_proof() { # $1=getent mode  $2=socket path  $3=host[:port] -> installer rc; 
     MIRROR_MDNS_RESOLVE_PAUSE_SECONDS=0
     # shellcheck disable=SC2034
     NEURALICE_AVAHI_SOCKET="$socket"
-    export PATH="$MDNS_TMP/bin:$PATH" NI_TEST_GETENT_MODE="$mode" NI_TEST_GETENT_LOG="$MDNS_TMP/getent.log"
+    # shellcheck disable=SC2034
+    NEURALICE_LIVE_HOSTS="$MDNS_TMP/hosts"
+    export PATH="$MDNS_TMP/bin:$PATH" NI_TEST_GETENT_MODE="$mode" NI_TEST_GETENT_LOG="$MDNS_TMP/getent.log" NI_TEST_AVAHI_LOG="$MDNS_TMP/avahi.log"
     # shellcheck source=/dev/null
     . "$MDNS_TMP/proof.sh"
     assert_mirror_name_resolves "$host"
@@ -442,15 +461,18 @@ fi
 # A name that resolves: accepted, the port stripped, the address logged.
 rc=0; run_proof answer "$MDNS_TMP/avahi.socket" registry.neural-ice.local:5055 || rc=$?
 if [ "$rc" = 0 ] && grep -q 'log: LAN mirror registry.neural-ice.local resolves by mDNS' "$MDNS_TMP/out" \
-   && grep -q ' to 192.168.178.63 ' "$MDNS_TMP/out" && grep -qx 'ahostsv4 registry.neural-ice.local' "$MDNS_TMP/getent.log"; then
-  verdict "a resolving .local mirror is accepted and its address logged" 0
+   && grep -q ' to 192.168.178.63' "$MDNS_TMP/out" && grep -qx 'ahostsv4 registry.neural-ice.local' "$MDNS_TMP/getent.log" \
+   && grep -qx -- '-4 -n registry.neural-ice.local' "$MDNS_TMP/avahi.log" \
+   && grep -qx '192.168.178.63 registry.neural-ice.local' "$MDNS_TMP/hosts" \
+   && grep -qx '127.0.0.1 localhost' "$MDNS_TMP/hosts"; then
+  verdict "a resolving .local mirror is accepted, pinned in the live hosts file and its address logged" 0
 else
-  verdict "a resolving .local mirror is accepted and its address logged" 1
+  verdict "a resolving .local mirror is accepted, pinned in the live hosts file and its address logged" 1
 fi
 # A name nothing announces: the named refusal, after exactly the bounded attempts.
 expect_refusal "an unannounced .local mirror is refused by name (mirror-name-unresolvable)" \
   notfound "$MDNS_TMP/avahi.socket" 'the LAN mirror registry.neural-ice.local did not resolve by mDNS'
-if [ "$(grep -c . "$MDNS_TMP/getent.log")" = 2 ]; then
+if [ "$(grep -c . "$MDNS_TMP/avahi.log")" = 2 ] && [ ! -e "$MDNS_TMP/getent.log" ]; then
   verdict "the unannounced name was asked exactly the bounded number of times" 0
 else
   verdict "the unannounced name was asked exactly the bounded number of times" 1
@@ -472,7 +494,7 @@ done
 # BEFORE getent is asked, so the message says which mechanism is missing.
 expect_refusal "an absent avahi socket is refused by name, naming the socket" \
   answer "$MDNS_TMP/no-such.socket" 'offers no socket at '
-if [ ! -e "$MDNS_TMP/getent.log" ]; then
+if [ ! -e "$MDNS_TMP/getent.log" ] && [ ! -e "$MDNS_TMP/avahi.log" ]; then
   verdict "an absent avahi socket is refused without asking NSS" 0
 else
   verdict "an absent avahi socket is refused without asking NSS" 1

@@ -43,31 +43,13 @@ RUN stub_rpm=/tmp/systemd-boot-unsigned-257-31.el10.aarch64.rpm \
     && test -x /usr/bin/fuse-overlayfs \
     && test -s /usr/lib/systemd/boot/efi/linuxaa64.efi.stub
 
-# nss-mdns (FAB-0057 P1.1c): the glibc NSS module through which `getent`, curl,
-# podman and skopeo resolve a `.local` name via avahi. INSTALLER IMAGE ONLY: the
-# appliance is this image's BASE, never its derivative, so neither the package
-# nor the `hosts:` line below can reach an installed system. Media seal the LAN
-# mirror by NAME (`registry.neural-ice.local:5055`, Owner 2026-09-09); without
-# this module the READY fetch died on NXDOMAIN (bench 2026-09-09). The daemon
-# it talks to is started by the runtime generator, RESOLVE-ONLY (no record of
-# any kind is published), and only on a boot whose signed command line seals a
-# `.local` mirror -- image/installer/neural-ice-installer-runtime-generator.sh.
-# On every other boot avahi stays masked, the module answers UNAVAIL on its
-# absent socket, and the line below is inert.
-#
-# `hosts: files myhostname mdns4_minimal [NOTFOUND=return] dns`: the installer's
-# own name stays answerable (`myhostname`, as the base does); only `.local` names are
-# asked of avahi; a `.local` name avahi does not know is NOT leaked to unicast
-# DNS; every other name goes to DNS exactly as before. The base's `hosts:` line
-# is replaced, not appended to, and the result is asserted to be that one line.
-# This is a NEW package in the installer image (docs/SEED-FROM-MIRROR.md).
-RUN dnf --disablerepo='nvidia*' -y install nss-mdns \
-    && dnf clean all \
-    && test -e /usr/lib64/libnss_mdns4_minimal.so.2 \
-    && test "$(grep -c '^hosts:' /etc/nsswitch.conf)" = 1 \
-    && sed -i --follow-symlinks -E 's/^hosts:.*$/hosts: files myhostname mdns4_minimal [NOTFOUND=return] dns/' /etc/nsswitch.conf \
-    && test "$(grep -c '^hosts:' /etc/nsswitch.conf)" = 1 \
-    && grep -qx 'hosts: files myhostname mdns4_minimal \[NOTFOUND=return\] dns' /etc/nsswitch.conf
+# mDNS resolution of a `.local` LAN mirror (FAB-0057 P1.1c) needs NO package:
+# nss-mdns is not in the EL10 repositories (the image build refused it on
+# 2026-09-09). The runtime generator starts the avahi this image inherits from
+# the appliance in RESOLVE-ONLY mode on a `.local`-mirror boot, and the
+# installer asks it with `avahi-resolve`, then pins the answer in the live
+# root's hosts file for curl/podman/skopeo (ota/neural-ice-autoinstall.sh).
+# The nsswitch line of the base is left untouched.
 
 # The live UKI is rebuilt below by build-installer-usb.sh, but bootc installs
 # the source image's prebuilt /usr/lib/modules/<kver>/initramfs.img. Copying only
