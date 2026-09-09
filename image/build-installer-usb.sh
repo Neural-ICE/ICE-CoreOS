@@ -119,6 +119,11 @@ MIRROR_CACHE_GENERATION="${MIRROR_CACHE_GENERATION:-}"
 SEED_CLOSURE="${SEED_CLOSURE:-}"
 SEED_TRUSTED_NOW="${SEED_TRUSTED_NOW:-}"
 RELEASE_MANIFEST_FILE="${RELEASE_MANIFEST_FILE:-}"
+# WHERE the sealed closure's objects come from at install time. Unset: the
+# ni-seed partition a PRELOADED build appends. `mirror`: the installer fetches
+# every object from INSTALL_MIRROR and this medium carries no seed partition
+# (FAB-0057 P1.1, docs/SEED-FROM-MIRROR.md). Sealed by seal_offline_seed_kargs.
+SEED_SOURCE="${SEED_SOURCE:-}"
 PCR_POLICY_DIGEST="${PCR_POLICY_DIGEST:-}"
 PCR_POLICY_PUBLIC_KEY_FILE="${PCR_POLICY_PUBLIC_KEY_FILE:-}"
 PCR_POLICY_PUBLIC_KEY_SHA256="${PCR_POLICY_PUBLIC_KEY_SHA256:-}"
@@ -152,6 +157,19 @@ sha256_of() { # $1=path -> lowercase hex
 # --------------------------------------------------------------------------- #
 seal_offline_seed_kargs() { # appends to UKI_KARGS; $1=install source
   local install_source=$1 seed_manifest_sha256 _seed_expected_os_ref
+  # 🔴 THE MIRROR-SOURCED SEED IS THE SAME SEED, SEALED THE SAME WAY (FAB-0057
+  # P1.1). SEED_SOURCE=mirror changes WHERE the closure's objects come from at
+  # install time -- the LAN mirror instead of an ni-seed partition -- and
+  # nothing about what is sealed: the same six documents are read here, the
+  # same closure/manifest hashes are sealed, and the same preseal reconciliation
+  # runs. It is a value with exactly one spelling, and it is admitted only where
+  # every gate below already holds (the checks at the end of this function).
+  if [[ -n "${SEED_SOURCE:-}" ]]; then
+    [[ "${SEED_SOURCE:-}" == mirror ]] \
+      || { echo "ERROR: SEED_SOURCE must be unset (seed on the ni-seed partition) or 'mirror', got: $SEED_SOURCE" >&2; exit 1; }
+    [[ -n "$SEED_CLOSURE" ]] \
+      || { echo "ERROR: SEED_SOURCE=mirror names where a sealed release closure is fetched from, and SEED_CLOSURE names none" >&2; exit 1; }
+  fi
   if [[ -z "$SEED_CLOSURE" ]]; then
     [[ -z "$SEED_TRUSTED_NOW" && -z "$RELEASE_MANIFEST_FILE" ]] \
       || { echo "ERROR: SEED_TRUSTED_NOW/RELEASE_MANIFEST_FILE describe an offline seed and SEED_CLOSURE names none; a medium either carries the seed it was cut with or carries no seed argument at all" >&2; exit 1; }
@@ -257,6 +275,25 @@ SEED_PRESEAL_PY
   UKI_KARGS+=("neuralice.seed_closure=${SEED_CLOSURE}" \
     "neuralice.seed_manifest=${seed_manifest_sha256}" \
     "neuralice.seed_trusted_now=${SEED_TRUSTED_NOW}")
+
+  # The mirror-sourced seed needs every gate of the composed medium: a registry
+  # OS root, the mirror the objects come from, the preseal set that reconciles
+  # the two, and a mirror that declares READY exactly this closure. The sealed
+  # grammar refuses the same absences; refusing HERE means the operator learns
+  # before the medium is cut. Nothing is copied to the medium: the objects are
+  # fetched at install time and proved by the same verifier the ni-seed path runs.
+  if [[ "${SEED_SOURCE:-}" == mirror ]]; then
+    [[ "$install_source" == registry ]] \
+      || { echo "ERROR: SEED_SOURCE=mirror requires INSTALL_SOURCE=registry; a medium install carries its seed on the stick" >&2; exit 1; }
+    [[ -n "$INSTALL_MIRROR" ]] \
+      || { echo "ERROR: SEED_SOURCE=mirror requires INSTALL_MIRROR, the LAN mirror the installer fetches the closure's objects from" >&2; exit 1; }
+    [[ -n "$PRESEAL_STAGE_ROOT" ]] \
+      || { echo "ERROR: SEED_SOURCE=mirror requires the signed preseal set (PRESEAL_SET_DIR/PRESEAL_SET_SHA256); nothing else reconciles a fetched seed with the pulled appliance" >&2; exit 1; }
+    [[ "$MIRROR_READY_SHA256" == "$SEED_CLOSURE" && "$MIRROR_READY_MANIFEST_SHA256" == "$seed_manifest_sha256" ]] \
+      || { echo "ERROR: SEED_SOURCE=mirror requires MIRROR_READY_SHA256/MIRROR_READY_MANIFEST_SHA256 to equal the sealed seed closure and manifest; a mirror that declares another release cannot serve this one" >&2; exit 1; }
+    UKI_KARGS+=("neuralice.seed_source=mirror")
+    echo "    seed source sealed: the closure's objects are fetched from ${INSTALL_MIRROR} at install time; this medium carries no ni-seed partition"
+  fi
 }
 # --------------------------------------------------------------------------- #
 # THE SEALED BOOT PATH. All of these are explicit: a default here would be a
@@ -997,7 +1034,7 @@ case "$MEDIA_MODE" in
     # A Live medium stages nothing either. Refusing here rather than silently
     # dropping the tuple is what stops an operator receiving a Live stick that
     # LOOKS preloaded; the sealed grammar refuses a seed argument on a Live line.
-    [[ -z "$SEED_CLOSURE" && -z "$SEED_TRUSTED_NOW" && -z "$RELEASE_MANIFEST_FILE" ]] \
+    [[ -z "$SEED_CLOSURE" && -z "$SEED_TRUSTED_NOW" && -z "$RELEASE_MANIFEST_FILE" && -z "$SEED_SOURCE" ]] \
       || { echo "ERROR: a Live medium installs nothing; an offline seed closure is meaningless on one" >&2; exit 1; }
     ;;
 esac
@@ -1086,7 +1123,14 @@ zero_partition() { sudo dd if=/dev/zero of="$1" bs=4M conv=fsync status=none 2>/
 PAYLOADPART=""; PAYLOADPART_NUM=""
 for p in "${LOOP}"p*; do
   case "$(part_label "$p")" in
-    EFI-SYSTEM | boot | ni-seed) continue ;;
+    ni-seed)
+      # A medium whose seed arrives from the mirror carries no seed partition: a
+      # stick with both is two unreconciled sources of one closure, and the
+      # installer refuses it before the wipe. Refusing here is cheaper.
+      [[ "$SEED_SOURCE" != mirror ]] \
+        || { echo "ERROR: SEED_SOURCE=mirror and this raw carries an ni-seed partition; a mirror-sourced seed medium carries no seed partition" >&2; exit 1; }
+      continue ;;
+    EFI-SYSTEM | boot) continue ;;
   esac
   sudo mkdir -p "$MNT"
   if sudo mount -o ro "$p" "$MNT" 2>/dev/null; then

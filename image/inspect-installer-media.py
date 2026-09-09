@@ -735,6 +735,7 @@ SEALED_INSTALL_OPTIONAL_KEYS = (
     "neuralice.seed_closure",
     "neuralice.seed_manifest",
     "neuralice.seed_trusted_now",
+    "neuralice.seed_source",
     "neuralice.pcr_policy",
     "neuralice.pcr_policy_key",
     "neuralice.pcr_policy_signature",
@@ -905,6 +906,10 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
         return bool(re.fullmatch(r"[1-9][0-9]{0,18}", value))
     if key == "neuralice.seed_trusted_now":
         return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value))
+    if key == "neuralice.seed_source":
+        # Absent, the seed is the ni-seed partition; `mirror` is the only other
+        # source (docs/SEED-FROM-MIRROR.md). Its company is checked below.
+        return value == "mirror"
     if key == "neuralice.target":
         # This value selects the disk that is about to be destroyed.
         return bool(re.fullmatch(r"/dev/[a-zA-Z0-9][a-zA-Z0-9_-]*", value))
@@ -1146,6 +1151,22 @@ def classify_sealed_cmdline(cmdline: str) -> str:
                 raise SelectorRefusal("mirror-manifest-not-the-sealed-seed-manifest")
     elif "neuralice.seed_manifest" in optional or "neuralice.seed_trusted_now" in optional:
         raise SelectorRefusal("seed-manifest-without-closure")
+
+    # THE SEED THAT ARRIVES OVER THE LAN (FAB-0057 P1.1). The sealed closure's
+    # objects are fetched from the mirror rather than read off an ni-seed
+    # partition, which is only meaningful beside a registry OS root, the mirror
+    # itself, the preseal set and the seed tuple. Checked LAST so every rule
+    # above keeps its precedence; the mirror_ready/seed_closure equality is
+    # already forced by the two blocks above once both are required here.
+    if "neuralice.seed_source" in optional:
+        if source != "registry":
+            raise SelectorRefusal("seed-source-mirror-without-registry-source")
+        if "neuralice.mirror" not in optional:
+            raise SelectorRefusal("seed-source-mirror-without-mirror")
+        if "neuralice.preseal" not in optional:
+            raise SelectorRefusal("seed-source-mirror-without-preseal")
+        if "neuralice.seed_closure" not in optional:
+            raise SelectorRefusal("seed-source-mirror-without-seed-closure")
     return mode
 
 

@@ -269,6 +269,15 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
     neuralice.seed_trusted_now)
       [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
       ;;
+    neuralice.seed_source)
+      # WHERE the sealed release closure's objects come from. Absent, the seed
+      # is the `ni-seed` partition on this medium (the byte-identical historical
+      # path). `mirror` is the ONLY other value: the installer materialises the
+      # closure from the LAN mirror, object by object, each hashed against the
+      # name the sealed closure gives it (docs/SEED-FROM-MIRROR.md). What that
+      # value may sit beside is a question about the LINE, answered in section 4.
+      [[ "$value" == mirror ]]
+      ;;
     neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.preseal|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature)
       # SHA-256 of an artefact the producer staged on the ESP, or of the exact
       # release closure a mirror declares READY. Sealed into the UKI so the
@@ -308,6 +317,7 @@ _ni_sealed_install_optional_keys=(
   neuralice.mirror_ca_sha256 neuralice.mirror_ready neuralice.mirror_manifest
   neuralice.mirror_generation
   neuralice.seed_closure neuralice.seed_manifest neuralice.seed_trusted_now
+  neuralice.seed_source
   neuralice.pcr_policy neuralice.pcr_policy_key neuralice.pcr_policy_signature neuralice.pcr_policy_seq
 )
 
@@ -676,6 +686,34 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
     [[ -z "${optional_seen[neuralice.seed_manifest]:-}" \
        && -z "${optional_seen[neuralice.seed_trusted_now]:-}" ]] \
       || { _ni_sealed_refuse seed-manifest-without-closure; return 1; }
+  fi
+
+  # ------------------------------------------------------------------------- #
+  # THE SEED THAT ARRIVES OVER THE LAN (FAB-0057 P1.1). `neuralice.seed_source=
+  # mirror` says the sealed closure's objects are NOT on this medium: the
+  # installer fetches them from `neuralice.mirror`, each hashed against the name
+  # the sealed closure gives it, and proves the whole tree with the same
+  # verifier the `ni-seed` path runs. That is only meaningful in the company of
+  # every gate the composed medium already needs -- a registry OS root, the
+  # mirror with its pinned CA and READY closure, the preseal set that
+  # reconciles the two, and the seed tuple itself -- so each absence is its own
+  # refusal. This block runs LAST on purpose: every rule above keeps its
+  # precedence, and a line these refusals reach is one the rest of the grammar
+  # already accepts.
+  #
+  # `mirror_ready == seed_closure` and `mirror_manifest == seed_manifest` are
+  # not restated: a mirror forces `mirror_ready`, a seed closure beside it
+  # forces the equality, and both are required here.
+  # ------------------------------------------------------------------------- #
+  if [[ -n "${optional_seen[neuralice.seed_source]:-}" ]]; then
+    (( registry_source == 1 )) \
+      || { _ni_sealed_refuse seed-source-mirror-without-registry-source; return 1; }
+    [[ -n "$mirror_seen" ]] \
+      || { _ni_sealed_refuse seed-source-mirror-without-mirror; return 1; }
+    [[ -n "${optional_seen[neuralice.preseal]:-}" ]] \
+      || { _ni_sealed_refuse seed-source-mirror-without-preseal; return 1; }
+    [[ -n "${optional_seen[neuralice.seed_closure]:-}" ]] \
+      || { _ni_sealed_refuse seed-source-mirror-without-seed-closure; return 1; }
   fi
 
   printf '%s' "$mode"

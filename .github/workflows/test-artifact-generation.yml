@@ -246,6 +246,7 @@ jobs:
             image/policy/render-container-policy.sh image/test-access-policy.sh image/test-build-installer-root.sh \
             image/test-hardware-identity.sh image/test-installer-failure-surface.sh image/test-installer-live-diagnostics.sh \
             image/test-installer-media.sh image/test-installer-payload.sh image/test-installer-selector-grammar.sh \
+            image/test-seed-from-mirror.sh \
             image/test-installer-ssh-key.sh image/test-installer-systemd-lifecycle.sh image/test-installer-trust.sh \
             image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
             image/test-preloaded-sizing.sh image/qualify-installer-qemu.sh image/test-qualify-installer-qemu.sh \
@@ -421,6 +422,10 @@ jobs:
           # The three suites the systemd-lifecycle suite also chains, run here in
           # their own right so a change to that chaining cannot silently drop one.
           ./image/test-installer-selector-grammar.sh
+          # The seed that arrives over the LAN (FAB-0057 P1.1): a real local
+          # HTTPS mirror, the installer's own lifted functions, and a sabotaged
+          # object that must refuse. Needs bash, python3, curl and openssl only.
+          ./image/test-seed-from-mirror.sh
           ./image/test-installer-live-diagnostics.sh
           ./image/test-installer-failure-surface.sh
           # The signed-media command-line grammar, the failure sink and the
