@@ -2067,6 +2067,51 @@ readonly SEED_PACK_DIR="$INSTALLER_STATE_DIR/seed-pack"
 # the closure, drives `curl` with the pinned transport, hashes in flight, and
 # publishes each object by atomic rename only when the bytes hash to the name.
 # Positional arguments only; the exit status is the verdict.
+# NETWORK HEALTH OF THE LIVE INSTALLER, READ-ONLY, ONE LOG LINE. The mirror
+# fetch of C28 (2026-09-11, lab GX10) ran at 185-235 MB/s on a 10 GbE link with
+# 1.26 % TCP retransmissions measured on the mirror host, while the same NIC
+# under the installed OS receives 1.1 GB/s with 0.01-0.1 % loss: the loss is
+# on the live receiver, and the live boot carries no SSH and no readout. This
+# snapshot names, for the interface that reaches the mirror: driver, every IRQ
+# with its EFFECTIVE affinity and the CPU that serviced it most, rx_missed /
+# rx_dropped (deltas after the fetch), softnet dropped/squeezed, cpufreq
+# governor and whether irqbalance runs. Taken before and after the phase-5
+# fetch so the deltas cover exactly the transfer. Every read is guarded: a
+# missing file yields "?" and never a refusal -- this is evidence, not a gate.
+declare -A _net_health_before=()
+network_health_snapshot() { # $1=label (before|after)
+  local label="$1" host iface driver irqs q eff top missed dropped bytes soft gov irqb line=""
+  host="${INSTALL_MIRROR%%:*}"
+  iface="$(ip -o -4 route get "$host" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+  if [[ -z "$iface" || ! -d "/sys/class/net/$iface" ]]; then
+    log "NET ${label}: no resolvable route to the mirror host ${host}; no readout"
+    return 0
+  fi
+  driver="$(basename "$(readlink -f "/sys/class/net/$iface/device/driver" 2>/dev/null)" 2>/dev/null)"; driver="${driver:-?}"
+  missed="$(cat "/sys/class/net/$iface/statistics/rx_missed_errors" 2>/dev/null || echo 0)"
+  dropped="$(cat "/sys/class/net/$iface/statistics/rx_dropped" 2>/dev/null || echo 0)"
+  bytes="$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo 0)"
+  soft="$(awk '{d+=strtonum("0x"$2); s+=strtonum("0x"$3)} END {printf "%d/%d", d, s}' /proc/net/softnet_stat 2>/dev/null || echo "?/?")"
+  gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+  irqb="$(systemctl is-active irqbalance.service 2>/dev/null)" || irqb="${irqb:-inactive}"
+  irqs="$(awk -v n="$iface" -v d="$driver" -F: 'index($0, n) || index($0, d) { gsub(/ /, "", $1); print $1 }' /proc/interrupts 2>/dev/null | head -8 | tr '\n' ' ')"
+  for q in $irqs; do
+    [[ "$q" =~ ^[0-9]+$ ]] || continue
+    eff="$(cat "/proc/irq/$q/effective_affinity_list" 2>/dev/null || echo ?)"
+    top="$(awk -v q="$q" -F: '$1 ~ "^ *"q"$" { n = split($2, c, " "); best = 0; bi = -1; for (k = 1; k <= n; k++) { if (c[k] !~ /^[0-9]+$/) break; if (c[k] + 0 > best) { best = c[k] + 0; bi = k - 1 } } printf "cpu%d", bi }' /proc/interrupts 2>/dev/null || echo "cpu?")"
+    line+=" irq${q}[eff=${eff},top=${top}]"
+  done
+  if [[ "$label" == before ]]; then
+    _net_health_before=([missed]="$missed" [dropped]="$dropped" [bytes]="$bytes")
+    log "NET before: ${iface} driver=${driver} governor=${gov} irqbalance=${irqb} softnet(dropped/squeezed)=${soft}${line:- irq=?}"
+  else
+    local dm dd db
+    dm=$(( missed - ${_net_health_before[missed]:-0} )); dd=$(( dropped - ${_net_health_before[dropped]:-0} )); db=$(( bytes - ${_net_health_before[bytes]:-0} ))
+    log "NET after: ${iface} rx=$(( db / 1048576 )) MiB rx_missed=+${dm} rx_dropped=+${dd} ($(awk -v m="$dm" -v b="$db" 'BEGIN { if (b > 0) printf "%.3f", 100 * m / (b / 1448); else printf "0" }')% of segments) softnet(dropped/squeezed)=${soft} irqbalance=${irqb}${line:- irq=?}"
+  fi
+  return 0
+}
+
 seed_mirror_helper() { # $1=documents|plan|objects $2..=positional arguments -> the fetcher's exit status
   python3 - "$@" <<'SEED_MIRROR_PY'
 """Bounded fetcher for the mirror-sourced seed (docs/SEED-FROM-MIRROR.md).
@@ -2801,11 +2846,13 @@ seed_from_mirror_materialize() { # $1=destination release/<closure> directory on
   [[ "$object_count" =~ ^[0-9]+$ && "$bytes_declared" =~ ^[0-9]+$ ]] \
     || die "the closure fetch plan is malformed"
   log "MIRROR: materialising release closure sha256:${SEED_CLOSURE} from ${INSTALL_MIRROR} — ${object_count} declared objects, $(awk -v t="$bytes_declared" 'BEGIN{printf "%.1f", t / 2^30}') GiB declared; each object is hashed against its name before it is named…"
+  network_health_snapshot before
   copy_progress_start "$bytes_declared" "$destination"
   seed_mirror_helper objects "$INSTALL_MIRROR" "$MIRROR_CA_FILE" "$destination/release-closure.json" \
     "$NEURALICE_RELEASE_AUTHORITY" "$destination" "$SEED_CLOSURE" "$SEED_MANIFEST_SHA256" \
     || die "the release closure could not be materialised from the LAN mirror ${INSTALL_MIRROR} (a missing, corrupt, oversize or unreachable object, or a full data volume); refusing to finish an install whose offline objects cannot be proved"
   bg_stop
+  network_health_snapshot after
   heartbeat_start "seed flush to disk (sync)"
   sync
   bg_stop
