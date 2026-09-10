@@ -48,7 +48,7 @@ medium=$work_dir/medium.qcow2; target=$work_dir/target.qcow2
 [[ -f "$medium" ]] || die "$medium is absent: the rehearsal was not run with --medium-overlay, so no escrow exists"
 [[ -f "$target" ]] || die "$target is absent"
 ! pgrep -f "[q]emu-system-aarch64.*$work_dir" >/dev/null || die "a QEMU guest still owns $work_dir"
-for tool in qemu-nbd cryptsetup lsblk findmnt journalctl blockdev shred; do
+for tool in qemu-nbd cryptsetup lsblk findmnt journalctl partprobe shred; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 modprobe nbd max_part=16 2>/dev/null || true
@@ -83,7 +83,7 @@ trap cleanup EXIT
 # 1. The escrow, off the overlay's ESP.
 nbd_medium=$(free_nbd) || die "no free /dev/nbd device"
 qemu-nbd --read-only -c "$nbd_medium" "$medium" || die "cannot attach $medium read-only"
-udevadm settle 2>/dev/null || true; blockdev --rereadpt "$nbd_medium" 2>/dev/null || true; udevadm settle 2>/dev/null || true
+partprobe "$nbd_medium" >/dev/null 2>&1 || true; udevadm settle 2>/dev/null || true
 esp=$(lsblk -rno NAME,FSTYPE "$nbd_medium" | awk '$2 == "vfat" && !f { print $1; f=1 }')
 [[ -n "$esp" ]] || die "the medium overlay has no vfat partition"
 mkdir -m 0700 "$esp_mnt"
@@ -99,7 +99,7 @@ umount "$esp_mnt"; qemu-nbd -d "$nbd_medium" >/dev/null; nbd_medium=""
 # 2. The system volume, read-only, and the deployment's persistent journal.
 nbd_target=$(free_nbd) || die "no free /dev/nbd device"
 qemu-nbd --read-only -c "$nbd_target" "$target" || die "cannot attach $target read-only"
-udevadm settle 2>/dev/null || true; blockdev --rereadpt "$nbd_target" 2>/dev/null || true; udevadm settle 2>/dev/null || true
+partprobe "$nbd_target" >/dev/null 2>&1 || true; udevadm settle 2>/dev/null || true
 sysp=${nbd_target}p3
 [[ -b "$sysp" ]] || die "$sysp is not a block device: the target carries no partition 3 (system)"
 cryptsetup isLuks "$sysp" || die "$sysp is not LUKS: the target was never installed"
