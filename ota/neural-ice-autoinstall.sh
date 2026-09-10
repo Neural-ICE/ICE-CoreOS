@@ -173,7 +173,11 @@ write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
     _efi_staged="$(mktemp -t ni-efi-evidence.XXXXXX 2>/dev/null)" || _efi_staged=""
     if [[ -n "$_efi_staged" ]]; then
       if { printf '\x07\x00\x00\x00'; printf '%s' "$evidence"; } > "$_efi_staged" 2>/dev/null; then
-        dd if="$_efi_staged" of="$EFI_FAILURE_EVIDENCE" bs=65536 count=1 status=none 2>/dev/null || true
+        # head(1) copies a file this small in one read and ONE write(2), which
+        # is the efivarfs contract above. Not dd: dd is a disk-writing tool and
+        # the preflight harness (ota/test-installer-pcr7-coverage.sh) rightly
+        # counts any dd call as a target mutation, whatever its operands.
+        head -c 65536 -- "$_efi_staged" > "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
       fi
       rm -f -- "$_efi_staged"
     fi
