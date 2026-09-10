@@ -18,7 +18,13 @@ RestrictAddressFamilies=AF_UNIX
 PrivateNetwork=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice
+# /run/neural-ice is created by neural-ice-hostname-init, which is not ordered
+# before this unit and may not have run (or may have failed) yet. A required
+# ReadWritePaths= that is absent makes systemd fail this unit at the NAMESPACE
+# step, before the script runs and without a line of output: the lab GX10
+# first boots of 2026-09-10 died there. The path is optional here (`-`); the
+# script writes nothing under it.
+ReadWritePaths=/var/lib/neural-ice/data -/run/neural-ice
 
 [Install]
 WantedBy=multi-user.target
