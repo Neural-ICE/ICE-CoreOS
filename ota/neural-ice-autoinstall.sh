@@ -4176,6 +4176,15 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
     printf '[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n' \
       > "$_lab_dropin_dir/50-lab-console.conf" \
       || die "cannot write the LAB console drop-in for ${_lab_unit}"
+    if [[ "$_lab_unit" == neural-ice-seed-import ]]; then
+      # Interim, until the appliance image carries the fixed unit: the shipped
+      # unit REQUIRES /run/neural-ice, which nothing before it creates on a
+      # GX10, and systemd fails it at the NAMESPACE step (2026-09-10). An empty
+      # assignment resets the list; the directory is optional again.
+      printf 'ReadWritePaths=\nReadWritePaths=/var/lib/neural-ice/data -/run/neural-ice\n' \
+        >> "$_lab_dropin_dir/50-lab-console.conf" \
+        || die "cannot write the LAB seed-import sandbox drop-in"
+    fi
     chmod 0644 -- "$_lab_dropin_dir/50-lab-console.conf"
   done
   echo "[neural-ice-autoinstall] LAB first-boot units mirror their output to the console (tty2)."
