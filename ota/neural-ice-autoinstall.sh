@@ -4161,6 +4161,25 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get
   "$dep/etc/containers/policy.json" \
   || die "the container policy restored onto the target is not the fail-closed grafted one"
 echo "[neural-ice-autoinstall] Strict container signature policy restored on the target deployment."
+# LAB media only: the first-boot units whose refusal decides whether the
+# appliance ever opens its network write to the console as well as the
+# journal. On 2026-09-10 neural-ice-seed-import.service failed on a lab GX10
+# with its reason in a journal nobody could reach (network held, no SSH); the
+# installed appliance keeps its console on tty2 (console=tty2 above), so an
+# operator reads the refusal with Alt+F2. A customer medium writes nothing here.
+if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
+  for _lab_unit in neural-ice-seed-import neural-ice-payload-apply neural-ice-device-root \
+      neural-ice-firstboot-sshkey neural-ice-firstboot-sshkey-activate; do
+    _lab_dropin_dir="$dep/etc/systemd/system/${_lab_unit}.service.d"
+    install -d -m 0755 -- "$_lab_dropin_dir" \
+      || die "cannot prepare the LAB console drop-in directory for ${_lab_unit}"
+    printf '[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n' \
+      > "$_lab_dropin_dir/50-lab-console.conf" \
+      || die "cannot write the LAB console drop-in for ${_lab_unit}"
+    chmod 0644 -- "$_lab_dropin_dir/50-lab-console.conf"
+  done
+  echo "[neural-ice-autoinstall] LAB first-boot units mirror their output to the console (tty2)."
+fi
 # The mirror is an INSTALL-TIME convenience and must not survive onto the
 # appliance: an installed machine that keeps pointing at a bench would silently
 # stop being air-gapped the day that bench is gone -- or, worse, keep trusting a
