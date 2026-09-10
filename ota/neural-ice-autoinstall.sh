@@ -3973,6 +3973,17 @@ fi
 # is broken at its source (PrivateTmp=disconnected in the appliance's own
 # unit, verified after finalize below), and a mask would have been a permanent
 # karg disabling the very root-capable-extension gate the image installs.
+# LAB media only: the installed appliance keeps its kernel console on /dev/tty2.
+# The first-boot status screen owns tty1 and repaints it, so a unit whose
+# stderr is journal+console (the TPM owner ceremony, ADR-0015) had its refusal
+# line erased on the screen and sent to the SPCR UART nobody reads: on
+# 2026-09-09 a lab appliance showed NI-E02 with no reason anywhere. With the
+# console on tty2 the operator presses Alt+F2 and reads it; the journal copy
+# is unchanged. A customer medium seals no console= and keeps the firmware's.
+lab_console_karg=()
+if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
+  lab_console_karg=(--karg "console=tty2")
+fi
 heartbeat_start "bootc install to-filesystem"
 # The SAME container the pre-wipe proof exercised (bootc_container_base_args:
 # store, storage config, lent fuse-overlayfs helper, masked bound images).
@@ -3993,6 +4004,7 @@ podman "${bootc_container_base_args[@]}" --log-driver=passthrough-tty \
     --karg "neuralice.pcr_policy_signature=$PCR_POLICY_SIGNATURE_SHA256" \
     --karg "neuralice.pcr_policy_seq=$PCR_POLICY_SEQ" \
     "${sshkey_karg[@]}" \
+    "${lab_console_karg[@]}" \
     "$TGT" \
   || die "bootc install to-filesystem failed"
 bg_stop
