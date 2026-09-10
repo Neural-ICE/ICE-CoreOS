@@ -563,4 +563,12 @@ for required in \
     || fail "the installed ceremony inputs are not durably published: $required"
 done
 
+# A bash function must be defined above its first caller: partdev() defined
+# after the pre-wipe readout was `command not found` (exit 127) under KVM on
+# 2026-09-10, and no static check saw it.
+_def_line="$(grep -n '^partdev() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_use_line="$(grep -n 'partdev [0-9]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$_def_line" && -n "$_use_line" && "$_def_line" -lt "$_use_line" ]] \
+  || fail "partdev() is defined at line ${_def_line:-?} but first used at line ${_use_line:-?}"
+
 echo "AUTOINSTALL_KARGS_TEST_OK"

@@ -3661,6 +3661,12 @@ assert_bootc_container_reads_source "$source_imgref"
 # xfs ro,norecovery), prints the last lines of the ceremony unit's persistent
 # journal and the last errors, closes everything and shreds the key. Never on
 # a customer medium; never a write; never a reason to stop the install.
+# Partition device naming for the internal target, needed here by the pre-wipe
+# readout and below by the partitioner. Bash resolves a function at CALL time:
+# defined after its first caller, this was `command not found` (exit 127) on
+# the 2026-09-10 KVM rehearsal of medium C14, right after the pre-wipe proof.
+partdev() { case "$target" in *[0-9]) echo "${target}p$1";; *) echo "${target}$1";; esac; }
+
 log_previous_firstboot_journal() {
   [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] || return 0
   local sysp esp mountpoint mounted=0 recfile key keyfile mapper=ni-previous-system mnt journal_dir out line
@@ -3726,7 +3732,6 @@ phase 2 "Partition + encrypt (GPT, 2× LUKS2, TPM2/PCR7 enroll)"
 # 3) Partition the target (GPT): ESP, /boot, LUKS system, LUKS data
 # --------------------------------------------------------------------------- #
 # Partition device name helper (nvme0n1 -> nvme0n1pN ; sda -> sdaN)
-partdev() { case "$target" in *[0-9]) echo "${target}p$1";; *) echo "${target}$1";; esac; }
 ESP="$(partdev 1)"; BOOT="$(partdev 2)"; SYSP="$(partdev 3)"; DATAP="$(partdev 4)"
 
 # Target mountpoint for the install (real dir; /mnt is a dangling symlink in

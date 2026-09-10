@@ -632,4 +632,14 @@ done
 
 (( induced >= 15 )) || fail "only $induced failure classes were induced; the coverage shrank"
 
+# The unit's start timeout must outlive the longest hold the script can be
+# told to keep, or systemd kills the evidence screen before its power-off and
+# the machine stays on with no terminal action (KVM, medium C14, 2026-09-10).
+_delay_max="$(sed -n 's/^readonly DELAY_MAX=\([0-9]*\)$/\1/p' "$FAILURE" | head -1)"
+_timeout="$(sed -n 's/^TimeoutStartSec=\([0-9]*\)$/\1/p' "$FAILURE_UNIT" | head -1)"
+[[ "$_delay_max" =~ ^[0-9]+$ && "$_timeout" =~ ^[0-9]+$ ]] \
+  || fail "DELAY_MAX (${_delay_max:-?}) or TimeoutStartSec (${_timeout:-?}) is not a plain number"
+(( _timeout > _delay_max + 120 )) \
+  || fail "TimeoutStartSec=$_timeout does not outlive DELAY_MAX=$_delay_max plus the render"
+
 echo "INSTALLER_FAILURE_SURFACE_TEST_OK (${induced} failure classes induced; evidence is bounded, closed-vocabulary and one-way; the sink takes no input and always reaches a terminal action)"
