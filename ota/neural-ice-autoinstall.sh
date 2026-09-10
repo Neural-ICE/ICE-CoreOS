@@ -4103,6 +4103,7 @@ if [[ "$SEED_SOURCE" == mirror ]]; then
   # hashed in flight against its name. The whole-tree proof is the common
   # re-verification below -- the same verifier, the same sealed hash.
   install -d -m 0755 /run/seed-dst/release
+  install -d -m 0700 /run/seed-dst/tmp   # first-boot staging (seed-import's skopeo --tmpdir / LAB BindPaths)
   _seed_dst="/run/seed-dst/release/$SEED_CLOSURE"
   # A partial destination from an interrupted earlier attempt is not a source of
   # truth and is not merged with: it is removed and rebuilt.
@@ -4113,6 +4114,7 @@ elif [[ -n "$SEED_VERIFIED_ROOT" ]]; then
   seed_total=0
   seed_total="$(du -sb "$SEED_VERIFIED_ROOT" | awk '{print $1}')"
   install -d -m 0755 /run/seed-dst/release
+  install -d -m 0700 /run/seed-dst/tmp   # first-boot staging (seed-import's skopeo --tmpdir / LAB BindPaths)
   _seed_dst="/run/seed-dst/release/$SEED_CLOSURE"
   # A partial destination from an interrupted earlier attempt is not a source of
   # truth and is not merged with: it is removed and rebuilt.
@@ -4343,6 +4345,72 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get
   "$dep/etc/containers/policy.json" \
   || die "the container policy restored onto the target is not the fail-closed grafted one"
 echo "[neural-ice-autoinstall] Strict container signature policy restored on the target deployment."
+# LAB media only: the first-boot units whose refusal decides whether the
+# appliance ever opens its network write to the console as well as the
+# journal. On 2026-09-10 neural-ice-seed-import.service failed on a lab GX10
+# with its reason in a journal nobody could reach (network held, no SSH); the
+# installed appliance keeps its console on tty2 (console=tty2 above), so an
+# operator reads the refusal with Alt+F2. A customer medium writes nothing here.
+if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
+  for _lab_unit in neural-ice-seed-import neural-ice-payload-apply neural-ice-device-root \
+      neural-ice-firstboot-sshkey neural-ice-firstboot-sshkey-activate sshd; do
+    _lab_dropin_dir="$dep/etc/systemd/system/${_lab_unit}.service.d"
+    install -d -m 0755 -- "$_lab_dropin_dir" \
+      || die "cannot prepare the LAB console drop-in directory for ${_lab_unit}"
+    printf '[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n' \
+      > "$_lab_dropin_dir/50-lab-console.conf" \
+      || die "cannot write the LAB console drop-in for ${_lab_unit}"
+    if [[ "$_lab_unit" == neural-ice-seed-import ]]; then
+      # Interim, until the appliance image carries the fixed unit: the shipped
+      # unit REQUIRES /run/neural-ice, which nothing before it creates on a
+      # GX10, and systemd fails it at the NAMESPACE step (2026-09-10); the
+      # verifier then needs it writable (seed-verify scratch). The unit owns
+      # the directory: created before the sandbox, kept afterwards. skopeo
+      # stages layers under /var/tmp regardless of TMPDIR (containers/image),
+      # read-only in the sandbox: bind the data volume's tmp (created in phase
+      # 5 below) over /var/tmp for this unit only.
+      printf 'RuntimeDirectory=neural-ice\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryMode=0755\nBindPaths=/var/lib/neural-ice/data/tmp:/var/tmp\n' \
+        >> "$_lab_dropin_dir/50-lab-console.conf" \
+        || die "cannot write the LAB seed-import sandbox drop-in"
+      # Interim as well: the shipped script copies its oci: layouts under the
+      # SYSTEM policy (default reject, docker: scopes only) and is refused at
+      # once -- "Source image rejected: Running image oci:///var/lib/neural-ice/
+      # data/offline-generations/…:seed is rejected by policy" (lab GX10,
+      # 2026-09-10, C25, after 23 min of re-verification). The fixed image hands
+      # skopeo a dedicated policy (/usr/lib/neural-ice/seed-import-policy.json);
+      # until the appliance carries it, this unit ALONE sees that policy as
+      # /etc/containers/policy.json through a per-unit read-only bind. The file
+      # the rest of the system reads stays the strict one restored above.
+      install -d -m 0755 -- "$dep/etc/neural-ice" \
+        || die "cannot prepare /etc/neural-ice on the target deployment"
+      printf '%s\n' '{"default":[{"type":"reject"}],"transports":{"oci":{"/var/lib/neural-ice/data/offline-generations":[{"type":"insecureAcceptAnything"}]}}}' \
+        > "$dep/etc/neural-ice/seed-import-policy.json" \
+        || die "cannot write the LAB seed-import transport policy"
+      chmod 0644 -- "$dep/etc/neural-ice/seed-import-policy.json"
+      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("default")==[{"type":"reject"}] and list(d.get("transports",{}))==["oci"] else 1)' \
+        "$dep/etc/neural-ice/seed-import-policy.json" \
+        || die "the LAB seed-import transport policy is not the fail-closed oci-only one"
+      printf 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json:/etc/containers/policy.json\n' \
+        >> "$_lab_dropin_dir/50-lab-console.conf" \
+        || die "cannot write the LAB seed-import policy bind"
+    fi
+    chmod 0644 -- "$_lab_dropin_dir/50-lab-console.conf"
+    if [[ "$_lab_unit" == neural-ice-firstboot-sshkey-activate ]]; then
+      # Interim, until the appliance image carries the fixed unit (PR #181):
+      # the activate phase polls sshd for ten seconds, but the vendor sshd is
+      # After=network.target, which waits for NetworkManager, which waits for
+      # seed-import (~23 min of re-verification on the unrecut image). The poll
+      # expired on a merely queued job and the rollback's mask killed it:
+      # "[FAILED] Failed to start sshd.service" at ~135 s (GX10, 2026-09-10).
+      # Activation waits for the barrier; nothing is ordered after it (no cycle).
+      printf '[Unit]\nWants=network.target\nAfter=network.target\n' \
+        > "$_lab_dropin_dir/60-lab-network-order.conf" \
+        || die "cannot write the LAB sshd activation ordering drop-in"
+      chmod 0644 -- "$_lab_dropin_dir/60-lab-network-order.conf"
+    fi
+  done
+  echo "[neural-ice-autoinstall] LAB first-boot units mirror their output to the console (tty2); sshd activation waits for network.target."
+fi
 # The mirror is an INSTALL-TIME convenience and must not survive onto the
 # appliance: an installed machine that keeps pointing at a bench would silently
 # stop being air-gapped the day that bench is gone -- or, worse, keep trusting a

@@ -569,6 +569,43 @@ for required in \
     || fail "the installed ceremony inputs are not durably published: $required"
 done
 
+# A LAB appliance's first-boot units mirror their output to the console
+# (tty2) through installer-written drop-ins; a customer medium writes none.
+grep -Fq -- 'StandardOutput=journal+console\nStandardError=journal+console' "$AUTOINSTALL" \
+  || fail "the LAB first-boot console drop-in content is gone"
+grep -Fq -- '_lab_dropin_dir="$dep/etc/systemd/system/${_lab_unit}.service.d"' "$AUTOINSTALL" \
+  || fail "the LAB first-boot console drop-ins no longer land in the deployment /etc"
+_lab_dropin_line="$(grep -n 'for _lab_unit in neural-ice-seed-import' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+sed -n "$((_lab_dropin_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
+  || fail "the LAB first-boot console drop-ins are not gated on the sealed lab-managed profile"
+
+grep -Fq -- "RuntimeDirectory=neural-ice\\nRuntimeDirectoryPreserve=yes" "$AUTOINSTALL" \
+  || fail "the interim LAB seed-import drop-in (unit-owned /run/neural-ice) is gone"
+grep -Fq -- "BindPaths=/var/lib/neural-ice/data/tmp:/var/tmp" "$AUTOINSTALL" \
+  || fail "the interim LAB seed-import drop-in leaves skopeo's staging on the read-only /var/tmp"
+[ "$(grep -c 'install -d -m 0700 /run/seed-dst/tmp' "$AUTOINSTALL")" = 2 ] \
+  || fail "the data volume's tmp staging directory is not created on both seed paths"
+grep -Fq -- 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json:/etc/containers/policy.json' "$AUTOINSTALL" \
+  || fail "the interim LAB seed-import drop-in leaves skopeo under the strict system policy (oci: rejected)"
+# The policy the installer writes for that bind: extract the literal and judge it.
+_lab_seed_policy="$(grep -o "'{\"default\":\[{\"type\":\"reject\"}\],\"transports\":{\"oci\":[^']*}'" "$AUTOINSTALL" | head -1 | tr -d "'")"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); s=list(d["transports"]["oci"]); sys.exit(0 if d["default"]==[{"type":"reject"}] and list(d["transports"])==["oci"] and s==["/var/lib/neural-ice/data/offline-generations"] else 1)' "$_lab_seed_policy" \
+  || fail "the LAB seed-import transport policy literal is not default=reject with the single offline-generations oci: scope"
+_lab_bind_line="$(grep -n 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[ "$_lab_bind_line" -gt "$_lab_dropin_line" ] \
+  || fail "the LAB seed-import policy bind is written outside the lab-managed drop-in block"
+grep -Fq -- "printf '[Unit]\\nWants=network.target\\nAfter=network.target\\n'" "$AUTOINSTALL" \
+  || fail "the interim LAB sshd activation ordering drop-in (After=network.target) is gone"
+grep -Fq -- '60-lab-network-order.conf' "$AUTOINSTALL" \
+  || fail "the interim LAB sshd activation ordering drop-in has no file"
+_lab_order_line="$(grep -n '60-lab-network-order.conf' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[ "$_lab_order_line" -gt "$_lab_dropin_line" ] \
+  || fail "the LAB sshd activation ordering drop-in is written outside the lab-managed drop-in block"
+sed -n "$((_lab_order_line - 9)),$((_lab_order_line))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$_lab_unit" == neural-ice-firstboot-sshkey-activate ]]; then' \
+  || fail "the LAB sshd activation ordering drop-in is not scoped to the activation unit"
+grep -Fq -- 'neural-ice-firstboot-sshkey neural-ice-firstboot-sshkey-activate sshd; do' "$AUTOINSTALL" \
+  || fail "sshd is not in the LAB console mirror list"
+
 # A LAB appliance keeps its kernel console on tty2 (the status screen owns
 # tty1), so a unit's journal+console stderr stays readable with Alt+F2; a
 # customer medium adds no console= at all.
