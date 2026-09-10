@@ -39,7 +39,7 @@ ok()   { printf '  ok    %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*" >&2; failures=$((failures + 1)); }
 
 echo "1) the shipped policy and the script that uses it"
-python3 - "$POLICY" "$SCOPE" <<'PY' && ok "default=reject, one oci: scope ($SCOPE), nothing for docker:" || fail "policy shape"
+if python3 - "$POLICY" "$SCOPE" <<'PY'
 import json, sys
 policy = json.load(open(sys.argv[1])); scope = sys.argv[2]
 assert policy["default"] == [{"type": "reject"}], policy["default"]
@@ -48,19 +48,24 @@ assert list(policy["transports"]["oci"]) == [scope], list(policy["transports"]["
 assert policy["transports"]["oci"][scope] == [{"type": "insecureAcceptAnything"}]
 assert scope.startswith("/") and not scope.endswith("/") and "//" not in scope
 PY
-grep -q 'skopeo --policy "\$SEED_POLICY" copy ' "$SCRIPT" \
-  && ok "the script passes its policy before the copy verb" \
-  || fail "the script does not hand skopeo the seed-import policy"
-grep -q '^SEED_POLICY=\$(path /usr/lib/neural-ice/seed-import-policy.json)$' "$SCRIPT" \
-  && ok "the script reads /usr/lib/neural-ice/seed-import-policy.json" \
-  || fail "the script does not read the shipped policy path"
-grep -q '^COPY image/firstboot/neural-ice-seed-import-policy.json  */usr/lib/neural-ice/seed-import-policy.json$' image/Containerfile.bootc \
-  && ok "the image ships the policy at that path" \
-  || fail "Containerfile.bootc does not ship the policy where the script reads it"
-grep -q "^generation_base=\"\$DATA/offline-generations\"$" "$SCRIPT" \
-  && grep -q '^DATA=$(path /var/lib/neural-ice/data)$' "$SCRIPT" \
-  && ok "the scope is the directory the script stages its layouts under" \
-  || fail "the script's layout directory no longer matches the policy scope"
+then ok "default=reject, one oci: scope ($SCOPE), nothing for docker:"; else fail "policy shape"; fi
+# The patterns below are literal script text; the $ are not expansions.
+# shellcheck disable=SC2016
+if grep -q 'skopeo --policy "\$SEED_POLICY" copy ' "$SCRIPT"; then
+  ok "the script passes its policy before the copy verb"
+else fail "the script does not hand skopeo the seed-import policy"; fi
+# shellcheck disable=SC2016
+if grep -q '^SEED_POLICY=\$(path /usr/lib/neural-ice/seed-import-policy.json)$' "$SCRIPT"; then
+  ok "the script reads /usr/lib/neural-ice/seed-import-policy.json"
+else fail "the script does not read the shipped policy path"; fi
+if grep -q '^COPY image/firstboot/neural-ice-seed-import-policy.json  */usr/lib/neural-ice/seed-import-policy.json$' image/Containerfile.bootc; then
+  ok "the image ships the policy at that path"
+else fail "Containerfile.bootc does not ship the policy where the script reads it"; fi
+# shellcheck disable=SC2016
+if grep -q '^generation_base="\$DATA/offline-generations"$' "$SCRIPT" \
+   && grep -q '^DATA=$(path /var/lib/neural-ice/data)$' "$SCRIPT"; then
+  ok "the scope is the directory the script stages its layouts under"
+else fail "the script's layout directory no longer matches the policy scope"; fi
 
 echo "2) the decisions, against the containers/image policy engine"
 command -v skopeo >/dev/null || { fail "skopeo is required for this test"; exit 1; }
