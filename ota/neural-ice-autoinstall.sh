@@ -4360,7 +4360,7 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
       # GX10, and systemd fails it at the NAMESPACE step (2026-09-10); the
       # verifier then needs it writable (seed-verify scratch). The unit owns
       # the directory: created before the sandbox, kept afterwards.
-      printf 'RuntimeDirectory=neural-ice\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryMode=0755\n' \
+      printf 'RuntimeDirectory=neural-ice\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryMode=0755\nEnvironment=TMPDIR=/var/lib/neural-ice/data\n' \
         >> "$_lab_dropin_dir/50-lab-console.conf" \
         || die "cannot write the LAB seed-import sandbox drop-in"
     fi
