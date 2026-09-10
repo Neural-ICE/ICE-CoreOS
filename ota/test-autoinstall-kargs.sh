@@ -563,4 +563,15 @@ for required in \
     || fail "the installed ceremony inputs are not durably published: $required"
 done
 
+# The installer's console lines reach every active serial console, not only the
+# one /dev/console names (the last console=): a verbose LAB medium seals
+# console=tty0 and left the UART silent under KVM on 2026-09-10. Only serial
+# devices qualify (never a VT), and /dev/console itself is not written twice.
+grep -Fq -- 'IFS= read -r active < /sys/class/tty/console/active' "$AUTOINSTALL" \
+  || fail "log() no longer reads the kernel's active console list"
+grep -Fq -- '[[ "$name" != "$last" && "$name" =~ ^tty(S|AMA)[0-9]+$ && -c "/dev/$name" ]] || continue' "$AUTOINSTALL" \
+  || fail "log() mirror admits a VT, the /dev/console entry, or an absent device"
+grep -Fq -- 'for mirror in "${LOG_MIRROR_TTYS[@]}"; do' "$AUTOINSTALL" \
+  || fail "log() no longer mirrors to the other active serial consoles"
+
 echo "AUTOINSTALL_KARGS_TEST_OK"

@@ -73,7 +73,36 @@ ni_path() { # $1=environment variable name  $2=the production value
 }
 
 readonly LOG_TAG="neural-ice-autoinstall"
-log()  { logger -t "$LOG_TAG" -- "$*"; printf '\n[%s] %s\n' "$LOG_TAG" "$*" > /dev/console 2>/dev/null || true; printf '[%s] %s\n' "$LOG_TAG" "$*" >&2; }
+# /dev/console is ONE console: the last entry of /sys/class/tty/console/active
+# (sysfs-tty ABI), i.e. the last `console=` on the command line. A verbose LAB
+# medium seals console=tty0 (image/build-installer-usb.sh, MEDIA_VERBOSE_CONSOLE)
+# so an operator at the screen sees the phases -- which made the serial UART the
+# firmware also registers (SPCR: ttyS0 on GB10, ttyAMA0 on QEMU virt) go silent:
+# the KVM rehearsal of medium C13 on 2026-09-10 logged 0 installer lines. Every
+# other active serial console is therefore mirrored, exactly as the first-boot
+# status screen does (image/firstboot/neural-ice-status-screen.sh,
+# serial_console_device). Only ttyS<n>/ttyAMA<n>, never a VT, never a guess.
+LOG_MIRROR_TTYS=()
+log_mirrors_init() {
+  local active last name
+  IFS= read -r active < /sys/class/tty/console/active 2>/dev/null || return 0
+  last="${active##* }"
+  for name in $active; do
+    [[ "$name" != "$last" && "$name" =~ ^tty(S|AMA)[0-9]+$ && -c "/dev/$name" ]] || continue
+    LOG_MIRROR_TTYS+=("/dev/$name")
+  done
+}
+log_mirrors_init
+readonly -a LOG_MIRROR_TTYS
+log()  {
+  local mirror
+  logger -t "$LOG_TAG" -- "$*"
+  printf '\n[%s] %s\n' "$LOG_TAG" "$*" > /dev/console 2>/dev/null || true
+  for mirror in "${LOG_MIRROR_TTYS[@]}"; do
+    printf '\n[%s] %s\n' "$LOG_TAG" "$*" > "$mirror" 2>/dev/null || true
+  done
+  printf '[%s] %s\n' "$LOG_TAG" "$*" >&2
+}
 
 # --------------------------------------------------------------------------- #
 # 🔴 THE FAILURE EVIDENCE. BOUNDED, STABLE, AND FREE OF EVERYTHING THAT COULD
