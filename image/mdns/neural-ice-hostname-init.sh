@@ -94,7 +94,8 @@ linklocal_address() {
 #     GONE at t=45 s — with `ipv6.method=auto` and no RA on the link both address
 #     families fail and NetworkManager tears the connection down
 #     (`ip-config -> failed (reason 'ip-config-unavailable')`).
-#   * a separate profile with `ipv4.method=manual` + `ipv6.method=link-local`
+#   * a separate profile with `ipv4.method=manual` (IPv6 disabled since
+#     2026-09-11, Owner decision: no IPv6 on the appliance; it was link-local)
 #     stays `activated` (checked at t=5, 20, 45 and 70 s), and NM switches to it
 #     on its own ~150 s after the DHCP attempts start failing.
 # The management profile is left EXACTLY as shipped: it keeps priority 100 and
@@ -129,7 +130,7 @@ method=manual
 address1=${addr}/16
 
 [ipv6]
-method=link-local
+method=disabled
 EOF
     then
         rm -f "$tmp"
