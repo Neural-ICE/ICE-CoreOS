@@ -10,10 +10,11 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 
 use crate::delegated::contract::{
     canonical_hash, encode_base64, parse_canonical, public_key_pem, validate_snapshot,
@@ -104,6 +105,49 @@ fn hash_file(path: &Path) -> Result<(String, u64), Refusal> {
         let _ = write!(digest, "{byte:02x}");
     }
     Ok((digest, count))
+}
+
+/// The object walk hashes a whole seed (128 GiB on the 0.60.1 lab release)
+/// and was the single longest step of an install: one core, one file at a
+/// time, ~11 min in the KVM rehearsal of 2026-09-10 and ~15 min on a GB10.
+/// Hash with at most HASH_WORKERS threads, each holding one 1 MiB buffer, and
+/// hand the outcomes back IN THE CLOSURE'S ORDER so the first refusal is the
+/// same whatever the completion order. Nothing else about the proof changes:
+/// every object is still read in full and compared to its name by the caller.
+const HASH_WORKERS: usize = 8;
+type HashOutcome = Result<(String, u64), Refusal>;
+
+fn hash_objects(seed_root: &Path, hexes: &[String]) -> Vec<HashOutcome> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, HASH_WORKERS)
+        .min(hexes.len().max(1));
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<HashOutcome>>> = hexes.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= hexes.len() {
+                    break;
+                }
+                let path = seed_root.join("objects/sha256").join(&hexes[index]);
+                let outcome = hash_file(&path);
+                *slots[index]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|| Err(Refusal("an object was never hashed".into())))
+        })
+        .collect()
 }
 
 fn is_hex64(value: &str) -> bool {
@@ -2339,9 +2383,10 @@ pub(crate) fn verify_seed_with(
     reconcile_manifest_closure(&manifest.roots, &closure)?;
 
     let expected_objects = validate_closure(seed_root, &closure, &expectation.registry_host)?;
-    for hex in &expected_objects {
-        let path = seed_root.join("objects/sha256").join(hex);
-        let (observed, size) = hash_file(&path)?;
+    let object_order: Vec<String> = expected_objects.iter().cloned().collect();
+    let hashed = hash_objects(seed_root, &object_order);
+    for (hex, outcome) in object_order.iter().zip(hashed) {
+        let (observed, size) = outcome?;
         if &observed != hex {
             return refuse(format!("object sha256:{hex} bytes do not match its name"));
         }
