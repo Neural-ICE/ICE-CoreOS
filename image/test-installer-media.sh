@@ -1480,7 +1480,7 @@ grep -q '^pcr_policy_seq_from_counter()' "$counter_fn" || fail "cannot extract t
 printf '41\n' > "$TMP/seq.counter"
 got="$(bash -c 'source "$1"; pcr_policy_seq_from_counter "$2"' _ "$counter_fn" "$TMP/seq.counter")" \
   || fail "the sequence counter reader refused a valid counter"
-[ "$got" = 42 ] && [ "$(cat "$TMP/seq.counter")" = 42 ] \
+{ [ "$got" = 42 ] && [ "$(cat "$TMP/seq.counter")" = 42 ]; } \
   || fail "the sequence counter did not advance 41 -> 42 (got '$got', file '$(cat "$TMP/seq.counter")')"
 got="$(bash -c 'source "$1"; pcr_policy_seq_from_counter "$2"' _ "$counter_fn" "$TMP/seq.counter")"
 [ "$got" = 43 ] || fail "a second cut did not take the next sequence (got '$got')"
