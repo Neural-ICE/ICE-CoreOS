@@ -266,6 +266,18 @@ if unit_values "$ACTIVATE_UNIT" Before | grep -qx -- sshd.service; then
   echo "activation is ordered BEFORE sshd — this is the deadlock the split removes" >&2
   exit 1
 fi
+# THE BARRIER THE TEN-SECOND POLL MUST NOT RACE. sshd is After=network.target and
+# network.target waits for seed-import (through NetworkManager); activation that
+# starts before the barrier falls polls a merely queued sshd job, times out and
+# rolls the key back (GX10, 2026-09-10). Activation waits for the barrier.
+unit_has "$ACTIVATE_UNIT" After network.target \
+  || { echo "activation is not ordered after network.target: it would poll sshd while its job is still queued behind seed-import" >&2; exit 1; }
+unit_has "$ACTIVATE_UNIT" Wants network.target \
+  || { echo "activation does not pull network.target: the barrier it waits for must be in its own transaction" >&2; exit 1; }
+if unit_values "$ACTIVATE_UNIT" Before | grep -qx -- network.target; then
+  echo "activation is ordered BEFORE network.target — that is a cycle with the After= above" >&2
+  exit 1
+fi
 act_condition="$(unit_values "$ACTIVATE_UNIT" ConditionPathExists)"
 [ "$act_condition" = /var/lib/neural-ice/sshkey-activation-pending ] \
   || { echo "the activation unit is not conditioned on the provisioning handoff" >&2; exit 1; }
