@@ -608,7 +608,9 @@ sed -n "$((_lab_dropin_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED
 
 grep -Fq -- "RuntimeDirectory=neural-ice\\nRuntimeDirectoryPreserve=yes" "$AUTOINSTALL" \
   || fail "the interim LAB seed-import drop-in (unit-owned /run/neural-ice) is gone"
-grep -Fq -- "Environment=TMPDIR=/var/lib/neural-ice/data" "$AUTOINSTALL" \
-  || fail "the interim LAB seed-import drop-in leaves skopeo's TMPDIR on the read-only /var/tmp"
+grep -Fq -- "BindPaths=/var/lib/neural-ice/data/tmp:/var/tmp" "$AUTOINSTALL" \
+  || fail "the interim LAB seed-import drop-in leaves skopeo's staging on the read-only /var/tmp"
+[ "$(grep -c 'install -d -m 0700 /run/seed-dst/tmp' "$AUTOINSTALL")" = 2 ] \
+  || fail "the data volume's tmp staging directory is not created on both seed paths"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"

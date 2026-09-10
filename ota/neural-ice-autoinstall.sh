@@ -4099,6 +4099,7 @@ if [[ "$SEED_SOURCE" == mirror ]]; then
   # hashed in flight against its name. The whole-tree proof is the common
   # re-verification below -- the same verifier, the same sealed hash.
   install -d -m 0755 /run/seed-dst/release
+  install -d -m 0700 /run/seed-dst/tmp   # first-boot staging (seed-import's skopeo --tmpdir / LAB BindPaths)
   _seed_dst="/run/seed-dst/release/$SEED_CLOSURE"
   # A partial destination from an interrupted earlier attempt is not a source of
   # truth and is not merged with: it is removed and rebuilt.
@@ -4109,6 +4110,7 @@ elif [[ -n "$SEED_VERIFIED_ROOT" ]]; then
   seed_total=0
   seed_total="$(du -sb "$SEED_VERIFIED_ROOT" | awk '{print $1}')"
   install -d -m 0755 /run/seed-dst/release
+  install -d -m 0700 /run/seed-dst/tmp   # first-boot staging (seed-import's skopeo --tmpdir / LAB BindPaths)
   _seed_dst="/run/seed-dst/release/$SEED_CLOSURE"
   # A partial destination from an interrupted earlier attempt is not a source of
   # truth and is not merged with: it is removed and rebuilt.
@@ -4359,8 +4361,11 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
       # unit REQUIRES /run/neural-ice, which nothing before it creates on a
       # GX10, and systemd fails it at the NAMESPACE step (2026-09-10); the
       # verifier then needs it writable (seed-verify scratch). The unit owns
-      # the directory: created before the sandbox, kept afterwards.
-      printf 'RuntimeDirectory=neural-ice\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryMode=0755\nEnvironment=TMPDIR=/var/lib/neural-ice/data\n' \
+      # the directory: created before the sandbox, kept afterwards. skopeo
+      # stages layers under /var/tmp regardless of TMPDIR (containers/image),
+      # read-only in the sandbox: bind the data volume's tmp (created in phase
+      # 5 below) over /var/tmp for this unit only.
+      printf 'RuntimeDirectory=neural-ice\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryMode=0755\nBindPaths=/var/lib/neural-ice/data/tmp:/var/tmp\n' \
         >> "$_lab_dropin_dir/50-lab-console.conf" \
         || die "cannot write the LAB seed-import sandbox drop-in"
     fi
