@@ -606,4 +606,7 @@ _lab_dropin_line="$(grep -n 'for _lab_unit in neural-ice-seed-import' "$AUTOINST
 sed -n "$((_lab_dropin_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
   || fail "the LAB first-boot console drop-ins are not gated on the sealed lab-managed profile"
 
+grep -Fq -- "ReadWritePaths=\\nReadWritePaths=/var/lib/neural-ice/data -/run/neural-ice" "$AUTOINSTALL" \
+  || fail "the interim LAB seed-import sandbox drop-in (optional /run/neural-ice) is gone"
+
 echo "AUTOINSTALL_KARGS_TEST_OK"
