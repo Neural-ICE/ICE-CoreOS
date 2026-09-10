@@ -214,6 +214,8 @@ echo "== the driver keeps its load-bearing contracts"
 # shellcheck disable=SC2016 # literal source contracts are being matched
 for contract in \
   'readonly=on,file=$raw' \
+  '-b "$raw" -F raw "$medium_overlay_file"' \
+  'medium_overlay_file=$work_dir/medium.qcow2' \
   'virt,accel=kvm,gic-version=3' \
   'manufacturer=NVIDIA,product=NVIDIA_DGX_Spark' \
   'manufacturer=NVIDIA,product=P4242' \
