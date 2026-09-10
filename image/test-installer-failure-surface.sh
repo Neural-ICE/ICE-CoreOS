@@ -268,14 +268,19 @@ long_read="$(NEURALICE_FAILURE_POLICY="$long_policy" bash -c 'POLICY_FILE="$NEUR
 [ "$long_read" = "reboot 1500" ] \
   || fail "a policy whose values follow a long comment block is not honoured (read: '$long_read')"
 # The EFI variable is written in ONE write(2) (efivarfs requirement): a staged
-# file and one bounded dd, never a printf straight into efivarfs, in both the
-# installer and the failure surface (2026-09-09: a printf left 115 bytes).
+# file copied by one bounded head(1), never a printf straight into efivarfs,
+# in both the installer and the failure surface (2026-09-09: a printf left
+# 115 bytes). Not dd either: the preflight harness counts every dd call as a
+# target mutation (ota/test-installer-pcr7-coverage.sh, 2026-09-10).
 for writer in "$FAILURE" "$ROOT/ota/neural-ice-autoinstall.sh"; do
   if grep -Eq "printf '\\\\x07\\\\x00\\\\x00\\\\x00%s' .* > \"\\\$EFI_" "$writer"; then
     fail "$(basename "$writer") writes the EFI evidence with printf, which efivarfs splits into a refused second write"
   fi
-  if ! { grep -Fq 'of="$EFI_' "$writer" && grep -Fq 'bs=65536 count=1' "$writer"; }; then
-    fail "$(basename "$writer") does not write the EFI evidence in one bounded dd"
+  if grep -Fq 'of="$EFI_' "$writer"; then
+    fail "$(basename "$writer") writes the EFI evidence with dd, which the preflight harness counts as a target mutation"
+  fi
+  if ! grep -Fq 'head -c 65536 -- "$_efi_staged" > "$EFI_FAILURE_EVIDENCE"' "$writer"; then
+    fail "$(basename "$writer") does not copy the staged EFI evidence in one bounded write"
   fi
 done
 # LAB medium: the failure screen carries the installer journal tail; any other
