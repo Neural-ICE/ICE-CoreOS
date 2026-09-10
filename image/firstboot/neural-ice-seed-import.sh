@@ -105,9 +105,10 @@ registry_host=$(<"$REGISTRY")
 # the container store, generic CASes, HF hub and OFFLINE-READY receipt.
 install -d -m 0700 "$generation_base" "$DATA/seed-store" "$DATA/content" \
   "$DATA/models" "$DATA/hf-cache" "$DATA/tmp"
-# skopeo's staging area: the unit points TMPDIR here (data volume, writable in
-# the sandbox, sized for the layers); it must exist before the first copy.
-export TMPDIR="$DATA/tmp"
+# skopeo's staging area for the layers it imports: containers/image ignores
+# TMPDIR on Linux and stages under /var/tmp unless --tmpdir says otherwise
+# (measured on the lab GX10, 2026-09-10); /var/tmp is read-only in this sandbox
+# and on the 100 GiB system volume anyway. The data volume has the room.
 
 ensure_consumer_link() {
   local link=$1 target=$2 temporary
@@ -195,7 +196,7 @@ while IFS= read -r -d '' layout \
     destination="containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot]${repository}:${tag}"
     # Import this host's platform. containers-storage rejects --all for an
     # index; skopeo retains the original index digest as a local repo digest.
-    skopeo copy --preserve-digests "oci:${layout}:seed" \
+    skopeo copy --tmpdir "$DATA/tmp" --preserve-digests "oci:${layout}:seed" \
       "$destination" \
       || die "cannot import signed artifact $artifact_key"
     # Reading by tag reports the selected child digest. The runtime pulls by

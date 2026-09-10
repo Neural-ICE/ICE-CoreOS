@@ -31,12 +31,6 @@ RuntimeDirectory=neural-ice
 RuntimeDirectoryPreserve=yes
 RuntimeDirectoryMode=0755
 ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice
-# skopeo stages what it imports in a temporary directory under TMPDIR, which
-# defaults to /var/tmp: read-only under ProtectSystem=strict, and on the 100 GiB
-# system volume anyway. The data volume is the only place with room for the
-# staged layers and the only one this unit may write (lab GX10, 2026-09-10:
-# `mkdir /var/tmp/container_images_storage…: read-only file system`).
-Environment=TMPDIR=/var/lib/neural-ice/data/tmp
 
 [Install]
 WantedBy=multi-user.target
