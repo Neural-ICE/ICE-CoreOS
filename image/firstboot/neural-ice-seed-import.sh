@@ -104,7 +104,10 @@ registry_host=$(<"$REGISTRY")
 # links never move; publishing offline-current is the sole visibility event for
 # the container store, generic CASes, HF hub and OFFLINE-READY receipt.
 install -d -m 0700 "$generation_base" "$DATA/seed-store" "$DATA/content" \
-  "$DATA/models" "$DATA/hf-cache"
+  "$DATA/models" "$DATA/hf-cache" "$DATA/tmp"
+# skopeo's staging area: the unit points TMPDIR here (data volume, writable in
+# the sandbox, sized for the layers); it must exist before the first copy.
+export TMPDIR="$DATA/tmp"
 
 ensure_consumer_link() {
   local link=$1 target=$2 temporary

@@ -460,5 +460,9 @@ grep -Fqx 'RuntimeDirectoryPreserve=yes' "$ROOT/image/firstboot/neural-ice-seed-
   || fail "neural-ice-seed-import.service would remove /run/neural-ice from under hostname-init when it ends"
 grep -Fqx 'ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
   || fail "neural-ice-seed-import.service must keep /run/neural-ice writable: ni-ota-verify writes seed-verify under it"
+grep -Fqx 'Environment=TMPDIR=/var/lib/neural-ice/data/tmp' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service leaves skopeo's TMPDIR on the read-only /var/tmp"
+grep -Fq 'export TMPDIR="$DATA/tmp"' "$ROOT/image/firstboot/neural-ice-seed-import.sh" \
+  || fail "neural-ice-seed-import.sh does not create and export its data-volume TMPDIR"
 
 echo "TPM_CEREMONY_SYSTEMD_OFFLINE_TEST_OK (${#dropin_units[@]} direct consumers plus firstboot chain)"
