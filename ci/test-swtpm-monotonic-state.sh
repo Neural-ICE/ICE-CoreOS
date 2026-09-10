@@ -453,12 +453,18 @@ install_value="$(hw counter-read)"
 high_water="$(hw freshness-read)"
 bound_digest="$(hw profile-read)"
 [[ "$install_value" =~ ^[1-9][0-9]*$ ]] || fail "invalid install counter: $install_value"
-[[ "$high_water" =~ ^[1-9][0-9]*$ && "$bound_digest" == "$digest" ]] \
+[[ "$high_water" =~ ^(0|[1-9][0-9]*)$ && "$bound_digest" == "$digest" ]] \
   || fail "invalid ceremony evidence: $install_value $high_water $bound_digest"
 [[ "$(runtime_complete)" == complete ]] \
   || fail "runtime rejected completed ceremony"
-[[ "$(hw freshness-read)" == "$(abs_counter 0x01500004)" ]] \
-  || fail "freshness is not the absolute NV counter"
+# ADR-0015 M: the high-water is the NV counter minus the base sealed in the
+# write-once record (bytes 40..47), because a real TPM is born wherever its
+# largest counter ever went. The real TPM is the only witness of both values.
+tpm2_nvread 0x01500005 -C 0x01500005 -s 64 -o "$TMP/record.bin" >/dev/null || fail "cannot read the sealed record"
+sealed_base="$(python3 -c 'import struct,sys; print(struct.unpack(">Q", open(sys.argv[1],"rb").read()[40:48])[0])' "$TMP/record.bin")"
+[[ "$sealed_base" =~ ^[1-9][0-9]*$ ]] || fail "the record seals no freshness base: $sealed_base"
+[[ "$(( $(hw freshness-read) + sealed_base ))" == "$(abs_counter 0x01500004)" ]] \
+  || fail "freshness is not the NV counter minus the sealed base"
 expect_refusal "consumed issuance sequence N replayed" hw freshness-consume "$high_water"
 next_high_water=$(( high_water + 1 ))
 [[ "$(hw freshness-consume "$next_high_water")" == "$next_high_water" ]] || fail "N+1 was not consumed"
