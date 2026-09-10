@@ -76,6 +76,13 @@ Options:
                            constant; changing it CHANGES PCR7)
   --firmware-code FILE     AAVMF code image (default AAVMF_CODE.secboot.fd)
   --source-transport T     virtio, nvme or usb for the medium (default virtio)
+  --medium-overlay         attach a qcow2 COPY-ON-WRITE overlay of the medium
+                           (work-dir/medium.qcow2, backing = --raw, which stays
+                           read-only and unwritten) so phase 8 can escrow the
+                           SYSTEM recovery key on the medium ESP the way it does
+                           on a real USB stick; read it back from the overlay
+                           after the run. Default: the medium is attached
+                           read-only and the escrow is silently skipped
   --target-transport T     nvme or virtio for the target disk (default nvme)
   --target-size SIZE       sparse qcow2 logical size (default 1T)
   --smp N                  guest vCPUs (default 8)
@@ -387,6 +394,7 @@ ssh_wait=900
 ssh_port=22222
 serial_max_bytes=8388608
 skip_firstboot=0
+medium_overlay=0
 allow_root=0
 
 while (( $# )); do
@@ -422,6 +430,7 @@ while (( $# )); do
       esac
       ;;
     --skip-firstboot) skip_firstboot=1; shift ;;
+    --medium-overlay) medium_overlay=1; shift ;;
     --allow-root) allow_root=1; shift ;;
     -h|--help) bench_usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -741,7 +750,16 @@ add_network() { # $1="" or a hostfwd fragment
 say "install phase: medium=$raw target=$target_size transport=$source_transport/$target_transport network=$network"
 start_swtpm
 build_qemu_base install
-qemu+=(-drive "if=none,id=installer,format=raw,readonly=on,file=$raw")
+if (( medium_overlay )); then
+  # The overlay is the only writable thing; the backing raw is opened by QEMU
+  # through the overlay's backing chain, read-only, and never receives a byte.
+  medium_overlay_file=$work_dir/medium.qcow2
+  qemu-img create -q -f qcow2 -b "$raw" -F raw "$medium_overlay_file" \
+    || die "cannot create the medium overlay $medium_overlay_file"
+  qemu+=(-drive "if=none,id=installer,format=qcow2,file=$medium_overlay_file")
+else
+  qemu+=(-drive "if=none,id=installer,format=raw,readonly=on,file=$raw")
+fi
 case "$source_transport" in
   virtio) qemu+=(-device "virtio-blk-pci,drive=installer,bootindex=1") ;;
   nvme)   qemu+=(-device "nvme,drive=installer,serial=NIBENCHMEDIUM,bootindex=1") ;;
@@ -888,6 +906,7 @@ NI_BENCH_SWTPM_VERSION="$(swtpm --version | head -1)" \
 NI_BENCH_VIRT_FW_VARS="$have_virt_fw_vars" NI_BENCH_EUID="$EUID" \
 NI_BENCH_SMP="$smp" NI_BENCH_MEMORY="$memory" \
 NI_BENCH_SOURCE_TRANSPORT="$source_transport" NI_BENCH_TARGET_TRANSPORT="$target_transport" \
+NI_BENCH_MEDIUM_MODE="$([[ $medium_overlay -eq 1 ]] && echo overlay || echo read-only)" \
 NI_BENCH_TARGET_SIZE="$target_size" NI_BENCH_NETWORK="$network" \
 NI_BENCH_FIRMWARE_CODE="$firmware_code" NI_BENCH_FIRMWARE_VARS_ORIGIN="$firmware_vars_origin" \
 NI_BENCH_ENROL_OWNER="$enrol_owner_guid" \
@@ -939,6 +958,7 @@ receipt = {
         "smp": number("NI_BENCH_SMP"),
         "memory_mib": number("NI_BENCH_MEMORY"),
         "source_transport": os.environ["NI_BENCH_SOURCE_TRANSPORT"],
+        "medium_mode": os.environ["NI_BENCH_MEDIUM_MODE"],
         "target_transport": os.environ["NI_BENCH_TARGET_TRANSPORT"],
         "target_size": os.environ["NI_BENCH_TARGET_SIZE"],
         "network": os.environ["NI_BENCH_NETWORK"],
