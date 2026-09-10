@@ -2125,13 +2125,19 @@ MAX_TIME_FLOOR = 120
 MAX_TIME_BYTES_PER_SECOND = 512 * KIB
 DISK_MARGIN_FRACTION = 0.05
 DISK_MARGIN_BYTES = 256 * MIB
-CHUNK = MIB
-# Objects in flight at once. One stream is bound by a single core doing TLS,
-# SHA-256 and the encrypted write (200 MB/s on a GB10, 330 MB/s on the bench
-# host, 2026-09-10); six streams spread that over six cores and fill a 10 GbE
-# link. Memory stays bounded: INFLIGHT curl processes and INFLIGHT × CHUNK of
-# buffer. Refusals keep their meaning: the first one aborts every stream.
+CHUNK = 8 * MIB
+# Objects in flight at once. curl writes each object straight to its temporary
+# file and a reader FOLLOWS that file, hashing what has landed so far -- no pipe
+# between curl and Python. MEASURED on the lab GX10 against the bench mirror
+# (2026-09-11, 2 GiB objects, six in flight): the former pipe pipeline
+# (curl | 1 MiB reads | sha256 | write) was capped at ~350 MB/s whatever the
+# parallelism (the pipe and the GIL serialise every byte), curl alone landed
+# 1136 MB/s on the LUKS data volume, and one Python thread hashes ~800 MB/s
+# (2.1 GB/s across six). Six streams therefore fill a 10 GbE link. Memory stays
+# bounded: INFLIGHT curl processes and INFLIGHT × CHUNK of buffer. Refusals keep
+# their meaning: the first one aborts every stream.
 INFLIGHT = 6
+FOLLOW_IDLE_SECONDS = 0.005
 STDERR_KEEP = 4 * KIB
 READY_SCHEMA = "neural-ice-seed-closure-ready-v1"
 NODE_KINDS = ("index", "manifest", "config", "layer")
@@ -2256,7 +2262,7 @@ class Transport:
     def url(self, path):
         return f"https://{self.mirror}/v2/{path}"
 
-    def command(self, url, accept, limit):
+    def command(self, url, accept, limit, output):
         max_time = MAX_TIME_FLOOR + limit // MAX_TIME_BYTES_PER_SECOND
         return [
             "curl", "--silent", "--show-error", "--fail",
@@ -2265,44 +2271,53 @@ class Transport:
             "--speed-limit", str(STALL_BYTES_PER_SECOND), "--speed-time", str(STALL_SECONDS),
             "--max-time", str(max_time), "--max-filesize", str(max(limit, 1)),
             "--header", f"Accept: {accept}",
-            "--output", "-", url,
+            "--output", output, url,
         ]
 
     def fetch_once(self, url, accept, limit, expected_hex, expected_size, destination):
-        """One transfer to a temporary file, hashed in flight, published by rename.
+        """One transfer to a temporary file, hashed as it lands, published by rename.
 
-        Raises Transient for a transport failure, Refusal for a verdict."""
+        curl writes the temporary file itself; this thread follows the file and
+        hashes every byte that has landed, so the transfer and the hash overlap
+        and no byte crosses a pipe. Raises Transient for a transport failure,
+        Refusal for a verdict."""
         directory = os.path.dirname(destination) or "."
         handle, temporary = tempfile.mkstemp(prefix=".fetch.", dir=directory)
+        os.close(handle)
         errors = tempfile.TemporaryFile(prefix=".fetch-stderr.", dir=directory)
         try:
             hasher = hashlib.sha256()
             count = 0
             overflow = False
-            with os.fdopen(handle, "wb") as sink:
-                process = subprocess.Popen(
-                    self.command(url, accept, limit), stdout=subprocess.PIPE, stderr=errors,
-                    stdin=subprocess.DEVNULL)
-                try:
-                    while True:
-                        if self.abort.is_set():
+            process = subprocess.Popen(
+                self.command(url, accept, limit, temporary), stdout=subprocess.DEVNULL,
+                stderr=errors, stdin=subprocess.DEVNULL)
+            try:
+                with open(temporary, "rb", buffering=0) as follow:
+                    finished = False
+                    while not self.abort.is_set():
+                        chunk = follow.read(CHUNK)
+                        if chunk:
+                            count += len(chunk)
+                            if count > limit:
+                                overflow = True
+                                break
+                            hasher.update(chunk)
+                            continue
+                        if finished:
                             break
-                        chunk = process.stdout.read(CHUNK)
-                        if not chunk:
-                            break
-                        count += len(chunk)
-                        if count > limit:
-                            overflow = True
-                            break
-                        hasher.update(chunk)
-                        sink.write(chunk)
-                finally:
-                    if overflow or self.abort.is_set():
-                        process.kill()
-                    process.stdout.close()
-                    status = process.wait()
-                sink.flush()
-                os.fsync(sink.fileno())
+                        if process.poll() is None:
+                            time.sleep(FOLLOW_IDLE_SECONDS)
+                            continue
+                        # curl has exited: one more pass drains what landed after
+                        # the last empty read, then the loop ends on the next one.
+                        finished = True
+            finally:
+                if overflow or self.abort.is_set():
+                    process.kill()
+                status = process.wait()
+            with open(temporary, "rb") as landed:
+                os.fsync(landed.fileno())
             if overflow:
                 refuse(f"{url} served more than the {limit} bytes it may be")
             if self.abort.is_set():
