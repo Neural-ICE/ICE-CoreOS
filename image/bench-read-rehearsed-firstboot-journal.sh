@@ -11,8 +11,12 @@
 # READ-ONLY, mount the deployment's /var read-only without journal replay, and
 # print the ceremony unit's last lines plus the error-level tail.
 #
-# Everything is read-only: qemu-nbd --read-only, cryptsetup --readonly,
-# mount -o ro,norecovery. The key file is shredded on every exit path.
+# The rehearsed target is never written: the medium overlay is attached
+# read-only; the target is read through a throw-away qcow2 overlay of its own
+# (target.journal-read.qcow2, deleted on exit) because XFS must replay its log
+# to show what a hard-stopped first boot wrote -- system.journal of the C15
+# rehearsal was an unreadable inode under norecovery on 2026-09-10. The key
+# file is shredded on every exit path.
 # Root is required for nbd, device-mapper and mount. The rehearsal VM must have
 # ended (a live guest still owns the disks).
 set -euo pipefail
@@ -67,7 +71,7 @@ free_nbd() { # -> first /dev/nbdN with no backing
 scratch=$(mktemp -d /run/ni-bench-journal.XXXXXX); chmod 0700 "$scratch"
 keyfile=$scratch/key; esp_mnt=$scratch/esp; sys_mnt=$scratch/system
 mapper=ni-rehearsed-system-$$
-nbd_medium="" nbd_target=""
+nbd_medium="" nbd_target="" target_overlay=""
 cleanup() {
   set +e
   findmnt -n "$sys_mnt" >/dev/null 2>&1 && umount "$sys_mnt"
@@ -75,6 +79,7 @@ cleanup() {
   findmnt -n "$esp_mnt" >/dev/null 2>&1 && umount "$esp_mnt"
   [[ -n "$nbd_target" ]] && qemu-nbd -d "$nbd_target" >/dev/null 2>&1
   [[ -n "$nbd_medium" ]] && qemu-nbd -d "$nbd_medium" >/dev/null 2>&1
+  [[ -n "$target_overlay" && -e "$target_overlay" ]] && rm -f -- "$target_overlay"
   [[ -e "$keyfile" ]] && shred -u -- "$keyfile"
   rm -rf -- "$scratch"
 }
@@ -98,16 +103,21 @@ umount "$esp_mnt"; qemu-nbd -d "$nbd_medium" >/dev/null; nbd_medium=""
 
 # 2. The system volume, read-only, and the deployment's persistent journal.
 nbd_target=$(free_nbd) || die "no free /dev/nbd device"
-qemu-nbd --read-only -c "$nbd_target" "$target" || die "cannot attach $target read-only"
+target_overlay=$work_dir/target.journal-read.qcow2
+[[ ! -e "$target_overlay" ]] || die "$target_overlay already exists; a previous read did not clean up"
+qemu-img create -q -f qcow2 -b "$target" -F qcow2 "$target_overlay" \
+  || die "cannot create the throw-away overlay of $target"
+qemu-nbd -c "$nbd_target" "$target_overlay" || die "cannot attach the target overlay"
 partprobe "$nbd_target" >/dev/null 2>&1 || true; udevadm settle 2>/dev/null || true
 sysp=${nbd_target}p3
 [[ -b "$sysp" ]] || die "$sysp is not a block device: the target carries no partition 3 (system)"
 cryptsetup isLuks "$sysp" || die "$sysp is not LUKS: the target was never installed"
-cryptsetup open --type luks2 --readonly --key-file "$keyfile" "$sysp" "$mapper" \
+cryptsetup open --type luks2 --key-file "$keyfile" "$sysp" "$mapper" \
   || die "the escrowed key does not open $sysp"
 shred -u -- "$keyfile"
 mkdir -m 0700 "$sys_mnt"
-mount -o ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper" "$sys_mnt" || die "the system volume did not mount read-only"
+# ro without norecovery: XFS replays its log into the throw-away overlay only.
+mount -o ro,nodev,nosuid,noexec "/dev/mapper/$mapper" "$sys_mnt" || die "the system volume did not mount read-only"
 journal_dir=$(find "$sys_mnt/ostree/deploy" -maxdepth 4 -type d -path '*/var/log/journal' 2>/dev/null | head -1)
 [[ -n "$journal_dir" ]] || die "no persistent journal under the deployed /var (never booted?)"
 say "journal: ${journal_dir#"$sys_mnt"}"
