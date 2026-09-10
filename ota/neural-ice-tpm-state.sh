@@ -491,7 +491,7 @@ import struct, sys
 value, = struct.unpack(">Q", open(sys.argv[1], "rb").read()[40:48])
 print(value)
 ' "$WORK/record.bin")"
-  [[ "$base" =~ ^[0-9]{1,16}$ ]] && (( base <= MAX_SAFE_INTEGER )) \
+  { [[ "$base" =~ ^[0-9]{1,16}$ ]] && (( base <= MAX_SAFE_INTEGER )); } \
     || die "the sealed record carries an unusable freshness base"
   printf '%s\n' "$base"
 }
@@ -700,7 +700,7 @@ profile_bind() { # read-only compatibility gate; provisioning belongs to ceremon
 }
 
 write_record() { # $1=binding digest $2=freshness base; workspace and policies already prepared
-  [[ "$2" =~ ^[0-9]{1,16}$ ]] && (( 10#$2 <= MAX_SAFE_INTEGER )) \
+  { [[ "$2" =~ ^[0-9]{1,16}$ ]] && (( 10#$2 <= MAX_SAFE_INTEGER )); } \
     || die "the freshness base to seal is not a safe integer"
   "$(tool tpm2_nvdefine)" "$RECORD_INDEX" -C o -s "$RECORD_BYTES" \
     -a "policywrite|authread|ownerread|writedefine" -L "$WORK/policy-record" \
