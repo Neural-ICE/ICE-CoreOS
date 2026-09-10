@@ -573,5 +573,12 @@ grep -Fq -- '[[ "$name" != "$last" && "$name" =~ ^tty(S|AMA)[0-9]+$ && -c "/dev/
   || fail "log() mirror admits a VT, the /dev/console entry, or an absent device"
 grep -Fq -- 'for mirror in "${LOG_MIRROR_TTYS[@]}"; do' "$AUTOINSTALL" \
   || fail "log() no longer mirrors to the other active serial consoles"
+# A bash function must be defined above its first caller: partdev() defined
+# after the pre-wipe readout was `command not found` (exit 127) under KVM on
+# 2026-09-10, and no static check saw it.
+_def_line="$(grep -n '^partdev() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_use_line="$(grep -n 'partdev [0-9]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$_def_line" && -n "$_use_line" && "$_def_line" -lt "$_use_line" ]] \
+  || fail "partdev() is defined at line ${_def_line:-?} but first used at line ${_use_line:-?}"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"
