@@ -462,8 +462,10 @@ grep -Fqx 'ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice' "$ROOT/image
   || fail "neural-ice-seed-import.service must keep /run/neural-ice writable: ni-ota-verify writes seed-verify under it"
 # containers/image ignores TMPDIR on Linux: only --tmpdir moves skopeo's staging
 # off the read-only /var/tmp (lab GX10, 2026-09-10, twice).
+# shellcheck disable=SC2016  # literal script text, not an expansion
 grep -Fq 'skopeo copy --tmpdir "$DATA/tmp" --preserve-digests' "$ROOT/image/firstboot/neural-ice-seed-import.sh" \
   || fail "neural-ice-seed-import.sh lets skopeo stage under the read-only /var/tmp (missing --tmpdir)"
+# shellcheck disable=SC2016
 grep -Fq '"$DATA/tmp"' "$ROOT/image/firstboot/neural-ice-seed-import.sh" \
   || fail "neural-ice-seed-import.sh does not create the data-volume staging directory"
 
