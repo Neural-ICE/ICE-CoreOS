@@ -2049,6 +2049,7 @@ seed_mirror_helper() { # $1=documents|plan|objects $2..=positional arguments -> 
 
 Exit 0 only when every byte asked for landed and hashed to its name.
 """
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -2057,6 +2058,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -2095,6 +2097,12 @@ MAX_TIME_BYTES_PER_SECOND = 512 * KIB
 DISK_MARGIN_FRACTION = 0.05
 DISK_MARGIN_BYTES = 256 * MIB
 CHUNK = MIB
+# Objects in flight at once. One stream is bound by a single core doing TLS,
+# SHA-256 and the encrypted write (200 MB/s on a GB10, 330 MB/s on the bench
+# host, 2026-09-10); six streams spread that over six cores and fill a 10 GbE
+# link. Memory stays bounded: INFLIGHT curl processes and INFLIGHT × CHUNK of
+# buffer. Refusals keep their meaning: the first one aborts every stream.
+INFLIGHT = 6
 STDERR_KEEP = 4 * KIB
 READY_SCHEMA = "neural-ice-seed-closure-ready-v1"
 NODE_KINDS = ("index", "manifest", "config", "layer")
@@ -2214,6 +2222,7 @@ class Transport:
             refuse(f"the pinned mirror CA is not a file: {cacert}")
         self.mirror = mirror
         self.cacert = cacert
+        self.abort = threading.Event()
 
     def url(self, path):
         return f"https://{self.mirror}/v2/{path}"
@@ -2247,6 +2256,8 @@ class Transport:
                     stdin=subprocess.DEVNULL)
                 try:
                     while True:
+                        if self.abort.is_set():
+                            break
                         chunk = process.stdout.read(CHUNK)
                         if not chunk:
                             break
@@ -2257,7 +2268,7 @@ class Transport:
                         hasher.update(chunk)
                         sink.write(chunk)
                 finally:
-                    if overflow:
+                    if overflow or self.abort.is_set():
                         process.kill()
                     process.stdout.close()
                     status = process.wait()
@@ -2265,6 +2276,8 @@ class Transport:
                 os.fsync(sink.fileno())
             if overflow:
                 refuse(f"{url} served more than the {limit} bytes it may be")
+            if self.abort.is_set():
+                raise Transient(f"{url}: abandoned because another object was refused")
             if status != 0:
                 errors.seek(0)
                 detail = errors.read(STDERR_KEEP).decode("utf-8", "replace").strip()
@@ -2294,6 +2307,8 @@ class Transport:
             try:
                 return self.fetch_once(url, accept, limit, expected_hex, expected_size, destination)
             except Transient as error:
+                if self.abort.is_set():
+                    raise
                 if attempt == ATTEMPTS:
                     refuse(f"{what}: transport failed {ATTEMPTS} times; last: {error}")
                 wait = RETRY_WAITS[attempt - 1]
@@ -2588,15 +2603,25 @@ def objects(mirror, cacert, closure_path, release_authority, destination, closur
         if hash_present(os.path.join(store, item.hex)) is None:
             remaining += item.size if item.size is not None else item.limit
     require_space(store, remaining, "exact sizes")
-    # 4) Everything else, one object in flight at a time.
-    for item in plan.items.values():
-        if item.hex in landed:
-            continue
-        new, count = materialise(transport, plan, store, item)
-        fetched += new
-        skipped += 1 - new
-        bytes_landed += count
-        landed.add(item.hex)
+    # 4) Everything else, INFLIGHT objects at a time. Each object is still
+    #    fetched, hashed in flight and published by rename on its own; only the
+    #    scheduling is concurrent. The first refusal raises the abort flag, every
+    #    other stream kills its transfer, and the refusal propagates unchanged.
+    pending = [item for item in plan.items.values() if item.hex not in landed]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=INFLIGHT) as pool:
+        futures = {pool.submit(materialise, transport, plan, store, item): item for item in pending}
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                new, count = future.result()
+                fetched += new
+                skipped += 1 - new
+                bytes_landed += count
+                landed.add(futures[future].hex)
+        except BaseException:
+            transport.abort.set()
+            for future in futures:
+                future.cancel()
+            raise
     # 5) Nothing the closure does not name may sit in the store.
     present = set(os.listdir(store))
     stray = sorted(present - set(plan.items))

@@ -250,3 +250,17 @@ garbage) and asserts the proof precedes the READY fetch and the first write.
   with a mocked `getent`), `image/test-installer-systemd-lifecycle.sh` (the
   generator driven for real on a `.local`, an IP and a unicast-DNS mirror; no
   announcement; the sabotaged generator).
+
+## Throughput (P1.10, 2026-09-10)
+
+One object in flight was bound by one core doing TLS, SHA-256 and the encrypted
+write: 200 MB/s on a GB10, 330 MB/s on the bench host with the mirror local, and
+the verifier then re-hashed the 128.5 GiB seed on one core (~11–15 min). The
+fetcher now keeps `INFLIGHT = 6` objects in flight (six `curl` processes, six
+1 MiB buffers; the first refusal raises an abort flag that kills every other
+stream and propagates unchanged), and `ni-ota-verify verify-seed-closure` hashes
+objects with at most eight worker threads, returning outcomes in the closure's
+order so the first refusal is deterministic. The installer image rebuilds
+`ni-ota-verify` from its own revision (`image/Containerfile.installer` §0) so the
+proof it runs is the one this repository revision defines; the appliance keeps
+re-proving the seed at first boot with its own copy.

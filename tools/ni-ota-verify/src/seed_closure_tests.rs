@@ -1839,3 +1839,68 @@ fn fabric_ota_seed_authorization_profile_and_mutations_are_differential() {
         assert!(validate_authorization_contract(changed.as_object().unwrap()).is_err());
     }
 }
+
+#[test]
+fn objects_are_hashed_by_bounded_workers_in_closure_order() {
+    let base =
+        std::env::temp_dir().join(format!("ni-ota-verify-hash-objects-{}", std::process::id()));
+    let object_root = base.join("objects/sha256");
+    std::fs::create_dir_all(&object_root).unwrap();
+    // Sizes straddle the 1 MiB read block; more objects than workers.
+    let sizes = [
+        0usize,
+        1,
+        1024,
+        1024 * 1024 - 1,
+        1024 * 1024,
+        1024 * 1024 + 7,
+        3 * 1024 * 1024,
+        17,
+        4096,
+        2 * 1024 * 1024 + 3,
+        5,
+        1024 * 1024 * 2,
+    ];
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for (index, size) in sizes.iter().enumerate() {
+        let bytes: Vec<u8> = (0..*size)
+            .map(|i| ((i * 31 + index * 7) % 251) as u8)
+            .collect();
+        let hex = hex_digest(&bytes);
+        std::fs::write(object_root.join(&hex), &bytes).unwrap();
+        names.push(hex.clone());
+        expected.push((hex, *size as u64));
+    }
+    // A misnamed object and an absent one, in the middle of the list.
+    let wrong_name = "00".repeat(32);
+    std::fs::write(object_root.join(&wrong_name), b"not what the name says").unwrap();
+    let absent = "ff".repeat(32);
+    names.insert(3, wrong_name.clone());
+    names.insert(5, absent.clone());
+
+    let outcomes = hash_objects(&base, &names);
+    assert_eq!(outcomes.len(), names.len());
+    let mut expected_iter = expected.iter();
+    for (name, outcome) in names.iter().zip(&outcomes) {
+        if name == &wrong_name {
+            let (observed, size) = outcome.as_ref().unwrap();
+            assert_ne!(observed, name);
+            assert_eq!(*size, b"not what the name says".len() as u64);
+        } else if name == &absent {
+            assert!(outcome.is_err());
+        } else {
+            let (hex, size) = expected_iter.next().unwrap();
+            assert_eq!(outcome.as_ref().unwrap(), &(hex.clone(), *size));
+            assert_eq!(
+                hash_file(&object_root.join(name)).unwrap(),
+                (hex.clone(), *size)
+            );
+        }
+    }
+    // Empty and single-object lists take the same path.
+    assert!(hash_objects(&base, &[]).is_empty());
+    let one = hash_objects(&base, &names[..1]);
+    assert_eq!(one[0].as_ref().unwrap(), &expected[0]);
+    std::fs::remove_dir_all(&base).unwrap();
+}
