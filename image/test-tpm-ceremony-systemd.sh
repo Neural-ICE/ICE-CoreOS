@@ -454,9 +454,11 @@ grep -qx 'neural-ice-status-screen.service' <<<"$(grep -oE '[A-Za-z0-9@._-]+\.se
 # A required ReadWritePaths= naming a directory nothing before this unit creates
 # fails the unit at the NAMESPACE step, silently (lab GX10, 2026-09-10):
 # /run/neural-ice is hostname-init's and must stay optional here.
-grep -Fqx 'ReadWritePaths=/var/lib/neural-ice/data -/run/neural-ice' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
-  || fail "neural-ice-seed-import.service requires /run/neural-ice at NAMESPACE setup; it must be optional (-)"
-grep -vE '^[[:space:]]*#' "$ROOT/image/firstboot/neural-ice-seed-import.service" | grep -Eq 'ReadWritePaths=.*[^-]/run/neural-ice($|[[:space:]])' \
-  && fail "neural-ice-seed-import.service names /run/neural-ice as a required path again"
+grep -Fqx 'RuntimeDirectory=neural-ice' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service does not create /run/neural-ice itself (RuntimeDirectory=)"
+grep -Fqx 'RuntimeDirectoryPreserve=yes' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service would remove /run/neural-ice from under hostname-init when it ends"
+grep -Fqx 'ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service must keep /run/neural-ice writable: ni-ota-verify writes seed-verify under it"
 
 echo "TPM_CEREMONY_SYSTEMD_OFFLINE_TEST_OK (${#dropin_units[@]} direct consumers plus firstboot chain)"
