@@ -120,7 +120,11 @@ printf '%s' "\$attrs" > "$NV/\$index/attrs"
 printf '%s' "\$size" > "$NV/\$index/size"
 cp "\$policy" "$NV/\$index/policy"
 if [[ "\$attrs" == *"nt=counter"* ]]; then
-  python3 -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack(">Q",0))' "$NV/\$index/data"
+  # TPM 2.0 (Part 1, NV counters): a new counter is initialised to the largest
+  # value any counter of this TPM ever held, and that value survives TPM2_Clear.
+  # Measured on the lab GX10 on 2026-09-09 (index absent, born at 9) and on
+  # 2026-09-10 (freshness counter born at 21).
+  python3 -c 'import struct,sys,os; m=int(open(sys.argv[2]).read()) if os.path.exists(sys.argv[2]) else 0; open(sys.argv[1],"wb").write(struct.pack(">Q",m))' "$NV/\$index/data" "$NV/.max-ever"
 else
   head -c "\$size" /dev/zero > "$NV/\$index/data"
 fi
@@ -274,11 +278,13 @@ done
 [[ -d "$NV/\$index" ]] || exit 1
 [[ "\$(cat "$NV/\$index/attrs")" == *"nt=counter"* ]] || exit 1
 bash "$TOOLS/_ni_check_session" "\$index" "\$auth" TPM2_CC_NV_Increment || exit 1
-python3 - "$NV/\$index/data" <<'PY'
-import struct, sys
-path = sys.argv[1]
+python3 - "$NV/\$index/data" "$NV/.max-ever" <<'PY'
+import os, struct, sys
+path, max_path = sys.argv[1], sys.argv[2]
 value, = struct.unpack(">Q", open(path, "rb").read())
 open(path, "wb").write(struct.pack(">Q", value + 1))
+previous = int(open(max_path).read()) if os.path.exists(max_path) else 0
+open(max_path, "w").write(str(max(previous, value + 1)))
 PY
 : > "$NV/\$index/written"
 EOF
@@ -431,7 +437,7 @@ NI_TEST_CHANGEAUTH_FAIL=1 st ceremony-finalize customer-locked "$TARGET" "$POLIC
 st provisioning-status >/dev/null 2>&1 && fail "record deletion became virgin"
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4 >/dev/null 2>&1 \
   && fail "ceremony recreated a deleted record"
-rm -rf "${NV:?}"/*
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"
 activate_pcr_policy
 
 # A process loss after successful changeauth is already a completed lifecycle:
@@ -447,7 +453,7 @@ NI_TEST_INTERRUPT_AFTER_CHANGEAUTH=1 st ceremony-finalize customer-locked "$TARG
   bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   "$install_at" "$freshness_at")" = complete ] \
   || fail "post-changeauth interruption was not recoverable as authenticated complete"
-rm -rf "${NV:?}"/*; rm -f "$OWNER_AUTH_MARK"
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK"
 activate_pcr_policy
 
 result="$(st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4)"
@@ -460,27 +466,41 @@ NI_TEST_CHANGEAUTH_FAIL=1 st ceremony-finalize customer-locked "$TARGET" "$POLIC
 st provisioning-status >/dev/null 2>&1 && fail "deleting record+freshness became virgin"
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4 >/dev/null 2>&1 \
   && fail "ceremony recreated both deleted indices"
-rm -rf "${NV:?}"/*
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"
 activate_pcr_policy
 
+# THE GX10 CASE (2026-09-10, NI-E02 on every first boot): the chip's counters
+# already went to 21 (PCR policy sequences of the bench, before a TPM Clear), so the freshness
+# and install counters are BORN at 21 while the release's issuance sequence is 4. The
+# ceremony must bind and report the high-water from the sealed base, not refuse.
+printf '21' > "$NV/.max-ever"
 result="$(st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4)"
-[ "$result" = "1 4 $EXPECT" ] || fail "ceremony returned unexpected evidence: $result"
+[ "$result" = "22 4 $EXPECT" ] || fail "ceremony returned unexpected evidence: $result"
 st ceremony-finalize customer-locked "$TARGET" "$POLICY" \
-  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 4 >/dev/null
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4 >/dev/null
 snapshot="$(st state-snapshot customer-locked "$TARGET" "$POLICY")"
 python3 - "$snapshot" <<'PY' || fail "state snapshot does not bind both exact NV public Names and values"
 import json,re,sys
 d=json.loads(sys.argv[1])
-assert d["install_counter"] == 1 and d["freshness_counter"] == 4
+assert d["install_counter"] == 22 and d["freshness_counter"] == 4
 assert re.fullmatch(r"[0-9a-f]{64}",d["install_public_sha256"])
 assert re.fullmatch(r"[0-9a-f]{64}",d["freshness_public_sha256"])
 assert d["install_public_sha256"] != d["freshness_public_sha256"]
 PY
 [ "$(st runtime-status customer-locked "$TARGET" "$POLICY" \
-  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 4)" = complete ] \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4)" = complete ] \
   || fail "completed state did not pass runtime status"
-[ "$(st counter-read)" = 1 ] || fail "install counter mismatch"
-[ "$(st freshness-read)" = 4 ] || fail "freshness is not the absolute TPM value"
+[ "$(st counter-read)" = 22 ] || fail "install counter mismatch"
+[ "$(st freshness-read)" = 4 ] || fail "freshness is not counted from the sealed base"
+python3 - "$NV/01500004/data" "$NV/01500005/data" <<'PY' || fail "the counter was not born at the chip's max-ever, or the record does not seal that base"
+import struct, sys
+counter, = struct.unpack(">Q", open(sys.argv[1], "rb").read())
+record = open(sys.argv[2], "rb").read()
+base, = struct.unpack(">Q", record[40:48])
+assert base == 23, base          # install counter born at 21 -> 22 (max-ever 22); freshness born at 22, +1 for WRITTEN
+assert counter == 27, counter    # base + the 4 consumed issuance sequences
+assert record[48:] == bytes(16), record[48:].hex()
+PY
 [ "$(st profile-read)" = "$EXPECT" ] || fail "profile binding mismatch"
 [ "$(st profile-bind customer-locked "$TARGET" "$POLICY")" = "$EXPECT" ] \
   || fail "read-only profile-bind refused exact state"
@@ -494,7 +514,7 @@ st freshness-consume 4 >/dev/null 2>&1 && fail "consumed N replayed"
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 5 >/dev/null 2>&1 \
   && fail "one-time ceremony became idempotent acceptance"
 [ "$(st runtime-status customer-locked "$TARGET" "$POLICY" \
-  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 4)" = complete ] \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4)" = complete ] \
   || fail "second-boot runtime status failed"
 
 # Runtime root cannot delete record only, delete both, recreate an index, or
@@ -508,12 +528,12 @@ done
   && fail "runtime root recreated an owner object after seal"
 rm -f "$PERSIST/81000001"
 st runtime-status customer-locked "$TARGET" "$POLICY" \
-  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 4 >/dev/null 2>&1 \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4 >/dev/null 2>&1 \
   && fail "persistent SRK mismatch was accepted"
 : > "$PERSIST/81000001"
 rm -f "$PERSIST/81010005"
 st runtime-status customer-locked "$TARGET" "$POLICY" \
-  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 4 >/dev/null 2>&1 \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4 >/dev/null 2>&1 \
   && fail "persistent device-root mismatch was accepted"
 : > "$PERSIST/81010005"
 
@@ -526,7 +546,7 @@ st profile-bind customer-locked "$TARGET" "$POLICY" >/dev/null 2>&1 \
 # Owner-profile completion uses an exact preseal-prepared discriminator and a
 # separately versioned completion record. It must neither weaken nor reinterpret
 # the retained v1 commands above.
-rm -rf "${NV:?}"/*; rm -f "$OWNER_AUTH_MARK"
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK"
 activate_pcr_policy
 printf '42\n' > "$OWNER_OTA_FLOOR"
 printf '0\n' > "$OWNER_OTA_CLEAR"
@@ -558,7 +578,7 @@ st provisioning-status >/dev/null 2>&1 \
 
 # A partial post-NV03 ceremony is recovery-only. Reset this filesystem mock to
 # model the separately approved physical reinstall before the successful case.
-rm -rf "${NV:?}"/*; rm -f "$OWNER_AUTH_MARK"
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK"
 activate_pcr_policy
 printf '42\n' > "$OWNER_OTA_FLOOR"
 printf '0\n' > "$OWNER_OTA_CLEAR"
@@ -613,7 +633,10 @@ grep -Fq 'os.urandom(32)' "$SCRIPT" || fail "owner auth is not 32-byte CSPRNG ou
 find "$NI_TPM_STATE_TEST_RUN_DIR" -name 'owner-auth*' -print 2>/dev/null | grep -q . \
   && fail "owner authorization survived ceremony"
 grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -Eq 'current[[:space:]]*-' \
-  && fail "legacy relative-counter arithmetic remains executable"
+  && fail "an ad hoc subtraction outside freshness_value would be a second freshness contract"
+[ "$(grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -c 'counter - base')" = 1 ] \
+  || fail "the freshness high-water must be counter minus the sealed base, in exactly one place (ADR-0015 M)"
+grep -Fq 'read()[40:48]' "$SCRIPT" || fail "the freshness base is not read from record bytes 40..47"
 grep -Fq 'tpm2_nvundefine' "$SCRIPT" && fail "runtime helper can undefine state"
 grep -Fq 'ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state' \
   "$ROOT/image/Containerfile.bootc" || fail "image does not ship TPM helper"
