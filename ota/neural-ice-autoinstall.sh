@@ -3686,10 +3686,14 @@ assert_bootc_container_reads_source "$source_imgref"
 # and nothing reachable (2026-09-09: NI-E02 on the bench appliance, cause
 # unread). The medium that installed it escrowed the SYSTEM volume recovery
 # key on its own ESP (phase 8); a LAB medium finding that escrow for THIS
-# target disk opens the previous system volume READ-ONLY (LUKS --readonly,
-# xfs ro,norecovery), prints the last lines of the ceremony unit's persistent
-# journal and the last errors, closes everything and shreds the key. Never on
-# a customer medium; never a write; never a reason to stop the install.
+# target disk opens the previous system volume, mounts it read-only WITH log
+# replay -- a first boot that ended in NI-E02 is powered off by hand, so the
+# lines that matter sit in the unreplayed XFS log (the C15 rehearsal's
+# system.journal was an unreadable inode under norecovery, 2026-09-10); the
+# replay is the only write and the disk is wiped seconds later -- prints the
+# last lines of the ceremony unit's persistent journal and the last errors,
+# closes everything and shreds the key. Never on a customer medium; never a
+# reason to stop the install.
 # Partition device naming for the internal target, needed here by the pre-wipe
 # readout and below by the partitioner. Bash resolves a function at CALL time:
 # defined after its first caller, this was `command not found` (exit 127) on
@@ -3716,10 +3720,10 @@ log_previous_firstboot_journal() {
     if [[ "$key" =~ ^[A-Za-z0-9-]{16,128}$ ]]; then
       keyfile="$(mktemp -p /run/neural-ice-installer ni-previous-key.XXXXXX)"
       printf '%s' "$key" > "$keyfile"
-      if cryptsetup open --type luks2 --readonly --key-file "$keyfile" "$sysp" "$mapper" 2>/dev/null; then
+      if cryptsetup open --type luks2 --key-file "$keyfile" "$sysp" "$mapper" 2>/dev/null; then
         mnt=/run/neural-ice-installer/previous-system
         install -d -m 0700 "$mnt"
-        if mount -o ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper" "$mnt" 2>/dev/null; then
+        if mount -o ro,nodev,nosuid,noexec "/dev/mapper/$mapper" "$mnt" 2>/dev/null; then
           journal_dir="$(find "$mnt/ostree/deploy" -maxdepth 4 -type d -path '*/var/log/journal' 2>/dev/null | head -1)"
           if [[ -n "$journal_dir" ]]; then
             log "Previous first boot on this disk (LAB medium, read before the wipe) — neural-ice-firstboot-tpm-ceremony.service, last 60 lines:"

@@ -186,10 +186,16 @@ grep -Fq 'would reject the containers-storage source' "$AUTOINSTALL" \
 # key is shredded; the readout never stops the install.
 grep -Fq '[[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] || return 0' "$AUTOINSTALL" \
   || fail "the previous-first-boot journal readout is not restricted to a LAB medium"
-grep -Fq 'cryptsetup open --type luks2 --readonly --key-file "$keyfile"' "$AUTOINSTALL" \
-  || fail "the previous system volume is not opened read-only"
-grep -Fq 'mount -o ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper"' "$AUTOINSTALL" \
-  || fail "the previous system volume is not mounted read-only without log replay"
+# Mounted ro WITH log replay: a first boot that ended in NI-E02 is powered off
+# by hand and its last journal lines sit in the unreplayed XFS log (C15
+# rehearsal, 2026-09-10). norecovery would read an empty journal; --readonly
+# would make the replay impossible. The disk is wiped seconds later.
+grep -Fq 'cryptsetup open --type luks2 --key-file "$keyfile" "$sysp" "$mapper"' "$AUTOINSTALL" \
+  || fail "the previous system volume is not opened for the readout"
+grep -Fq 'mount -o ro,nodev,nosuid,noexec "/dev/mapper/$mapper" "$mnt"' "$AUTOINSTALL" \
+  || fail "the previous system volume is not mounted read-only with log replay"
+! grep -Fq 'ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper"' "$AUTOINSTALL" \
+  || fail "norecovery is back on the readout mount; it hides the lines of a hard-stopped first boot"
 grep -Fq 'shred -u -- "$keyfile"' "$AUTOINSTALL" \
   || fail "the escrowed recovery key is not shredded after the readout"
 readout_line="$(grep -n '^log_previous_firstboot_journal$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
