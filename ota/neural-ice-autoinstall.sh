@@ -189,8 +189,49 @@ write_failure_evidence() { # $1=the diagnostic message (hashed, never printed)
   # an existing object here: this is a best-effort evidence write on an already
   # failing path, not authority to mutate an arbitrary filesystem object.
   if [[ -d "${EFI_FAILURE_EVIDENCE%/*}" && ! -L "$EFI_FAILURE_EVIDENCE" ]]; then
-    printf '\x07\x00\x00\x00%s' "$evidence" > "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
+    # efivarfs marks an existing variable immutable; the write of the previous
+    # attempt's evidence was refused with EPERM on every failed install of
+    # 2026-09-09 (four attempts, no evidence kept). Clearing the attribute is
+    # the documented way to rewrite a variable; a variable that was never
+    # written has no file and no attribute.
+    [[ ! -e "$EFI_FAILURE_EVIDENCE" ]] || chattr -i -- "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
+    # ONE write(2): efivarfs takes the attributes and the whole value in a
+    # single write and treats a second one as a new (refused) SetVariable
+    # (Documentation/filesystems/efivarfs.rst). printf's buffered pieces left
+    # a 115-byte variable on the bench on 2026-09-09 -- no stage, no PCR7.
+    _efi_staged="$(mktemp -t ni-efi-evidence.XXXXXX 2>/dev/null)" || _efi_staged=""
+    if [[ -n "$_efi_staged" ]]; then
+      if { printf '\x07\x00\x00\x00'; printf '%s' "$evidence"; } > "$_efi_staged" 2>/dev/null; then
+        # head(1) copies a file this small in one read and ONE write(2), which
+        # is the efivarfs contract above. Not dd: dd is a disk-writing tool and
+        # the preflight harness (ota/test-installer-pcr7-coverage.sh) rightly
+        # counts any dd call as a target mutation, whatever its operands.
+        head -c 65536 -- "$_efi_staged" > "$EFI_FAILURE_EVIDENCE" 2>/dev/null || true
+      fi
+      rm -f -- "$_efi_staged"
+    fi
   fi
+}
+
+# The evidence a PREVIOUS attempt left in NVRAM, said once at the top of this
+# one. The failure screen is gone with the power; this line survives it. Read
+# bounded, keys whitelisted, values shape-checked, and never acted upon.
+log_previous_failure_evidence() {
+  [[ -f "$EFI_FAILURE_EVIDENCE" && ! -L "$EFI_FAILURE_EVIDENCE" ]] || return 0
+  local raw line key value summary=''
+  raw="$(head -c 4096 -- "$EFI_FAILURE_EVIDENCE" 2>/dev/null | tail -c +5 | tr -d '\000')" || return 0
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      code|phase|phase_total|stage|detail|pcr7|pcr7_policy|pcr7_verified_count) ;;
+      *) continue ;;
+    esac
+    [[ "$value" =~ ^[A-Za-z0-9._,-]{1,128}$ ]] || continue
+    summary+="${summary:+ }${key}=${value}"
+  done <<<"$raw"
+  [[ -n "$summary" ]] || return 0
+  log "Previous installer attempt on this machine left failure evidence in NVRAM: ${summary} (informational; this attempt starts clean)"
 }
 
 die()  {
@@ -2037,6 +2078,7 @@ seed_mirror_helper() { # $1=documents|plan|objects $2..=positional arguments -> 
 
 Exit 0 only when every byte asked for landed and hashed to its name.
 """
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -2045,6 +2087,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -2083,6 +2126,12 @@ MAX_TIME_BYTES_PER_SECOND = 512 * KIB
 DISK_MARGIN_FRACTION = 0.05
 DISK_MARGIN_BYTES = 256 * MIB
 CHUNK = MIB
+# Objects in flight at once. One stream is bound by a single core doing TLS,
+# SHA-256 and the encrypted write (200 MB/s on a GB10, 330 MB/s on the bench
+# host, 2026-09-10); six streams spread that over six cores and fill a 10 GbE
+# link. Memory stays bounded: INFLIGHT curl processes and INFLIGHT × CHUNK of
+# buffer. Refusals keep their meaning: the first one aborts every stream.
+INFLIGHT = 6
 STDERR_KEEP = 4 * KIB
 READY_SCHEMA = "neural-ice-seed-closure-ready-v1"
 NODE_KINDS = ("index", "manifest", "config", "layer")
@@ -2202,6 +2251,7 @@ class Transport:
             refuse(f"the pinned mirror CA is not a file: {cacert}")
         self.mirror = mirror
         self.cacert = cacert
+        self.abort = threading.Event()
 
     def url(self, path):
         return f"https://{self.mirror}/v2/{path}"
@@ -2235,6 +2285,8 @@ class Transport:
                     stdin=subprocess.DEVNULL)
                 try:
                     while True:
+                        if self.abort.is_set():
+                            break
                         chunk = process.stdout.read(CHUNK)
                         if not chunk:
                             break
@@ -2245,7 +2297,7 @@ class Transport:
                         hasher.update(chunk)
                         sink.write(chunk)
                 finally:
-                    if overflow:
+                    if overflow or self.abort.is_set():
                         process.kill()
                     process.stdout.close()
                     status = process.wait()
@@ -2253,6 +2305,8 @@ class Transport:
                 os.fsync(sink.fileno())
             if overflow:
                 refuse(f"{url} served more than the {limit} bytes it may be")
+            if self.abort.is_set():
+                raise Transient(f"{url}: abandoned because another object was refused")
             if status != 0:
                 errors.seek(0)
                 detail = errors.read(STDERR_KEEP).decode("utf-8", "replace").strip()
@@ -2282,6 +2336,8 @@ class Transport:
             try:
                 return self.fetch_once(url, accept, limit, expected_hex, expected_size, destination)
             except Transient as error:
+                if self.abort.is_set():
+                    raise
                 if attempt == ATTEMPTS:
                     refuse(f"{what}: transport failed {ATTEMPTS} times; last: {error}")
                 wait = RETRY_WAITS[attempt - 1]
@@ -2576,15 +2632,25 @@ def objects(mirror, cacert, closure_path, release_authority, destination, closur
         if hash_present(os.path.join(store, item.hex)) is None:
             remaining += item.size if item.size is not None else item.limit
     require_space(store, remaining, "exact sizes")
-    # 4) Everything else, one object in flight at a time.
-    for item in plan.items.values():
-        if item.hex in landed:
-            continue
-        new, count = materialise(transport, plan, store, item)
-        fetched += new
-        skipped += 1 - new
-        bytes_landed += count
-        landed.add(item.hex)
+    # 4) Everything else, INFLIGHT objects at a time. Each object is still
+    #    fetched, hashed in flight and published by rename on its own; only the
+    #    scheduling is concurrent. The first refusal raises the abort flag, every
+    #    other stream kills its transfer, and the refusal propagates unchanged.
+    pending = [item for item in plan.items.values() if item.hex not in landed]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=INFLIGHT) as pool:
+        futures = {pool.submit(materialise, transport, plan, store, item): item for item in pending}
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                new, count = future.result()
+                fetched += new
+                skipped += 1 - new
+                bytes_landed += count
+                landed.add(futures[future].hex)
+        except BaseException:
+            transport.abort.set()
+            for future in futures:
+                future.cancel()
+            raise
     # 5) Nothing the closure does not name may sit in the store.
     present = set(os.listdir(store))
     stray = sorted(present - set(plan.items))
@@ -3643,6 +3709,82 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
 }
 assert_bootc_container_reads_source "$source_imgref"
 
+# LAB MEDIUM ONLY: THE PREVIOUS FIRST BOOT'S OWN WORDS, READ BEFORE THE WIPE.
+# The installed appliance holds its network until the TPM ceremony succeeds,
+# so a ceremony that fails on first boot leaves a status screen with a code
+# and nothing reachable (2026-09-09: NI-E02 on the bench appliance, cause
+# unread). The medium that installed it escrowed the SYSTEM volume recovery
+# key on its own ESP (phase 8); a LAB medium finding that escrow for THIS
+# target disk opens the previous system volume, mounts it read-only WITH log
+# replay -- a first boot that ended in NI-E02 is powered off by hand, so the
+# lines that matter sit in the unreplayed XFS log (the C15 rehearsal's
+# system.journal was an unreadable inode under norecovery, 2026-09-10); the
+# replay is the only write and the disk is wiped seconds later -- prints the
+# last lines of the ceremony unit's persistent journal and the last errors,
+# closes everything and shreds the key. Never on a customer medium; never a
+# reason to stop the install.
+# Partition device naming for the internal target, needed here by the pre-wipe
+# readout and below by the partitioner. Bash resolves a function at CALL time:
+# defined after its first caller, this was `command not found` (exit 127) on
+# the 2026-09-10 KVM rehearsal of medium C14, right after the pre-wipe proof.
+partdev() { case "$target" in *[0-9]) echo "${target}p$1";; *) echo "${target}$1";; esac; }
+
+log_previous_firstboot_journal() {
+  [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] || return 0
+  local sysp esp mountpoint mounted=0 recfile key keyfile mapper=ni-previous-system mnt journal_dir out line
+  sysp="$(partdev 3)"
+  [[ -b "$sysp" ]] && cryptsetup isLuks "$sysp" 2>/dev/null || return 0
+  esp="$(media_vfat_partition || true)"; [[ -n "$esp" ]] || return 0
+  mountpoint="$(mounted_at "/dev/$esp" || true)"
+  if [[ -z "$mountpoint" ]]; then
+    mountpoint=/run/neural-ice-installer/esp-previous
+    install -d -m 0700 "$mountpoint"
+    mount -o ro,nodev,nosuid,noexec "/dev/$esp" "$mountpoint" 2>/dev/null || return 0
+    mounted=1
+  fi
+  recfile="$mountpoint/NEURAL-ICE-RECOVERY-${target_serial}.txt"
+  if [[ -f "$recfile" && ! -L "$recfile" ]]; then
+    key="$(head -c 4096 -- "$recfile" | tr -d '\r' \
+      | awk '/^\[INTERNAL\] SYSTEM volume recovery key/ { getline; gsub(/^[ \t]+|[ \t]+$/, ""); print; exit }')"
+    if [[ "$key" =~ ^[A-Za-z0-9-]{16,128}$ ]]; then
+      keyfile="$(mktemp -p /run/neural-ice-installer ni-previous-key.XXXXXX)"
+      printf '%s' "$key" > "$keyfile"
+      if cryptsetup open --type luks2 --key-file "$keyfile" "$sysp" "$mapper" 2>/dev/null; then
+        mnt=/run/neural-ice-installer/previous-system
+        install -d -m 0700 "$mnt"
+        if mount -o ro,nodev,nosuid,noexec "/dev/mapper/$mapper" "$mnt" 2>/dev/null; then
+          journal_dir="$(find "$mnt/ostree/deploy" -maxdepth 4 -type d -path '*/var/log/journal' 2>/dev/null | head -1)"
+          if [[ -n "$journal_dir" ]]; then
+            log "Previous first boot on this disk (LAB medium, read before the wipe) — neural-ice-firstboot-tpm-ceremony.service, last 60 lines:"
+            out="$(journalctl -D "$journal_dir" -u neural-ice-firstboot-tpm-ceremony.service -n 60 --no-pager -o short-iso 2>/dev/null \
+              | tr -cd '\11\12\40-\176' | cut -c1-220)"
+            [[ -n "$out" ]] || out="(no entries for that unit)"
+            while IFS= read -r line; do printf '    | %s\n' "$line" > /dev/console 2>/dev/null || true; done <<<"$out"
+            log "Previous first boot on this disk — last 30 error-level entries:"
+            out="$(journalctl -D "$journal_dir" -p err -n 30 --no-pager -o short-iso 2>/dev/null \
+              | tr -cd '\11\12\40-\176' | cut -c1-220)"
+            [[ -n "$out" ]] || out="(none)"
+            while IFS= read -r line; do printf '    | %s\n' "$line" > /dev/console 2>/dev/null || true; done <<<"$out"
+          else
+            log "Previous first boot on this disk: no persistent journal found under the deployed /var"
+          fi
+          umount "$mnt" 2>/dev/null || true
+        else
+          log "Previous first boot on this disk: the system volume opened but did not mount read-only"
+        fi
+        cryptsetup close "$mapper" 2>/dev/null || true
+      else
+        log "Previous first boot on this disk: the escrowed system recovery key does not open ${sysp} (a different install?)"
+      fi
+      shred -u -- "$keyfile" 2>/dev/null || rm -f -- "$keyfile"
+    fi
+  fi
+  (( mounted == 0 )) || umount "$mountpoint" 2>/dev/null || true
+  return 0
+}
+
+log_previous_failure_evidence
+log_previous_firstboot_journal
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
 sleep 5
 
@@ -3652,7 +3794,6 @@ phase 2 "Partition + encrypt (GPT, 2× LUKS2, TPM2/PCR7 enroll)"
 # 3) Partition the target (GPT): ESP, /boot, LUKS system, LUKS data
 # --------------------------------------------------------------------------- #
 # Partition device name helper (nvme0n1 -> nvme0n1pN ; sda -> sdaN)
-partdev() { case "$target" in *[0-9]) echo "${target}p$1";; *) echo "${target}$1";; esac; }
 ESP="$(partdev 1)"; BOOT="$(partdev 2)"; SYSP="$(partdev 3)"; DATAP="$(partdev 4)"
 
 # Target mountpoint for the install (real dir; /mnt is a dangling symlink in

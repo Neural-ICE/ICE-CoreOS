@@ -13,6 +13,19 @@ After=neural-ice-firstboot-tpm-ceremony.service neural-ice-firstboot-sshkey.serv
 # to run the sshd job while this one watches for the effect. The provisioning
 # unit (Before=sshd.service) structurally cannot observe that.
 After=sshd.service
+# ...and AFTER the network barrier. The vendor sshd.service is After=network.target,
+# and on this OS network.target waits for NetworkManager, which Requires= and is
+# After= neural-ice-seed-import.service (a long oneshot: it re-verifies the whole
+# release closure). Without this line the activate phase asked for sshd, polled
+# its ten seconds while the sshd job was merely queued behind that barrier, and
+# rolled the key back -- disable, mask, daemon-reload -- which killed the queued
+# job: "[FAILED] Failed to start sshd.service" at ~135 s on the lab GX10
+# (2026-09-10, C23/C24/C25; C21, where seed-import failed at once and the
+# barrier fell immediately, was fine). Nothing is ordered after this unit, so no
+# cycle; a failed seed-import still lets network.target through (a Wants= of a
+# target does not fail the target), so activation is never held forever.
+Wants=network.target
+After=network.target
 
 [Service]
 Type=oneshot

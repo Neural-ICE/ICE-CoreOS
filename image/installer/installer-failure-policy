@@ -8,9 +8,12 @@
 # action         poweroff | reboot. Anything else is ignored and `poweroff` is
 #                used: a machine that powers off after a failed install cannot
 #                loop through the destructive path unattended.
-# delay_seconds  5..300. Long enough for an operator to read and photograph the
+# delay_seconds  5..1800. Long enough for an operator to read and photograph the
 #                failure code, short enough that a medium left in a machine does
-#                not sit on a console.
+#                not sit on a console. The producer rewrites this value at image
+#                build time from the SEALED access profile: 1800 on a LAB medium
+#                (an operator on the bench may have stepped away; 2026-09-09),
+#                60 on every other one (this file's value).
 #
 # image/installer/neural-ice-installer-failure.sh is the only reader; it bounds
 # and re-validates both fields rather than trusting this file's shape.
