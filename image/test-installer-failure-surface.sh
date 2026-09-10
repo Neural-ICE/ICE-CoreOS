@@ -279,7 +279,7 @@ for writer in "$FAILURE" "$ROOT/ota/neural-ice-autoinstall.sh"; do
   if grep -Fq 'of="$EFI_' "$writer"; then
     fail "$(basename "$writer") writes the EFI evidence with dd, which the preflight harness counts as a target mutation"
   fi
-  if ! grep -Fq 'head -c 65536 -- "$_efi_staged" > "$EFI_FAILURE_EVIDENCE"' "$writer"; then
+  if ! grep -Eq 'head -c 65536 -- "\$_efi_staged" > "\$EFI_(FAILURE_EVIDENCE|EVIDENCE_FILE)"' "$writer"; then
     fail "$(basename "$writer") does not copy the staged EFI evidence in one bounded write"
   fi
 done
