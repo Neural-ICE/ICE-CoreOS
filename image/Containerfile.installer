@@ -10,7 +10,32 @@
 #     --build-arg BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest> \
 #     -t localhost/ice-coreos-installer:local .
 ARG BASE_IMAGE
+# 0) Builder stage: the installer's own ni-ota-verify, from THIS revision of
+#    tools/ni-ota-verify (same pinned toolchain and flags as
+#    image/Containerfile.bootc §0). The appliance image below ships its own copy,
+#    built from the revision the appliance was cut from; the installer proves the
+#    staged seed with the verifier of the revision the medium was cut from, so a
+#    verifier fix reaches the bench without recutting the appliance (P1.10,
+#    parallel object hashing, 2026-09-10). The appliance keeps re-proving the
+#    seed at first boot with its own copy; nothing about the proof differs.
+FROM docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS ni-ota-verify-build
+WORKDIR /build
+COPY tools/ni-ota-verify/ /build/
+ARG NI_TRUSTED_TIME_ISSUER
+RUN set -eux; \
+    test -n "${NI_TRUSTED_TIME_ISSUER}"; \
+    target="$(rustc -vV | sed -n 's/^host: //p')"; \
+    test -n "$target"; \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    NI_TRUSTED_TIME_ISSUER="${NI_TRUSTED_TIME_ISSUER}" \
+        cargo build --release --locked --target "$target"; \
+    install -D -m 0755 "target/${target}/release/ni-ota-verify" /out/ni-ota-verify; \
+    ( ldd /out/ni-ota-verify 2>&1 || true ) \
+        | grep -Eq 'statically linked|not a dynamic executable'; \
+    /out/ni-ota-verify --version
+
 FROM ${BASE_IMAGE}
+COPY --from=ni-ota-verify-build /out/ni-ota-verify /usr/bin/ni-ota-verify
 
 # All the partitioning/encryption tools required by the auto-install are
 # already in the CentOS Stream 10 bootc base: sfdisk/partx/wipefs/blkid/lsblk

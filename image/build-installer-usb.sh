@@ -79,6 +79,11 @@ SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
 # keeps the quiet line. Introduced 2026-09-09 after a bench medium powered off
 # on hardware with nothing on the screen and nothing to read.
 MEDIA_VERBOSE_CONSOLE="${MEDIA_VERBOSE_CONSOLE:-0}"
+# The installer image rebuilds its own ni-ota-verify (image/Containerfile.installer
+# §0) and the verifier's trusted-time issuer is compiled in, exactly as for the
+# appliance (ci/build-image.sh). No default: a medium whose verifier trusts an
+# issuer chosen by an unset variable is not a sealed medium.
+NI_TRUSTED_TIME_ISSUER="${NI_TRUSTED_TIME_ISSUER:-}"
 SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
 LAB_BASELINE_BOM_FILE="${LAB_BASELINE_BOM_FILE:-}"
 LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
@@ -1101,6 +1106,8 @@ fi
 # it from a remapped process and then fail after a successful image commit with
 # EACCES. A private task-owned directory gives the writer an absent pathname
 # while preserving atomic, non-shared capture of this exact build result.
+[[ -n "$NI_TRUSTED_TIME_ISSUER" ]] \
+  || { echo "ERROR: NI_TRUSTED_TIME_ISSUER is empty; the installer image compiles the verifier's trusted-time issuer in, as ci/build-image.sh does for the appliance" >&2; exit 1; }
 INSTALLER_IID_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ni-installer-image-id.XXXXXX")"
 chmod 0700 "$INSTALLER_IID_DIR"
 INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
@@ -1109,6 +1116,7 @@ INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
 sudo podman build --pull=never --platform linux/arm64 \
   --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+  --build-arg "NI_TRUSTED_TIME_ISSUER=${NI_TRUSTED_TIME_ISSUER}" \
   --build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}" \
   --build-arg "INSTALLER_FAILURE_DELAY_SECONDS=${INSTALLER_FAILURE_DELAY_SECONDS}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
