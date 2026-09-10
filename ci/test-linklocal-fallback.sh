@@ -39,7 +39,7 @@ autoconnect-priority=100
 method=auto
 
 [ipv6]
-method=auto
+method=disabled
 EOF
   printf '[server]\nhost-name=x\n' > "$bac/etc/avahi.conf"
   printf 'inconnu\n'               > "$bac/etc/hostname"
@@ -130,7 +130,7 @@ for ligne in \
   "autoconnect-priority=10" \
   "method=manual" \
   "address1=169.254.147.185/16" \
-  "method=link-local"; do
+  "method=disabled"; do
   grep -qxF "$ligne" "$profil" || fail "ligne absente du profil : $ligne"
 done
 ok "toutes les clés attendues sont présentes"

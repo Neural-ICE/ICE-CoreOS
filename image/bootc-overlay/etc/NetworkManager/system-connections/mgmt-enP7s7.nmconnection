@@ -13,4 +13,10 @@ autoconnect-priority=100
 method=auto
 
 [ipv6]
-method=auto
+# No IPv6 on the appliance (Owner decision, 2026-09-11). With method=auto on a
+# LAN without an IPv6 router, NetworkManager held the interface in ip-check for
+# 51 s (router solicitation, then a 45 s DHCPv6 transaction) before declaring
+# startup complete -- 0.1 s after nm-online's 60 s timeout, so
+# NetworkManager-wait-online failed and every unit After=network-online.target
+# waited a minute for nothing (lab GX10, first boot C27, 2026-09-10).
+method=disabled
