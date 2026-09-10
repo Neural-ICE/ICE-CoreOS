@@ -143,6 +143,40 @@ PCR_POLICY_PUBLIC_KEY_SHA256="${PCR_POLICY_PUBLIC_KEY_SHA256:-}"
 PCR_POLICY_SIGNATURE_FILE="${PCR_POLICY_SIGNATURE_FILE:-}"
 PCR_POLICY_SIGNATURE_SHA256="${PCR_POLICY_SIGNATURE_SHA256:-}"
 PCR_POLICY_SEQ="${PCR_POLICY_SEQ:-}"
+# THE BENCH NEVER GUESSES A SEQUENCE. Every activation of the signed PCR policy
+# advances a durable TPM counter on the target, and a medium sealing a sequence
+# at or below it is refused in the initramfs; on 2026-09-09 a run whose console
+# was dead activated a sequence unseen, and five media were then refused for
+# it. With PCR_POLICY_SEQ_COUNTER_FILE set (and PCR_POLICY_SEQ unset) the
+# producer takes the NEXT value from that file -- read, +1, written back under
+# a lock, before anything is sealed -- so each cut carries a sequence no earlier
+# cut on this bench has carried. The value sealed is printed and recorded like
+# any other. Exactly one source: both set is a refusal.
+PCR_POLICY_SEQ_COUNTER_FILE="${PCR_POLICY_SEQ_COUNTER_FILE:-}"
+pcr_policy_seq_from_counter() { # $1=counter file -> prints the sequence this cut seals
+  local file=$1 current next lock
+  [[ -f "$file" && ! -L "$file" ]] \
+    || { echo "ERROR: PCR_POLICY_SEQ_COUNTER_FILE must be a regular file holding the last sealed sequence: $file" >&2; return 1; }
+  lock="$file.lock"
+  exec {lockfd}>"$lock" || { echo "ERROR: cannot open the sequence counter lock $lock" >&2; return 1; }
+  flock -w 30 "$lockfd" || { echo "ERROR: cannot lock the sequence counter $file" >&2; return 1; }
+  current="$(head -c 32 -- "$file" | tr -d '[:space:]')"
+  [[ "$current" =~ ^[0-9]{1,15}$ ]] \
+    || { echo "ERROR: the sequence counter $file does not hold a decimal integer" >&2; return 1; }
+  next=$(( 10#$current + 1 ))
+  if ! { printf '%s\n' "$next" > "$file.next" && mv -f -- "$file.next" "$file"; }; then
+    echo "ERROR: cannot advance the sequence counter $file" >&2; return 1
+  fi
+  sync -- "$file" 2>/dev/null || true
+  exec {lockfd}>&-
+  printf '%s' "$next"
+}
+if [[ -n "$PCR_POLICY_SEQ_COUNTER_FILE" ]]; then
+  [[ -z "$PCR_POLICY_SEQ" ]] \
+    || { echo "ERROR: PCR_POLICY_SEQ and PCR_POLICY_SEQ_COUNTER_FILE are two sources for one sealed value; set exactly one" >&2; exit 1; }
+  PCR_POLICY_SEQ="$(pcr_policy_seq_from_counter "$PCR_POLICY_SEQ_COUNTER_FILE")" || exit 1
+  echo "    PCR policy sequence ${PCR_POLICY_SEQ} taken from the bench counter ${PCR_POLICY_SEQ_COUNTER_FILE} (previous cut sealed $((PCR_POLICY_SEQ - 1)))"
+fi
 RELEASE_AUTHORIZATION_STAGE_ROOT=""
 
 sha256_of() { # $1=path -> lowercase hex
