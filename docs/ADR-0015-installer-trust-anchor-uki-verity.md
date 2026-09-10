@@ -502,7 +502,7 @@ machine that needs a TPM clear at the firmware setup screen before it can be
 reinstalled. That is the fail-closed answer, and the window is three TPM commands
 long.
 
-### J. The issuance high-water is the absolute TPM value
+### J. The issuance high-water is the absolute TPM value *(superseded by amendment M, 2026-09-10)*
 
 The freshness contract contains no subtraction or per-install offset. The raw
 value of counter `0x01500004` is the issuance high-water, and consuming *N*
@@ -565,6 +565,50 @@ a `sealed-core.json` beside the raw: a final gate that can be invoked without
 inspecting what the medium boots is the finding. The receipt records what was
 established, so a medium blessed without an inspection is visible in the receipt
 and not only in an exit status.
+
+### M. The issuance high-water is the freshness counter minus a base sealed in the record (2026-09-10)
+
+Supersedes §J. A TPM 2.0 initialises every new `nt=counter` index to the
+largest value any counter of that chip ever held, and that value survives
+`TPM2_Clear`. §J read the raw value of `0x01500004` as the issuance high-water
+and refused an initial issuance sequence below it. On the lab GX10 (`.67`,
+2026-09-10, read off tty2) the first boot refused every ceremony with
+`initial issuance sequence 10 is below the TPM's absolute freshness value 21`:
+the freshness counter was born at 21 because the PCR policy counter
+(`0x01500007`) had been advanced to 20 by the bench's media, and the release's
+issuance sequence was 10. swtpm does not implement that rule, which is why the
+KVM rehearsal of the same medium completed its first boot. Any appliance whose
+PCR policy generations ever outrun its release issuance sequences would refuse
+the same way, and an appliance whose counter is born above the issuance
+sequence could never consume an authorization again.
+
+The contract is now relative to a base the ceremony seals beside the binding:
+
+- `ceremony-prepare` creates the install counter, then the freshness counter,
+  increments the latter once (WRITTEN), reads its value -- the BASE -- and
+  increments it `N` more times for an initial issuance sequence `N`
+  (bounded by `MAX_FRESHNESS_GAP`). It then writes the record: magic, binding
+  digest, the base as 8 big-endian bytes at offsets 40..47, zeroes to 64. The
+  record is still written once and write-locked, so the base is exactly as
+  tamper-evident as the binding.
+- The issuance high-water reported by `freshness-read`, consumed by
+  `freshness-consume`, snapshotted for the access-profile anchor and compared
+  by `runtime-status` and `ceremony-finalize` is `counter - base`, computed in
+  one place (`freshness_value`). A counter read below its sealed base is a
+  refusal: counters do not go backwards.
+- Nothing about replay changes: consuming `N` still advances the counter until
+  `counter - base == N`; equal or lower values are still replay; absence,
+  partial pairs and unlocked records are still fail-closed physical recovery.
+- The install counter (`anchor_seq`) keeps its absolute value: it is an
+  identifier of this installation, never compared to an externally issued
+  sequence.
+
+Evidence: `ota/test-neural-ice-tpm-state.sh` models the max-ever rule (a
+counter is born at the chip's largest value ever; `TPM2_Clear` does not reset
+it) and binds a chip whose counters already went to 21 with issuance sequence
+4, reads the base 23 and the raw value 27 back, and refuses an absolute
+reading by sabotage; `ci/test-swtpm-monotonic-state.sh` checks on a real TPM
+that `freshness-read + sealed base == raw counter`.
 
 ## Consequences
 
