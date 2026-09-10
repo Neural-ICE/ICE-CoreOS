@@ -99,6 +99,12 @@ Options:
   --ssh-port PORT          loopback forward to guest TCP/22 (default 22222)
   --serial-max-bytes N     per-phase serial log ceiling (default 8388608)
   --skip-firstboot         stop after the install phase
+  --resume-firstboot       run ONLY the first-boot phase on a work directory
+                           whose install phase already finished (target.qcow2,
+                           tpmstate/, AAVMF_VARS.fd are reused as they are; the
+                           install outcome is asserted complete by the caller,
+                           which is what a medium without serial installer
+                           lines needs); --firmware-vars is ignored
   --allow-root             run as root anyway, with a stated reason
   -h, --help               this text
 
@@ -395,6 +401,7 @@ ssh_port=22222
 serial_max_bytes=8388608
 skip_firstboot=0
 medium_overlay=0
+resume_firstboot=0
 allow_root=0
 
 while (( $# )); do
@@ -431,6 +438,7 @@ while (( $# )); do
       ;;
     --skip-firstboot) skip_firstboot=1; shift ;;
     --medium-overlay) medium_overlay=1; shift ;;
+    --resume-firstboot) resume_firstboot=1; shift ;;
     --allow-root) allow_root=1; shift ;;
     -h|--help) bench_usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -441,8 +449,12 @@ done
   || die "--work-dir must be an absolute non-root path"
 [[ -n "$raw" && -f "$raw" && ! -L "$raw" && -r "$raw" ]] \
   || die "--raw must name one readable regular file"
-[[ -n "$firmware_vars" && -f "$firmware_vars" && ! -L "$firmware_vars" && -r "$firmware_vars" ]] \
-  || die "--firmware-vars must name one readable regular file"
+if (( resume_firstboot )); then
+  (( skip_firstboot == 0 )) || die "--resume-firstboot and --skip-firstboot exclude each other"
+else
+  [[ -n "$firmware_vars" && -f "$firmware_vars" && ! -L "$firmware_vars" && -r "$firmware_vars" ]] \
+    || die "--firmware-vars must name one readable regular file"
+fi
 [[ -f "$firmware_code" && -r "$firmware_code" ]] || die "AAVMF code is unreadable"
 if [[ -n "$enrol_cert" ]]; then
   [[ -f "$enrol_cert" && ! -L "$enrol_cert" && -r "$enrol_cert" ]] \
@@ -500,10 +512,17 @@ if [[ -n "$mirror_ip" ]]; then
   fi
 fi
 
-[[ ! -e "$work_dir" ]] || die "the work directory already exists; a rehearsal never reuses one"
-mkdir -m 0700 -- "$work_dir"
 tpm_dir=$work_dir/tpmstate
-mkdir -m 0700 -- "$tpm_dir"
+if (( resume_firstboot )); then
+  [[ -d "$work_dir" && -d "$tpm_dir" && -f "$work_dir/target.qcow2" && -f "$work_dir/AAVMF_VARS.fd" ]] \
+    || die "--resume-firstboot needs a finished install run in $work_dir (tpmstate/, target.qcow2, AAVMF_VARS.fd)"
+  [[ ! -e "$work_dir/firstboot.console.log" ]] \
+    || die "$work_dir already ran its first boot; a rehearsal never reuses one"
+else
+  [[ ! -e "$work_dir" ]] || die "the work directory already exists; a rehearsal never reuses one"
+  mkdir -m 0700 -- "$work_dir"
+  mkdir -m 0700 -- "$tpm_dir"
+fi
 
 target=$work_dir/target.qcow2
 vars=$work_dir/AAVMF_VARS.fd
@@ -521,29 +540,33 @@ receipt=$work_dir/bench-rehearsal-receipt.json
 # "enable secure boot mode". `--enroll-cert CERT` is NOT a file path — it names a
 # certificate bundled with virt-firmware as `domain/name` and fails on a path.
 # --------------------------------------------------------------------------- #
-firmware_vars_origin=copied-as-supplied
-if [[ -n "$enrol_cert" ]]; then
-  virt-fw-vars -i "$firmware_vars" \
-    --set-pk "$enrol_owner_guid" "$enrol_cert" \
-    --add-kek "$enrol_owner_guid" "$enrol_cert" \
-    --add-db "$enrol_owner_guid" "$enrol_cert" \
-    --secure-boot \
-    -o "$vars" \
-    || die "virt-fw-vars refused to build the Secure Boot variable store"
-  firmware_vars_origin=enrolled-by-virt-fw-vars
+if (( resume_firstboot )); then
+  firmware_vars_origin=resumed-from-install-run
 else
-  cp --reflink=auto -- "$firmware_vars" "$vars"
-fi
-chmod 0600 -- "$vars"
-if [[ "$have_virt_fw_vars" == yes ]]; then
-  virt-fw-vars -i "$vars" -p > "$work_dir/firmware-vars.before.txt" \
-    || die "the Secure Boot variable store could not be read back"
-  grep -Eq '^SecureBootEnable +: bool: ON' "$work_dir/firmware-vars.before.txt" \
-    || die "the variable store does not have Secure Boot enabled; PCR7 would not be the appliance's"
-fi
+  firmware_vars_origin=copied-as-supplied
+  if [[ -n "$enrol_cert" ]]; then
+    virt-fw-vars -i "$firmware_vars" \
+      --set-pk "$enrol_owner_guid" "$enrol_cert" \
+      --add-kek "$enrol_owner_guid" "$enrol_cert" \
+      --add-db "$enrol_owner_guid" "$enrol_cert" \
+      --secure-boot \
+      -o "$vars" \
+      || die "virt-fw-vars refused to build the Secure Boot variable store"
+    firmware_vars_origin=enrolled-by-virt-fw-vars
+  else
+    cp --reflink=auto -- "$firmware_vars" "$vars"
+  fi
+  chmod 0600 -- "$vars"
+  if [[ "$have_virt_fw_vars" == yes ]]; then
+    virt-fw-vars -i "$vars" -p > "$work_dir/firmware-vars.before.txt" \
+      || die "the Secure Boot variable store could not be read back"
+    grep -Eq '^SecureBootEnable +: bool: ON' "$work_dir/firmware-vars.before.txt" \
+      || die "the variable store does not have Secure Boot enabled; PCR7 would not be the appliance's"
+  fi
 
-qemu-img create -q -f qcow2 "$target" "$target_size" \
-  || die "the sparse target disk could not be created"
+  qemu-img create -q -f qcow2 "$target" "$target_size" \
+    || die "the sparse target disk could not be created"
+fi
 
 # --------------------------------------------------------------------------- #
 # Phase runner. Every exit path — refusal, timeout, signal, success — goes
@@ -747,40 +770,48 @@ add_network() { # $1="" or a hostfwd fragment
 # --------------------------------------------------------------------------- #
 # Install phase.
 # --------------------------------------------------------------------------- #
-say "install phase: medium=$raw target=$target_size transport=$source_transport/$target_transport network=$network"
-start_swtpm
-build_qemu_base install
-if (( medium_overlay )); then
-  # The overlay is the only writable thing; the backing raw is opened by QEMU
-  # through the overlay's backing chain, read-only, and never receives a byte.
-  medium_overlay_file=$work_dir/medium.qcow2
-  qemu-img create -q -f qcow2 -b "$raw" -F raw "$medium_overlay_file" \
-    || die "cannot create the medium overlay $medium_overlay_file"
-  qemu+=(-drive "if=none,id=installer,format=qcow2,file=$medium_overlay_file")
+if (( resume_firstboot )); then
+  install_rc=none; install_stop=resumed; install_truncated=no
+  install_facts=$work_dir/install.facts
+  [[ -f "$install_facts" ]] || : > "$install_facts"
+  install_outcome=complete
+  say "resume: first boot of the target an earlier run installed in $work_dir (install outcome asserted complete by --resume-firstboot)"
 else
-  qemu+=(-drive "if=none,id=installer,format=raw,readonly=on,file=$raw")
+  say "install phase: medium=$raw target=$target_size transport=$source_transport/$target_transport network=$network"
+  start_swtpm
+  build_qemu_base install
+  if (( medium_overlay )); then
+    # The overlay is the only writable thing; the backing raw is opened by QEMU
+    # through the overlay's backing chain, read-only, and never receives a byte.
+    medium_overlay_file=$work_dir/medium.qcow2
+    qemu-img create -q -f qcow2 -b "$raw" -F raw "$medium_overlay_file" \
+      || die "cannot create the medium overlay $medium_overlay_file"
+    qemu+=(-drive "if=none,id=installer,format=qcow2,file=$medium_overlay_file")
+  else
+    qemu+=(-drive "if=none,id=installer,format=raw,readonly=on,file=$raw")
+  fi
+  case "$source_transport" in
+    virtio) qemu+=(-device "virtio-blk-pci,drive=installer,bootindex=1") ;;
+    nvme)   qemu+=(-device "nvme,drive=installer,serial=NIBENCHMEDIUM,bootindex=1") ;;
+    usb)    qemu+=(-device "qemu-xhci,id=xhci" -device "usb-storage,drive=installer,bootindex=1,removable=on") ;;
+  esac
+  add_target_drive
+  add_network ""
+  qemu+=(-nographic -no-reboot)
+
+  run_phase install "$install_timeout" \
+    'done — install completed' 'FAILED in phase ' send-key-ret ''
+  install_rc=$PHASE_RC
+  install_stop=$PHASE_STOP
+  install_truncated=$PHASE_TRUNCATED
+  stop_swtpm
+  say "install phase ended: qemu_rc=$install_rc stop=$install_stop"
+
+  install_facts=$work_dir/install.facts
+  ni_bench_parse_install_log "$work_dir/install.console.log" > "$install_facts"
+  install_outcome="$(awk -F= '$1=="outcome"{print $2; exit}' "$install_facts")"
+  say "install outcome: $install_outcome"
 fi
-case "$source_transport" in
-  virtio) qemu+=(-device "virtio-blk-pci,drive=installer,bootindex=1") ;;
-  nvme)   qemu+=(-device "nvme,drive=installer,serial=NIBENCHMEDIUM,bootindex=1") ;;
-  usb)    qemu+=(-device "qemu-xhci,id=xhci" -device "usb-storage,drive=installer,bootindex=1,removable=on") ;;
-esac
-add_target_drive
-add_network ""
-qemu+=(-nographic -no-reboot)
-
-run_phase install "$install_timeout" \
-  'done — install completed' 'FAILED in phase ' send-key-ret ''
-install_rc=$PHASE_RC
-install_stop=$PHASE_STOP
-install_truncated=$PHASE_TRUNCATED
-stop_swtpm
-say "install phase ended: qemu_rc=$install_rc stop=$install_stop"
-
-install_facts=$work_dir/install.facts
-ni_bench_parse_install_log "$work_dir/install.console.log" > "$install_facts"
-install_outcome="$(awk -F= '$1=="outcome"{print $2; exit}' "$install_facts")"
-say "install outcome: $install_outcome"
 
 # The installer persists its bounded failure evidence — the closed-vocabulary
 # code, the phase, and the live PCR7 — in one non-volatile EFI variable
@@ -907,6 +938,7 @@ NI_BENCH_VIRT_FW_VARS="$have_virt_fw_vars" NI_BENCH_EUID="$EUID" \
 NI_BENCH_SMP="$smp" NI_BENCH_MEMORY="$memory" \
 NI_BENCH_SOURCE_TRANSPORT="$source_transport" NI_BENCH_TARGET_TRANSPORT="$target_transport" \
 NI_BENCH_MEDIUM_MODE="$([[ $medium_overlay -eq 1 ]] && echo overlay || echo read-only)" \
+NI_BENCH_RESUMED_FIRSTBOOT="$([[ $resume_firstboot -eq 1 ]] && echo yes || echo no)" \
 NI_BENCH_TARGET_SIZE="$target_size" NI_BENCH_NETWORK="$network" \
 NI_BENCH_FIRMWARE_CODE="$firmware_code" NI_BENCH_FIRMWARE_VARS_ORIGIN="$firmware_vars_origin" \
 NI_BENCH_ENROL_OWNER="$enrol_owner_guid" \
@@ -959,6 +991,7 @@ receipt = {
         "memory_mib": number("NI_BENCH_MEMORY"),
         "source_transport": os.environ["NI_BENCH_SOURCE_TRANSPORT"],
         "medium_mode": os.environ["NI_BENCH_MEDIUM_MODE"],
+        "resumed_firstboot": os.environ["NI_BENCH_RESUMED_FIRSTBOOT"],
         "target_transport": os.environ["NI_BENCH_TARGET_TRANSPORT"],
         "target_size": os.environ["NI_BENCH_TARGET_SIZE"],
         "network": os.environ["NI_BENCH_NETWORK"],
