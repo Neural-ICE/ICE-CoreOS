@@ -580,5 +580,15 @@ _def_line="$(grep -n '^partdev() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 _use_line="$(grep -n 'partdev [0-9]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 [[ -n "$_def_line" && -n "$_use_line" && "$_def_line" -lt "$_use_line" ]] \
   || fail "partdev() is defined at line ${_def_line:-?} but first used at line ${_use_line:-?}"
+# A LAB appliance keeps its kernel console on tty2 (the status screen owns
+# tty1), so a unit's journal+console stderr stays readable with Alt+F2; a
+# customer medium adds no console= at all.
+grep -Fq -- 'lab_console_karg=(--karg "console=tty2")' "$AUTOINSTALL" \
+  || fail "the LAB appliance console karg is gone"
+grep -Fq -- '"${lab_console_karg[@]}" \' "$AUTOINSTALL" \
+  || fail "the LAB console karg never reaches bootc install"
+_lab_console_line="$(grep -n 'lab_console_karg=(--karg "console=tty2")' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+sed -n "$((_lab_console_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
+  || fail "the LAB console karg is not gated on the sealed lab-managed profile"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"
