@@ -596,5 +596,14 @@ grep -Fq -- '"${lab_console_karg[@]}" \' "$AUTOINSTALL" \
 _lab_console_line="$(grep -n 'lab_console_karg=(--karg "console=tty2")' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 sed -n "$((_lab_console_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
   || fail "the LAB console karg is not gated on the sealed lab-managed profile"
+# A LAB appliance's first-boot units mirror their output to the console
+# (tty2) through installer-written drop-ins; a customer medium writes none.
+grep -Fq -- 'StandardOutput=journal+console\nStandardError=journal+console' "$AUTOINSTALL" \
+  || fail "the LAB first-boot console drop-in content is gone"
+grep -Fq -- '_lab_dropin_dir="$dep/etc/systemd/system/${_lab_unit}.service.d"' "$AUTOINSTALL" \
+  || fail "the LAB first-boot console drop-ins no longer land in the deployment /etc"
+_lab_dropin_line="$(grep -n 'for _lab_unit in neural-ice-seed-import' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+sed -n "$((_lab_dropin_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
+  || fail "the LAB first-boot console drop-ins are not gated on the sealed lab-managed profile"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"
