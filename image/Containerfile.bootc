@@ -387,6 +387,10 @@ COPY image/lib/tpm2-nv-public.sh /usr/lib/dracut/modules.d/91neural-ice-tpm-poli
 # key via a `neuralice.sshkey=<base64>` karg (community path; no rebuild needed).
 COPY image/firstboot/neural-ice-firstboot-sshkey.sh      /usr/local/bin/neural-ice-firstboot-sshkey.sh
 COPY image/firstboot/neural-ice-seed-import.sh           /usr/local/bin/neural-ice-seed-import.sh
+# The transport policy seed-import hands skopeo for the layouts it assembles
+# from the ni-ota-verify-checked closure (see the script): default reject, one
+# oci: scope, nothing for docker:. /etc/containers/policy.json stays strict.
+COPY image/firstboot/neural-ice-seed-import-policy.json  /usr/lib/neural-ice/seed-import-policy.json
 COPY image/model-cache-contract.py                       /usr/libexec/neural-ice-model-cache-contract
 COPY image/content-cache-contract.py                     /usr/libexec/neural-ice-content-cache-contract
 # TWO units, one script. Provisioning is ordered Before=sshd.service and writes

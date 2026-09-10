@@ -166,6 +166,7 @@ the QEMU process **group** and then `swtpm`.
 | `install.pcr7_live` / `pcr7_policy` / `pcr7_available` | printed by the installer once the coverage gate has PASSED (`ota/neural-ice-autoinstall.sh:1718-1720`) |
 | `efi_failure_evidence.*` | the same evidence read back out of the varstore — **the only place the live PCR 7 appears when the coverage gate is what refused** |
 | `firstboot.ssh` | `open` = the operator key answered on TCP/22 |
+| `vm.medium_mode` | `read-only` (default: the raw medium is never written, so phase 8 cannot escrow the SYSTEM recovery key and skips it) or `overlay` (`--medium-overlay`: a qcow2 copy-on-write overlay in the work directory receives the escrow; the raw stays unwritten). With `overlay`, the SYSTEM recovery key of the rehearsed install is readable afterwards from `medium.qcow2`'s ESP, e.g. `qemu-nbd` + `NEURAL-ICE-RECOVERY-<serial>.txt`, which is what `image/bench-read-rehearsed-firstboot-journal.sh --work-dir DIR` does (root on the bench host, everything read-only) to print the ceremony unit's journal off the target disk after a failed first boot |
 | `firstboot.firstboot_ready`, `firstboot_device_trust`, `firstboot_core_services`, `firstboot_status_failure` | the status screen's serial mirror (`image/firstboot/neural-ice-status-screen.sh:343`) |
 | `install.serial_truncated` | the console hit `--serial-max-bytes` and the VM was stopped |
 

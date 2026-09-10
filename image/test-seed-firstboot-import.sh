@@ -6,9 +6,17 @@ FAKEBIN="$ROOT/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/skopeo" <<'EOF'
 #!/bin/sh
 [ "${FAIL_SKOPEO:-0}" = 0 ] || exit 42
+# skopeo global options precede the verb; the script must hand over its own
+# transport policy (the system one rejects oci:), and that file must exist.
+policy_seen=0
+if [ "${1:-}" = --policy ]; then
+  [ -f "${2:-}" ] || { echo "seed-import policy file is absent: ${2:-}" >&2; exit 46; }
+  policy_seen=1; shift 2
+fi
 if [ "${ASSERT_STORAGE_CONTRACT:-0}" = 1 ]; then
   case "${1:-}" in
     copy)
+      [ "$policy_seen" = 1 ] || { echo 'copy without the seed-import transport policy' >&2; exit 47; }
       for arg in "$@"; do
         [ "$arg" != --all ] || { echo 'storage transport rejects --all' >&2; exit 43; }
       done
@@ -47,6 +55,7 @@ printf '1\n' > "$data/release/PCR-POLICY-SEQ"
 printf '%s\n' nvidia-gb10-arm64 > "$ROOT/usr/lib/neural-ice/hardware-target"
 printf '%s\n' lab-managed > "$ROOT/usr/lib/neural-ice/access-policy"
 printf '%s\n' lab-v1 > "$ROOT/usr/lib/neural-ice/signed-boot-trust-policy-id"
+cp image/firstboot/neural-ice-seed-import-policy.json "$ROOT/usr/lib/neural-ice/seed-import-policy.json"
 printf delegated-key > "$ROOT/usr/lib/neural-ice/keys/release-authorization.pub"
 mkdir -p "$ROOT/etc/neural-ice/keys"
 printf ota-root-key > "$ROOT/etc/neural-ice/keys/ota-root.pub"

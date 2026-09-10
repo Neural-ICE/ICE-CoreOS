@@ -31,6 +31,17 @@ DATA=$(path /var/lib/neural-ice/data)
 RELEASE="$DATA/release"
 POINTER="$RELEASE/CLOSURE"
 VERIFIER=$(path /usr/bin/ni-ota-verify)
+# containers/image consults /etc/containers/policy.json for every copy, and the
+# appliance's is fail-closed: default reject, docker: scopes only. The oci:
+# layouts below are assembled by THIS script from objects ni-ota-verify has
+# already checked against the signed closure, so the transport needs no second
+# signature check -- but the strict file rejects the oci: transport outright
+# ("Source image rejected: … is rejected by policy", lab GX10, 2026-09-10).
+# Hand skopeo the seed-import policy instead: default reject, one oci: scope
+# (the offline-generations directory, a mount, no symlink), nothing for docker:.
+# The system policy is never touched.
+SEED_POLICY=$(path /usr/lib/neural-ice/seed-import-policy.json)
+[[ -f $SEED_POLICY && ! -L $SEED_POLICY ]] || die "seed-import transport policy is missing"
 ROOT_KEY=$(path /etc/neural-ice/keys/ota-root.pub)
 REGISTRY="$RELEASE/AUTHORITY"
 CHANNEL="$RELEASE/CHANNEL"
@@ -104,7 +115,11 @@ registry_host=$(<"$REGISTRY")
 # links never move; publishing offline-current is the sole visibility event for
 # the container store, generic CASes, HF hub and OFFLINE-READY receipt.
 install -d -m 0700 "$generation_base" "$DATA/seed-store" "$DATA/content" \
-  "$DATA/models" "$DATA/hf-cache"
+  "$DATA/models" "$DATA/hf-cache" "$DATA/tmp"
+# skopeo's staging area for the layers it imports: containers/image ignores
+# TMPDIR on Linux and stages under /var/tmp unless --tmpdir says otherwise
+# (measured on the lab GX10, 2026-09-10); /var/tmp is read-only in this sandbox
+# and on the 100 GiB system volume anyway. The data volume has the room.
 
 ensure_consumer_link() {
   local link=$1 target=$2 temporary
@@ -192,7 +207,7 @@ while IFS= read -r -d '' layout \
     destination="containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot]${repository}:${tag}"
     # Import this host's platform. containers-storage rejects --all for an
     # index; skopeo retains the original index digest as a local repo digest.
-    skopeo copy --preserve-digests "oci:${layout}:seed" \
+    skopeo --policy "$SEED_POLICY" copy --tmpdir "$DATA/tmp" --preserve-digests "oci:${layout}:seed" \
       "$destination" \
       || die "cannot import signed artifact $artifact_key"
     # Reading by tag reports the selected child digest. The runtime pulls by

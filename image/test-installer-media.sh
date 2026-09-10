@@ -1770,6 +1770,27 @@ inspect --expect-no-sshkey >/dev/null || fail "the restored keyless medium was r
 #    nothing invokes is what the review found the first time.
 # --------------------------------------------------------------------------- #
 USB="$ROOT/image/build-installer-usb.sh"
+# The bench sequence counter: read, +1, written back under a lock, one source only.
+grep -Fq 'PCR_POLICY_SEQ="$(pcr_policy_seq_from_counter "$PCR_POLICY_SEQ_COUNTER_FILE")" || exit 1' "$USB" \
+  || fail "the media producer does not take the PCR policy sequence from the bench counter"
+grep -Fq 'two sources for one sealed value' "$USB" \
+  || fail "the media producer accepts both a fixed PCR_POLICY_SEQ and a counter file"
+counter_fn="$TMP/counter-fn.sh"
+awk '/^pcr_policy_seq_from_counter\(\) \{/,/^}$/' "$USB" > "$counter_fn"
+grep -q '^pcr_policy_seq_from_counter()' "$counter_fn" || fail "cannot extract the sequence counter reader"
+printf '41\n' > "$TMP/seq.counter"
+got="$(bash -c 'source "$1"; pcr_policy_seq_from_counter "$2"' _ "$counter_fn" "$TMP/seq.counter")" \
+  || fail "the sequence counter reader refused a valid counter"
+{ [ "$got" = 42 ] && [ "$(cat "$TMP/seq.counter")" = 42 ]; } \
+  || fail "the sequence counter did not advance 41 -> 42 (got '$got', file '$(cat "$TMP/seq.counter")')"
+got="$(bash -c 'source "$1"; pcr_policy_seq_from_counter "$2"' _ "$counter_fn" "$TMP/seq.counter")"
+[ "$got" = 43 ] || fail "a second cut did not take the next sequence (got '$got')"
+printf 'not-a-number\n' > "$TMP/seq.counter"
+bash -c 'source "$1"; pcr_policy_seq_from_counter "$2"' _ "$counter_fn" "$TMP/seq.counter" >/dev/null 2>&1 \
+  && fail "a malformed sequence counter was accepted"
+ln -sf /dev/null "$TMP/seq.symlink"
+bash -c 'source "$1"; pcr_policy_seq_from_counter "$2"' _ "$counter_fn" "$TMP/seq.symlink" >/dev/null 2>&1 \
+  && fail "a symlinked sequence counter was accepted"
 # The installer's console stays on the firmware framebuffer: the installer image
 # must pin nvidia_drm to modeset=0 fbdev=0 (bench, 2026-09-09: every boot went
 # dark at the nvidia-drm handover and nothing after it could be read).

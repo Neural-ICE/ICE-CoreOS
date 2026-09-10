@@ -79,6 +79,11 @@ SSH_AUTHORIZED_KEYS_FILE="${SSH_AUTHORIZED_KEYS_FILE:-}"
 # keeps the quiet line. Introduced 2026-09-09 after a bench medium powered off
 # on hardware with nothing on the screen and nothing to read.
 MEDIA_VERBOSE_CONSOLE="${MEDIA_VERBOSE_CONSOLE:-0}"
+# The installer image rebuilds its own ni-ota-verify (image/Containerfile.installer
+# §0) and the verifier's trusted-time issuer is compiled in, exactly as for the
+# appliance (ci/build-image.sh). No default: a medium whose verifier trusts an
+# issuer chosen by an unset variable is not a sealed medium.
+NI_TRUSTED_TIME_ISSUER="${NI_TRUSTED_TIME_ISSUER:-}"
 SSH_AUTHORIZED_KEYS_SHA256="${SSH_AUTHORIZED_KEYS_SHA256:-}"
 LAB_BASELINE_BOM_FILE="${LAB_BASELINE_BOM_FILE:-}"
 LAB_BASELINE_BOM_SHA256="${LAB_BASELINE_BOM_SHA256:-}"
@@ -143,6 +148,40 @@ PCR_POLICY_PUBLIC_KEY_SHA256="${PCR_POLICY_PUBLIC_KEY_SHA256:-}"
 PCR_POLICY_SIGNATURE_FILE="${PCR_POLICY_SIGNATURE_FILE:-}"
 PCR_POLICY_SIGNATURE_SHA256="${PCR_POLICY_SIGNATURE_SHA256:-}"
 PCR_POLICY_SEQ="${PCR_POLICY_SEQ:-}"
+# THE BENCH NEVER GUESSES A SEQUENCE. Every activation of the signed PCR policy
+# advances a durable TPM counter on the target, and a medium sealing a sequence
+# at or below it is refused in the initramfs; on 2026-09-09 a run whose console
+# was dead activated a sequence unseen, and five media were then refused for
+# it. With PCR_POLICY_SEQ_COUNTER_FILE set (and PCR_POLICY_SEQ unset) the
+# producer takes the NEXT value from that file -- read, +1, written back under
+# a lock, before anything is sealed -- so each cut carries a sequence no earlier
+# cut on this bench has carried. The value sealed is printed and recorded like
+# any other. Exactly one source: both set is a refusal.
+PCR_POLICY_SEQ_COUNTER_FILE="${PCR_POLICY_SEQ_COUNTER_FILE:-}"
+pcr_policy_seq_from_counter() { # $1=counter file -> prints the sequence this cut seals
+  local file=$1 current next lock
+  [[ -f "$file" && ! -L "$file" ]] \
+    || { echo "ERROR: PCR_POLICY_SEQ_COUNTER_FILE must be a regular file holding the last sealed sequence: $file" >&2; return 1; }
+  lock="$file.lock"
+  exec {lockfd}>"$lock" || { echo "ERROR: cannot open the sequence counter lock $lock" >&2; return 1; }
+  flock -w 30 "$lockfd" || { echo "ERROR: cannot lock the sequence counter $file" >&2; return 1; }
+  current="$(head -c 32 -- "$file" | tr -d '[:space:]')"
+  [[ "$current" =~ ^[0-9]{1,15}$ ]] \
+    || { echo "ERROR: the sequence counter $file does not hold a decimal integer" >&2; return 1; }
+  next=$(( 10#$current + 1 ))
+  if ! { printf '%s\n' "$next" > "$file.next" && mv -f -- "$file.next" "$file"; }; then
+    echo "ERROR: cannot advance the sequence counter $file" >&2; return 1
+  fi
+  sync -- "$file" 2>/dev/null || true
+  exec {lockfd}>&-
+  printf '%s' "$next"
+}
+if [[ -n "$PCR_POLICY_SEQ_COUNTER_FILE" ]]; then
+  [[ -z "$PCR_POLICY_SEQ" ]] \
+    || { echo "ERROR: PCR_POLICY_SEQ and PCR_POLICY_SEQ_COUNTER_FILE are two sources for one sealed value; set exactly one" >&2; exit 1; }
+  PCR_POLICY_SEQ="$(pcr_policy_seq_from_counter "$PCR_POLICY_SEQ_COUNTER_FILE")" || exit 1
+  echo "    PCR policy sequence ${PCR_POLICY_SEQ} taken from the bench counter ${PCR_POLICY_SEQ_COUNTER_FILE} (previous cut sealed $((PCR_POLICY_SEQ - 1)))"
+fi
 RELEASE_AUTHORIZATION_STAGE_ROOT=""
 
 sha256_of() { # $1=path -> lowercase hex
@@ -906,6 +945,15 @@ readonly MEDIA_VERBOSE_CONSOLE
 CONSOLE_KARGS=()
 if [[ "$MEDIA_VERBOSE_CONSOLE" == 0 ]]; then CONSOLE_KARGS=("quiet"); else CONSOLE_KARGS=("console=tty0"); fi
 readonly -a CONSOLE_KARGS
+# The failure screen's hold time travels in the signed /usr, chosen here from
+# the sealed access profile: a LAB bench holds it half an hour, a customer
+# medium a minute (image/installer/installer-failure-policy).
+if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
+  INSTALLER_FAILURE_DELAY_SECONDS=1800
+else
+  INSTALLER_FAILURE_DELAY_SECONDS=60
+fi
+readonly INSTALLER_FAILURE_DELAY_SECONDS
 installer_trust_value_is_valid neuralice.hardware_target "$HARDWARE_TARGET" \
   || { echo "ERROR: HARDWARE_TARGET is required and must be a valid hardware target" >&2; exit 1; }
 [[ -f "$HARDWARE_IDENTITY_FILE" && ! -L "$HARDWARE_IDENTITY_FILE" ]] \
@@ -1058,6 +1106,8 @@ fi
 # it from a remapped process and then fail after a successful image commit with
 # EACCES. A private task-owned directory gives the writer an absent pathname
 # while preserving atomic, non-shared capture of this exact build result.
+[[ -n "$NI_TRUSTED_TIME_ISSUER" ]] \
+  || { echo "ERROR: NI_TRUSTED_TIME_ISSUER is empty; the installer image compiles the verifier's trusted-time issuer in, as ci/build-image.sh does for the appliance" >&2; exit 1; }
 INSTALLER_IID_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ni-installer-image-id.XXXXXX")"
 chmod 0700 "$INSTALLER_IID_DIR"
 INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
@@ -1066,7 +1116,9 @@ INSTALLER_IID_FILE="$INSTALLER_IID_DIR/iid"
 sudo podman build --pull=never --platform linux/arm64 \
   --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+  --build-arg "NI_TRUSTED_TIME_ISSUER=${NI_TRUSTED_TIME_ISSUER}" \
   --build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}" \
+  --build-arg "INSTALLER_FAILURE_DELAY_SECONDS=${INSTALLER_FAILURE_DELAY_SECONDS}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
 # --------------------------------------------------------------------------- #

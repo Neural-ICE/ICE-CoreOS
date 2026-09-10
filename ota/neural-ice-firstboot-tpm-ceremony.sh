@@ -502,7 +502,7 @@ read -r anchor_seq freshness_at binding < <(
       "$SIGNED_BOOT_TRUST_POLICY_ID" "$INITIAL_ISSUANCE_SEQ"
   fi
 )
-[[ "$anchor_seq" =~ ^[1-9][0-9]*$ && "$freshness_at" =~ ^[1-9][0-9]*$ && "$binding" =~ ^[0-9a-f]{64}$ ]] \
+[[ "$anchor_seq" =~ ^[1-9][0-9]*$ && "$freshness_at" =~ ^(0|[1-9][0-9]*)$ && "$binding" =~ ^[0-9a-f]{64}$ ]] \
   || die "TPM ceremony preparation returned malformed evidence"
 
 enrolled_at="$(python3 - "$INSTALL_IDENTITY" <<'PY'

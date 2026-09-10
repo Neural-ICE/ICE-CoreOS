@@ -10,7 +10,32 @@
 #     --build-arg BASE_IMAGE=ghcr.io/neural-ice/neural-ice-coreos@sha256:<digest> \
 #     -t localhost/ice-coreos-installer:local .
 ARG BASE_IMAGE
+# 0) Builder stage: the installer's own ni-ota-verify, from THIS revision of
+#    tools/ni-ota-verify (same pinned toolchain and flags as
+#    image/Containerfile.bootc §0). The appliance image below ships its own copy,
+#    built from the revision the appliance was cut from; the installer proves the
+#    staged seed with the verifier of the revision the medium was cut from, so a
+#    verifier fix reaches the bench without recutting the appliance (P1.10,
+#    parallel object hashing, 2026-09-10). The appliance keeps re-proving the
+#    seed at first boot with its own copy; nothing about the proof differs.
+FROM docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS ni-ota-verify-build
+WORKDIR /build
+COPY tools/ni-ota-verify/ /build/
+ARG NI_TRUSTED_TIME_ISSUER
+RUN set -eux; \
+    test -n "${NI_TRUSTED_TIME_ISSUER}"; \
+    target="$(rustc -vV | sed -n 's/^host: //p')"; \
+    test -n "$target"; \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    NI_TRUSTED_TIME_ISSUER="${NI_TRUSTED_TIME_ISSUER}" \
+        cargo build --release --locked --target "$target"; \
+    install -D -m 0755 "target/${target}/release/ni-ota-verify" /out/ni-ota-verify; \
+    ( ldd /out/ni-ota-verify 2>&1 || true ) \
+        | grep -Eq 'statically linked|not a dynamic executable'; \
+    /out/ni-ota-verify --version
+
 FROM ${BASE_IMAGE}
+COPY --from=ni-ota-verify-build /out/ni-ota-verify /usr/bin/ni-ota-verify
 
 # All the partitioning/encryption tools required by the auto-install are
 # already in the CentOS Stream 10 bootc base: sfdisk/partx/wipefs/blkid/lsblk
@@ -167,6 +192,13 @@ RUN case "$INSTALLER_VERBOSE_CONSOLE" in \
          && grep -qx 'kernel.printk = 7 4 1 7' /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf ;; \
       *) echo "INSTALLER_VERBOSE_CONSOLE must be 0 or 1" >&2; exit 1 ;; \
     esac
+# The failure screen's hold time, chosen by the producer from the sealed
+# access profile (1800 s on a LAB medium, 60 s otherwise) and asserted after
+# the rewrite so a typo cannot silently keep the default.
+ARG INSTALLER_FAILURE_DELAY_SECONDS=60
+RUN test "$(printf '%s' "$INSTALLER_FAILURE_DELAY_SECONDS" | grep -cE '^[0-9]{1,4}$')" = 1 \
+    && sed -i -E "s/^delay_seconds=.*/delay_seconds=${INSTALLER_FAILURE_DELAY_SECONDS}/" /usr/lib/neural-ice/installer-failure-policy \
+    && grep -qx "delay_seconds=${INSTALLER_FAILURE_DELAY_SECONDS}" /usr/lib/neural-ice/installer-failure-policy
 # 🔴 THE ONE SIGNATURE-POLICY READER (independent review 2026-09-02, P1 #2).
 # image/build-installer-usb.sh runs this same file on the build host before a
 # registry medium is cut, and ota/neural-ice-autoinstall.sh runs it twice at
