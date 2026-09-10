@@ -553,7 +553,7 @@ done
 # customer medium adds no console= at all.
 grep -Fq -- 'lab_console_karg=(--karg "console=tty2")' "$AUTOINSTALL" \
   || fail "the LAB appliance console karg is gone"
-grep -Fq -- '"${lab_console_karg[@]}" \' "$AUTOINSTALL" \
+grep -Fq -- '"${lab_console_karg[@]}"' "$AUTOINSTALL" \
   || fail "the LAB console karg never reaches bootc install"
 _lab_console_line="$(grep -n 'lab_console_karg=(--karg "console=tty2")' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 sed -n "$((_lab_console_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
