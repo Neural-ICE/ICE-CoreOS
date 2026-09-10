@@ -573,5 +573,16 @@ python3 -c 'import json,sys; d=json.loads(sys.argv[1]); s=list(d["transports"]["
 _lab_bind_line="$(grep -n 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 [ "$_lab_bind_line" -gt "$_lab_dropin_line" ] \
   || fail "the LAB seed-import policy bind is written outside the lab-managed drop-in block"
+grep -Fq -- "printf '[Unit]\\nWants=network.target\\nAfter=network.target\\n'" "$AUTOINSTALL" \
+  || fail "the interim LAB sshd activation ordering drop-in (After=network.target) is gone"
+grep -Fq -- '60-lab-network-order.conf' "$AUTOINSTALL" \
+  || fail "the interim LAB sshd activation ordering drop-in has no file"
+_lab_order_line="$(grep -n '60-lab-network-order.conf' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[ "$_lab_order_line" -gt "$_lab_dropin_line" ] \
+  || fail "the LAB sshd activation ordering drop-in is written outside the lab-managed drop-in block"
+sed -n "$((_lab_order_line - 9)),$((_lab_order_line))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$_lab_unit" == neural-ice-firstboot-sshkey-activate ]]; then' \
+  || fail "the LAB sshd activation ordering drop-in is not scoped to the activation unit"
+grep -Fq -- 'neural-ice-firstboot-sshkey neural-ice-firstboot-sshkey-activate sshd; do' "$AUTOINSTALL" \
+  || fail "sshd is not in the LAB console mirror list"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"

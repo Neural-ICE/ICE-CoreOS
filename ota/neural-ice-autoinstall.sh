@@ -4171,7 +4171,7 @@ echo "[neural-ice-autoinstall] Strict container signature policy restored on the
 # operator reads the refusal with Alt+F2. A customer medium writes nothing here.
 if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
   for _lab_unit in neural-ice-seed-import neural-ice-payload-apply neural-ice-device-root \
-      neural-ice-firstboot-sshkey neural-ice-firstboot-sshkey-activate; do
+      neural-ice-firstboot-sshkey neural-ice-firstboot-sshkey-activate sshd; do
     _lab_dropin_dir="$dep/etc/systemd/system/${_lab_unit}.service.d"
     install -d -m 0755 -- "$_lab_dropin_dir" \
       || die "cannot prepare the LAB console drop-in directory for ${_lab_unit}"
@@ -4213,8 +4213,21 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
         || die "cannot write the LAB seed-import policy bind"
     fi
     chmod 0644 -- "$_lab_dropin_dir/50-lab-console.conf"
+    if [[ "$_lab_unit" == neural-ice-firstboot-sshkey-activate ]]; then
+      # Interim, until the appliance image carries the fixed unit (PR #181):
+      # the activate phase polls sshd for ten seconds, but the vendor sshd is
+      # After=network.target, which waits for NetworkManager, which waits for
+      # seed-import (~23 min of re-verification on the unrecut image). The poll
+      # expired on a merely queued job and the rollback's mask killed it:
+      # "[FAILED] Failed to start sshd.service" at ~135 s (GX10, 2026-09-10).
+      # Activation waits for the barrier; nothing is ordered after it (no cycle).
+      printf '[Unit]\nWants=network.target\nAfter=network.target\n' \
+        > "$_lab_dropin_dir/60-lab-network-order.conf" \
+        || die "cannot write the LAB sshd activation ordering drop-in"
+      chmod 0644 -- "$_lab_dropin_dir/60-lab-network-order.conf"
+    fi
   done
-  echo "[neural-ice-autoinstall] LAB first-boot units mirror their output to the console (tty2)."
+  echo "[neural-ice-autoinstall] LAB first-boot units mirror their output to the console (tty2); sshd activation waits for network.target."
 fi
 # The mirror is an INSTALL-TIME convenience and must not survive onto the
 # appliance: an installed machine that keeps pointing at a bench would silently
