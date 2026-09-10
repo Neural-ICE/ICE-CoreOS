@@ -940,6 +940,15 @@ readonly MEDIA_VERBOSE_CONSOLE
 CONSOLE_KARGS=()
 if [[ "$MEDIA_VERBOSE_CONSOLE" == 0 ]]; then CONSOLE_KARGS=("quiet"); else CONSOLE_KARGS=("console=tty0"); fi
 readonly -a CONSOLE_KARGS
+# The failure screen's hold time travels in the signed /usr, chosen here from
+# the sealed access profile: a LAB bench holds it half an hour, a customer
+# medium a minute (image/installer/installer-failure-policy).
+if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
+  INSTALLER_FAILURE_DELAY_SECONDS=1800
+else
+  INSTALLER_FAILURE_DELAY_SECONDS=60
+fi
+readonly INSTALLER_FAILURE_DELAY_SECONDS
 installer_trust_value_is_valid neuralice.hardware_target "$HARDWARE_TARGET" \
   || { echo "ERROR: HARDWARE_TARGET is required and must be a valid hardware target" >&2; exit 1; }
 [[ -f "$HARDWARE_IDENTITY_FILE" && ! -L "$HARDWARE_IDENTITY_FILE" ]] \
@@ -1101,6 +1110,7 @@ sudo podman build --pull=never --platform linux/arm64 \
   --iidfile "$INSTALLER_IID_FILE" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   --build-arg "INSTALLER_VERBOSE_CONSOLE=${MEDIA_VERBOSE_CONSOLE}" \
+  --build-arg "INSTALLER_FAILURE_DELAY_SECONDS=${INSTALLER_FAILURE_DELAY_SECONDS}" \
   -f image/Containerfile.installer -t "${INSTALLER_IMG}" "${REPO_ROOT}"
 
 # --------------------------------------------------------------------------- #

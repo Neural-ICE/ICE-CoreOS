@@ -49,6 +49,13 @@ fi
 readonly EVIDENCE_FILE="${NEURALICE_FAILURE_EVIDENCE:-/run/neural-ice-installer-failure/evidence}"
 readonly POLICY_FILE="${NEURALICE_FAILURE_POLICY:-/usr/lib/neural-ice/installer-failure-policy}"
 readonly EFI_EVIDENCE_FILE="${NEURALICE_EFI_FAILURE_EVIDENCE:-/sys/firmware/efi/efivars/NeuralICEInstallerFailure-870a0500-25d2-574e-a1cc-79a69630bf96}"
+# The immutable access policy of the image this medium installs: on a LAB
+# medium the operator standing at the console is ours, and the diagnostic is
+# what they came for (2026-09-09: the bootc error scrolled off the screen
+# before the failure block, and the attempt cost an hour for nothing).
+readonly ACCESS_POLICY_FILE="${NEURALICE_ACCESS_POLICY_FILE:-/usr/lib/neural-ice/access-policy}"
+readonly INSTALLER_UNIT="${NEURALICE_INSTALLER_UNIT:-neural-ice-autoinstall.service}"
+readonly LAB_JOURNAL_LINES=40
 DRY_RUN=0
 case "${1:-}" in
   '')        ;;
@@ -127,7 +134,20 @@ persist_efi_evidence() {
     "$(value stage)" "$(value detail)" "$(value pcr7)" "$(value pcr7_policy)" \
     "$(value pcr7_verified)" "$(value pcr7_verified_count)"
   if [[ -d "${EFI_EVIDENCE_FILE%/*}" && ! -L "$EFI_EVIDENCE_FILE" ]]; then
-    printf '\x07\x00\x00\x00%s' "$payload" > "$EFI_EVIDENCE_FILE" 2>/dev/null || true
+    # efivarfs marks an existing variable immutable (EPERM on rewrite, seen
+    # on every failed install of 2026-09-09); clear it before rewriting.
+    [[ ! -e "$EFI_EVIDENCE_FILE" ]] || chattr -i -- "$EFI_EVIDENCE_FILE" 2>/dev/null || true
+    # ONE write(2), as efivarfs requires (Documentation/filesystems/efivarfs.rst):
+    # the attributes and the whole value go through a single dd of a staged file.
+    _efi_staged="$(mktemp -t ni-efi-evidence.XXXXXX 2>/dev/null)" || _efi_staged=""
+    if [[ -n "$_efi_staged" ]]; then
+      if { printf '\x07\x00\x00\x00'; printf '%s' "$payload"; } > "$_efi_staged" 2>/dev/null; then
+        # One bounded head(1) copy = one write(2) for a value this small; not dd,
+        # which the preflight harness counts as a disk-writing tool.
+        head -c 65536 -- "$_efi_staged" > "$EFI_EVIDENCE_FILE" 2>/dev/null || true
+      fi
+      rm -f -- "$_efi_staged"
+    fi
   fi
 }
 
@@ -140,7 +160,12 @@ persist_efi_evidence() {
 readonly DEFAULT_ACTION=poweroff
 readonly DEFAULT_DELAY=60
 readonly DELAY_MIN=5
-readonly DELAY_MAX=300
+# 1800 rather than 300: a LAB bench medium holds the failure screen for half an
+# hour so an operator who stepped away still reads it (2026-09-09: a failure
+# powered off unread and its cause was lost). The value a medium ships is set
+# by its producer from the SEALED access profile (customer media keep 60 s);
+# this is only the ceiling the reader admits.
+readonly DELAY_MAX=1800
 
 read_policy() { # -> "<action> <delay-seconds>"
   local action=$DEFAULT_ACTION delay=$DEFAULT_DELAY line key raw
@@ -153,12 +178,17 @@ read_policy() { # -> "<action> <delay-seconds>"
           case "$raw" in poweroff|reboot) action="$raw" ;; esac
           ;;
         delay_seconds)
-          if [[ "$raw" =~ ^[0-9]{1,3}$ ]] && [ "$raw" -ge "$DELAY_MIN" ] && [ "$raw" -le "$DELAY_MAX" ]; then
+          if [[ "$raw" =~ ^[0-9]{1,4}$ ]] && [ "$raw" -ge "$DELAY_MIN" ] && [ "$raw" -le "$DELAY_MAX" ]; then
             delay="$raw"
           fi
           ;;
       esac
-    done < <(head -c 256 -- "$POLICY_FILE" 2>/dev/null | tr -d '\000')
+    # 4096, not 256: the shipped policy opens with a comment block longer
+    # than 256 bytes, so a 256-byte read never reached the two values and the
+    # defaults ruled every failure screen (2026-09-09, the 1800 s lab hold
+    # measured as 60 s). The bound still keeps a hostile file from being read
+    # at length; the values are validated below regardless of where they sit.
+    done < <(head -c 4096 -- "$POLICY_FILE" 2>/dev/null | tr -d '\000')
   fi
   printf '%s %s' "$action" "$delay"
 }
@@ -190,10 +220,26 @@ if [[ "$(value pcr7_verified)" != none && "$(value pcr7_verified)" != unclassifi
 fi
 printf '  %-18s %s\n' 'schema'         "$EVIDENCE_SCHEMA"
 printf '\n'
-printf '  The full diagnostic is in this boot'"'"'s journal on the medium only. It\n'
-printf '  is deliberately not printed here: a console is read by whoever is\n'
-printf '  standing at the machine, and this one may hold a customer appliance.\n'
-printf '\n'
+lab_medium() { # -> 0 when the image being installed is lab-managed
+  [ -f "$ACCESS_POLICY_FILE" ] && [ ! -L "$ACCESS_POLICY_FILE" ] \
+    && [ "$(head -c 64 -- "$ACCESS_POLICY_FILE" 2>/dev/null | tr -d '[:space:]')" = lab-managed ]
+}
+if lab_medium && command -v journalctl >/dev/null 2>&1; then
+  # LAB medium: the last lines of the installer's own journal, bounded in
+  # count and width, control characters stripped. Output only; nothing here
+  # reads input or changes state.
+  printf '  Last %s lines of the installer journal (LAB medium):\n' "$LAB_JOURNAL_LINES"
+  printf '  ----------------------------------------------------------------------\n'
+  journalctl -u "$INSTALLER_UNIT" -n "$LAB_JOURNAL_LINES" --no-pager -o cat 2>/dev/null \
+    | tr -cd '\11\12\40-\176' | cut -c1-200 | sed 's/^/  /'
+  printf '  ----------------------------------------------------------------------\n'
+  printf '\n'
+else
+  printf '  The full diagnostic is in this boot'"'"'s journal on the medium only. It\n'
+  printf '  is deliberately not printed here: a console is read by whoever is\n'
+  printf '  standing at the machine, and this one may hold a customer appliance.\n'
+  printf '\n'
+fi
 printf '  Report the failure code and stage above to Neural ICE support. Cut a\n'
 printf '  fresh signed medium rather than re-running this one.\n'
 printf '\n'

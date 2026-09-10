@@ -167,6 +167,13 @@ RUN case "$INSTALLER_VERBOSE_CONSOLE" in \
          && grep -qx 'kernel.printk = 7 4 1 7' /usr/lib/sysctl.d/20-neural-ice-quiet-console.conf ;; \
       *) echo "INSTALLER_VERBOSE_CONSOLE must be 0 or 1" >&2; exit 1 ;; \
     esac
+# The failure screen's hold time, chosen by the producer from the sealed
+# access profile (1800 s on a LAB medium, 60 s otherwise) and asserted after
+# the rewrite so a typo cannot silently keep the default.
+ARG INSTALLER_FAILURE_DELAY_SECONDS=60
+RUN test "$(printf '%s' "$INSTALLER_FAILURE_DELAY_SECONDS" | grep -cE '^[0-9]{1,4}$')" = 1 \
+    && sed -i -E "s/^delay_seconds=.*/delay_seconds=${INSTALLER_FAILURE_DELAY_SECONDS}/" /usr/lib/neural-ice/installer-failure-policy \
+    && grep -qx "delay_seconds=${INSTALLER_FAILURE_DELAY_SECONDS}" /usr/lib/neural-ice/installer-failure-policy
 # 🔴 THE ONE SIGNATURE-POLICY READER (independent review 2026-09-02, P1 #2).
 # image/build-installer-usb.sh runs this same file on the build host before a
 # registry medium is cut, and ota/neural-ice-autoinstall.sh runs it twice at
