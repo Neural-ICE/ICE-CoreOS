@@ -636,4 +636,18 @@ _use_line="$(grep -n 'partdev [0-9]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 [[ -n "$_def_line" && -n "$_use_line" && "$_def_line" -lt "$_use_line" ]] \
   || fail "partdev() is defined at line ${_def_line:-?} but first used at line ${_use_line:-?}"
 
+# The phase-5 mirror fetch is bracketed by a read-only network health readout
+# (C28, 2026-09-11: 1.26 % loss on the live receiver, no readout, no SSH). The
+# function must exist, be called before AND after the objects fetch, and never
+# refuse: it is evidence, not a gate.
+_nh_def="$(grep -n '^network_health_snapshot() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_nh_before="$(grep -n '^  network_health_snapshot before$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_nh_fetch="$(grep -n '^  seed_mirror_helper objects ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_nh_after="$(grep -n '^  network_health_snapshot after$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$_nh_def" && -n "$_nh_before" && -n "$_nh_fetch" && -n "$_nh_after" && "$_nh_def" -lt "$_nh_before" && "$_nh_before" -lt "$_nh_fetch" && "$_nh_fetch" -lt "$_nh_after" ]] \
+  || fail "the network health readout does not bracket the phase-5 objects fetch (def=${_nh_def:-?} before=${_nh_before:-?} fetch=${_nh_fetch:-?} after=${_nh_after:-?})"
+_nh_out="$(bash -c 'set -u; INSTALL_MIRROR=203.0.113.9:5055; log() { printf "%s\n" "$*"; }; source <(awk "/^declare -A _net_health_before/,/^}\$/" "$1"); network_health_snapshot before && network_health_snapshot after' _ "$AUTOINSTALL" 2>&1)" \
+  || fail "the network health readout refused instead of reporting (rc != 0)"
+[ "$(grep -c '^NET ' <<<"$_nh_out")" = 2 ] \
+  || fail "the network health readout did not produce exactly two NET lines: $(head -c 300 <<<"$_nh_out")"
 echo "AUTOINSTALL_KARGS_TEST_OK"
