@@ -916,8 +916,8 @@ runtime_status_impl() { # completion version then profile target policy digest c
   (( $# == 6 )) || die "internal runtime-status argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   [[ "$4" =~ ^[0-9a-f]{64}$ ]] || die "runtime completion evidence digest is malformed"
-  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^[1-9][0-9]{0,15}$ ]] \
-    || die "runtime ceremony counter evidence is malformed"
+  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^(0|[1-9][0-9]{0,15})$ ]] \
+    || die "runtime ceremony counter evidence is malformed"   # freshness may be 0: counted from the sealed base (ADR-0015 M)
   local wanted expected_install="$5" expected_freshness="$6"
   wanted="$(profile_digest "$1" "$2" "$3")"
   with_workspace; compute_policies
@@ -1132,7 +1132,7 @@ ceremony_finalize_impl() { # magic, optional owner floor, profile target policy 
   (( $# == 6 )) || die "internal ceremony-finalize argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   [[ "$4" =~ ^[0-9a-f]{64}$ ]] || die "completion evidence digest is malformed"
-  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^[1-9][0-9]{0,15}$ ]] \
+  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^(0|[1-9][0-9]{0,15})$ ]] \
     || die "ceremony counter evidence is malformed"
   local wanted install_value freshness_value expected_install="$5" expected_freshness="$6"
   wanted="$(profile_digest "$1" "$2" "$3")"
