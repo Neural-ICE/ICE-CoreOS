@@ -181,6 +181,27 @@ grep -Fq -- '-v "$NEURALICE_CONTAINER_POLICY:/etc/containers/policy.json:ro"' "$
   || fail "the bootc container is left with the appliance's strict policy, which rejects the containers-storage source"
 grep -Fq 'would reject the containers-storage source' "$AUTOINSTALL" \
   || fail "the pre-wipe probe does not prove the container's policy admits the source"
+# The previous first boot's journal is read BEFORE the wipe, on a LAB medium
+# only, from the system volume opened read-only with the escrowed key, and the
+# key is shredded; the readout never stops the install.
+grep -Fq '[[ "$SEALED_ACCESS_PROFILE" == lab-managed ]] || return 0' "$AUTOINSTALL" \
+  || fail "the previous-first-boot journal readout is not restricted to a LAB medium"
+# Mounted ro WITH log replay: a first boot that ended in NI-E02 is powered off
+# by hand and its last journal lines sit in the unreplayed XFS log (C15
+# rehearsal, 2026-09-10). norecovery would read an empty journal; --readonly
+# would make the replay impossible. The disk is wiped seconds later.
+grep -Fq 'cryptsetup open --type luks2 --key-file "$keyfile" "$sysp" "$mapper"' "$AUTOINSTALL" \
+  || fail "the previous system volume is not opened for the readout"
+grep -Fq 'mount -o ro,nodev,nosuid,noexec "/dev/mapper/$mapper" "$mnt"' "$AUTOINSTALL" \
+  || fail "the previous system volume is not mounted read-only with log replay"
+! grep -Fq 'ro,norecovery,nodev,nosuid,noexec "/dev/mapper/$mapper"' "$AUTOINSTALL" \
+  || fail "norecovery is back on the readout mount; it hides the lines of a hard-stopped first boot"
+grep -Fq 'shred -u -- "$keyfile"' "$AUTOINSTALL" \
+  || fail "the escrowed recovery key is not shredded after the readout"
+readout_line="$(grep -n '^log_previous_firstboot_journal$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+readout_wipe_line="$(grep -nE '^[[:space:]]*wipefs -a "\$target"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$readout_line" && -n "$readout_wipe_line" && "$readout_line" -lt "$readout_wipe_line" ]] \
+  || fail "the previous-first-boot readout does not precede the wipe"
 
 # The post-bootc verifier consumes the resolved deployment root, not the
 # /var/tmp/nitarget OSTree sysroot. Make the distinction executable with the
@@ -558,5 +579,24 @@ grep -Fq -- '"${lab_console_karg[@]}"' "$AUTOINSTALL" \
 _lab_console_line="$(grep -n 'lab_console_karg=(--karg "console=tty2")' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 sed -n "$((_lab_console_line - 1))p" "$AUTOINSTALL" | grep -Fq -- 'if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then' \
   || fail "the LAB console karg is not gated on the sealed lab-managed profile"
+
+# The installer's console lines reach every active serial console, not only the
+# one /dev/console names (the last console=): a verbose LAB medium seals
+# console=tty0 and left the UART silent under KVM on 2026-09-10. Only serial
+# devices qualify (never a VT), and /dev/console itself is not written twice.
+grep -Fq -- 'IFS= read -r active < /sys/class/tty/console/active' "$AUTOINSTALL" \
+  || fail "log() no longer reads the kernel's active console list"
+grep -Fq -- '[[ "$name" != "$last" && "$name" =~ ^tty(S|AMA)[0-9]+$ && -c "/dev/$name" ]] || continue' "$AUTOINSTALL" \
+  || fail "log() mirror admits a VT, the /dev/console entry, or an absent device"
+grep -Fq -- 'for mirror in "${LOG_MIRROR_TTYS[@]}"; do' "$AUTOINSTALL" \
+  || fail "log() no longer mirrors to the other active serial consoles"
+
+# A bash function must be defined above its first caller: partdev() defined
+# after the pre-wipe readout was `command not found` (exit 127) under KVM on
+# 2026-09-10, and no static check saw it.
+_def_line="$(grep -n '^partdev() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_use_line="$(grep -n 'partdev [0-9]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$_def_line" && -n "$_use_line" && "$_def_line" -lt "$_use_line" ]] \
+  || fail "partdev() is defined at line ${_def_line:-?} but first used at line ${_use_line:-?}"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"

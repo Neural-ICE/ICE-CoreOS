@@ -18,6 +18,18 @@ RestrictAddressFamilies=AF_UNIX
 PrivateNetwork=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
+# ni-ota-verify writes its scratch under /run/neural-ice/seed-verify, so that
+# directory must exist before the sandbox is set up AND be writable inside it.
+# It used to be created only by neural-ice-hostname-init, which is not ordered
+# before this unit: when it had not run yet, a required ReadWritePaths= naming
+# an absent directory failed this unit at the NAMESPACE step, before the script
+# and without a line of output (lab GX10, 2026-09-10); marking it optional then
+# left the verifier on a read-only /run. The unit now owns the directory:
+# systemd creates it before the namespace and keeps it after the oneshot ends
+# (hostname-init and others share it).
+RuntimeDirectory=neural-ice
+RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0755
 ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice
 
 [Install]

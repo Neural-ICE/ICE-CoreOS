@@ -252,8 +252,56 @@ grep -Fq 'would poweroff after 60 seconds' "$TMP/nopolicy" \
 # medium's default is not silently replaced by the fallback.
 grep -qx 'action=poweroff' "$POLICY" \
   || fail "the shipped failure policy no longer powers the machine off"
+# The shipped policy is read WHOLE. Its comment block alone exceeds 256 bytes;
+# a reader bounded at 256 bytes never saw the values and silently used the
+# defaults (measured 2026-09-09). The shipped file must be within the bound
+# the reader applies, and a policy whose values sit after a long comment
+# must still be honoured.
+policy_bytes="$(wc -c < "$POLICY")"
+[ "$policy_bytes" -le 4096 ] || fail "the shipped failure policy ($policy_bytes bytes) exceeds the reader's 4096-byte bound"
+grep -qF 'head -c 4096 -- "$POLICY_FILE"' "$FAILURE" \
+  || fail "the failure surface no longer reads the whole shipped policy (4096-byte bound)"
+long_policy="$TMP/long-comment-policy"
+{ for _ in $(seq 1 12); do printf '# %s\n' "$(printf 'x%.0s' $(seq 1 60))"; done; printf 'action=reboot\ndelay_seconds=1500\n'; } > "$long_policy"
+[ "$(wc -c < "$long_policy")" -gt 600 ] || fail "the long-comment fixture is not long"
+long_read="$(NEURALICE_FAILURE_POLICY="$long_policy" bash -c 'POLICY_FILE="$NEURALICE_FAILURE_POLICY"; source <(sed -n "/^readonly DEFAULT_ACTION/,/^}/p" "$0"); read_policy' "$FAILURE" 2>/dev/null || true)"
+[ "$long_read" = "reboot 1500" ] \
+  || fail "a policy whose values follow a long comment block is not honoured (read: '$long_read')"
+# The EFI variable is written in ONE write(2) (efivarfs requirement): a staged
+# file copied by one bounded head(1), never a printf straight into efivarfs,
+# in both the installer and the failure surface (2026-09-09: a printf left
+# 115 bytes). Not dd either: the preflight harness counts every dd call as a
+# target mutation (ota/test-installer-pcr7-coverage.sh, 2026-09-10).
+for writer in "$FAILURE" "$ROOT/ota/neural-ice-autoinstall.sh"; do
+  if grep -Eq "printf '\\\\x07\\\\x00\\\\x00\\\\x00%s' .* > \"\\\$EFI_" "$writer"; then
+    fail "$(basename "$writer") writes the EFI evidence with printf, which efivarfs splits into a refused second write"
+  fi
+  if grep -Fq 'of="$EFI_' "$writer"; then
+    fail "$(basename "$writer") writes the EFI evidence with dd, which the preflight harness counts as a target mutation"
+  fi
+  if ! grep -Eq 'head -c 65536 -- "\$_efi_staged" > "\$EFI_(FAILURE_EVIDENCE|EVIDENCE_FILE)"' "$writer"; then
+    fail "$(basename "$writer") does not copy the staged EFI evidence in one bounded write"
+  fi
+done
+# LAB medium: the failure screen carries the installer journal tail; any other
+# access policy keeps the diagnostic off the console. journalctl is a fixture on
+# PATH; the access policy is a file the seam names.
+lab_bin="$TMP/lab-bin"; mkdir -p "$lab_bin"
+printf '#!/usr/bin/env bash\nprintf "journal line one\\njournal line two: bootc install failed: SIMULATED\\n"\n' > "$lab_bin/journalctl"
+chmod 0755 "$lab_bin/journalctl"
+printf 'lab-managed\n' > "$TMP/policy-lab"; printf 'customer-locked\n' > "$TMP/policy-customer"
+lab_out="$(env PATH="$lab_bin:$PATH" NEURALICE_ACCESS_POLICY_FILE="$TMP/policy-lab" NEURALICE_FAILURE_EVIDENCE="$TMP/nominal" NEURALICE_FAILURE_POLICY="$POLICY" NEURALICE_EFI_FAILURE_EVIDENCE="$SINK_EFI" bash "$FAILURE" --dry-run 2>&1 || true)"
+grep -q 'bootc install failed: SIMULATED' <<<"$lab_out" \
+  || fail "a LAB medium's failure screen does not carry the installer journal tail"
+grep -q 'Last 40 lines of the installer journal (LAB medium)' <<<"$lab_out" \
+  || fail "the LAB journal tail is not announced with its bound"
+cust_out="$(env PATH="$lab_bin:$PATH" NEURALICE_ACCESS_POLICY_FILE="$TMP/policy-customer" NEURALICE_FAILURE_EVIDENCE="$TMP/nominal" NEURALICE_FAILURE_POLICY="$POLICY" NEURALICE_EFI_FAILURE_EVIDENCE="$SINK_EFI" bash "$FAILURE" --dry-run 2>&1 || true)"
+grep -q 'SIMULATED' <<<"$cust_out" \
+  && fail "a customer medium's failure screen leaks the installer journal"
+grep -q 'deliberately not printed here' <<<"$cust_out" \
+  || fail "a customer medium's failure screen lost its no-diagnostic notice"
 shipped_delay="$(sed -n 's/^delay_seconds=//p' "$POLICY")"
-{ [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 300 ]; } \
+{ [[ "$shipped_delay" =~ ^[0-9]+$ ]] && [ "$shipped_delay" -ge 5 ] && [ "$shipped_delay" -le 1800 ]; } \
   || fail "the shipped failure delay ($shipped_delay) is outside the bounds its own reader enforces"
 
 # --------------------------------------------------------------------------- #
@@ -588,5 +636,15 @@ done
   || fail "an unnumbered phase silently inherits an identity instead of being unclassified"
 
 (( induced >= 15 )) || fail "only $induced failure classes were induced; the coverage shrank"
+
+# The unit's start timeout must outlive the longest hold the script can be
+# told to keep, or systemd kills the evidence screen before its power-off and
+# the machine stays on with no terminal action (KVM, medium C14, 2026-09-10).
+_delay_max="$(sed -n 's/^readonly DELAY_MAX=\([0-9]*\)$/\1/p' "$FAILURE" | head -1)"
+_timeout="$(sed -n 's/^TimeoutStartSec=\([0-9]*\)$/\1/p' "$FAILURE_UNIT" | head -1)"
+[[ "$_delay_max" =~ ^[0-9]+$ && "$_timeout" =~ ^[0-9]+$ ]] \
+  || fail "DELAY_MAX (${_delay_max:-?}) or TimeoutStartSec (${_timeout:-?}) is not a plain number"
+(( _timeout > _delay_max + 120 )) \
+  || fail "TimeoutStartSec=$_timeout does not outlive DELAY_MAX=$_delay_max plus the render"
 
 echo "INSTALLER_FAILURE_SURFACE_TEST_OK (${induced} failure classes induced; evidence is bounded, closed-vocabulary and one-way; the sink takes no input and always reaches a terminal action)"

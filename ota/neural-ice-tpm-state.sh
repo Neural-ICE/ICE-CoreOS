@@ -18,11 +18,18 @@
 #
 #   0x01500003  INSTALL COUNTER (`nt=counter`). Each installation takes the next
 #               value as its `anchor_seq`.
-#   0x01500004  FRESHNESS COUNTER (`nt=counter`). Its ABSOLUTE TPM value is the
-#               high-water of consumed release authorizations.
-#   0x01500005  THE SEALED RECORD (64 bytes, WRITE-ONCE). Magic and the digest
+#   0x01500004  FRESHNESS COUNTER (`nt=counter`). The high-water of consumed
+#               release authorizations is its TPM value MINUS THE BASE sealed in
+#               the record: a TPM 2.0 initialises every new `nt=counter` index
+#               to the largest value any counter of the chip ever held (and
+#               that survives TPM2_Clear), so the counter is born wherever the
+#               PCR policy counter went -- 21 on the lab GX10 on 2026-09-09,
+#               above the release's issuance sequence 10, which refused every
+#               first boot (ADR-0015 amendment M, superseding §J).
+#   0x01500005  THE SEALED RECORD (64 bytes, WRITE-ONCE). Magic, the digest
 #               that binds this machine's access profile, hardware target and
-#               Secure Boot trust policy. The remaining bytes are fixed zeroes.
+#               Secure Boot trust policy, then the freshness base as 8 big-endian
+#               bytes. The remaining 16 bytes are fixed zeroes.
 #   0x01500007  PCR POLICY COUNTER (`nt=counter`). Its absolute value is the
 #               high-water of signed PolicyAuthorize generations activated for
 #               LUKS. It advances only after both enrolled tokens read back.
@@ -467,10 +474,37 @@ import sys
 print(open(sys.argv[1], "rb").read()[8:40].hex())
 ' "$WORK/record.bin")"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "the sealed record carries no usable profile binding"
-  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[40:].hex())' "$WORK/record.bin")"
-  [[ "$reserved" == "$(printf '00%.0s' {1..24})" ]] \
+  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[48:].hex())' "$WORK/record.bin")"
+  [[ "$reserved" == "$(printf '00%.0s' {1..16})" ]] \
     || die "the sealed record carries non-zero bytes outside its closed v2 contract"
   printf '%s\n' "$digest"
+}
+
+# The freshness base: the counter's value the moment the ceremony created it,
+# sealed beside the binding in the same write-once record. Bytes 40..47,
+# big-endian. Readers never guess it and never take it from anywhere else.
+record_base() { # -> decimal; the record must be sealed (record_read semantics)
+  record_read >/dev/null || return $?
+  local base
+  base="$("$(tool python3)" -c '
+import struct, sys
+value, = struct.unpack(">Q", open(sys.argv[1], "rb").read()[40:48])
+print(value)
+' "$WORK/record.bin")"
+  { [[ "$base" =~ ^[0-9]{1,16}$ ]] && (( base <= MAX_SAFE_INTEGER )); } \
+    || die "the sealed record carries an unusable freshness base"
+  printf '%s\n' "$base"
+}
+
+# The issuance high-water this machine reports: counter minus base. The only
+# subtraction in this file, and the only reader of the base.
+freshness_value() { # -> decimal; record must be sealed and the counter present
+  local base counter
+  base="$(record_base)" || return $?
+  counter="$(counter_value "$FRESHNESS_INDEX")"
+  (( counter >= base )) \
+    || die "the freshness counter reads below the base sealed in this machine's record; a counter cannot go backwards and no reader may believe one that did"
+  printf '%s\n' "$(( counter - base ))"
 }
 
 # --------------------------------------------------------------------------- #
@@ -520,7 +554,7 @@ freshness_read() {
     die "this machine has a sealed record but no freshness counter; its anti-replay state is incoherent"
   fi
   assert_index_shape "$FRESHNESS_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
-  counter_value "$FRESHNESS_INDEX"
+  freshness_value
 }
 
 freshness_consume() { # $1=the signed issuance sequence being consumed
@@ -545,7 +579,7 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
     || die "this machine has a sealed record but no freshness counter; its anti-replay state is incoherent"
   assert_index_shape "$FRESHNESS_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
   local current high_water
-  current="$(counter_value "$FRESHNESS_INDEX")"
+  current="$(freshness_value)"
   high_water="$current"
   # STRICTLY greater. Equal is the same authorization being consumed twice, which
   # is the replay this counter exists for.
@@ -559,7 +593,7 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
   done
   # READ BACK what landed. A sequence of increments that silently stopped short
   # would leave the machine replayable while reporting success.
-  current="$(counter_value "$FRESHNESS_INDEX")"
+  current="$(freshness_value)"
   (( current == requested )) \
     || die "the freshness high-water read back as $current, not $requested"
   printf '%s\n' "$requested"
@@ -665,16 +699,18 @@ profile_bind() { # read-only compatibility gate; provisioning belongs to ceremon
   printf '%s\n' "$wanted"
 }
 
-write_record() { # $1=binding digest; workspace and policies already prepared
+write_record() { # $1=binding digest $2=freshness base; workspace and policies already prepared
+  { [[ "$2" =~ ^[0-9]{1,16}$ ]] && (( 10#$2 <= MAX_SAFE_INTEGER )); } \
+    || die "the freshness base to seal is not a safe integer"
   "$(tool tpm2_nvdefine)" "$RECORD_INDEX" -C o -s "$RECORD_BYTES" \
     -a "policywrite|authread|ownerread|writedefine" -L "$WORK/policy-record" \
     >/dev/null 2>&1 || die "cannot provision the sealed record at $RECORD_INDEX"
   "$(tool python3)" -c '
-import sys
-magic, digest, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
-blob = magic.encode("ascii") + bytes.fromhex(digest)
-open(sys.argv[4], "wb").write(blob.ljust(size, b"\x00"))
-' "$RECORD_MAGIC" "$1" "$RECORD_BYTES" "$WORK/record-new.bin"
+import struct, sys
+magic, digest, base, size = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+blob = magic.encode("ascii") + bytes.fromhex(digest) + struct.pack(">Q", base)
+open(sys.argv[5], "wb").write(blob.ljust(size, b"\x00"))
+' "$RECORD_MAGIC" "$1" "$2" "$RECORD_BYTES" "$WORK/record-new.bin"
   session_for TPM2_CC_NV_Write or
   "$(tool tpm2_nvwrite)" "$RECORD_INDEX" -C "$RECORD_INDEX" -P "session:$SESSION" \
     -i "$WORK/record-new.bin" >/dev/null 2>&1 || die "the TPM refused to write the sealed record"
@@ -684,6 +720,7 @@ open(sys.argv[4], "wb").write(blob.ljust(size, b"\x00"))
     >/dev/null 2>&1 || die "the TPM refused to write-lock the sealed record"
   session_close
   [[ "$(record_read)" == "$1" ]] || die "the sealed record did not read back exactly"
+  [[ "$(record_base)" == "$2" ]] || die "the sealed record's freshness base did not read back exactly"
 }
 
 completion_read_versioned() {
@@ -848,7 +885,7 @@ state_snapshot() { # $1=profile $2=target $3=policy
   assert_fixed_state "$wanted"
   local install_value freshness_value install_public freshness_public
   install_value="$(counter_value "$COUNTER_INDEX")"
-  freshness_value="$(counter_value "$FRESHNESS_INDEX")"
+  freshness_value="$(freshness_value)"
   install_public="$(public_contract_digest "$COUNTER_INDEX")"
   freshness_public="$(public_contract_digest "$FRESHNESS_INDEX")"
   "$(tool python3)" - "$wanted" "$install_value" "$freshness_value" "$install_public" "$freshness_public" <<'PY'
@@ -879,8 +916,8 @@ runtime_status_impl() { # completion version then profile target policy digest c
   (( $# == 6 )) || die "internal runtime-status argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   [[ "$4" =~ ^[0-9a-f]{64}$ ]] || die "runtime completion evidence digest is malformed"
-  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^[1-9][0-9]{0,15}$ ]] \
-    || die "runtime ceremony counter evidence is malformed"
+  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^(0|[1-9][0-9]{0,15})$ ]] \
+    || die "runtime ceremony counter evidence is malformed"   # freshness may be 0: counted from the sealed base (ADR-0015 M)
   local wanted expected_install="$5" expected_freshness="$6"
   wanted="$(profile_digest "$1" "$2" "$3")"
   with_workspace; compute_policies
@@ -893,7 +930,7 @@ runtime_status_impl() { # completion version then profile target policy digest c
   [[ "$completion_version" == "$expected_version" && "$completion" == "$4" ]] \
     || die "authenticated TPM completion evidence does not match the canonical lifecycle evidence"
   install_value="$(counter_value "$COUNTER_INDEX")"
-  freshness_value="$(counter_value "$FRESHNESS_INDEX")"
+  freshness_value="$(freshness_value)"
   (( install_value == 10#$expected_install )) \
     || die "the live install counter no longer equals its authenticated ceremony value"
   (( freshness_value >= 10#$expected_freshness )) \
@@ -1064,18 +1101,18 @@ ceremony_prepare_impl() { # optional owner floor, profile, target, policy, initi
   # changes: install counter, freshness counter, then written+write-locked record.
   provision_counter "$COUNTER_INDEX"; increment_counter "$COUNTER_INDEX"
   provision_counter "$FRESHNESS_INDEX"; increment_counter "$FRESHNESS_INDEX"
-  current="$(counter_value "$FRESHNESS_INDEX")"
-  if (( requested > 0 )); then
-    (( requested >= current )) \
-      || die "initial issuance sequence $requested is below the TPM's absolute freshness value $current"
-    (( requested - current <= MAX_FRESHNESS_GAP )) \
-      || die "initial issuance sequence $requested is more than $MAX_FRESHNESS_GAP ahead of the TPM's absolute value $current"
-    for (( step = current; step < requested; step++ )); do increment_counter "$FRESHNESS_INDEX"; done
-  fi
-  write_record "$wanted"
+  # The counter is born wherever the chip's largest counter ever went, plus the
+  # one increment that sets WRITTEN. That value is the BASE this machine seals
+  # in its record; the issuance high-water is counted from it, never from zero.
+  local base
+  base="$(counter_value "$FRESHNESS_INDEX")"
+  (( requested <= MAX_FRESHNESS_GAP )) \
+    || die "initial issuance sequence $requested is more than $MAX_FRESHNESS_GAP; a TPM counter advances by one and this ceremony will not spin it that far"
+  for (( step = 0; step < requested; step++ )); do increment_counter "$FRESHNESS_INDEX"; done
+  write_record "$wanted" "$base"
   assert_fixed_state "$wanted"
   printf '%s %s %s\n' "$(counter_value "$COUNTER_INDEX")" \
-    "$(counter_value "$FRESHNESS_INDEX")" "$wanted"
+    "$(freshness_value)" "$wanted"
 }
 
 ceremony_finalize() { # retained v1
@@ -1095,7 +1132,7 @@ ceremony_finalize_impl() { # magic, optional owner floor, profile target policy 
   (( $# == 6 )) || die "internal ceremony-finalize argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
   [[ "$4" =~ ^[0-9a-f]{64}$ ]] || die "completion evidence digest is malformed"
-  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^[1-9][0-9]{0,15}$ ]] \
+  [[ "$5" =~ ^[1-9][0-9]{0,15}$ && "$6" =~ ^(0|[1-9][0-9]{0,15})$ ]] \
     || die "ceremony counter evidence is malformed"
   local wanted install_value freshness_value expected_install="$5" expected_freshness="$6"
   wanted="$(profile_digest "$1" "$2" "$3")"
@@ -1111,7 +1148,7 @@ ceremony_finalize_impl() { # magic, optional owner floor, profile target policy 
   ! index_present "$COMPLETION_INDEX" \
     || die "ceremony completion evidence already exists before finalize; this is not a trusted one-time transition"
   install_value="$(counter_value "$COUNTER_INDEX")"
-  freshness_value="$(counter_value "$FRESHNESS_INDEX")"
+  freshness_value="$(freshness_value)"
   (( install_value == 10#$expected_install && freshness_value == 10#$expected_freshness )) \
     || die "live TPM counters changed between ceremony preparation and authenticated finalization"
   write_completion "$completion_magic" "$4"

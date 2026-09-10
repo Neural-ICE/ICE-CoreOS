@@ -37,7 +37,10 @@ TTYReset=yes
 TTYVHangup=yes
 # The script's own delay is bounded to 300 s by its policy reader; this is the
 # manager's independent bound on the same thing.
-TimeoutStartSec=600
+# Above DELAY_MAX (1800 s, neural-ice-installer-failure.sh) plus the render: at
+# 600 systemd killed the 1800 s LAB hold before its power-off, and the machine
+# stayed on forever (KVM rehearsal of medium C14, 2026-09-10).
+TimeoutStartSec=2100
 
 # Bounds that survive a wrong script.
 MemoryMax=64M

@@ -451,4 +451,22 @@ grep -qx 'neural-ice-status-screen.service' <<<"$(grep -oE '[A-Za-z0-9@._-]+\.se
 ! printf '%s\n' "${dropin_units[@]}" | grep -qx 'neural-ice-status-screen.service' \
   || fail "the status screen must not be in the ceremony hard-gate set"
 
+# A required ReadWritePaths= naming a directory nothing before this unit creates
+# fails the unit at the NAMESPACE step, silently (lab GX10, 2026-09-10):
+# /run/neural-ice is hostname-init's and must stay optional here.
+grep -Fqx 'RuntimeDirectory=neural-ice' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service does not create /run/neural-ice itself (RuntimeDirectory=)"
+grep -Fqx 'RuntimeDirectoryPreserve=yes' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service would remove /run/neural-ice from under hostname-init when it ends"
+grep -Fqx 'ReadWritePaths=/var/lib/neural-ice/data /run/neural-ice' "$ROOT/image/firstboot/neural-ice-seed-import.service" \
+  || fail "neural-ice-seed-import.service must keep /run/neural-ice writable: ni-ota-verify writes seed-verify under it"
+# containers/image ignores TMPDIR on Linux: only --tmpdir moves skopeo's staging
+# off the read-only /var/tmp (lab GX10, 2026-09-10, twice).
+# shellcheck disable=SC2016  # literal script text, not an expansion
+grep -Fq 'skopeo --policy "$SEED_POLICY" copy --tmpdir "$DATA/tmp" --preserve-digests' "$ROOT/image/firstboot/neural-ice-seed-import.sh" \
+  || fail "neural-ice-seed-import.sh lets skopeo stage under the read-only /var/tmp (missing --tmpdir)"
+# shellcheck disable=SC2016
+grep -Fq '"$DATA/tmp"' "$ROOT/image/firstboot/neural-ice-seed-import.sh" \
+  || fail "neural-ice-seed-import.sh does not create the data-volume staging directory"
+
 echo "TPM_CEREMONY_SYSTEMD_OFFLINE_TEST_OK (${#dropin_units[@]} direct consumers plus firstboot chain)"
