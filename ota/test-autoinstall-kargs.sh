@@ -612,5 +612,14 @@ grep -Fq -- "BindPaths=/var/lib/neural-ice/data/tmp:/var/tmp" "$AUTOINSTALL" \
   || fail "the interim LAB seed-import drop-in leaves skopeo's staging on the read-only /var/tmp"
 [ "$(grep -c 'install -d -m 0700 /run/seed-dst/tmp' "$AUTOINSTALL")" = 2 ] \
   || fail "the data volume's tmp staging directory is not created on both seed paths"
+grep -Fq -- 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json:/etc/containers/policy.json' "$AUTOINSTALL" \
+  || fail "the interim LAB seed-import drop-in leaves skopeo under the strict system policy (oci: rejected)"
+# The policy the installer writes for that bind: extract the literal and judge it.
+_lab_seed_policy="$(grep -o "'{\"default\":\[{\"type\":\"reject\"}\],\"transports\":{\"oci\":[^']*}'" "$AUTOINSTALL" | head -1 | tr -d "'")"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); s=list(d["transports"]["oci"]); sys.exit(0 if d["default"]==[{"type":"reject"}] and list(d["transports"])==["oci"] and s==["/var/lib/neural-ice/data/offline-generations"] else 1)' "$_lab_seed_policy" \
+  || fail "the LAB seed-import transport policy literal is not default=reject with the single offline-generations oci: scope"
+_lab_bind_line="$(grep -n 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[ "$_lab_bind_line" -gt "$_lab_dropin_line" ] \
+  || fail "the LAB seed-import policy bind is written outside the lab-managed drop-in block"
 
 echo "AUTOINSTALL_KARGS_TEST_OK"

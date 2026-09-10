@@ -4368,6 +4368,27 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
       printf 'RuntimeDirectory=neural-ice\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryMode=0755\nBindPaths=/var/lib/neural-ice/data/tmp:/var/tmp\n' \
         >> "$_lab_dropin_dir/50-lab-console.conf" \
         || die "cannot write the LAB seed-import sandbox drop-in"
+      # Interim as well: the shipped script copies its oci: layouts under the
+      # SYSTEM policy (default reject, docker: scopes only) and is refused at
+      # once -- "Source image rejected: Running image oci:///var/lib/neural-ice/
+      # data/offline-generations/…:seed is rejected by policy" (lab GX10,
+      # 2026-09-10, C25, after 23 min of re-verification). The fixed image hands
+      # skopeo a dedicated policy (/usr/lib/neural-ice/seed-import-policy.json);
+      # until the appliance carries it, this unit ALONE sees that policy as
+      # /etc/containers/policy.json through a per-unit read-only bind. The file
+      # the rest of the system reads stays the strict one restored above.
+      install -d -m 0755 -- "$dep/etc/neural-ice" \
+        || die "cannot prepare /etc/neural-ice on the target deployment"
+      printf '%s\n' '{"default":[{"type":"reject"}],"transports":{"oci":{"/var/lib/neural-ice/data/offline-generations":[{"type":"insecureAcceptAnything"}]}}}' \
+        > "$dep/etc/neural-ice/seed-import-policy.json" \
+        || die "cannot write the LAB seed-import transport policy"
+      chmod 0644 -- "$dep/etc/neural-ice/seed-import-policy.json"
+      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("default")==[{"type":"reject"}] and list(d.get("transports",{}))==["oci"] else 1)' \
+        "$dep/etc/neural-ice/seed-import-policy.json" \
+        || die "the LAB seed-import transport policy is not the fail-closed oci-only one"
+      printf 'BindReadOnlyPaths=/etc/neural-ice/seed-import-policy.json:/etc/containers/policy.json\n' \
+        >> "$_lab_dropin_dir/50-lab-console.conf" \
+        || die "cannot write the LAB seed-import policy bind"
     fi
     chmod 0644 -- "$_lab_dropin_dir/50-lab-console.conf"
   done
