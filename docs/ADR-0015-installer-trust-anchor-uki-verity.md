@@ -643,9 +643,22 @@ The contract is now:
   activation counter with an unsealed owner authorization is a pre-ceremony
   retry and is allowed with any signed generation.
 - `pcr-policy-activate` defines `0x01500007` when absent (born at the chip's
-  max-ever, as every counter) and advances it by exactly one per activation,
-  still only after both signed-policy LUKS tokens were enrolled and read back.
-  Its absolute value is chip-relative and carries no generation number.
+  max-ever, as every counter), increments it once, seals that value as the
+  GENERATION BASE in a write-once record at `0x01500008` (`NI-PCRG1`, the base
+  as 8 big-endian bytes, zeroes to 64 — the same shape and policy as the sealed
+  record of §M), then advances the counter by the generation label so that
+  `counter - base == generation`. Still only after both signed-policy LUKS
+  tokens were enrolled and read back. Re-activating the same generation moves
+  nothing; a higher generation advances the counter by the difference; a lower
+  one is refused.
+- The initramfs hook (`91neural-ice-tpm-policy`) reads the base beside the
+  counter and unlocks LUKS only when the UKI's sealed generation equals
+  `counter - base`: the boot-time anti-rollback of the signed policy stays
+  strict and is now relative, exactly like the freshness reading of §M. A
+  missing or unsealed base on an installed system is a refusal (signed physical
+  recovery); on exact Install media it is the interrupted-activation retry.
+- `pcr-policy-generation` reports that difference for the runtime and for the
+  future OTA rotation, which advances the counter by `new label - generation`.
 - Which generations a factory medium may install is a fleet decision, not a
   device history: a signed floor (`pcr_policy_floor`) in the installer release
   authorization, raised by Neural ICE only when a policy generation is revoked.
@@ -667,11 +680,19 @@ must be onboarded again, visible at the portal; revocation stays available
 through the signed floor.
 
 Evidence: `ota/test-neural-ice-tpm-state.sh` pins the C30 case (chip max-ever
-1050, generation 1004 accepted by the check, activated, counter born at 1050
-and read back at 1051), the pre-ceremony retry (any label, counter advances by
-exactly one per activation), and the sealed-device refusal that names
-`TPM2_Clear`; `ci/test-swtpm-monotonic-state.sh` checks the same three
-behaviours on a real software TPM.
+1050, generation 1004 accepted by the check, activated, base sealed at 1051,
+counter at 2055, generation read back as 1004; re-activation moves nothing,
+1003 refused, 1010 advances to 2061), the pre-ceremony retry contract and the
+sealed-device refusal that names `TPM2_Clear`; `image/test-tpm-policy-initramfs.sh`
+pins the hook (base 3, counter 7: only generation 4 unlocks, the absolute value
+7 is refused; absent, unsealed, wrong-policy, wrong-size, wrong-magic or dirty
+base records are refused; a counter below its base is refused);
+`ci/test-swtpm-monotonic-state.sh` checks the same on a real software TPM.
+The first medium built on this amendment without the base record (C31,
+2026-09-11) installed and was refused at first boot by the hook with
+`signed UKI PCR policy sequence does not equal the durable TPM high-water`:
+the boot check is the second consumer of the counter, and the base is what
+makes the label meaningful to it.
 
 ## Consequences
 
