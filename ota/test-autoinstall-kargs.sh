@@ -640,6 +640,23 @@ _use_line="$(grep -n 'partdev [0-9]' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 # (C28, 2026-09-11: 1.26 % loss on the live receiver, no readout, no SSH). The
 # function must exist, be called before AND after the objects fetch, and never
 # refuse: it is evidence, not a gate.
+# The mirror NIC's IRQ is isolated from the fetch workload before the readout
+# and the fetch (C28, 2026-09-11: NAPI/workload contention = 1.26 % loss in the
+# live installer; isolation measured at 0.003 %). Best effort, never a refusal.
+_irq_def="$(grep -n '^isolate_mirror_nic_irq() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_irq_call="$(grep -n '^  isolate_mirror_nic_irq$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+_nh_before0="$(grep -n '^  network_health_snapshot before$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[[ -n "$_irq_def" && -n "$_irq_call" && "$_irq_def" -lt "$_irq_call" && "$_irq_call" -lt "$_nh_before0" ]] \
+  || fail "the mirror NIC IRQ isolation does not precede the phase-5 readout and fetch (def=${_irq_def:-?} call=${_irq_call:-?} readout=${_nh_before0:-?})"
+grep -Fq 'confine_to_cpuset(os.environ.get("NI_FETCH_CPUSET", ""))' "$AUTOINSTALL" \
+  || fail "the fetcher no longer confines itself to the cpuset the installer hands it"
+grep -Fq 'os.sched_setaffinity(0, cpus)' "$AUTOINSTALL" \
+  || fail "the fetcher's cpuset confinement no longer applies an affinity"
+_irq_out="$(bash -c 'set -u; INSTALL_MIRROR=203.0.113.9:5055; log() { printf "%s\n" "$*"; }; source <(awk "/^isolate_mirror_nic_irq\(\) /,/^}\$/" "$1"); isolate_mirror_nic_irq; printf "cpuset=[%s]\n" "${NI_FETCH_CPUSET-unset}"' _ "$AUTOINSTALL" 2>&1)" \
+  || fail "the IRQ isolation refused instead of reporting (rc != 0)"
+if ! { grep -q '^IRQ: ' <<<"$_irq_out" && grep -q '^cpuset=\[\]$' <<<"$_irq_out"; }; then
+  fail "the IRQ isolation did not report and leave the cpuset empty for an unroutable mirror: $(head -c 300 <<<"$_irq_out")"
+fi
 _nh_def="$(grep -n '^network_health_snapshot() ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 _nh_before="$(grep -n '^  network_health_snapshot before$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 _nh_fetch="$(grep -n '^  seed_mirror_helper objects ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
