@@ -101,14 +101,12 @@ persist_prerequisites() {
       || fail "virgin signed PCR policy was refused"
     [[ "$(hw pcr-policy-activate "$candidate")" == "$candidate" ]] \
       || fail "signed PCR policy activation did not commit"
-    expect_refusal "activated PCR policy sequence replayed" \
-      hw pcr-policy-check "$candidate"
-    if (( candidate > 1 )); then
-      expect_refusal "lower PCR policy sequence replayed" \
-        hw pcr-policy-check "$(( candidate - 1 ))"
-    fi
-    [[ "$(hw pcr-policy-check "$(( candidate + 1 ))")" == "$candidate" ]] \
-      || fail "the next PCR policy generation was not eligible without mutation"
+    # ADR-0015 N: before the owner ceremony any signed generation may be
+    # retried; the check prints 0 and never compares to the chip's counter.
+    [[ "$(hw pcr-policy-check "$candidate")" == 0 ]] \
+      || fail "pre-ceremony retry of the activated generation was refused"
+    [[ "$(hw pcr-policy-check 1)" == 0 ]] \
+      || fail "pre-ceremony retry of a lower generation was refused"
     PCR_POLICY_CANDIDATE=$(( candidate + 1 ))
   fi
 }
@@ -372,11 +370,13 @@ tpm2_readpublic -Q -c 0x81000001 -f tpmt -o "$TMP/retry-srk.before"
 retry_high_water="$(abs_counter 0x01500007)"
 [[ "$retry_high_water" =~ ^[1-9][0-9]*$ ]] \
   || fail "pre-ceremony fixture has no usable absolute PCR policy high-water"
-retry_candidate=$((retry_high_water + 1))
-[[ "$(hw pcr-policy-check "$retry_candidate")" == "$retry_high_water" ]] \
-  || fail "higher signed policy was not eligible for pre-ceremony retry"
+retry_candidate=1
+[[ "$(hw pcr-policy-check "$retry_candidate")" == 0 ]] \
+  || fail "a factory generation below the chip's counter was not eligible for pre-ceremony retry"
 [[ "$(hw pcr-policy-activate "$retry_candidate")" == "$retry_candidate" ]] \
-  || fail "pre-ceremony retry did not activate the next policy generation"
+  || fail "pre-ceremony retry did not activate the factory generation"
+[[ "$(abs_counter 0x01500007)" == "$((retry_high_water + 1))" ]] \
+  || fail "the activation counter did not advance by exactly one"
 [[ "$(hw provisioning-status)" == pcr-policy-activated ]] \
   || fail "higher policy activation changed the pre-ceremony state class"
 tpm2_readpublic -Q -c 0x81010005 -f tpmt -o "$TMP/retry-device-root.after"
@@ -390,6 +390,8 @@ firstboot >/dev/null \
   || fail "mandatory ceremony failed after pre-ceremony retry"
 [[ "$(firstboot status)" == complete ]] \
   || fail "mandatory ceremony was not complete after pre-ceremony retry"
+expect_refusal "a provisioned device accepted a factory install without TPM2_Clear" hw pcr-policy-check 1
+expect_refusal "a provisioned device activated a factory generation without TPM2_Clear" hw pcr-policy-activate 1
 [[ "$(runtime_complete)" == complete ]] \
   || fail "runtime rejected the ceremony completed after pre-ceremony retry"
 # Keep later fixtures above the TPM's process-lifetime counter floor.

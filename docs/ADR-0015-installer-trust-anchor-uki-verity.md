@@ -610,6 +610,69 @@ it) and binds a chip whose counters already went to 21 with issuance sequence
 reading by sabotage; `ci/test-swtpm-monotonic-state.sh` checks on a real TPM
 that `freshness-read + sealed base == raw counter`.
 
+### N. Installation is a factory operation: the signed PCR policy generation is never compared to the chip's counter history (2026-09-11)
+
+Supersedes the install-time anti-replay of `0x01500007`. The customer receives
+an appliance already installed and ready to onboard with its licence; the only
+software path at the customer is the signed OTA update. Installation is a
+factory operation performed by Neural ICE or the OEM bench with a controlled,
+signed medium on a controlled bench. The per-device monotonic comparison of the
+medium's signed PCR policy generation with the chip's counter therefore
+protected nothing a customer can be exposed to, and it cost a rebuilt medium
+per bench cycle plus a hand-maintained sequence counter.
+
+What it did on the lab GX10 (`.67`, 2026-09-11, medium C30, train 0.61.0,
+read off tty2): after a `TPM2_Clear` the PCR policy index was absent, the
+read-only check reported a virgin high-water of 0, the installer partitioned
+the disk, and the activation of sequence 1004 was refused with
+`TPM refused to commit the activated PCR policy generation` because the counter
+it had just defined was born at 1050, the previous cycle's issuance (the same
+max-ever rule as §M). The tty1 failure block showed a silent exit, and the
+previous cycle had already needed the bench counter set by hand to 1000 so that
+1001 would exceed 950.
+
+The contract is now:
+
+- The medium's `neuralice.pcr_policy_seq` is the LABEL of the installed
+  generation, sealed in the UKI command line of the installed system. It is
+  never compared to a value of this chip.
+- `pcr-policy-check` writes nothing and refuses exactly one thing: a device
+  whose owner authorization is already sealed (`ownerAuthSet=1`) — that device
+  is provisioned, and a reinstall requires `TPM2_Clear` first. It prints 0 so
+  the installer's `sequence > printed value` guard stays in place. A present
+  activation counter with an unsealed owner authorization is a pre-ceremony
+  retry and is allowed with any signed generation.
+- `pcr-policy-activate` defines `0x01500007` when absent (born at the chip's
+  max-ever, as every counter) and advances it by exactly one per activation,
+  still only after both signed-policy LUKS tokens were enrolled and read back.
+  Its absolute value is chip-relative and carries no generation number.
+- Which generations a factory medium may install is a fleet decision, not a
+  device history: a signed floor (`pcr_policy_floor`) in the installer release
+  authorization, raised by Neural ICE only when a policy generation is revoked.
+  Issuing that field belongs to ICE-Fabric and its verifier and is the tracked
+  follow-up of this amendment; until it lands every signed generation is
+  accepted, which is what a cleared chip already did before this amendment.
+- A future OTA rotation of the signed policy compares generation labels
+  (new label above the installed one and above the signed floor) and advances
+  `0x01500007` once; it inherits the relative reading of §M, never an absolute
+  one.
+
+Consequences: one factory medium per train, reinstallable on any bench machine
+any number of times; no bench counter; no per-cycle rebuild for TPM reasons;
+the lab and the OEM follow the customer path (`customer-locked` media included).
+What is given up: a stolen factory medium plus physical access could reinstall
+an appliance on an older, still-signed and not revoked generation — the
+reinstall destroys the customer's data and produces a new device identity that
+must be onboarded again, visible at the portal; revocation stays available
+through the signed floor.
+
+Evidence: `ota/test-neural-ice-tpm-state.sh` pins the C30 case (chip max-ever
+1050, generation 1004 accepted by the check, activated, counter born at 1050
+and read back at 1051), the pre-ceremony retry (any label, counter advances by
+exactly one per activation), and the sealed-device refusal that names
+`TPM2_Clear`; `ci/test-swtpm-monotonic-state.sh` checks the same three
+behaviours on a real software TPM.
+
 ## Consequences
 
 - **The four OTA verification commands gained a required `--candidate-root`.**

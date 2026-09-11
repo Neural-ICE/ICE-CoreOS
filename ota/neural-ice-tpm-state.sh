@@ -30,9 +30,16 @@
 #               that binds this machine's access profile, hardware target and
 #               Secure Boot trust policy, then the freshness base as 8 big-endian
 #               bytes. The remaining 16 bytes are fixed zeroes.
-#   0x01500007  PCR POLICY COUNTER (`nt=counter`). Its absolute value is the
-#               high-water of signed PolicyAuthorize generations activated for
-#               LUKS. It advances only after both enrolled tokens read back.
+#   0x01500007  PCR POLICY ACTIVATION COUNTER (`nt=counter`). Present means a
+#               signed PolicyAuthorize generation was activated for LUKS by a
+#               factory install (the pre-ceremony state class). It advances by
+#               one per activation, only after both enrolled tokens read back.
+#               Its absolute value is chip-relative (born at the chip's max-ever)
+#               and carries NO generation number (ADR-0015 N): the installed
+#               generation is the sealed kernel command line's
+#               `neuralice.pcr_policy_seq`; which generations a factory medium
+#               may install is governed by the release authorization's signed
+#               floor, never by this chip's history.
 #
 # Neither index overlaps the OTA state indices (0x01500001 legacy floor,
 # 0x01500002 atomic state-v1) or the device-root/PKI persistent handles.
@@ -600,10 +607,23 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
 }
 
 # --------------------------------------------------------------------------- #
-# pcr-policy-check / pcr-policy-activate — signed PCR policy anti-replay.
-# Check is read-only and runs before LUKS enrollment. Activate is the only
-# writer and is called only after both signed-policy tokens were enrolled and
-# read back successfully by systemd-cryptenroll.
+# pcr-policy-check / pcr-policy-activate — factory-install semantics (ADR-0015 N).
+# Installation is a factory operation (Neural ICE or the OEM bench); customers
+# never install, they only take signed OTA updates. The signed generation of the
+# medium is therefore NEVER compared to this chip's counter history: a TPM 2.0
+# initialises every new `nt=counter` index to the largest value any counter of
+# the chip ever held, that value survives TPM2_Clear, and comparing a medium's
+# generation to it refused a valid factory medium on the lab GX10 on 2026-09-11
+# (sequence 1004 against a counter born at 1050, refused AFTER the disk was
+# partitioned). Check runs before LUKS enrollment and writes nothing; activate
+# is the only writer and is called only after both signed-policy tokens were
+# enrolled and read back successfully by systemd-cryptenroll.
+#   absent index, owner authorization unset   -> a fresh factory install
+#   present index, owner authorization unset  -> a pre-ceremony retry (allowed)
+#   owner authorization sealed                -> this device is provisioned;
+#                                                a reinstall requires TPM2_Clear
+# The check prints 0: the installer keeps its `sequence > printed value` guard,
+# and no value of this chip is ever a floor for a factory medium.
 # --------------------------------------------------------------------------- #
 validate_pcr_policy_seq() {
   if ! [[ "$1" =~ ^[1-9][0-9]{0,15}$ ]] || (( 10#$1 > MAX_SAFE_INTEGER )); then
@@ -611,62 +631,51 @@ validate_pcr_policy_seq() {
   fi
 }
 
-pcr_policy_current() {
+pcr_policy_current() { # -> the activation counter's absolute (chip-relative) value
   index_present "$PCR_POLICY_INDEX" \
-    || die "the PCR policy high-water is absent; signed physical recovery is required"
+    || die "the PCR policy activation counter is absent; signed physical recovery is required"
   assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
   counter_value "$PCR_POLICY_INDEX"
+}
+
+pcr_policy_state() { # -> fresh | retry ; dies when the device is already provisioned
+  if [[ "$(owner_auth_set)" != 0 ]]; then
+    die "this device holds a sealed owner authorization: it is provisioned, and a reinstall requires TPM2_Clear first"
+  fi
+  if index_present "$PCR_POLICY_INDEX"; then
+    assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
+    printf 'retry\n'
+    return 0
+  fi
+  local index
+  for index in "$COUNTER_INDEX" "$FRESHNESS_INDEX" "$RECORD_INDEX" "$COMPLETION_INDEX"; do
+    ! index_present "$index" \
+      || die "PCR policy state is absent while another appliance state index exists"
+  done
+  printf 'fresh\n'
 }
 
 pcr_policy_check() { # $1=signed candidate sequence
   (( $# == 1 )) || die "pcr-policy-check requires exactly one signed policy sequence"
   validate_pcr_policy_seq "$1"
-  local requested=$((10#$1)) current index
   with_workspace; compute_policies
-  if index_present "$PCR_POLICY_INDEX"; then
-    current="$(pcr_policy_current)"
-  else
-    [[ "$(owner_auth_set)" == 0 ]] \
-      || die "the PCR policy high-water is absent after owner authorization was sealed"
-    for index in "$COUNTER_INDEX" "$FRESHNESS_INDEX" "$RECORD_INDEX" "$COMPLETION_INDEX"; do
-      ! index_present "$index" \
-        || die "PCR policy state is absent while another appliance state index exists"
-    done
-    current=0
-  fi
-  (( requested > current )) \
-    || die "refusing signed PCR policy sequence $requested at or below high-water $current"
-  (( requested - current <= MAX_FRESHNESS_GAP )) \
-    || die "signed PCR policy sequence $requested is more than $MAX_FRESHNESS_GAP ahead of high-water $current"
-  printf '%s\n' "$current"
+  pcr_policy_state >/dev/null
+  printf '0\n'
 }
 
 pcr_policy_activate() { # $1=signed sequence whose two LUKS tokens succeeded
   (( $# == 1 )) || die "pcr-policy-activate requires exactly one signed policy sequence"
   validate_pcr_policy_seq "$1"
-  local requested=$((10#$1)) current step newly_defined=0
+  local requested=$((10#$1)) state
   with_workspace; compute_policies
-  if index_present "$PCR_POLICY_INDEX"; then
-    current="$(pcr_policy_current)"
-  else
-    [[ "$(owner_auth_set)" == 0 ]] \
-      || die "cannot provision PCR policy high-water after owner authorization was sealed"
+  state="$(pcr_policy_state)"
+  if [[ "$state" == fresh ]]; then
     provision_counter "$PCR_POLICY_INDEX"
-    increment_counter "$PCR_POLICY_INDEX"
-    current="$(pcr_policy_current)"
-    newly_defined=1
   fi
-  (( requested > current || (newly_defined == 1 && requested == current) )) \
-    || die "refusing to activate signed PCR policy sequence $requested at or below high-water $current"
-  (( requested >= current && requested - current <= MAX_FRESHNESS_GAP )) \
-    || die "signed PCR policy sequence $requested cannot advance the TPM high-water $current"
-  for (( step = current; step < requested; step++ )); do
-    increment_counter "$PCR_POLICY_INDEX"
-  done
-  current="$(pcr_policy_current)"
-  (( current == requested )) \
-    || die "PCR policy high-water read back as $current, not activated sequence $requested"
-  printf '%s\n' "$current"
+  increment_counter "$PCR_POLICY_INDEX"
+  assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
+  counter_value "$PCR_POLICY_INDEX" >/dev/null
+  printf '%s\n' "$requested"
 }
 
 # --------------------------------------------------------------------------- #
