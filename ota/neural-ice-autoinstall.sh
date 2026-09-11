@@ -2078,6 +2078,50 @@ readonly SEED_PACK_DIR="$INSTALLER_STATE_DIR/seed-pack"
 # governor and whether irqbalance runs. Taken before and after the phase-5
 # fetch so the deltas cover exactly the transfer. Every read is guarded: a
 # missing file yields "?" and never a refusal -- this is evidence, not a gate.
+# ISOLATE THE MIRROR NIC'S IRQ FROM THE FETCH WORKLOAD. The live installer
+# boots a minimal target (no irqbalance) and the r8169 on the GX10 has ONE
+# receive queue and a 256-descriptor ring: when the CPU that services its IRQ
+# also runs curl/TLS/hashing, NAPI is late and the ring overflows -- 1.26 % of
+# segments retransmitted and ~250 MB/s on a 10 GbE link during the C28 install
+# (2026-09-11). Measured on the installed OS with the same NIC, six 2 GiB
+# streams: workload anywhere 0.29-0.38 % missed frames; IRQ pinned to the last
+# CPU and the workload kept off it, 0.003 %. This pins every IRQ of the
+# interface that routes to the mirror to the last online CPU and hands the
+# fetcher a cpuset without it (NI_FETCH_CPUSET, applied by the helper with
+# sched_setaffinity and inherited by its curl children). Best effort: any
+# failure is logged and the fetch proceeds unpinned; the health readout that
+# follows prints the effective affinity either way.
+isolate_mirror_nic_irq() {
+  local host iface online last cpuset q eff pinned=0 driver
+  NI_FETCH_CPUSET=""
+  host="${INSTALL_MIRROR%%:*}"
+  iface="$(ip -o -4 route get "$host" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+  [[ -n "$iface" && -d "/sys/class/net/$iface" ]] || { log "IRQ: no resolvable route to the mirror host ${host}; fetch runs unpinned"; return 0; }
+  online="$(cat /sys/devices/system/cpu/online 2>/dev/null || echo 0)"
+  last="${online##*-}"; last="${last##*,}"
+  [[ "$last" =~ ^[0-9]+$ && "$last" -ge 3 ]] || { log "IRQ: only cpus '${online}' online; fetch runs unpinned"; return 0; }
+  driver="$(basename "$(readlink -f "/sys/class/net/$iface/device/driver" 2>/dev/null)" 2>/dev/null)"; driver="${driver:-?}"
+  for q in $(awk -v n="$iface" -v d="$driver" -F: 'index($0, n) || index($0, d) { gsub(/ /, "", $1); print $1 }' /proc/interrupts 2>/dev/null | head -8); do
+    [[ "$q" =~ ^[0-9]+$ ]] || continue
+    if printf '%s\n' "$last" > "/proc/irq/$q/smp_affinity_list" 2>/dev/null; then
+      eff="$(cat "/proc/irq/$q/effective_affinity_list" 2>/dev/null || echo ?)"
+      log "IRQ: ${iface} irq${q} -> cpu${last} (effective ${eff})"
+      [[ "$eff" == "$last" ]] && pinned=$((pinned + 1))
+    else
+      log "IRQ: ${iface} irq${q}: cannot set affinity; fetch runs unpinned for it"
+    fi
+  done
+  if (( pinned > 0 )); then
+    cpuset="0-$((last - 1))"
+    NI_FETCH_CPUSET="$cpuset"
+    log "IRQ: fetch workload confined to cpus ${cpuset}"
+  else
+    log "IRQ: no interrupt of ${iface} pinned; fetch runs unpinned"
+  fi
+  export NI_FETCH_CPUSET
+  return 0
+}
+
 declare -A _net_health_before=()
 network_health_snapshot() { # $1=label (before|after)
   local label="$1" host iface driver irqs q eff top missed dropped bytes soft gov irqb line=""
@@ -2734,6 +2778,23 @@ def objects(mirror, cacert, closure_path, release_authority, destination, closur
          f"({fetched} fetched, {skipped} already present, {bytes_landed} bytes); READY written")
 
 
+def confine_to_cpuset(spec):
+    """Keep this process and every child (the curl streams) off the CPU that
+    services the mirror NIC's IRQ (see isolate_mirror_nic_irq in the installer).
+    Best effort: a malformed or empty spec leaves the affinity untouched."""
+    if not spec:
+        return
+    cpus = set()
+    try:
+        for part in spec.split(","):
+            low, _, high = part.partition("-")
+            cpus.update(range(int(low), int(high or low) + 1))
+        os.sched_setaffinity(0, cpus)
+        note(f"fetch workload confined to cpus {spec}")
+    except (ValueError, OSError) as error:
+        note(f"fetch workload not confined ({spec}): {error}")
+
+
 def main(argv):
     if not argv:
         refuse("no subcommand")
@@ -2743,6 +2804,7 @@ def main(argv):
     elif command == "plan" and len(arguments) == 2:
         plan_summary(*arguments)
     elif command == "objects" and len(arguments) == 7:
+        confine_to_cpuset(os.environ.get("NI_FETCH_CPUSET", ""))
         objects(*arguments)
     else:
         refuse(f"unknown subcommand or argument count: {command} ({len(arguments)} arguments)")
@@ -2846,6 +2908,7 @@ seed_from_mirror_materialize() { # $1=destination release/<closure> directory on
   [[ "$object_count" =~ ^[0-9]+$ && "$bytes_declared" =~ ^[0-9]+$ ]] \
     || die "the closure fetch plan is malformed"
   log "MIRROR: materialising release closure sha256:${SEED_CLOSURE} from ${INSTALL_MIRROR} — ${object_count} declared objects, $(awk -v t="$bytes_declared" 'BEGIN{printf "%.1f", t / 2^30}') GiB declared; each object is hashed against its name before it is named…"
+  isolate_mirror_nic_irq
   network_health_snapshot before
   copy_progress_start "$bytes_declared" "$destination"
   seed_mirror_helper objects "$INSTALL_MIRROR" "$MIRROR_CA_FILE" "$destination/release-closure.json" \
