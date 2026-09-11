@@ -341,8 +341,9 @@ if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
       [ $((ni_requested - ni_generation)) -le "$ni_max_activation_gap" ] \
         || ni_die "signed Install PCR policy generation is more than $ni_max_activation_gap ahead of the activated generation"
     else
-      [ "$ni_requested" -ge 1 ] && [ "$ni_requested" -le "$ni_max_activation_gap" ] \
-        || ni_die "initial signed PCR policy generation is outside the activation window"
+      if ! { [ "$ni_requested" -ge 1 ] && [ "$ni_requested" -le "$ni_max_activation_gap" ]; }; then
+        ni_die "initial signed PCR policy generation is outside the activation window"
+      fi
     fi
   else
     ni_read_generation_base \
