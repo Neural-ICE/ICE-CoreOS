@@ -237,6 +237,10 @@ log_previous_failure_evidence() {
 die()  {
   write_failure_evidence "$*"
   log "FAILED in phase ${PHASE_ID}/${PHASE_TOTAL} (${PHASE_LABEL}) [${PHASE_CODE}]: $*"
+  # ONE recovery path, named on the same screen as every refusal (ADR-0015 O):
+  # the operator clears the TPM at the firmware setup screen and boots this
+  # same medium again. Nothing else is expected of a factory bench.
+  log "RECOVERY: power off, clear the TPM at the firmware setup screen, then boot this same medium again"
   exit 1
 }
 
@@ -4005,8 +4009,20 @@ assert_luks_srk_token "$DATAP" /run/neural-ice-installer/data-luks-evidence.json
 # This is the activation commit: both enrolled tokens have survived exact
 # readback under the signed PolicyAuthorize key. Only now may the TPM remember
 # the policy generation; a failed or partial enrollment burns no sequence.
-[[ "$("$TPM_STATE" pcr-policy-activate "$PCR_POLICY_SEQ")" == "$PCR_POLICY_SEQ" ]] \
+# ADR-0015 O: a first activation costs ONE counter increment whatever the label
+# (the label is sealed beside the counter); a retry costs its distance from the
+# activated generation, bounded by the helper. Seconds, not minutes -- and the
+# heartbeat proves liveness on the console should a TPM be slow.
+log "Activating signed PCR policy generation $PCR_POLICY_SEQ (bounded TPM writes)…"
+heartbeat_start "activating the signed PCR policy generation"
+_pcr_activate_err="$(mktemp /run/ni-pcr-activate.XXXXXX)"
+_pcr_activated="$("$TPM_STATE" pcr-policy-activate "$PCR_POLICY_SEQ" 2>"$_pcr_activate_err")" \
+  || die "TPM refused to commit the activated PCR policy generation: $(tr -d '\n' < "$_pcr_activate_err" | cut -c1-240)"
+bg_stop
+[[ "$_pcr_activated" == "$PCR_POLICY_SEQ" ]] \
   || die "TPM refused to commit the activated PCR policy generation"
+rm -f -- "$_pcr_activate_err"
+log "PCR policy generation $PCR_POLICY_SEQ activated"
 
 mkfs.xfs -q -L sysroot /dev/mapper/system
 mkfs.xfs -q -L data    /dev/mapper/data

@@ -694,6 +694,65 @@ The first medium built on this amendment without the base record (C31,
 the boot check is the second consumer of the counter, and the base is what
 makes the label meaningful to it.
 
+### O. One activation, one increment: the label and the origin are sealed, never spun (2026-09-11)
+
+Completes §M and §N. Both relative contracts were correct and both were
+implemented by spinning the counter to the signed number: `pcr-policy-activate`
+advanced `0x01500007` by the generation label, `ceremony-prepare` advanced
+`0x01500004` by the initial issuance sequence. On swtpm that is instant; on
+the GX10's discrete TPM every increment is a policy session plus an NV write.
+Medium C32 (label 1105, the bench's counter file) sat silent for minutes after
+`Wiped slot 0` while the installer spun the counter 1105 times, and the C29
+ceremony had done the same 1050 times at first boot. The Owner's verdict:
+not an industrial process; an OEM bench cannot be handed a medium whose
+install time depends on a number nobody chose for that purpose.
+
+The security property does not depend on the number of increments. Only the
+DIFFERENCE between the counter and a sealed reference is ever read; the
+reference can carry the signed number itself:
+
+- `0x01500008` seals `(born, label)`: the counter value at first activation as
+  8 big-endian bytes at 8..15 and the generation label activated then at
+  16..23, zeroes to 64. The activated generation is
+  `label + (counter - born)`. A first activation costs ONE increment (the one
+  that sets WRITTEN on the new counter) whatever the label; a pre-ceremony
+  retry at a higher label costs the difference, bounded by
+  `MAX_ACTIVATION_STEPS` (64); a lower label is refused. The initramfs hook
+  reads the same record and unlocks on the same equality. A record written
+  before this amendment carries a zero label, which is exactly the §N reading.
+- The sealed record at `0x01500005` seals the freshness ORIGIN, the initial
+  issuance sequence, at bytes 48..55 (the last 8 bytes stay zero). The
+  high-water is `origin + (counter - base)`, still computed in the one place
+  `freshness_value`; `ceremony-prepare` costs two increments (install and
+  freshness WRITTEN) whatever the sequence; `freshness-consume` advances the
+  counter by the distance to the new sequence, bounded by
+  `MAX_ACTIVATION_STEPS`, and beyond that refuses with signed physical
+  recovery. A record written before this amendment carries a zero origin,
+  which is exactly the §M reading.
+- The installer names the single recovery path on the same console as every
+  refusal: power off, clear the TPM at the firmware setup screen, boot the
+  same medium again. The activation step announces itself and carries the
+  heartbeat like every other long phase, so a slow TPM is visible, never
+  silent.
+
+Industrial criteria this amendment is measured against (Owner, 2026-09-11):
+a bounded, known duration per step, shown on the main console; every refusal
+names its action on that screen; one recovery path.
+
+Evidence: `ota/test-neural-ice-tpm-state.sh` counts the increments through
+the mocked `tpm2_nvincrement` (a first activation at label 1004 and at label
+4096: one increment each; the ceremony at issuance 4: two; the next
+consumption: one), pins the sealed `(born, label)` and `(base, origin)` bytes,
+the 64-step bound with its refusal naming the TPM clear, and the zero-label
+and zero-origin readings of records written before this amendment;
+`image/test-tpm-policy-initramfs.sh` pins the hook on `(born 3, label 250,
+counter 7)`: only generation 254 unlocks (the label alone, the distance alone
+and the absolute value are refused), and the Install-media retry floor with a
+sealed label; `ci/test-swtpm-monotonic-state.sh` activates label 1105 on a
+real TPM in bounded time, reads `(born, label)` back and checks that the
+counter did not move past its birth value and that the ceremony's freshness
+counter equals its sealed base.
+
 ## Consequences
 
 - **The four OTA verification commands gained a required `--candidate-root`.**

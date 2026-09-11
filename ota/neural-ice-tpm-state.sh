@@ -28,20 +28,27 @@
 #               first boot (ADR-0015 amendment M, superseding §J).
 #   0x01500005  THE SEALED RECORD (64 bytes, WRITE-ONCE). Magic, the digest
 #               that binds this machine's access profile, hardware target and
-#               Secure Boot trust policy, then the freshness base as 8 big-endian
-#               bytes. The remaining 16 bytes are fixed zeroes.
+#               Secure Boot trust policy, the freshness base as 8 big-endian
+#               bytes (40..47), then the freshness ORIGIN as 8 big-endian bytes
+#               (48..55, ADR-0015 O): the issuance sequence the ceremony bound
+#               without spinning the counter. The last 8 bytes are fixed zeroes.
+#               high-water = origin + (counter - base).
 #   0x01500007  PCR POLICY COUNTER (`nt=counter`). Present means a signed
 #               PolicyAuthorize generation was activated for LUKS by a factory
 #               install (the pre-ceremony state class). It is born at the chip's
 #               max-ever value like every counter; the installed GENERATION is
-#               `counter - base` with the base sealed in 0x01500008 (ADR-0015 N,
-#               the same relative contract as the freshness base of §M). The
-#               initramfs hook and OTA rotations read that difference; the
-#               absolute value is never compared to anything.
-#   0x01500008  PCR POLICY GENERATION BASE (64 bytes, WRITE-ONCE). Magic, then
-#               the counter value at first activation as 8 big-endian bytes,
-#               zeroes to 64. Written and write-locked by the first activation,
-#               before the counter is advanced to `base + generation`.
+#               `label + (counter - born)` with both sealed in 0x01500008
+#               (ADR-0015 N and O, the same relative contract as the freshness
+#               reading of §M). The initramfs hook and OTA rotations read that
+#               value; the absolute counter is never compared to anything.
+#   0x01500008  PCR POLICY GENERATION BASE (64 bytes, WRITE-ONCE). Magic, the
+#               counter value at first activation as 8 big-endian bytes (8..15),
+#               the generation LABEL activated then as 8 big-endian bytes
+#               (16..23, ADR-0015 O), zeroes to 64. Written and write-locked by
+#               the first activation. A factory install therefore costs ONE
+#               counter increment whatever the label; a later activation costs
+#               its distance from the activated generation, bounded by
+#               MAX_ACTIVATION_STEPS.
 #
 # Neither index overlaps the OTA state indices (0x01500001 legacy floor,
 # 0x01500002 atomic state-v1) or the device-root/PKI persistent handles.
@@ -123,9 +130,10 @@ readonly FRESHNESS_INDEX="0x01500004"
 readonly RECORD_INDEX="0x01500005"
 readonly COMPLETION_INDEX="0x01500006"
 readonly PCR_POLICY_INDEX="0x01500007"
-# The PCR policy GENERATION BASE (ADR-0015 N): the counter value at first
-# activation, sealed write-once. generation = counter - base. Same relative
-# contract as the freshness base of amendment M.
+# The PCR policy GENERATION BASE (ADR-0015 N, O): the counter value and the
+# generation label at first activation, sealed write-once.
+# generation = label + (counter - born). Same relative contract as the
+# freshness reading of amendment M.
 readonly PCR_GENERATION_INDEX="0x01500008"
 readonly OTA_FLOOR_INDEX="0x01500001"
 readonly OTA_ANCHOR_INDEX="0x01500002"
@@ -146,6 +154,16 @@ readonly MAX_SAFE_INTEGER=9007199254740991
 # A machine further behind than this needs signed physical media, which is the
 # same answer as every other "this appliance cannot prove where it is" case.
 readonly MAX_FRESHNESS_GAP=4096
+# How many counter increments ONE activation or consumption may cost on this
+# machine (ADR-0015 O). The first activation and the ceremony seal the label
+# and the origin beside the counter, so they cost one increment whatever the
+# signed sequence is; only a later activation or consumption advances the
+# counter, by its distance from the activated value. A distance beyond this
+# bound is not a normal factory retry or update: the answer is TPM2_Clear and
+# the same medium (install) or signed physical media (runtime). 64 increments
+# stay under a minute on a discrete TPM; 1105 took the GX10 install of
+# 2026-09-11 (C32) past every operator's patience.
+readonly MAX_ACTIVATION_STEPS=64
 
 # The DEFINE-TIME attributes, as the TPM reports them. Asserted on every read: an
 # index redefined with `ownerwrite`, without `nt=counter`, or without
@@ -488,8 +506,8 @@ import sys
 print(open(sys.argv[1], "rb").read()[8:40].hex())
 ' "$WORK/record.bin")"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "the sealed record carries no usable profile binding"
-  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[48:].hex())' "$WORK/record.bin")"
-  [[ "$reserved" == "$(printf '00%.0s' {1..16})" ]] \
+  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[56:].hex())' "$WORK/record.bin")"
+  [[ "$reserved" == "$(printf '00%.0s' {1..8})" ]] \
     || die "the sealed record carries non-zero bytes outside its closed v2 contract"
   printf '%s\n' "$digest"
 }
@@ -510,15 +528,33 @@ print(value)
   printf '%s\n' "$base"
 }
 
-# The issuance high-water this machine reports: counter minus base. The only
-# subtraction in this file, and the only reader of the base.
+# The freshness ORIGIN (ADR-0015 O): the issuance sequence the ceremony bound
+# at the base, sealed in the same record at bytes 48..55, big-endian. A record
+# written before amendment O carries zeroes there, which is exactly the old
+# reading. Readers never guess it and never take it from anywhere else.
+record_origin() { # -> decimal; the record must be sealed (record_read semantics)
+  record_read >/dev/null || return $?
+  local origin
+  origin="$("$(tool python3)" -c '
+import struct, sys
+value, = struct.unpack(">Q", open(sys.argv[1], "rb").read()[48:56])
+print(value)
+' "$WORK/record.bin")"
+  { [[ "$origin" =~ ^[0-9]{1,16}$ ]] && (( origin <= MAX_SAFE_INTEGER )); } \
+    || die "the sealed record carries an unusable freshness origin"
+  printf '%s\n' "$origin"
+}
+
+# The issuance high-water this machine reports: origin plus counter minus base.
+# The only subtraction in this file, and the only reader of the base.
 freshness_value() { # -> decimal; record must be sealed and the counter present
-  local base counter
+  local base origin counter
   base="$(record_base)" || return $?
+  origin="$(record_origin)"
   counter="$(counter_value "$FRESHNESS_INDEX")"
   (( counter >= base )) \
     || die "the freshness counter reads below the base sealed in this machine's record; a counter cannot go backwards and no reader may believe one that did"
-  printf '%s\n' "$(( counter - base ))"
+  printf '%s\n' "$(( origin + counter - base ))"
 }
 
 # --------------------------------------------------------------------------- #
@@ -599,8 +635,8 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
   # is the replay this counter exists for.
   (( requested > high_water )) \
     || die "refusing to consume issuance sequence $requested at or below the recorded high-water $high_water"
-  (( requested - high_water <= MAX_FRESHNESS_GAP )) \
-    || die "issuance sequence $requested is more than $MAX_FRESHNESS_GAP ahead of this machine's high-water $high_water; a TPM counter advances by one and this would not be a normal update"
+  (( requested - high_water <= MAX_ACTIVATION_STEPS )) \
+    || die "issuance sequence $requested is more than $MAX_ACTIVATION_STEPS ahead of this machine's high-water $high_water; a TPM counter advances by one and this would not be a normal update — signed physical recovery is required (docs/ADR-0015)"
   local step
   for (( step = high_water; step < requested; step++ )); do
     increment_counter "$FRESHNESS_INDEX"
@@ -631,8 +667,8 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
 #                                                interrupted install activated
 #   owner authorization sealed                -> this device is provisioned;
 #                                                a reinstall requires TPM2_Clear
-# The generation lives in `counter - base` (base sealed at 0x01500008 by the
-# first activation); the check prints the generation the medium must exceed
+# The generation lives in `label + (counter - born)` (both sealed at 0x01500008
+# by the first activation); the check prints the generation the medium must exceed
 # (0 on a fresh device, activated generation - 1 on a retry) so the installer
 # keeps its `sequence > printed value` guard. No absolute value of this chip is
 # ever a floor for a factory medium.
@@ -659,7 +695,7 @@ pcr_generation_state() { # -> absent | sealed ; dies on an interrupted record
   printf 'sealed\n'
 }
 
-pcr_generation_base() { # -> decimal; the base record must be sealed
+pcr_generation_read() { # -> "born label"; the base record must be sealed
   [[ "$(pcr_generation_state)" == sealed ]] || return 2
   "$(tool tpm2_nvread)" "$PCR_GENERATION_INDEX" -C "$PCR_GENERATION_INDEX" -s "$RECORD_BYTES" \
     -o "$WORK/pcr-generation.bin" >/dev/null 2>&1 \
@@ -668,32 +704,43 @@ pcr_generation_base() { # -> decimal; the base record must be sealed
     || die "the PCR policy generation base did not return $RECORD_BYTES bytes"
   [[ "$(head -c 8 "$WORK/pcr-generation.bin")" == "$PCR_GENERATION_MAGIC" ]] \
     || die "the record at $PCR_GENERATION_INDEX is not this appliance's PCR policy generation base"
-  local base reserved
-  base="$("$(tool python3)" -c '
+  local born label reserved
+  read -r born label < <("$(tool python3)" -c '
 import struct, sys
 body = open(sys.argv[1], "rb").read()
-value, = struct.unpack(">Q", body[8:16])
-print(value)
-' "$WORK/pcr-generation.bin")"
-  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[16:].hex())' "$WORK/pcr-generation.bin")"
-  [[ "$reserved" == "$(printf '00%.0s' {1..48})" ]] \
+born, label = struct.unpack(">QQ", body[8:24])
+print(born, label)
+' "$WORK/pcr-generation.bin")
+  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[24:].hex())' "$WORK/pcr-generation.bin")"
+  [[ "$reserved" == "$(printf '00%.0s' {1..40})" ]] \
     || die "the PCR policy generation base carries bytes outside its closed contract"
-  { [[ "$base" =~ ^[0-9]{1,16}$ ]] && (( base <= MAX_SAFE_INTEGER )); } \
+  { [[ "$born" =~ ^[0-9]{1,16}$ ]] && (( born <= MAX_SAFE_INTEGER )); } \
     || die "the PCR policy generation base is not a safe integer"
-  printf '%s\n' "$base"
+  { [[ "$label" =~ ^[0-9]{1,16}$ ]] && (( label <= MAX_SAFE_INTEGER )); } \
+    || die "the PCR policy generation label is not a safe integer"
+  printf '%s %s\n' "$born" "$label"
 }
 
-write_pcr_generation() { # $1=counter value to seal as the base; workspace and policies already prepared
+pcr_generation_base() { # -> decimal counter value at first activation
+  local born label
+  read -r born label < <(pcr_generation_read) || return $?
+  [[ -n "$born" ]] || return 2
+  printf '%s\n' "$born"
+}
+
+write_pcr_generation() { # $1=counter value at first activation $2=generation label activated then
   { [[ "$1" =~ ^[0-9]{1,16}$ ]] && (( 10#$1 <= MAX_SAFE_INTEGER )); } \
     || die "the PCR policy generation base to seal is not a safe integer"
+  { [[ "$2" =~ ^[0-9]{1,16}$ ]] && (( 10#$2 <= MAX_SAFE_INTEGER )); } \
+    || die "the PCR policy generation label to seal is not a safe integer"
   "$(tool tpm2_nvdefine)" "$PCR_GENERATION_INDEX" -C o -s "$RECORD_BYTES" \
     -a "policywrite|authread|ownerread|writedefine" -L "$WORK/policy-record" \
     >/dev/null 2>&1 || die "cannot provision the PCR policy generation base at $PCR_GENERATION_INDEX"
   "$(tool python3)" -c '
 import struct, sys
-blob = sys.argv[1].encode("ascii") + struct.pack(">Q", int(sys.argv[2]))
-open(sys.argv[3], "wb").write(blob.ljust(int(sys.argv[4]), b"\x00"))
-' "$PCR_GENERATION_MAGIC" "$1" "$WORK/pcr-generation-new.bin" "$RECORD_BYTES"
+blob = sys.argv[1].encode("ascii") + struct.pack(">QQ", int(sys.argv[2]), int(sys.argv[3]))
+open(sys.argv[4], "wb").write(blob.ljust(int(sys.argv[5]), b"\x00"))
+' "$PCR_GENERATION_MAGIC" "$1" "$2" "$WORK/pcr-generation-new.bin" "$RECORD_BYTES"
   session_for TPM2_CC_NV_Write or
   "$(tool tpm2_nvwrite)" "$PCR_GENERATION_INDEX" -C "$PCR_GENERATION_INDEX" -P "session:$SESSION" \
     -i "$WORK/pcr-generation-new.bin" >/dev/null 2>&1 || die "the TPM refused to write the PCR policy generation base"
@@ -702,12 +749,12 @@ open(sys.argv[3], "wb").write(blob.ljust(int(sys.argv[4]), b"\x00"))
   "$(tool tpm2_nvwritelock)" "$PCR_GENERATION_INDEX" -C "$PCR_GENERATION_INDEX" -P "session:$SESSION" \
     >/dev/null 2>&1 || die "the TPM refused to write-lock the PCR policy generation base"
   session_close
-  [[ "$(pcr_generation_base)" == "$1" ]] || die "the PCR policy generation base did not read back exactly"
+  [[ "$(pcr_generation_read)" == "$1 $2" ]] || die "the PCR policy generation base did not read back exactly"
 }
 
-# The activated generation of this device: counter minus the sealed base. The
-# only reading any consumer (initramfs hook, OTA rotation, this helper) may
-# compare a signed generation label with.
+# The activated generation of this device: the sealed label plus the counter's
+# distance from its sealed birth value. The only reading any consumer
+# (initramfs hook, OTA rotation, this helper) may compare a signed label with.
 pcr_policy_generation() {
   (( $# == 0 )) || die "pcr-policy-generation takes no argument"
   with_workspace; compute_policies
@@ -715,13 +762,15 @@ pcr_policy_generation() {
 }
 
 pcr_policy_generation_value() { # workspace prepared -> decimal generation; dies when the pair is incomplete
-  local current base
-  current="$(pcr_policy_current)"
-  base="$(pcr_generation_base)" \
+  local counter born label
+  counter="$(pcr_policy_current)"
+  read -r born label < <(pcr_generation_read) \
     || die "the PCR policy generation base is absent while the counter exists; signed physical recovery is required"
-  (( current >= base )) \
-    || die "the PCR policy counter ($current) reads below its sealed base ($base): counters do not go backwards"
-  printf '%s\n' $(( current - base ))
+  [[ -n "$born" && -n "$label" ]] \
+    || die "the PCR policy generation base is absent while the counter exists; signed physical recovery is required"
+  (( counter >= born )) \
+    || die "the PCR policy counter ($counter) reads below its sealed base ($born): counters do not go backwards"
+  printf '%s\n' $(( label + counter - born ))
 }
 
 pcr_policy_state() { # -> fresh | retry ; dies when the device is already provisioned
@@ -755,16 +804,16 @@ pcr_policy_check() { # $1=signed candidate sequence -> the generation the medium
   fi
   generation="$(pcr_policy_generation_value)"
   (( requested >= generation )) \
-    || die "refusing signed PCR policy generation $requested below the generation $generation an interrupted install already activated on this device; use a medium at or above it"
-  (( requested - generation <= MAX_FRESHNESS_GAP )) \
-    || die "signed PCR policy generation $requested is more than $MAX_FRESHNESS_GAP ahead of the activated generation $generation"
+    || die "refusing signed PCR policy generation $requested below the generation $generation an interrupted install already activated on this device; clear the TPM at the firmware setup screen, then boot this medium again"
+  (( requested - generation <= MAX_ACTIVATION_STEPS )) \
+    || die "signed PCR policy generation $requested is more than $MAX_ACTIVATION_STEPS ahead of the activated generation $generation; clear the TPM at the firmware setup screen, then boot this medium again"
   printf '%s\n' $(( generation - 1 ))
 }
 
 pcr_policy_activate() { # $1=signed sequence whose two LUKS tokens succeeded
   (( $# == 1 )) || die "pcr-policy-activate requires exactly one signed policy sequence"
   validate_pcr_policy_seq "$1"
-  local requested=$((10#$1)) state generation step base
+  local requested=$((10#$1)) state generation step
   with_workspace; compute_policies
   state="$(pcr_policy_state)"
   if [[ "$state" == fresh ]]; then
@@ -773,19 +822,19 @@ pcr_policy_activate() { # $1=signed sequence whose two LUKS tokens succeeded
   fi
   if [[ "$(pcr_generation_state)" == absent ]]; then
     # First activation (or a retry interrupted before the base was sealed): the
-    # counter's current value is the base, then the counter advances by the
-    # generation label so that counter - base == label.
+    # counter's current value and the label are sealed together, so the
+    # generation reads as the label at once. ONE increment, whatever the label
+    # (ADR-0015 O); the counter is never spun to a signed number.
     (( requested <= MAX_FRESHNESS_GAP )) \
       || die "signed PCR policy generation $requested is beyond the $MAX_FRESHNESS_GAP activation window of a fresh device"
-    base="$(pcr_policy_current)"
-    write_pcr_generation "$base"
-    generation=0
+    write_pcr_generation "$(pcr_policy_current)" "$requested"
+    generation=$requested
   else
     generation="$(pcr_policy_generation_value)"
     (( requested >= generation )) \
-      || die "refusing to activate signed PCR policy generation $requested below the generation $generation already activated on this device"
-    (( requested - generation <= MAX_FRESHNESS_GAP )) \
-      || die "signed PCR policy generation $requested is more than $MAX_FRESHNESS_GAP ahead of the activated generation $generation"
+      || die "refusing to activate signed PCR policy generation $requested below the generation $generation already activated on this device; clear the TPM at the firmware setup screen, then boot this medium again"
+    (( requested - generation <= MAX_ACTIVATION_STEPS )) \
+      || die "signed PCR policy generation $requested is more than $MAX_ACTIVATION_STEPS ahead of the activated generation $generation; clear the TPM at the firmware setup screen, then boot this medium again"
   fi
   for (( step = generation; step < requested; step++ )); do
     increment_counter "$PCR_POLICY_INDEX"
@@ -825,18 +874,20 @@ profile_bind() { # read-only compatibility gate; provisioning belongs to ceremon
   printf '%s\n' "$wanted"
 }
 
-write_record() { # $1=binding digest $2=freshness base; workspace and policies already prepared
+write_record() { # $1=binding digest $2=freshness base $3=freshness origin; workspace and policies already prepared
   { [[ "$2" =~ ^[0-9]{1,16}$ ]] && (( 10#$2 <= MAX_SAFE_INTEGER )); } \
     || die "the freshness base to seal is not a safe integer"
+  { [[ "$3" =~ ^[0-9]{1,16}$ ]] && (( 10#$3 <= MAX_SAFE_INTEGER )); } \
+    || die "the freshness origin to seal is not a safe integer"
   "$(tool tpm2_nvdefine)" "$RECORD_INDEX" -C o -s "$RECORD_BYTES" \
     -a "policywrite|authread|ownerread|writedefine" -L "$WORK/policy-record" \
     >/dev/null 2>&1 || die "cannot provision the sealed record at $RECORD_INDEX"
   "$(tool python3)" -c '
 import struct, sys
-magic, digest, base, size = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-blob = magic.encode("ascii") + bytes.fromhex(digest) + struct.pack(">Q", base)
-open(sys.argv[5], "wb").write(blob.ljust(size, b"\x00"))
-' "$RECORD_MAGIC" "$1" "$2" "$RECORD_BYTES" "$WORK/record-new.bin"
+magic, digest, base, origin, size = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+blob = magic.encode("ascii") + bytes.fromhex(digest) + struct.pack(">Q", base) + struct.pack(">Q", origin)
+open(sys.argv[6], "wb").write(blob.ljust(size, b"\x00"))
+' "$RECORD_MAGIC" "$1" "$2" "$3" "$RECORD_BYTES" "$WORK/record-new.bin"
   session_for TPM2_CC_NV_Write or
   "$(tool tpm2_nvwrite)" "$RECORD_INDEX" -C "$RECORD_INDEX" -P "session:$SESSION" \
     -i "$WORK/record-new.bin" >/dev/null 2>&1 || die "the TPM refused to write the sealed record"
@@ -847,6 +898,7 @@ open(sys.argv[5], "wb").write(blob.ljust(size, b"\x00"))
   session_close
   [[ "$(record_read)" == "$1" ]] || die "the sealed record did not read back exactly"
   [[ "$(record_base)" == "$2" ]] || die "the sealed record's freshness base did not read back exactly"
+  [[ "$(record_origin)" == "$3" ]] || die "the sealed record's freshness origin did not read back exactly"
 }
 
 completion_read_versioned() {
@@ -1188,7 +1240,7 @@ ceremony_prepare_impl() { # optional owner floor, profile, target, policy, initi
   local owner_floor=$1; shift
   (( $# == 4 )) || die "internal ceremony-prepare argument mismatch"
   validate_profile "$1"; validate_target "$2"; validate_policy_id "$3"
-  local requested="$4" wanted index current step
+  local requested="$4" wanted index
   if ! [[ "$requested" =~ ^[0-9]{1,16}$ ]] || (( requested > MAX_SAFE_INTEGER )); then
     die "'$requested' is not a valid initial issuance sequence"
   fi
@@ -1232,10 +1284,9 @@ ceremony_prepare_impl() { # optional owner floor, profile, target, policy, initi
   # in its record; the issuance high-water is counted from it, never from zero.
   local base
   base="$(counter_value "$FRESHNESS_INDEX")"
-  (( requested <= MAX_FRESHNESS_GAP )) \
-    || die "initial issuance sequence $requested is more than $MAX_FRESHNESS_GAP; a TPM counter advances by one and this ceremony will not spin it that far"
-  for (( step = 0; step < requested; step++ )); do increment_counter "$FRESHNESS_INDEX"; done
-  write_record "$wanted" "$base"
+  # ADR-0015 O: the initial issuance sequence is sealed as the ORIGIN beside
+  # the base; the counter is not spun to it. The ceremony costs one increment.
+  write_record "$wanted" "$base" "$requested"
   assert_fixed_state "$wanted"
   printf '%s %s %s\n' "$(counter_value "$COUNTER_INDEX")" \
     "$(freshness_value)" "$wanted"
