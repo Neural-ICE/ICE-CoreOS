@@ -411,19 +411,38 @@ activate_pcr_policy
   || fail "PCR-only pre-ceremony state was not identified"
 prerequisite_digest="$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")"
 
-# Replay/lower/equal are refusals; only a strictly newer signed generation may
-# move the fixed 0x01500007 high-water, and check itself never mutates it.
-st pcr-policy-check 1 >/dev/null 2>&1 && fail "equal PCR policy sequence replayed"
+# ADR-0015 N: installation is a factory operation. Before the owner ceremony a
+# retry is allowed with ANY signed generation (the medium's generation is a
+# label, never compared to this chip's counter), the check writes nothing and
+# prints 0, and every activation advances 0x01500007 by exactly one.
+counter_value_of() { python3 -c 'import struct,sys; print(struct.unpack(">Q",open(sys.argv[1],"rb").read())[0])' "$NV/$1/data"; }
+before="$(counter_value_of 01500007)"
+[ "$(st pcr-policy-check 1)" = 0 ] || fail "pre-ceremony retry of the same generation was refused"
 st pcr-policy-check 0 >/dev/null 2>&1 && fail "zero PCR policy sequence was accepted"
-[ "$(st pcr-policy-check 2)" = 1 ] || fail "next PCR policy sequence was refused"
-[ "$(st pcr-policy-activate 2)" = 2 ] || fail "next PCR policy sequence did not activate"
-st pcr-policy-activate 2 >/dev/null 2>&1 && fail "equal PCR policy activation replayed"
+[ "$(counter_value_of 01500007)" = "$before" ] || fail "the read-only check moved the activation counter"
+[ "$(st pcr-policy-check 2)" = 0 ] || fail "pre-ceremony retry of another generation was refused"
+[ "$(st pcr-policy-activate 2)" = 2 ] || fail "pre-ceremony retry did not activate"
+[ "$(counter_value_of 01500007)" = "$((before + 1))" ] || fail "activation did not advance the counter by exactly one"
+[ "$(st pcr-policy-activate 2)" = 2 ] || fail "a second pre-ceremony retry of the same generation was refused"
+[ "$(counter_value_of 01500007)" = "$((before + 2))" ] || fail "the second activation did not advance the counter by exactly one"
 [ "$(st provisioning-status)" = pcr-policy-activated ] \
-  || fail "higher PCR policy activation left the supported pre-ceremony state"
+  || fail "pre-ceremony retries left the supported pre-ceremony state"
 [ "$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")" = "$prerequisite_digest" ] \
-  || fail "higher PCR policy activation changed persistent prerequisites"
-[ "$(st pcr-policy-check 3)" = 2 ] \
-  || fail "higher PCR policy activation did not persist as the durable high-water"
+  || fail "pre-ceremony retries changed persistent prerequisites"
+
+# THE C30 CASE (GX10, 2026-09-11): the PCR policy index is absent after a TPM
+# Clear but the chip's counters already reached 1050 (the previous cycle's
+# issuance). A factory medium sealed at generation 1004 must install: the
+# activation counter is born at 1050 and reads 1051, the generation is a label.
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"
+printf '1050' > "$NV/.max-ever"
+[ "$(st pcr-policy-check 1004)" = 0 ] || fail "a factory medium was compared to the chip's counter history"
+[ ! -d "$NV/01500007" ] || fail "the read-only check created the activation counter"
+[ "$(st pcr-policy-activate 1004)" = 1004 ] || fail "a factory generation below the chip's max-ever did not activate"
+[ "$(counter_value_of 01500007)" = 1051 ] || fail "the activation counter was not born at the chip's max-ever"
+[ "$(st provisioning-status)" = pcr-policy-activated ] || fail "the C30 install was not identified as pre-ceremony state"
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK"
+activate_pcr_policy
 
 # Interrupted ceremony: fixed state landed, owner auth did not. Deleting record
 # only, then record+freshness, must never make the mock call the TPM virgin once
@@ -490,6 +509,9 @@ PY
 [ "$(st runtime-status customer-locked "$TARGET" "$POLICY" \
   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4)" = complete ] \
   || fail "completed state did not pass runtime status"
+out="$(st pcr-policy-check 4096 2>&1)" && fail "a provisioned device accepted a factory install without TPM2_Clear"
+grep -Fq 'requires TPM2_Clear' <<<"$out" || fail "the provisioned-device refusal does not name TPM2_Clear: $out"
+st pcr-policy-activate 4096 >/dev/null 2>&1 && fail "a provisioned device activated a factory generation without TPM2_Clear"
 [ "$(st counter-read)" = 22 ] || fail "install counter mismatch"
 [ "$(st freshness-read)" = 4 ] || fail "freshness is not counted from the sealed base"
 python3 - "$NV/01500004/data" "$NV/01500005/data" <<'PY' || fail "the counter was not born at the chip's max-ever, or the record does not seal that base"

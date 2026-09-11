@@ -1807,10 +1807,15 @@ readonly LIVE_PCR7 LIVE_PCR7_POLICY AVAILABLE_PCR7_POLICIES
 log "Live SHA-256 PCR7 = $LIVE_PCR7"
 log "Live PCR7 PolicyPCR digest = $LIVE_PCR7_POLICY"
 log "Available signed PolicyPCR digests = $AVAILABLE_PCR7_POLICIES"
-PCR_POLICY_HIGH_WATER="$("$TPM_STATE" pcr-policy-check "$PCR_POLICY_SEQ")" \
-  || die "signed PCR policy sequence $PCR_POLICY_SEQ is replayed, stale or outside the TPM high-water window"
+# ADR-0015 N: installation is a factory operation. The check refuses a device
+# that already holds a sealed owner authorization (TPM2_Clear first) and never
+# compares the medium's generation to this chip's counter history; it prints 0.
+_pcr_check_err="$(mktemp /run/ni-pcr-check.XXXXXX)"
+PCR_POLICY_HIGH_WATER="$("$TPM_STATE" pcr-policy-check "$PCR_POLICY_SEQ" 2>"$_pcr_check_err")" \
+  || die "this device cannot take a factory install of signed PCR policy generation $PCR_POLICY_SEQ: $(tr -d '\n' < "$_pcr_check_err" | cut -c1-240)"
+rm -f -- "$_pcr_check_err"
 [[ "$PCR_POLICY_HIGH_WATER" =~ ^[0-9]{1,16}$ && "$PCR_POLICY_SEQ" -gt "$PCR_POLICY_HIGH_WATER" ]] \
-  || die "TPM PCR policy high-water check returned malformed state"
+  || die "TPM PCR policy check returned malformed state"
 
 
 # --------------------------------------------------------------------------- #
