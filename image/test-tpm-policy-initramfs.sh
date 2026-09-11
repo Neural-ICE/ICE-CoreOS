@@ -137,6 +137,19 @@ cp "$PARSER" "$test_root/lib/neural-ice-tpm2-nv-public.sh"
 # a deviation; every deviation must be refused before the counter is read.
 cat >"$tools/tpm2_nvreadpublic" <<'EOF2'
 #!/bin/sh
+if [ "$1" = 0x01500008 ]; then
+  # The sealed generation base (ADR-0015 N): a 64-byte write-once record.
+  [ "${NI_TEST_BASE_ABSENT:-0}" != 1 ] || exit 90
+  base_attributes=${NI_TEST_BASE_ATTRIBUTES:-0x20062808}
+  base_policy=${NI_TEST_BASE_POLICY:-F83217E5A2A04342F7DAA55CCFB3CD4B8A1F1E8EBB28C7719A9ABBDBD638A230}
+  printf '0x1500008:\n'
+  printf '  name: 000b%s\n' "$(printf 'd%.0s' $(seq 64))"
+  printf '  hash algorithm:\n    friendly: sha256\n    value: 0xB\n'
+  printf '  attributes:\n    friendly: policywrite|writedefine|ownerread|authread|written|writelocked\n    value: %s\n' "$base_attributes"
+  printf '  size: %s\n' "${NI_TEST_BASE_SIZE:-64}"
+  printf '  authorization policy: %s\n' "$base_policy"
+  exit 0
+fi
 test "$1" = 0x01500007 || exit 90
 name=000b$(printf 'c%.0s' $(seq 64))
 policy=${NI_TEST_NV_POLICY:-E8C02D3C5E701670CBAA327DB1A2E9F3F41B2C22793E5C669A6E7F44B912F6C0}
@@ -201,6 +214,16 @@ while [ "$#" -gt 0 ]; do
 done
 test -n "$out" || exit 91
 [ -n "$auth" ] && [ "$auth" = "$index" ] || { echo "tpm2_nvread: owner hierarchy authorization failed (sealed)" >&2; exit 93; }
+if [ "$index" = 0x01500008 ]; then
+  case "${NI_TEST_BASE_RECORD:-real}" in
+    real) { printf 'NI-PCRG1'; printf '\000\000\000\000\000\000\000'; printf "\\$(printf '%03o' "${NI_TEST_BASE:-0}")"; head -c 48 /dev/zero; } >"$out" ;;
+    wrong-magic) { printf 'NI-XXXX1'; head -c 56 /dev/zero; } >"$out" ;;
+    dirty-reserved) { printf 'NI-PCRG1'; head -c 8 /dev/zero; printf 'x'; head -c 47 /dev/zero; } >"$out" ;;
+    short) printf 'NI-PCRG1' >"$out" ;;
+    *) exit 92 ;;
+  esac
+  exit 0
+fi
 : >"${NI_TEST_NVREAD_TRACE:-/dev/null}"
 case "${NI_TEST_COUNTER_SEQ:-7}" in
   4) printf '\000\000\000\000\000\000\000\004' >"$out" ;;
@@ -293,6 +316,24 @@ must_accept after_nv_advance run_hook NI_TEST_COUNTER_SEQ=8
 write_cmdline 7
 must_refuse old_uki_after_power_cycle run_hook NI_TEST_COUNTER_SEQ=8
 
+# ADR-0015 N: the generation is counter minus the sealed base. A chip whose
+# counter was born at 3 and activated for generation 4 reads 7; only the UKI
+# sealed for generation 4 unlocks, never the one carrying the absolute value.
+write_cmdline 4
+must_accept relative_generation run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=3
+write_cmdline 7
+must_refuse absolute_counter_as_generation run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=3
+write_cmdline 7
+must_refuse base_record_absent run_hook NI_TEST_BASE_ABSENT=1
+must_refuse counter_below_base run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=8
+must_refuse base_wrong_policy run_hook NI_TEST_BASE_POLICY="${POLICY%?}1"
+must_refuse base_not_sealed run_hook NI_TEST_BASE_ATTRIBUTES=0x20062008
+must_refuse base_wrong_size run_hook NI_TEST_BASE_SIZE=8
+must_refuse base_wrong_magic run_hook NI_TEST_BASE_RECORD=wrong-magic
+must_refuse base_dirty_reserved run_hook NI_TEST_BASE_RECORD=dirty-reserved
+must_refuse base_short run_hook NI_TEST_BASE_RECORD=short
+must_accept base_zero_restored run_hook
+
 printf 'quiet neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
 must_refuse absent_sequence run_hook
 printf 'neuralice.pcr_policy_seq=7 neuralice.pcr_policy_seq=7 neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
@@ -369,8 +410,17 @@ write_install_cmdline 5
 must_accept preceremony_retry run_hook \
   NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
 write_install_cmdline 4
-must_refuse preceremony_equal_generation run_hook \
+must_accept preceremony_equal_generation run_hook \
   NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 4
+must_accept preceremony_base_absent_interrupted_activation run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n' NI_TEST_BASE_ABSENT=1
+write_install_cmdline 2
+must_accept preceremony_relative_generation run_hook \
+  NI_TEST_COUNTER_SEQ=8 NI_TEST_BASE=6 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 1
+must_refuse preceremony_below_relative_generation run_hook \
+  NI_TEST_COUNTER_SEQ=8 NI_TEST_BASE=6 NI_TEST_NV_HANDLES='- 0x1500007\n'
 write_install_cmdline 3
 must_refuse preceremony_lower_generation run_hook \
   NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'

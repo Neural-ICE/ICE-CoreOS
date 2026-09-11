@@ -30,16 +30,18 @@
 #               that binds this machine's access profile, hardware target and
 #               Secure Boot trust policy, then the freshness base as 8 big-endian
 #               bytes. The remaining 16 bytes are fixed zeroes.
-#   0x01500007  PCR POLICY ACTIVATION COUNTER (`nt=counter`). Present means a
-#               signed PolicyAuthorize generation was activated for LUKS by a
-#               factory install (the pre-ceremony state class). It advances by
-#               one per activation, only after both enrolled tokens read back.
-#               Its absolute value is chip-relative (born at the chip's max-ever)
-#               and carries NO generation number (ADR-0015 N): the installed
-#               generation is the sealed kernel command line's
-#               `neuralice.pcr_policy_seq`; which generations a factory medium
-#               may install is governed by the release authorization's signed
-#               floor, never by this chip's history.
+#   0x01500007  PCR POLICY COUNTER (`nt=counter`). Present means a signed
+#               PolicyAuthorize generation was activated for LUKS by a factory
+#               install (the pre-ceremony state class). It is born at the chip's
+#               max-ever value like every counter; the installed GENERATION is
+#               `counter - base` with the base sealed in 0x01500008 (ADR-0015 N,
+#               the same relative contract as the freshness base of §M). The
+#               initramfs hook and OTA rotations read that difference; the
+#               absolute value is never compared to anything.
+#   0x01500008  PCR POLICY GENERATION BASE (64 bytes, WRITE-ONCE). Magic, then
+#               the counter value at first activation as 8 big-endian bytes,
+#               zeroes to 64. Written and write-locked by the first activation,
+#               before the counter is advanced to `base + generation`.
 #
 # Neither index overlaps the OTA state indices (0x01500001 legacy floor,
 # 0x01500002 atomic state-v1) or the device-root/PKI persistent handles.
@@ -121,10 +123,15 @@ readonly FRESHNESS_INDEX="0x01500004"
 readonly RECORD_INDEX="0x01500005"
 readonly COMPLETION_INDEX="0x01500006"
 readonly PCR_POLICY_INDEX="0x01500007"
+# The PCR policy GENERATION BASE (ADR-0015 N): the counter value at first
+# activation, sealed write-once. generation = counter - base. Same relative
+# contract as the freshness base of amendment M.
+readonly PCR_GENERATION_INDEX="0x01500008"
 readonly OTA_FLOOR_INDEX="0x01500001"
 readonly OTA_ANCHOR_INDEX="0x01500002"
 readonly RECORD_BYTES=64
 readonly RECORD_MAGIC="NI-TPM02"
+readonly PCR_GENERATION_MAGIC="NI-PCRG1"
 readonly COMPLETION_MAGIC="NI-DONE1"
 readonly COMPLETION_MAGIC_V2="NI-DONE2"
 # Domain separation: the same three words must never hash to a value some other
@@ -619,11 +626,16 @@ freshness_consume() { # $1=the signed issuance sequence being consumed
 # is the only writer and is called only after both signed-policy tokens were
 # enrolled and read back successfully by systemd-cryptenroll.
 #   absent index, owner authorization unset   -> a fresh factory install
-#   present index, owner authorization unset  -> a pre-ceremony retry (allowed)
+#   present index, owner authorization unset  -> a pre-ceremony retry, allowed
+#                                                at or above the generation the
+#                                                interrupted install activated
 #   owner authorization sealed                -> this device is provisioned;
 #                                                a reinstall requires TPM2_Clear
-# The check prints 0: the installer keeps its `sequence > printed value` guard,
-# and no value of this chip is ever a floor for a factory medium.
+# The generation lives in `counter - base` (base sealed at 0x01500008 by the
+# first activation); the check prints the generation the medium must exceed
+# (0 on a fresh device, activated generation - 1 on a retry) so the installer
+# keeps its `sequence > printed value` guard. No absolute value of this chip is
+# ever a floor for a factory medium.
 # --------------------------------------------------------------------------- #
 validate_pcr_policy_seq() {
   if ! [[ "$1" =~ ^[1-9][0-9]{0,15}$ ]] || (( 10#$1 > MAX_SAFE_INTEGER )); then
@@ -636,6 +648,80 @@ pcr_policy_current() { # -> the activation counter's absolute (chip-relative) va
     || die "the PCR policy activation counter is absent; signed physical recovery is required"
   assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
   counter_value "$PCR_POLICY_INDEX"
+}
+
+pcr_generation_state() { # -> absent | sealed ; dies on an interrupted record
+  index_present "$PCR_GENERATION_INDEX" || { printf 'absent\n'; return 0; }
+  assert_index_shape "$PCR_GENERATION_INDEX" "$RECORD_ATTRIBUTES" "$POLICY_RECORD" "$RECORD_BYTES"
+  local raw; raw="$(index_raw_attributes "$PCR_GENERATION_INDEX")"
+  (( ( raw & RECORD_SEALED_BITS ) == RECORD_SEALED_BITS )) \
+    || die "the PCR policy generation base at $PCR_GENERATION_INDEX exists but is not sealed; that is an interrupted activation, and signed physical recovery is required"
+  printf 'sealed\n'
+}
+
+pcr_generation_base() { # -> decimal; the base record must be sealed
+  [[ "$(pcr_generation_state)" == sealed ]] || return 2
+  "$(tool tpm2_nvread)" "$PCR_GENERATION_INDEX" -C "$PCR_GENERATION_INDEX" -s "$RECORD_BYTES" \
+    -o "$WORK/pcr-generation.bin" >/dev/null 2>&1 \
+    || die "the PCR policy generation base exists at $PCR_GENERATION_INDEX but cannot be read"
+  [[ "$(wc -c < "$WORK/pcr-generation.bin" | tr -d '[:space:]')" == "$RECORD_BYTES" ]] \
+    || die "the PCR policy generation base did not return $RECORD_BYTES bytes"
+  [[ "$(head -c 8 "$WORK/pcr-generation.bin")" == "$PCR_GENERATION_MAGIC" ]] \
+    || die "the record at $PCR_GENERATION_INDEX is not this appliance's PCR policy generation base"
+  local base reserved
+  base="$("$(tool python3)" -c '
+import struct, sys
+body = open(sys.argv[1], "rb").read()
+value, = struct.unpack(">Q", body[8:16])
+print(value)
+' "$WORK/pcr-generation.bin")"
+  reserved="$("$(tool python3)" -c 'import sys; print(open(sys.argv[1], "rb").read()[16:].hex())' "$WORK/pcr-generation.bin")"
+  [[ "$reserved" == "$(printf '00%.0s' {1..48})" ]] \
+    || die "the PCR policy generation base carries bytes outside its closed contract"
+  { [[ "$base" =~ ^[0-9]{1,16}$ ]] && (( base <= MAX_SAFE_INTEGER )); } \
+    || die "the PCR policy generation base is not a safe integer"
+  printf '%s\n' "$base"
+}
+
+write_pcr_generation() { # $1=counter value to seal as the base; workspace and policies already prepared
+  { [[ "$1" =~ ^[0-9]{1,16}$ ]] && (( 10#$1 <= MAX_SAFE_INTEGER )); } \
+    || die "the PCR policy generation base to seal is not a safe integer"
+  "$(tool tpm2_nvdefine)" "$PCR_GENERATION_INDEX" -C o -s "$RECORD_BYTES" \
+    -a "policywrite|authread|ownerread|writedefine" -L "$WORK/policy-record" \
+    >/dev/null 2>&1 || die "cannot provision the PCR policy generation base at $PCR_GENERATION_INDEX"
+  "$(tool python3)" -c '
+import struct, sys
+blob = sys.argv[1].encode("ascii") + struct.pack(">Q", int(sys.argv[2]))
+open(sys.argv[3], "wb").write(blob.ljust(int(sys.argv[4]), b"\x00"))
+' "$PCR_GENERATION_MAGIC" "$1" "$WORK/pcr-generation-new.bin" "$RECORD_BYTES"
+  session_for TPM2_CC_NV_Write or
+  "$(tool tpm2_nvwrite)" "$PCR_GENERATION_INDEX" -C "$PCR_GENERATION_INDEX" -P "session:$SESSION" \
+    -i "$WORK/pcr-generation-new.bin" >/dev/null 2>&1 || die "the TPM refused to write the PCR policy generation base"
+  session_close
+  session_for TPM2_CC_NV_WriteLock or
+  "$(tool tpm2_nvwritelock)" "$PCR_GENERATION_INDEX" -C "$PCR_GENERATION_INDEX" -P "session:$SESSION" \
+    >/dev/null 2>&1 || die "the TPM refused to write-lock the PCR policy generation base"
+  session_close
+  [[ "$(pcr_generation_base)" == "$1" ]] || die "the PCR policy generation base did not read back exactly"
+}
+
+# The activated generation of this device: counter minus the sealed base. The
+# only reading any consumer (initramfs hook, OTA rotation, this helper) may
+# compare a signed generation label with.
+pcr_policy_generation() {
+  (( $# == 0 )) || die "pcr-policy-generation takes no argument"
+  with_workspace; compute_policies
+  pcr_policy_generation_value
+}
+
+pcr_policy_generation_value() { # workspace prepared -> decimal generation; dies when the pair is incomplete
+  local current base
+  current="$(pcr_policy_current)"
+  base="$(pcr_generation_base)" \
+    || die "the PCR policy generation base is absent while the counter exists; signed physical recovery is required"
+  (( current >= base )) \
+    || die "the PCR policy counter ($current) reads below its sealed base ($base): counters do not go backwards"
+  printf '%s\n' $(( current - base ))
 }
 
 pcr_policy_state() { # -> fresh | retry ; dies when the device is already provisioned
@@ -655,26 +741,57 @@ pcr_policy_state() { # -> fresh | retry ; dies when the device is already provis
   printf 'fresh\n'
 }
 
-pcr_policy_check() { # $1=signed candidate sequence
+pcr_policy_check() { # $1=signed candidate sequence -> the generation the medium must exceed
   (( $# == 1 )) || die "pcr-policy-check requires exactly one signed policy sequence"
   validate_pcr_policy_seq "$1"
+  local requested=$((10#$1)) state generation
   with_workspace; compute_policies
-  pcr_policy_state >/dev/null
-  printf '0\n'
+  state="$(pcr_policy_state)"
+  if [[ "$state" == fresh ]] || [[ "$(pcr_generation_state)" == absent ]]; then
+    (( requested <= MAX_FRESHNESS_GAP )) \
+      || die "signed PCR policy generation $requested is beyond the $MAX_FRESHNESS_GAP activation window of a fresh device"
+    printf '0\n'
+    return 0
+  fi
+  generation="$(pcr_policy_generation_value)"
+  (( requested >= generation )) \
+    || die "refusing signed PCR policy generation $requested below the generation $generation an interrupted install already activated on this device; use a medium at or above it"
+  (( requested - generation <= MAX_FRESHNESS_GAP )) \
+    || die "signed PCR policy generation $requested is more than $MAX_FRESHNESS_GAP ahead of the activated generation $generation"
+  printf '%s\n' $(( generation - 1 ))
 }
 
 pcr_policy_activate() { # $1=signed sequence whose two LUKS tokens succeeded
   (( $# == 1 )) || die "pcr-policy-activate requires exactly one signed policy sequence"
   validate_pcr_policy_seq "$1"
-  local requested=$((10#$1)) state
+  local requested=$((10#$1)) state generation step base
   with_workspace; compute_policies
   state="$(pcr_policy_state)"
   if [[ "$state" == fresh ]]; then
     provision_counter "$PCR_POLICY_INDEX"
+    increment_counter "$PCR_POLICY_INDEX"
   fi
-  increment_counter "$PCR_POLICY_INDEX"
-  assert_index_shape "$PCR_POLICY_INDEX" "$COUNTER_ATTRIBUTES" "$POLICY_INCREMENT" 8 "$NV_WRITTEN"
-  counter_value "$PCR_POLICY_INDEX" >/dev/null
+  if [[ "$(pcr_generation_state)" == absent ]]; then
+    # First activation (or a retry interrupted before the base was sealed): the
+    # counter's current value is the base, then the counter advances by the
+    # generation label so that counter - base == label.
+    (( requested <= MAX_FRESHNESS_GAP )) \
+      || die "signed PCR policy generation $requested is beyond the $MAX_FRESHNESS_GAP activation window of a fresh device"
+    base="$(pcr_policy_current)"
+    write_pcr_generation "$base"
+    generation=0
+  else
+    generation="$(pcr_policy_generation_value)"
+    (( requested >= generation )) \
+      || die "refusing to activate signed PCR policy generation $requested below the generation $generation already activated on this device"
+    (( requested - generation <= MAX_FRESHNESS_GAP )) \
+      || die "signed PCR policy generation $requested is more than $MAX_FRESHNESS_GAP ahead of the activated generation $generation"
+  fi
+  for (( step = generation; step < requested; step++ )); do
+    increment_counter "$PCR_POLICY_INDEX"
+  done
+  [[ "$(pcr_policy_generation_value)" == "$requested" ]] \
+    || die "the PCR policy generation did not read back as $requested after activation"
   printf '%s\n' "$requested"
 }
 
@@ -1224,6 +1341,7 @@ usage:
   neural-ice-tpm-state freshness-consume ISSUANCE_SEQ
   neural-ice-tpm-state pcr-policy-check POLICY_SEQ
   neural-ice-tpm-state pcr-policy-activate POLICY_SEQ
+  neural-ice-tpm-state pcr-policy-generation
   neural-ice-tpm-state profile-read
   neural-ice-tpm-state profile-bind PROFILE HARDWARE_TARGET TRUST_POLICY_ID
   neural-ice-tpm-state profile-digest PROFILE HARDWARE_TARGET TRUST_POLICY_ID
@@ -1250,6 +1368,7 @@ case "$command_name" in
   freshness-consume) freshness_consume "$@" ;;
   pcr-policy-check) pcr_policy_check "$@" ;;
   pcr-policy-activate) pcr_policy_activate "$@" ;;
+  pcr-policy-generation) pcr_policy_generation "$@" ;;
   profile-read) profile_read "$@" ;;
   profile-bind) profile_bind "$@" ;;
   profile-digest) profile_digest_command "$@" ;;

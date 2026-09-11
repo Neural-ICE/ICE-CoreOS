@@ -376,7 +376,10 @@ export NI_TPM_STATE_TEST_OTA_HELPER="$TOOLS/owner-ota-helper"
 st() { bash "$SCRIPT" "$@"; }
 activate_pcr_policy() {
   [ "$(st pcr-policy-check 1)" = 0 ] || fail "virgin PCR policy high-water check failed"
+  [ ! -d "$NV/01500008" ] || fail "the read-only check sealed a generation base"
   [ "$(st pcr-policy-activate 1)" = 1 ] || fail "initial PCR policy activation failed"
+  [ -d "$NV/01500008" ] || fail "activation did not seal the generation base"
+  [ "$(st pcr-policy-generation)" = 1 ] || fail "the activated generation is not counter minus base"
 }
 
 TARGET=nvidia-gb10-arm64
@@ -411,20 +414,27 @@ activate_pcr_policy
   || fail "PCR-only pre-ceremony state was not identified"
 prerequisite_digest="$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")"
 
-# ADR-0015 N: installation is a factory operation. Before the owner ceremony a
-# retry is allowed with ANY signed generation (the medium's generation is a
-# label, never compared to this chip's counter), the check writes nothing and
-# prints 0, and every activation advances 0x01500007 by exactly one.
+# ADR-0015 N: installation is a factory operation. The generation lives in
+# counter - base (base sealed at 0x01500008 by the first activation). Before the
+# owner ceremony a retry is allowed at or above the activated generation: the
+# check writes nothing and prints generation - 1, an equal label advances the
+# counter by nothing, a higher label by the difference, a lower label is refused.
 counter_value_of() { python3 -c 'import struct,sys; print(struct.unpack(">Q",open(sys.argv[1],"rb").read())[0])' "$NV/$1/data"; }
+base_value_of() { python3 -c 'import struct,sys; print(struct.unpack(">Q",open(sys.argv[1],"rb").read()[8:16])[0])' "$NV/01500008/data"; }
 before="$(counter_value_of 01500007)"
+[ "$(counter_value_of 01500007)" = "$(( $(base_value_of) + 1 ))" ] || fail "counter is not base + generation after activation"
 [ "$(st pcr-policy-check 1)" = 0 ] || fail "pre-ceremony retry of the same generation was refused"
 st pcr-policy-check 0 >/dev/null 2>&1 && fail "zero PCR policy sequence was accepted"
 [ "$(counter_value_of 01500007)" = "$before" ] || fail "the read-only check moved the activation counter"
-[ "$(st pcr-policy-check 2)" = 0 ] || fail "pre-ceremony retry of another generation was refused"
-[ "$(st pcr-policy-activate 2)" = 2 ] || fail "pre-ceremony retry did not activate"
-[ "$(counter_value_of 01500007)" = "$((before + 1))" ] || fail "activation did not advance the counter by exactly one"
-[ "$(st pcr-policy-activate 2)" = 2 ] || fail "a second pre-ceremony retry of the same generation was refused"
-[ "$(counter_value_of 01500007)" = "$((before + 2))" ] || fail "the second activation did not advance the counter by exactly one"
+[ "$(st pcr-policy-check 2)" = 0 ] || fail "pre-ceremony retry of a higher generation was refused"
+[ "$(st pcr-policy-activate 1)" = 1 ] || fail "pre-ceremony retry of the same generation did not activate"
+[ "$(counter_value_of 01500007)" = "$before" ] || fail "re-activating the same generation moved the counter"
+[ "$(st pcr-policy-activate 2)" = 2 ] || fail "pre-ceremony retry of a higher generation did not activate"
+[ "$(counter_value_of 01500007)" = "$((before + 1))" ] || fail "activating the next generation did not advance the counter by exactly one"
+[ "$(st pcr-policy-generation)" = 2 ] || fail "the generation did not follow the counter"
+st pcr-policy-check 1 >/dev/null 2>&1 && fail "a generation below the activated one passed the check"
+st pcr-policy-activate 1 >/dev/null 2>&1 && fail "a generation below the activated one was activated"
+[ "$(counter_value_of 01500007)" = "$((before + 1))" ] || fail "a refused activation moved the counter"
 [ "$(st provisioning-status)" = pcr-policy-activated ] \
   || fail "pre-ceremony retries left the supported pre-ceremony state"
 [ "$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")" = "$prerequisite_digest" ] \
@@ -433,13 +443,21 @@ st pcr-policy-check 0 >/dev/null 2>&1 && fail "zero PCR policy sequence was acce
 # THE C30 CASE (GX10, 2026-09-11): the PCR policy index is absent after a TPM
 # Clear but the chip's counters already reached 1050 (the previous cycle's
 # issuance). A factory medium sealed at generation 1004 must install: the
-# activation counter is born at 1050 and reads 1051, the generation is a label.
+# counter is born at 1050, reads 1051 (the sealed base), and advances to
+# base + 1004; the initramfs reads the difference, never the absolute value.
 rm -rf "${NV:?}"/* "${NV:?}/.max-ever"
 printf '1050' > "$NV/.max-ever"
 [ "$(st pcr-policy-check 1004)" = 0 ] || fail "a factory medium was compared to the chip's counter history"
 [ ! -d "$NV/01500007" ] || fail "the read-only check created the activation counter"
 [ "$(st pcr-policy-activate 1004)" = 1004 ] || fail "a factory generation below the chip's max-ever did not activate"
-[ "$(counter_value_of 01500007)" = 1051 ] || fail "the activation counter was not born at the chip's max-ever"
+[ "$(base_value_of)" = 1051 ] || fail "the sealed base is not the counter value at first activation"
+[ "$(counter_value_of 01500007)" = 2055 ] || fail "the counter is not base + generation"
+[ "$(st pcr-policy-generation)" = 1004 ] || fail "the C30 generation is not counter minus base"
+[ "$(st pcr-policy-activate 1004)" = 1004 ] || fail "re-activating the C30 generation was refused"
+[ "$(counter_value_of 01500007)" = 2055 ] || fail "re-activating the C30 generation moved the counter"
+st pcr-policy-activate 1003 >/dev/null 2>&1 && fail "a lower generation was activated on the C30 chip"
+[ "$(st pcr-policy-activate 1010)" = 1010 ] || fail "a higher generation was refused on the C30 chip"
+[ "$(counter_value_of 01500007)" = 2061 ] || fail "the higher generation did not advance the counter by its difference"
 [ "$(st provisioning-status)" = pcr-policy-activated ] || fail "the C30 install was not identified as pre-ceremony state"
 rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK"
 activate_pcr_policy

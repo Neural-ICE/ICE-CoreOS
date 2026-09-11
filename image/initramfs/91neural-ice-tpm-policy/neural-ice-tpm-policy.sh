@@ -54,6 +54,14 @@ fi
 
 ni_index=0x01500007
 ni_expected_attributes=393240 # 0x60018
+# ADR-0015 N: the activated generation is counter - base, the base being sealed
+# write-once at 0x01500008 by the first activation (64 bytes: "NI-PCRG1", the
+# base as 8 big-endian bytes, zeroes). No absolute counter value is compared.
+ni_base_index=0x01500008
+ni_base_expected_attributes=401416 # 0x62008 policywrite|writedefine|ownerread|authread
+ni_base_sealed=536872960          # 0x20000800 written|writelocked
+ni_base_expected_policy=f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230
+ni_base_magic_hex=4e492d50435247 # "NI-PCRG1" without its last byte, see below
 ni_dynamic_mask=805308416     # 0x30000800
 ni_written=536870912          # 0x20000000
 ni_expected_policy=e8c02d3c5e701670cbaa327db1a2e9f3f41b2c22793e5c669a6e7f44b912f6c0
@@ -279,16 +287,69 @@ if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
     *) ni_die "PCR policy high-water exceeds the safe integer ceiling" ;;
   esac
   ni_current=$((0x$ni_counter_hex))
+
+  # The sealed generation base. Returns 1 only when the index is absent (an
+  # activation interrupted before the base was sealed, tolerated for exact
+  # Install media alone); every other deviation is a refusal.
+  ni_generation=
+  ni_read_generation_base() {
+    ni_base_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_base_index" 2>/dev/null) || return 1
+    ni_base_parsed=$(printf '%s\n' "$ni_base_public" | ni_tpm2_nv_public_parse "$ni_base_index") \
+      || ni_die "PCR policy generation base public area is not the tpm2-tools contract"
+    # shellcheck disable=SC2086 # the parser emits exactly four validated words
+    set -- $ni_base_parsed
+    [ "$#" -eq 4 ] || ni_die "PCR policy generation base public area parse is incomplete"
+    ni_base_attributes_value=$(($1))
+    [ "$2" = 64 ] || ni_die "PCR policy generation base has the wrong size"
+    [ $((ni_base_attributes_value & ~ni_dynamic_mask)) -eq "$ni_base_expected_attributes" ] \
+      || ni_die "PCR policy generation base attributes do not match the sealed record contract"
+    [ $((ni_base_attributes_value & ni_base_sealed)) -eq "$ni_base_sealed" ] \
+      || ni_die "PCR policy generation base is not sealed"
+    [ "$3" = "$ni_base_expected_policy" ] \
+      || ni_die "PCR policy generation base authorization policy is wrong"
+    ni_base_file=${ni_root}/run/neural-ice-pcr-policy-base
+    "$ni_tools/tpm2_nvread" -C "$ni_base_index" -s 64 -o "$ni_base_file" "$ni_base_index" >/dev/null 2>&1 \
+      || ni_die "PCR policy generation base is unreadable"
+    [ "$(wc -c < "$ni_base_file")" -eq 64 ] || ni_die "PCR policy generation base is truncated"
+    ni_base_hex=$(od -An -tx1 -v "$ni_base_file" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+    [ "${#ni_base_hex}" -eq 128 ] || ni_die "PCR policy generation base is malformed"
+    # "NI-PCRG1" = 4e 49 2d 50 43 52 47 31
+    case "$ni_base_hex" in
+      "${ni_base_magic_hex}31"*) ;;
+      *) ni_die "the record at the PCR policy generation base index is not this appliance's base" ;;
+    esac
+    ni_base_value_hex=$(printf '%s' "$ni_base_hex" | cut -c17-32)
+    ni_base_reserved_hex=$(printf '%s' "$ni_base_hex" | cut -c33-128)
+    case "$ni_base_reserved_hex" in *[!0]*) ni_die "PCR policy generation base carries bytes outside its closed contract" ;; esac
+    case "$ni_base_value_hex" in
+      000*|001*) ;;
+      *) ni_die "PCR policy generation base exceeds the safe integer ceiling" ;;
+    esac
+    ni_base=$((0x$ni_base_value_hex))
+    [ "$ni_current" -ge "$ni_base" ] \
+      || ni_die "PCR policy counter reads below its sealed base: counters do not go backwards"
+    ni_generation=$((ni_current - ni_base))
+    return 0
+  }
+
   if [ "$ni_installer_media" -eq 1 ]; then
     ni_require_exact_install_boot
     ni_require_preceremony_state 1
-    [ "$ni_requested" -gt "$ni_current" ] \
-      || ni_die "signed Install PCR policy sequence is not strictly newer than the durable TPM high-water"
-    [ $((ni_requested - ni_current)) -le "$ni_max_activation_gap" ] \
-      || ni_die "signed Install PCR policy sequence is more than $ni_max_activation_gap ahead of the durable TPM high-water"
+    if ni_read_generation_base; then
+      [ "$ni_requested" -ge "$ni_generation" ] \
+        || ni_die "signed Install PCR policy generation is below the generation an interrupted install already activated on this device"
+      [ $((ni_requested - ni_generation)) -le "$ni_max_activation_gap" ] \
+        || ni_die "signed Install PCR policy generation is more than $ni_max_activation_gap ahead of the activated generation"
+    else
+      if ! { [ "$ni_requested" -ge 1 ] && [ "$ni_requested" -le "$ni_max_activation_gap" ]; }; then
+        ni_die "initial signed PCR policy generation is outside the activation window"
+      fi
+    fi
   else
-    [ "$ni_requested" -eq "$ni_current" ] \
-      || ni_die "signed UKI PCR policy sequence does not equal the durable TPM high-water"
+    ni_read_generation_base \
+      || ni_die "PCR policy generation base is absent while the counter exists; signed physical recovery is required"
+    [ "$ni_requested" -eq "$ni_generation" ] \
+      || ni_die "signed UKI PCR policy generation does not equal the activated generation of this device"
   fi
 else
   # A signed Install UKI before any LUKS enrollment may initialize the PCR

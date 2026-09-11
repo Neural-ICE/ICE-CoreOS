@@ -101,12 +101,17 @@ persist_prerequisites() {
       || fail "virgin signed PCR policy was refused"
     [[ "$(hw pcr-policy-activate "$candidate")" == "$candidate" ]] \
       || fail "signed PCR policy activation did not commit"
-    # ADR-0015 N: before the owner ceremony any signed generation may be
-    # retried; the check prints 0 and never compares to the chip's counter.
-    [[ "$(hw pcr-policy-check "$candidate")" == 0 ]] \
+    # ADR-0015 N: the generation is counter minus the base sealed at
+    # 0x01500008; before the owner ceremony a retry at or above it is allowed
+    # and the check prints generation - 1, a lower label is refused.
+    [[ "$(hw pcr-policy-generation)" == "$candidate" ]] \
+      || fail "the activated generation is not counter minus the sealed base"
+    [[ "$(hw pcr-policy-check "$candidate")" == "$(( candidate - 1 ))" ]] \
       || fail "pre-ceremony retry of the activated generation was refused"
-    [[ "$(hw pcr-policy-check 1)" == 0 ]] \
-      || fail "pre-ceremony retry of a lower generation was refused"
+    if (( candidate > 1 )); then
+      expect_refusal "lower generation accepted before the ceremony" \
+        hw pcr-policy-check "$(( candidate - 1 ))"
+    fi
     PCR_POLICY_CANDIDATE=$(( candidate + 1 ))
   fi
 }
@@ -370,13 +375,21 @@ tpm2_readpublic -Q -c 0x81000001 -f tpmt -o "$TMP/retry-srk.before"
 retry_high_water="$(abs_counter 0x01500007)"
 [[ "$retry_high_water" =~ ^[1-9][0-9]*$ ]] \
   || fail "pre-ceremony fixture has no usable absolute PCR policy high-water"
-retry_candidate=1
-[[ "$(hw pcr-policy-check "$retry_candidate")" == 0 ]] \
-  || fail "a factory generation below the chip's counter was not eligible for pre-ceremony retry"
+retry_generation="$(hw pcr-policy-generation)"
+retry_candidate=$retry_generation
+[[ "$(hw pcr-policy-check "$retry_candidate")" == "$(( retry_generation - 1 ))" ]] \
+  || fail "the activated generation was not eligible for pre-ceremony retry"
 [[ "$(hw pcr-policy-activate "$retry_candidate")" == "$retry_candidate" ]] \
-  || fail "pre-ceremony retry did not activate the factory generation"
+  || fail "pre-ceremony retry of the activated generation did not activate"
+[[ "$(abs_counter 0x01500007)" == "$retry_high_water" ]] \
+  || fail "re-activating the same generation moved the counter"
+retry_candidate=$(( retry_generation + 1 ))
+[[ "$(hw pcr-policy-activate "$retry_candidate")" == "$retry_candidate" ]] \
+  || fail "pre-ceremony retry of the next generation did not activate"
 [[ "$(abs_counter 0x01500007)" == "$((retry_high_water + 1))" ]] \
-  || fail "the activation counter did not advance by exactly one"
+  || fail "the next generation did not advance the counter by exactly one"
+[[ "$(hw pcr-policy-generation)" == "$retry_candidate" ]] \
+  || fail "the generation did not follow the counter on a real TPM"
 [[ "$(hw provisioning-status)" == pcr-policy-activated ]] \
   || fail "higher policy activation changed the pre-ceremony state class"
 tpm2_readpublic -Q -c 0x81010005 -f tpmt -o "$TMP/retry-device-root.after"
@@ -474,7 +487,7 @@ expect_refusal "second ceremony was idempotent success" hw ceremony-prepare "$PR
 [[ "$(firstboot status)" == complete ]] || fail "TPM-authenticated second boot was refused"
 
 # Runtime root cannot delete/recreate NV state or persistent objects after seal.
-for index in 0x01500003 0x01500004 0x01500005 0x01500006 0x01500007; do
+for index in 0x01500003 0x01500004 0x01500005 0x01500006 0x01500007 0x01500008; do
   expect_refusal "runtime root undefined $index after seal" tpm2_nvundefine "$index" -C o
   tpm2_nvreadpublic "$index" >/dev/null || fail "$index disappeared after refused undefine"
 done
