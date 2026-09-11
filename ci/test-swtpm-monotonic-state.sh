@@ -78,7 +78,10 @@ readonly PROFILE=customer-locked
 readonly TARGET=nvidia-gb10-arm64
 readonly POLICY=neural-ice-secureboot-lab-v1
 readonly FIRSTBOOT="$ROOT/ota/neural-ice-firstboot-tpm-ceremony.sh"
-PCR_POLICY_CANDIDATE=1
+# ADR-0015 O: start at the C32 label (1105) so the real TPM proves that a
+# first activation costs ONE increment whatever the label; the sealed record
+# carries (born, label) and the generation reads label + (counter - born).
+PCR_POLICY_CANDIDATE=1105
 
 clear_tpm() {
   tpm2_clear -c l >/dev/null 2>&1 || tpm2_clear -c p >/dev/null 2>&1 \
@@ -99,13 +102,22 @@ persist_prerequisites() {
     local candidate="$PCR_POLICY_CANDIDATE"
     [[ "$(hw pcr-policy-check "$candidate")" == 0 ]] \
       || fail "virgin signed PCR policy was refused"
+    local activation_t0=$SECONDS
     [[ "$(hw pcr-policy-activate "$candidate")" == "$candidate" ]] \
       || fail "signed PCR policy activation did not commit"
-    # ADR-0015 N: the generation is counter minus the base sealed at
-    # 0x01500008; before the owner ceremony a retry at or above it is allowed
-    # and the check prints generation - 1, a lower label is refused.
+    (( SECONDS - activation_t0 <= 60 )) \
+      || fail "activating label $candidate took $(( SECONDS - activation_t0 )) s on a fresh TPM; it must cost one increment (ADR-0015 O)"
+    tpm2_nvread 0x01500008 -C 0x01500008 -s 64 -o "$TMP/generation.bin" >/dev/null || fail "cannot read the generation base"
+    read -r sealed_born sealed_label < <(python3 -c 'import struct,sys; b=open(sys.argv[1],"rb").read(); print(*struct.unpack(">QQ", b[8:24]))' "$TMP/generation.bin")
+    [[ "$sealed_label" == "$candidate" ]] || fail "the generation record does not seal the activated label: $sealed_label"
+    [[ "$(abs_counter 0x01500007)" == "$sealed_born" ]] \
+      || fail "the first activation spun the counter past its sealed birth value"
+    # ADR-0015 N and O: the generation is the sealed label plus the counter's
+    # distance from its sealed birth value; before the owner ceremony a retry
+    # at or above it is allowed and the check prints generation - 1, a lower
+    # label is refused.
     [[ "$(hw pcr-policy-generation)" == "$candidate" ]] \
-      || fail "the activated generation is not counter minus the sealed base"
+      || fail "the activated generation is not the sealed label plus the counter's distance"
     [[ "$(hw pcr-policy-check "$candidate")" == "$(( candidate - 1 ))" ]] \
       || fail "pre-ceremony retry of the activated generation was refused"
     if (( candidate > 1 )); then
@@ -477,9 +489,15 @@ bound_digest="$(hw profile-read)"
 # largest counter ever went. The real TPM is the only witness of both values.
 tpm2_nvread 0x01500005 -C 0x01500005 -s 64 -o "$TMP/record.bin" >/dev/null || fail "cannot read the sealed record"
 sealed_base="$(python3 -c 'import struct,sys; print(struct.unpack(">Q", open(sys.argv[1],"rb").read()[40:48])[0])' "$TMP/record.bin")"
+sealed_origin="$(python3 -c 'import struct,sys; print(struct.unpack(">Q", open(sys.argv[1],"rb").read()[48:56])[0])' "$TMP/record.bin")"
 [[ "$sealed_base" =~ ^[1-9][0-9]*$ ]] || fail "the record seals no freshness base: $sealed_base"
-[[ "$(( $(hw freshness-read) + sealed_base ))" == "$(abs_counter 0x01500004)" ]] \
-  || fail "freshness is not the NV counter minus the sealed base"
+[[ "$sealed_origin" =~ ^(0|[1-9][0-9]*)$ ]] || fail "the record seals no freshness origin: $sealed_origin"
+# ADR-0015 O: the ceremony seals the issuance sequence as the origin and never
+# spins the counter to it; the high-water is origin + (counter - base).
+[[ "$(( $(hw freshness-read) - sealed_origin + sealed_base ))" == "$(abs_counter 0x01500004)" ]] \
+  || fail "freshness is not the sealed origin plus the NV counter minus the sealed base"
+[[ "$(abs_counter 0x01500004)" == "$sealed_base" ]] \
+  || fail "the ceremony spun the freshness counter past its sealed base"
 expect_refusal "consumed issuance sequence N replayed" hw freshness-consume "$high_water"
 next_high_water=$(( high_water + 1 ))
 [[ "$(hw freshness-consume "$next_high_water")" == "$next_high_water" ]] || fail "N+1 was not consumed"

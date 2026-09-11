@@ -278,6 +278,7 @@ done
 [[ -d "$NV/\$index" ]] || exit 1
 [[ "\$(cat "$NV/\$index/attrs")" == *"nt=counter"* ]] || exit 1
 bash "$TOOLS/_ni_check_session" "\$index" "\$auth" TPM2_CC_NV_Increment || exit 1
+[[ -z "\${NI_TEST_INCREMENT_TRACE:-}" ]] || printf '%s\n' "\$index" >> "\$NI_TEST_INCREMENT_TRACE"
 python3 - "$NV/\$index/data" "$NV/.max-ever" <<'PY'
 import os, struct, sys
 path, max_path = sys.argv[1], sys.argv[2]
@@ -379,7 +380,7 @@ activate_pcr_policy() {
   [ ! -d "$NV/01500008" ] || fail "the read-only check sealed a generation base"
   [ "$(st pcr-policy-activate 1)" = 1 ] || fail "initial PCR policy activation failed"
   [ -d "$NV/01500008" ] || fail "activation did not seal the generation base"
-  [ "$(st pcr-policy-generation)" = 1 ] || fail "the activated generation is not counter minus base"
+  [ "$(st pcr-policy-generation)" = 1 ] || fail "the activated generation is not the sealed label plus the counter's distance"
 }
 
 TARGET=nvidia-gb10-arm64
@@ -414,15 +415,18 @@ activate_pcr_policy
   || fail "PCR-only pre-ceremony state was not identified"
 prerequisite_digest="$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")"
 
-# ADR-0015 N: installation is a factory operation. The generation lives in
-# counter - base (base sealed at 0x01500008 by the first activation). Before the
-# owner ceremony a retry is allowed at or above the activated generation: the
-# check writes nothing and prints generation - 1, an equal label advances the
-# counter by nothing, a higher label by the difference, a lower label is refused.
+# ADR-0015 N and O: installation is a factory operation. The generation lives in
+# label + (counter - born), both sealed at 0x01500008 by the first activation,
+# which therefore costs ONE increment whatever the label. Before the owner
+# ceremony a retry is allowed at or above the activated generation: the check
+# writes nothing and prints generation - 1, an equal label advances the counter
+# by nothing, a higher label by the difference (bounded), a lower label is refused.
 counter_value_of() { python3 -c 'import struct,sys; print(struct.unpack(">Q",open(sys.argv[1],"rb").read())[0])' "$NV/$1/data"; }
 base_value_of() { python3 -c 'import struct,sys; print(struct.unpack(">Q",open(sys.argv[1],"rb").read()[8:16])[0])' "$NV/01500008/data"; }
+label_value_of() { python3 -c 'import struct,sys; print(struct.unpack(">Q",open(sys.argv[1],"rb").read()[16:24])[0])' "$NV/01500008/data"; }
 before="$(counter_value_of 01500007)"
-[ "$(counter_value_of 01500007)" = "$(( $(base_value_of) + 1 ))" ] || fail "counter is not base + generation after activation"
+[ "$(counter_value_of 01500007)" = "$(base_value_of)" ] || fail "the first activation spun the counter instead of sealing the label"
+[ "$(label_value_of)" = 1 ] || fail "the sealed label is not the activated generation"
 [ "$(st pcr-policy-check 1)" = 0 ] || fail "pre-ceremony retry of the same generation was refused"
 st pcr-policy-check 0 >/dev/null 2>&1 && fail "zero PCR policy sequence was accepted"
 [ "$(counter_value_of 01500007)" = "$before" ] || fail "the read-only check moved the activation counter"
@@ -440,26 +444,49 @@ st pcr-policy-activate 1 >/dev/null 2>&1 && fail "a generation below the activat
 [ "$(sha256sum "$PERSIST/81010005" "$PERSIST/81000001")" = "$prerequisite_digest" ] \
   || fail "pre-ceremony retries changed persistent prerequisites"
 
-# THE C30 CASE (GX10, 2026-09-11): the PCR policy index is absent after a TPM
-# Clear but the chip's counters already reached 1050 (the previous cycle's
-# issuance). A factory medium sealed at generation 1004 must install: the
-# counter is born at 1050, reads 1051 (the sealed base), and advances to
-# base + 1004; the initramfs reads the difference, never the absolute value.
+# THE C30/C32 CASE (GX10, 2026-09-11): the PCR policy index is absent after a
+# TPM Clear but the chip's counters already reached 1050 (the previous cycle's
+# issuance). A factory medium sealed at generation 1004 must install with ONE
+# increment (C32 spun the counter 1105 times, minutes of silence on a discrete
+# TPM): the counter is born at 1050, reads 1051, and the record seals
+# (1051, 1004); the initramfs reads label + (counter - born), never the
+# absolute value.
 rm -rf "${NV:?}"/* "${NV:?}/.max-ever"
 printf '1050' > "$NV/.max-ever"
 [ "$(st pcr-policy-check 1004)" = 0 ] || fail "a factory medium was compared to the chip's counter history"
 [ ! -d "$NV/01500007" ] || fail "the read-only check created the activation counter"
-[ "$(st pcr-policy-activate 1004)" = 1004 ] || fail "a factory generation below the chip's max-ever did not activate"
+trace="$NI_TPM_STATE_TEST_RUN_DIR/increment-trace"; rm -f "$trace"
+[ "$(NI_TEST_INCREMENT_TRACE="$trace" st pcr-policy-activate 1004)" = 1004 ] || fail "a factory generation below the chip's max-ever did not activate"
+[ "$(grep -c . "$trace")" = 1 ] || fail "the first activation cost $(grep -c . "$trace") counter increments instead of one (ADR-0015 O)"
 [ "$(base_value_of)" = 1051 ] || fail "the sealed base is not the counter value at first activation"
-[ "$(counter_value_of 01500007)" = 2055 ] || fail "the counter is not base + generation"
-[ "$(st pcr-policy-generation)" = 1004 ] || fail "the C30 generation is not counter minus base"
+[ "$(label_value_of)" = 1004 ] || fail "the sealed label is not the activated generation"
+[ "$(counter_value_of 01500007)" = 1051 ] || fail "the first activation spun the counter"
+[ "$(st pcr-policy-generation)" = 1004 ] || fail "the C30 generation is not the sealed label plus the counter's distance"
 [ "$(st pcr-policy-activate 1004)" = 1004 ] || fail "re-activating the C30 generation was refused"
-[ "$(counter_value_of 01500007)" = 2055 ] || fail "re-activating the C30 generation moved the counter"
+[ "$(counter_value_of 01500007)" = 1051 ] || fail "re-activating the C30 generation moved the counter"
 st pcr-policy-activate 1003 >/dev/null 2>&1 && fail "a lower generation was activated on the C30 chip"
 [ "$(st pcr-policy-activate 1010)" = 1010 ] || fail "a higher generation was refused on the C30 chip"
-[ "$(counter_value_of 01500007)" = 2061 ] || fail "the higher generation did not advance the counter by its difference"
+[ "$(counter_value_of 01500007)" = 1057 ] || fail "the higher generation did not advance the counter by its difference"
+[ "$(st pcr-policy-generation)" = 1010 ] || fail "the generation did not follow the counter's distance"
+out="$(st pcr-policy-check 1075 2>&1)" && fail "a retry 65 generations ahead was accepted by the check"
+grep -Fq 'clear the TPM' <<<"$out" || fail "the bounded-retry refusal does not name the TPM clear: $out"
+out="$(st pcr-policy-activate 1075 2>&1)" && fail "a retry 65 generations ahead was activated"
+grep -Fq 'clear the TPM' <<<"$out" || fail "the bounded-activation refusal does not name the TPM clear: $out"
+[ "$(counter_value_of 01500007)" = 1057 ] || fail "a refused bounded activation moved the counter"
+[ "$(st pcr-policy-check 1074)" = 1009 ] || fail "a retry 64 generations ahead was refused"
 [ "$(st provisioning-status)" = pcr-policy-activated ] || fail "the C30 install was not identified as pre-ceremony state"
+# A record written before amendment O carries a zero label: the old reading.
+python3 - "$NV/01500008/data" <<'PY'
+import sys
+p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[16:24] = bytes(8); open(p, "wb").write(bytes(b))
+PY
+[ "$(st pcr-policy-generation)" = 6 ] || fail "a zero sealed label did not read as counter minus born"
 rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK"
+# The largest label of the activation window still costs one increment.
+rm -f "$trace"
+[ "$(NI_TEST_INCREMENT_TRACE="$trace" st pcr-policy-activate 4096)" = 4096 ] || fail "the largest window label did not activate"
+[ "$(grep -c . "$trace")" = 1 ] || fail "label 4096 cost $(grep -c . "$trace") increments instead of one"
+rm -rf "${NV:?}"/* "${NV:?}/.max-ever"; rm -f "$OWNER_AUTH_MARK" "$trace"
 activate_pcr_policy
 
 # Interrupted ceremony: fixed state landed, owner auth did not. Deleting record
@@ -509,9 +536,13 @@ activate_pcr_policy
 # THE GX10 CASE (2026-09-10, NI-E02 on every first boot): the chip's counters
 # already went to 21 (PCR policy sequences of the bench, before a TPM Clear), so the freshness
 # and install counters are BORN at 21 while the release's issuance sequence is 4. The
-# ceremony must bind and report the high-water from the sealed base, not refuse.
+# ceremony must bind and report the high-water from the sealed base, not refuse --
+# and (ADR-0015 O) seal the issuance sequence as the ORIGIN instead of spinning
+# the counter to it: C29 spun the GX10's counter 1050 times at first boot.
 printf '21' > "$NV/.max-ever"
-result="$(st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4)"
+rm -f "$trace"
+result="$(NI_TEST_INCREMENT_TRACE="$trace" st ceremony-prepare customer-locked "$TARGET" "$POLICY" 4)"
+[ "$(grep -c . "$trace")" = 2 ] || fail "the ceremony cost $(grep -c . "$trace") counter increments instead of two (install + freshness WRITTEN)"
 [ "$result" = "22 4 $EXPECT" ] || fail "ceremony returned unexpected evidence: $result"
 st ceremony-finalize customer-locked "$TARGET" "$POLICY" \
   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 22 4 >/dev/null
@@ -532,14 +563,15 @@ grep -Fq 'requires TPM2_Clear' <<<"$out" || fail "the provisioned-device refusal
 st pcr-policy-activate 4096 >/dev/null 2>&1 && fail "a provisioned device activated a factory generation without TPM2_Clear"
 [ "$(st counter-read)" = 22 ] || fail "install counter mismatch"
 [ "$(st freshness-read)" = 4 ] || fail "freshness is not counted from the sealed base"
-python3 - "$NV/01500004/data" "$NV/01500005/data" <<'PY' || fail "the counter was not born at the chip's max-ever, or the record does not seal that base"
+python3 - "$NV/01500004/data" "$NV/01500005/data" <<'PY' || fail "the counter was not born at the chip's max-ever, or the record does not seal that base and origin"
 import struct, sys
 counter, = struct.unpack(">Q", open(sys.argv[1], "rb").read())
 record = open(sys.argv[2], "rb").read()
-base, = struct.unpack(">Q", record[40:48])
+base, origin = struct.unpack(">QQ", record[40:56])
 assert base == 23, base          # install counter born at 21 -> 22 (max-ever 22); freshness born at 22, +1 for WRITTEN
-assert counter == 27, counter    # base + the 4 consumed issuance sequences
-assert record[48:] == bytes(16), record[48:].hex()
+assert origin == 4, origin       # the issuance sequence is sealed, not spun (ADR-0015 O)
+assert counter == 23, counter    # the base: nothing was spun
+assert record[56:] == bytes(8), record[56:].hex()
 PY
 [ "$(st profile-read)" = "$EXPECT" ] || fail "profile binding mismatch"
 [ "$(st profile-bind customer-locked "$TARGET" "$POLICY")" = "$EXPECT" ] \
@@ -547,8 +579,24 @@ PY
 st profile-bind lab-managed "$TARGET" "$POLICY" >/dev/null 2>&1 \
   && fail "profile-bind accepted a different profile"
 st freshness-consume 4 >/dev/null 2>&1 && fail "consumed N replayed"
-[ "$(st freshness-consume 5)" = 5 ] || fail "next absolute issuance did not consume"
+rm -f "$trace"
+[ "$(NI_TEST_INCREMENT_TRACE="$trace" st freshness-consume 5)" = 5 ] || fail "next absolute issuance did not consume"
+[ "$(grep -c . "$trace")" = 1 ] || fail "consuming the next issuance cost $(grep -c . "$trace") increments instead of one"
 [ "$(st freshness-read)" = 5 ] || fail "absolute high-water did not advance"
+out="$(st freshness-consume 70 2>&1)" && fail "an issuance 65 ahead was consumed"
+grep -Fq 'signed physical recovery' <<<"$out" || fail "the bounded-consumption refusal does not name the recovery: $out"
+[ "$(st freshness-read)" = 5 ] || fail "a refused bounded consumption moved the high-water"
+# A record written before amendment O carries a zero origin: the old reading.
+python3 - "$NV/01500005/data" <<'PY'
+import sys
+p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[48:56] = bytes(8); open(p, "wb").write(bytes(b))
+PY
+[ "$(st freshness-read)" = 1 ] || fail "a zero sealed origin did not read as counter minus base"
+python3 - "$NV/01500005/data" <<'PY'
+import struct, sys
+p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[48:56] = struct.pack(">Q", 4); open(p, "wb").write(bytes(b))
+PY
+[ "$(st freshness-read)" = 5 ] || fail "restoring the origin did not restore the high-water"
 
 # A second ceremony is always refusal; subsequent boots use read-only status.
 st ceremony-prepare customer-locked "$TARGET" "$POLICY" 5 >/dev/null 2>&1 \
@@ -677,6 +725,9 @@ grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -Eq 'current[[:space:]]*-' \
 [ "$(grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -c 'counter - base')" = 1 ] \
   || fail "the freshness high-water must be counter minus the sealed base, in exactly one place (ADR-0015 M)"
 grep -Fq 'read()[40:48]' "$SCRIPT" || fail "the freshness base is not read from record bytes 40..47"
+grep -Fq 'read()[48:56]' "$SCRIPT" || fail "the freshness origin is not read from record bytes 48..55 (ADR-0015 O)"
+[ "$(grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -c 'increment_counter "$PCR_POLICY_INDEX"')" = 2 ] \
+  || fail "the PCR policy counter must be incremented in exactly two places: WRITTEN at provisioning and the bounded retry loop"
 grep -Fq 'tpm2_nvundefine' "$SCRIPT" && fail "runtime helper can undefine state"
 grep -Fq 'ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state' \
   "$ROOT/image/Containerfile.bootc" || fail "image does not ship TPM helper"

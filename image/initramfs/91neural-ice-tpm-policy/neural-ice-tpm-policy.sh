@@ -54,9 +54,11 @@ fi
 
 ni_index=0x01500007
 ni_expected_attributes=393240 # 0x60018
-# ADR-0015 N: the activated generation is counter - base, the base being sealed
-# write-once at 0x01500008 by the first activation (64 bytes: "NI-PCRG1", the
-# base as 8 big-endian bytes, zeroes). No absolute counter value is compared.
+# ADR-0015 N and O: the activated generation is label + (counter - born), both
+# sealed write-once at 0x01500008 by the first activation (64 bytes: "NI-PCRG1",
+# the counter value at first activation as 8 big-endian bytes, the label
+# activated then as 8 big-endian bytes, zeroes). No absolute counter value is
+# compared; a factory install costs one counter increment whatever its label.
 ni_base_index=0x01500008
 ni_base_expected_attributes=401416 # 0x62008 policywrite|writedefine|ownerread|authread
 ni_base_sealed=536872960          # 0x20000800 written|writelocked
@@ -319,16 +321,22 @@ if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
       *) ni_die "the record at the PCR policy generation base index is not this appliance's base" ;;
     esac
     ni_base_value_hex=$(printf '%s' "$ni_base_hex" | cut -c17-32)
-    ni_base_reserved_hex=$(printf '%s' "$ni_base_hex" | cut -c33-128)
+    ni_base_label_hex=$(printf '%s' "$ni_base_hex" | cut -c33-48)
+    ni_base_reserved_hex=$(printf '%s' "$ni_base_hex" | cut -c49-128)
     case "$ni_base_reserved_hex" in *[!0]*) ni_die "PCR policy generation base carries bytes outside its closed contract" ;; esac
     case "$ni_base_value_hex" in
       000*|001*) ;;
       *) ni_die "PCR policy generation base exceeds the safe integer ceiling" ;;
     esac
+    case "$ni_base_label_hex" in
+      000*|001*) ;;
+      *) ni_die "PCR policy generation label exceeds the safe integer ceiling" ;;
+    esac
     ni_base=$((0x$ni_base_value_hex))
+    ni_base_label=$((0x$ni_base_label_hex))
     [ "$ni_current" -ge "$ni_base" ] \
       || ni_die "PCR policy counter reads below its sealed base: counters do not go backwards"
-    ni_generation=$((ni_current - ni_base))
+    ni_generation=$((ni_base_label + ni_current - ni_base))
     return 0
   }
 

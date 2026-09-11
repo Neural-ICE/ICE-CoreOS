@@ -216,9 +216,9 @@ test -n "$out" || exit 91
 [ -n "$auth" ] && [ "$auth" = "$index" ] || { echo "tpm2_nvread: owner hierarchy authorization failed (sealed)" >&2; exit 93; }
 if [ "$index" = 0x01500008 ]; then
   case "${NI_TEST_BASE_RECORD:-real}" in
-    real) { printf 'NI-PCRG1'; printf '\000\000\000\000\000\000\000'; printf "\\$(printf '%03o' "${NI_TEST_BASE:-0}")"; head -c 48 /dev/zero; } >"$out" ;;
+    real) { printf 'NI-PCRG1'; printf '\000\000\000\000\000\000\000'; printf "\\$(printf '%03o' "${NI_TEST_BASE:-0}")"; printf '\000\000\000\000\000\000\000'; printf "\\$(printf '%03o' "${NI_TEST_BASE_LABEL:-0}")"; head -c 40 /dev/zero; } >"$out" ;;
     wrong-magic) { printf 'NI-XXXX1'; head -c 56 /dev/zero; } >"$out" ;;
-    dirty-reserved) { printf 'NI-PCRG1'; head -c 8 /dev/zero; printf 'x'; head -c 47 /dev/zero; } >"$out" ;;
+    dirty-reserved) { printf 'NI-PCRG1'; head -c 16 /dev/zero; printf 'x'; head -c 39 /dev/zero; } >"$out" ;;
     short) printf 'NI-PCRG1' >"$out" ;;
     *) exit 92 ;;
   esac
@@ -334,6 +334,19 @@ must_refuse base_dirty_reserved run_hook NI_TEST_BASE_RECORD=dirty-reserved
 must_refuse base_short run_hook NI_TEST_BASE_RECORD=short
 must_accept base_zero_restored run_hook
 
+# ADR-0015 O: the record also seals the label activated at birth; the
+# generation is label + (counter - born). Born at 3 with label 250, a counter
+# reading 7 is generation 254: the label alone, the distance alone and the
+# absolute value are all refused.
+write_cmdline 254
+must_accept relative_generation_with_label run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=3 NI_TEST_BASE_LABEL=250
+write_cmdline 250
+must_refuse label_alone_as_generation run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=3 NI_TEST_BASE_LABEL=250
+write_cmdline 4
+must_refuse distance_alone_as_generation run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=3 NI_TEST_BASE_LABEL=250
+write_cmdline 7
+must_refuse absolute_counter_with_label run_hook NI_TEST_COUNTER_SEQ=7 NI_TEST_BASE=3 NI_TEST_BASE_LABEL=250
+
 printf 'quiet neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
 must_refuse absent_sequence run_hook
 printf 'neuralice.pcr_policy_seq=7 neuralice.pcr_policy_seq=7 neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
@@ -421,6 +434,16 @@ must_accept preceremony_relative_generation run_hook \
 write_install_cmdline 1
 must_refuse preceremony_below_relative_generation run_hook \
   NI_TEST_COUNTER_SEQ=8 NI_TEST_BASE=6 NI_TEST_NV_HANDLES='- 0x1500007\n'
+# ADR-0015 O: with a sealed label the retry floor is the label plus the distance.
+write_install_cmdline 102
+must_accept preceremony_generation_with_label run_hook \
+  NI_TEST_COUNTER_SEQ=8 NI_TEST_BASE=6 NI_TEST_BASE_LABEL=100 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 150
+must_accept preceremony_above_generation_with_label run_hook \
+  NI_TEST_COUNTER_SEQ=8 NI_TEST_BASE=6 NI_TEST_BASE_LABEL=100 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 101
+must_refuse preceremony_below_generation_with_label run_hook \
+  NI_TEST_COUNTER_SEQ=8 NI_TEST_BASE=6 NI_TEST_BASE_LABEL=100 NI_TEST_NV_HANDLES='- 0x1500007\n'
 write_install_cmdline 3
 must_refuse preceremony_lower_generation run_hook \
   NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
