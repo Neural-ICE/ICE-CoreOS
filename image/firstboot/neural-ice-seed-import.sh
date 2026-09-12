@@ -207,8 +207,14 @@ while IFS= read -r -d '' layout \
     destination="containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot]${repository}:${tag}"
     # Import this host's platform. containers-storage rejects --all for an
     # index; skopeo retains the original index digest as a local repo digest.
-    skopeo --policy "$SEED_POLICY" copy --tmpdir "$DATA/tmp" --preserve-digests "oci:${layout}:seed" \
-      "$destination" \
+    # The merged root of every container is its top layer's diff directory, so
+    # a layer written under this script's umask 077 is a root no non-root
+    # container user can traverse: on the GX10 (.67, 2026-09-12, medium C34)
+    # all 222 layer roots were dr-x------ and every product container died with
+    # "exec … Permission denied" while root-run caddy lived. The store is
+    # written under 022; everything else this script writes keeps 077.
+    ( umask 022 && skopeo --policy "$SEED_POLICY" copy --tmpdir "$DATA/tmp" --preserve-digests \
+        "oci:${layout}:seed" "$destination" ) \
       || die "cannot import signed artifact $artifact_key"
     # Reading by tag reports the selected child digest. The runtime pulls by
     # the signed root digest, so prove that exact repository@root is usable.
@@ -221,6 +227,16 @@ while IFS= read -r -d '' layout \
   imported=$((imported + 1))
 done < "$plan"
 ((imported > 0)) || die "closure has no importable artifact"
+if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]]; then
+  # Refuse, before anything is published, a store whose layer roots the
+  # containers' own users could not traverse (the failure above would otherwise
+  # surface only as a dead service after first boot).
+  overlay="$candidate/seed-store/graphroot/overlay"
+  [[ -d $overlay ]] || die "imported container store has no overlay layers"
+  untraversable=$(find "$overlay" -mindepth 2 -maxdepth 2 -type d -name diff ! -perm -o=rx -print | head -3)
+  [[ -z $untraversable ]] \
+    || die "imported layer roots are not traversable by container users (umask leaked into the store): ${untraversable//$'\n'/ }"
+fi
 sync -f "$candidate/seed-store"
 durable_boundary container
 
