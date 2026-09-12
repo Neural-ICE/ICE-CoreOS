@@ -155,8 +155,23 @@ if [[ $generation_ready == 0 ]]; then
 plan="$candidate/seed-store/import-plan"
 python3 - "$source_root/release-closure.json" "$source_root/objects/sha256" \
   "$candidate/seed-store/layouts" "$plan" <<'PY'
-import json, pathlib, shutil, sys
+import fcntl, json, pathlib, shutil, sys
 closure_path, objects_path, layouts_path, plan_path = map(pathlib.Path, sys.argv[1:])
+def place(source, target):
+    # The staged objects and every published view live on the same XFS volume
+    # (reflink=1): a clone shares the extents and costs nothing, a copy is
+    # 129 GiB more per view (GX10 .67, 2026-09-12: 434 GB used for one 130 GB
+    # seed). Not a hard link: the cache contracts require every staged object
+    # to stay a single-link regular file. A filesystem without clones gets the
+    # copy, byte for byte.
+    FICLONE = 0x40049409
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        try:
+            fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+            return
+        except OSError:
+            pass
+    shutil.copyfile(source, target)
 closure = json.loads(closure_path.read_bytes())
 records = []
 for number, artifact in enumerate(closure["artifacts"]):
@@ -186,7 +201,7 @@ for number, artifact in enumerate(closure["artifacts"]):
         for digest in wanted:
             source = objects_path / digest.removeprefix("sha256:")
             target = layout / "blobs/sha256" / source.name
-            shutil.copyfile(source, target)
+            place(source, target)
         tag = "seed-" + import_root.removeprefix("sha256:")[:16]
         records.append((str(layout), repository, tag, label, import_root))
 with plan_path.open("wb") as handle:
@@ -245,10 +260,25 @@ for pair in "$candidate/content:all" "$candidate/models:model"; do
   dst=${pair%%:*}; selector=${pair##*:}
   python3 - "$source_root/release-closure.json" "$source_root/release-manifest.json" \
     "$source_root/objects/sha256" "$dst/sha256" "$selector" <<'PY'
-import json, pathlib, shutil, sys
+import fcntl, json, pathlib, shutil, sys
 closure = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
 manifest = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
 objects, destination, selector = pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), sys.argv[5]
+def place(source, target):
+    # The staged objects and every published view live on the same XFS volume
+    # (reflink=1): a clone shares the extents and costs nothing, a copy is
+    # 129 GiB more per view (GX10 .67, 2026-09-12: 434 GB used for one 130 GB
+    # seed). Not a hard link: the cache contracts require every staged object
+    # to stay a single-link regular file. A filesystem without clones gets the
+    # copy, byte for byte.
+    FICLONE = 0x40049409
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        try:
+            fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+            return
+        except OSError:
+            pass
+    shutil.copyfile(source, target)
 cache_roots = {(entry["repository"], entry["digest"])
                for entry in manifest.get("content", [])
                if entry.get("contract") == "content-cache-v1"}
@@ -267,7 +297,7 @@ if selector == "all":
     excluded = cache_segments - retained
     for source in objects.iterdir():
         if "sha256:" + source.name not in excluded:
-            shutil.copyfile(source, destination / source.name)
+            place(source, destination / source.name)
     raise SystemExit(0)
 content_roots = {(entry["repository"], entry["digest"]) for entry in manifest.get("content", [])
                  if entry.get("contract") != "content-cache-v1"}
@@ -284,7 +314,7 @@ for artifact in closure["artifacts"]:
     for digest in digests:
         source = objects / digest.removeprefix("sha256:")
         target = destination / source.name
-        if not target.exists(): shutil.copyfile(source, target)
+        if not target.exists(): place(source, target)
 PY
   while IFS= read -r -d '' object; do
     observed=$(sha256sum -- "$object" | awk '{print tolower($1)}')
