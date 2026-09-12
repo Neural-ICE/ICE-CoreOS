@@ -345,6 +345,17 @@ PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+# Published views are clones (FICLONE) of the staged objects where the volume
+# supports them and byte copies elsewhere -- never hard links: the cache
+# contracts require every staged object to stay a single-link regular file.
+grep -Fq 'FICLONE = 0x40049409' image/firstboot/neural-ice-seed-import.sh || { echo "views are not cloned with FICLONE" >&2; exit 1; }
+grep -Fq 'os.link' image/firstboot/neural-ice-seed-import.sh && { echo "a hard link would break the single-link contract of the staged objects" >&2; exit 1; }
+for object in "$data"/release/"$storage_closure"/objects/sha256/*; do
+  [ "$(stat -c %h "$object")" = 1 ] || { echo "staged object $object is no longer single-link" >&2; exit 1; }
+done
+for object in "$data"/offline-generations/"$storage_closure"/content/sha256/*; do
+  cmp -s "$object" "$data/release/$storage_closure/objects/sha256/$(basename "$object")" || { echo "content view $object differs from its staged object" >&2; exit 1; }
+done
 # The layer roots the fake created under the script's umask must be traversable
 # by others (the script itself runs under 077): 0755, not the 0500/0700 of C34.
 for diff in "$data"/offline-generations/"$storage_closure"/seed-store/graphroot/overlay/*/diff; do
@@ -383,4 +394,4 @@ fi
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 
-echo "seed-firstboot-import: 25 cases passed"
+echo "seed-firstboot-import: 27 cases passed"

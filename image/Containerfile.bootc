@@ -424,6 +424,11 @@ COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/syste
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/network-online.target.d/50-neural-ice-tpm-ceremony.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/NetworkManager.service.d/50-neural-ice-tpm-ceremony.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/NetworkManager-wait-online.service.d/50-neural-ice-tpm-ceremony.conf
+# wait-online without the seed-import gate started while NetworkManager was
+# still held and failed after 60 s on every first boot (GX10 .67, 2026-09-12):
+# one "failed" unit on the status screen for a network that was held on purpose.
+COPY image/firstboot/50-neural-ice-seed-import.conf /usr/lib/systemd/system/NetworkManager-wait-online.service.d/40-neural-ice-seed-import.conf
+COPY image/firstboot/60-neural-ice-wait-online-budget.conf /usr/lib/systemd/system/NetworkManager-wait-online.service.d/60-neural-ice-wait-online-budget.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/avahi-daemon.service.d/50-neural-ice-tpm-ceremony.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/avahi-daemon.socket.d/50-neural-ice-tpm-ceremony.conf
 COPY image/firstboot/50-neural-ice-tpm-ceremony-sshd.conf /usr/lib/systemd/system/systemd-user-sessions.service.d/50-neural-ice-tpm-ceremony.conf

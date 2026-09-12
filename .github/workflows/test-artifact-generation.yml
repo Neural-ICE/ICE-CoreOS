@@ -261,7 +261,7 @@ jobs:
             image/test-preloaded-sizing.sh image/qualify-installer-qemu.sh image/test-qualify-installer-qemu.sh \
             image/bench-rehearse-medium.sh image/bench-rehearse-phase4.sh image/test-bench-rehearse-medium.sh \
             image/test-registry-authorisation.sh image/test-release-authorization.sh \
-            image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-signing-trust.sh image/test-status-screen.sh image/test-tpm-ceremony-systemd.sh \
+            image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-wait-online-budget.sh image/test-signing-trust.sh image/test-status-screen.sh image/test-tpm-ceremony-systemd.sh \
             image/test-tpm-policy-initramfs.sh \
             image/test-verify-preloaded-media.sh ota/neural-ice-access-profile-anchor.sh ota/neural-ice-autoinstall.sh \
             ota/neural-ice-device-root-tpm.sh ota/neural-ice-firstboot-tpm-ceremony.sh ota/neural-ice-lab-baseline-handoff.sh \
@@ -459,6 +459,7 @@ jobs:
           ./image/test-bench-rehearse-medium.sh
           ./image/test-content-cache-contract.py
           ./image/test-seed-firstboot-import.sh
+          ./image/test-wait-online-budget.sh
           ./ota/test-autoinstall-kargs.sh
           ./ota/test-installer-device-root-guard.sh
           ./ota/test-installer-pcr7-coverage.sh
