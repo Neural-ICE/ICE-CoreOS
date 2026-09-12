@@ -17,9 +17,16 @@ if [ "${ASSERT_STORAGE_CONTRACT:-0}" = 1 ]; then
   case "${1:-}" in
     copy)
       [ "$policy_seen" = 1 ] || { echo 'copy without the seed-import transport policy' >&2; exit 47; }
+      graphroot=""
       for arg in "$@"; do
         [ "$arg" != --all ] || { echo 'storage transport rejects --all' >&2; exit 43; }
+        case "$arg" in containers-storage:\[overlay@*+*) graphroot="${arg#containers-storage:\[overlay@}"; graphroot="${graphroot%%+*}" ;; esac
       done
+      # containers-storage creates each layer's root under the caller's umask:
+      # the diff directory becomes the merged root of every container.
+      [ -n "$graphroot" ] || { echo 'copy without an overlay graphroot destination' >&2; exit 48; }
+      mkdir -p "$graphroot/overlay/layer-of-$$/diff"
+      [ -z "${FORCE_DIFF_MODE:-}" ] || chmod "$FORCE_DIFF_MODE" "$graphroot/overlay/layer-of-$$/diff"
       printf copied > "$COPY_MARKER"
       exit 0 ;;
     inspect)
@@ -338,6 +345,28 @@ PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+# The layer roots the fake created under the script's umask must be traversable
+# by others (the script itself runs under 077): 0755, not the 0500/0700 of C34.
+for diff in "$data"/offline-generations/"$storage_closure"/seed-store/graphroot/overlay/*/diff; do
+  mode=$(stat -c %a "$diff")
+  case "$mode" in 755|775|777|555|575|577) ;; *) echo "layer root $diff is $mode: not traversable by container users" >&2; exit 1 ;; esac
+done
+
+# A store whose layer roots are not traversable (the C34 shape) is refused
+# before publication: no generation, the previous one stays current.
+umask_closure=$(printf umask-leak | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$umask_closure"
+printf 'sha256:%s\n' "$umask_closure" > "$data/release/CLOSURE"
+rm -- "$ROOT/copied"
+if out=$(PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" FORCE_DIFF_MODE=0500 \
+    EXPECTED_IMPORT_DIGEST="sha256:$blob" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+    image/firstboot/neural-ice-seed-import.sh 2>&1); then
+  echo "a store with untraversable layer roots was published" >&2
+  exit 1
+fi
+grep -Fq 'not traversable by container users' <<<"$out" || { echo "wrong refusal for untraversable layer roots: $out" >&2; exit 1; }
+test ! -e "$data/offline-generations/$umask_closure"
+test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 
 # A transport that returns another digest must not publish its generation.
 wrong_closure=$(printf wrong-import-readback | sha256sum | awk '{print $1}')
@@ -354,4 +383,4 @@ fi
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 
-echo "seed-firstboot-import: 23 cases passed"
+echo "seed-firstboot-import: 25 cases passed"
