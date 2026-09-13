@@ -419,7 +419,7 @@ case "$index" in
   0x01500001) python3 -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack(">Q", int(sys.argv[2])))' "$out" '{legacy_floor}' ;;
   0x01500002) python3 -c 'import sys; open(sys.argv[1],"wb").write(bytes.fromhex(sys.argv[2]))' "$out" '{state_anchor}' ;;
   0x01500003) python3 -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack(">Q", 1))' "$out" ;;
-  0x01500005) python3 -c 'import sys; open(sys.argv[1],"wb").write((b"NI-TPM02"+bytes.fromhex(sys.argv[2])).ljust(64,b"\0"))' "$out" '{}' ;;
+  0x01500005) python3 -c 'import sys; open(sys.argv[1],"wb").write((b"NI-TPM02"+bytes.fromhex(sys.argv[2])+(2408).to_bytes(8,"big")+(1750).to_bytes(8,"big")).ljust(64,b"\0"))' "$out" '{}' ;;
   *) exit 97 ;;
 esac
 "#,
