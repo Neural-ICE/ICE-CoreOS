@@ -221,6 +221,14 @@ the encrypted `/var/lib/neural-ice/data` volume.
 
 ## Build
 
+> **Adopting this OS for your own deployment?** Read
+> [docs/ADOPTING.md](docs/ADOPTING.md) first. It lists the three things you must
+> decide before your first build — the trusted-time authority, your Secure Boot
+> keys, and the namespace this OS seals into your TPM — and what happens if you
+> do not. `NI_TRUSTED_TIME_ISSUER` in particular is **mandatory**: without it the
+> verifier accepts no trusted-time assertion, which is the intended fail-closed
+> behaviour and not a warning you can skip.
+
 The OS image needs **staged GB10 artifacts** that are produced rarely and live outside git
 (GB10 kernel (4k) RPMs with signed NVIDIA modules, NVIDIA userspace, signed boot payload):
 
@@ -361,12 +369,17 @@ VERSION         semantic version base for immutable source tags
 
 ## Architecture decisions
 
+Start with [ADR-0016](docs/ADR-0016-open-core-namespace.md) if you are adopting
+this OS rather than running ours: it states which strings identify the operator
+and which identify the mechanism.
+
 - [ADR-0002 — Secure Boot, zero-touch](docs/ADR-0002-secure-boot-zero-touch.md)
 - [ADR-0003 — Base OS, update model & open-core](docs/ADR-0003-base-and-update-model.md)
 - [ADR-0004 — TPM2/LUKS two-domain encryption](docs/ADR-0004-disk-encryption-tpm-luks.md)
 - [ADR-0005 — Release channels & promotion](docs/ADR-0005-release-channels.md)
 - [ADR-0006 — Kernel page size: 4k instead of kernel-64k](docs/ADR-0006-kernel-4k-page-size.md)
 - [ADR-0007 — Repository license: FSL-1.1-ALv2](docs/ADR-0007-license-fsl.md)
+- [ADR-0016 — One declared namespace, so the open core is adoptable](docs/ADR-0016-open-core-namespace.md)
 
 ## License
 
