@@ -34,7 +34,11 @@ use crate::state::FileStateStore;
 /// the test suite supplies a neutral value of its own.
 pub(crate) const TRUSTED_TIME_ISSUER: Option<&str> = option_env!("NI_TRUSTED_TIME_ISSUER");
 
-const TIME_DOMAIN: &[u8] = b"neural-ice:ota:trusted-time:v2\0";
+/// The purpose half of this signature's domain. The operator half comes from
+/// [`crate::namespace`], so an adopter's build separates its assertions from
+/// ours without editing this file — and an unconfigured build reproduces the
+/// exact bytes this constant used to be.
+const TIME_DOMAIN_PURPOSE: &str = "ota:trusted-time:v2";
 
 /// Compare l'émetteur annoncé à l'ancre de confiance compilée.
 ///
@@ -123,8 +127,14 @@ pub(crate) fn verify(
     validate(&assertion, snapshot, snapshot_sha256, expected)?;
     let key = authority(snapshot, &assertion, expected)?;
     let key = public_key_pem(&key.public_key)?;
-    match verify_signature(&key, TIME_DOMAIN, assertion_bytes, signature_bytes, scratch)
-        .map_err(ContractError::Internal)?
+    match verify_signature(
+        &key,
+        &crate::namespace::domain(TIME_DOMAIN_PURPOSE),
+        assertion_bytes,
+        signature_bytes,
+        scratch,
+    )
+    .map_err(ContractError::Internal)?
     {
         Ok(()) => {}
         Err(reason) => return Err(reason.into()),

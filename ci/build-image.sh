@@ -211,6 +211,7 @@ BUILD_ARGS=(
   # (`test -n`), c est-a-dire la ou une valeur absente doit empecher une IMAGE
   # d exister — pas la ou elle empecherait un test de forme de tourner.
   --build-arg "NI_TRUSTED_TIME_ISSUER=${NI_TRUSTED_TIME_ISSUER:-}"
+  --build-arg "NI_NAMESPACE=${NI_NAMESPACE:-}"
   --label "org.opencontainers.image.source=${SOURCE_URL}"
   --label "org.opencontainers.image.version=${SEMVER}"
   --label "ch.neural-ice.artifact-generation=${ARTIFACT_GENERATION}"

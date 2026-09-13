@@ -41,17 +41,29 @@ trust policies under `secureboot/trust-policies/` are **ours**. An appliance
 you ship must be anchored to keys you control, and the shim you distribute must
 be one you are entitled to distribute.
 
-### The sealed-record namespace
+### `NI_NAMESPACE` — whose records these are
 
-The magic bytes and domain-separation strings this OS writes into your TPM
-identify the *operator*, not the mechanism. They default to the values this
-repository has always used, so an unconfigured build keeps reading records
-sealed by earlier builds.
+The domain separators that bind every signature to its purpose, and the schema
+identifiers stamped into every evidence file, identify the *operator*, not the
+mechanism. They are composed from one declared namespace.
 
-Change them and you start a **new lineage**: appliances sealed under your
-namespace cannot be verified by a build using another, and the reverse. That is
-the intended property of a domain separator, and it is why the default exists —
-records already sealed in deployed hardware cannot be re-sealed.
+Unlike the time issuer, this one has a **default**, and the default is not a
+convenience: those exact bytes are already sealed into deployed TPMs and written
+into evidence files on deployed disks. An unconfigured build must reproduce them
+or those appliances stop verifying.
+
+```sh
+NI_NAMESPACE=example-org NI_TRUSTED_TIME_ISSUER=time.example.org ./ci/build-image.sh
+```
+
+Declaring your own starts a **new lineage**. Records sealed under one namespace
+cannot be verified by a build using another, in either direction. There is no
+migration and there should not be: that is what a domain separator is for, and
+two populations that must not be confused is the correct outcome.
+
+The test suite is green under either — `cargo test` with `NI_NAMESPACE` set
+checks that your namespace composes the same *shape*, and without it checks that
+the default reproduces the exact shipped bytes.
 
 ## What you inherit and should not change
 
