@@ -384,7 +384,9 @@ ceremony after the installer has persisted the device root and intended SRK:
 | --- | --- | --- |
 | magic | `0..8` | `NI-TPM02` |
 | profile binding | `8..40` | `sha256("neural-ice:tpm:access-profile-binding:v1" ‖ 0x00 ‖ profile ‖ 0x00 ‖ hardware_target ‖ 0x00 ‖ signed_boot_trust_policy_id)` |
-| reserved | `40..64` | zero |
+| freshness base | `40..48` | big-endian u64, the freshness counter's value at the ceremony (ADR-0015 M); sealed by the shell helper, not read here |
+| issuance origin | `48..56` | big-endian u64, the issuance sequence the ceremony bound (ADR-0015 O); sealed by the shell helper, not read here |
+| reserved | `56..64` | zero |
 
 Index contract, asserted before the content is read:
 

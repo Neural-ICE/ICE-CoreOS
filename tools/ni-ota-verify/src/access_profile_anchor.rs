@@ -411,6 +411,17 @@ const INSTALL_COUNTER_NV_INDEX: u32 = 0x0150_0003;
 const PROFILE_RECORD_NV_INDEX: u32 = 0x0150_0005;
 const PROFILE_RECORD_BYTES: usize = 64;
 const PROFILE_RECORD_MAGIC: &[u8] = b"NI-TPM02";
+/// The binding digest, bytes 8..40.
+const PROFILE_RECORD_BINDING: std::ops::Range<usize> = 8..40;
+/// Bytes 40..56 belong to the freshness contract the ceremony seals beside the
+/// binding (ADR-0015 M and O): the freshness counter's BASE at 40..48 and the
+/// issuance ORIGIN at 48..56, both big-endian u64 and both non-zero on any
+/// machine installed since 2026-09-11. This verifier reads neither; it must
+/// not refuse them either. Only the last eight bytes are the closed reserve.
+/// (The GX10 .67 on 2026-09-13, medium C36: base 2408 and origin 1750 sealed by
+/// the shell helper, every `authenticated-ota-status` REFUSED by this file,
+/// which still required zeroes from byte 40, so the licence gate never opened.)
+const PROFILE_RECORD_RESERVED_OFFSET: usize = 56;
 /// Domain separation: the same three words must never hash to a value some other
 /// statement in this tree also produces. Byte-for-byte the shell helper's
 /// `PROFILE_BINDING_DOMAIN`.
@@ -1094,23 +1105,33 @@ fn tpm_profile_binding(store: &FileStateStore) -> Result<Result<String, String>,
         ))));
     }
     let bytes = output.read()?;
+    Ok(profile_binding_from_record(&bytes))
+}
+
+/// The binding digest a sealed record carries, or the refusal it earns. The
+/// layout is the shell helper's (`record_read` in `ota/neural-ice-tpm-state.sh`),
+/// read from the other side: magic, binding, base, origin, then the reserve.
+fn profile_binding_from_record(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() != PROFILE_RECORD_BYTES {
-        return Ok(Err(reinstall_required(&format!(
+        return Err(reinstall_required(&format!(
             "the access-profile record is {} bytes, not {PROFILE_RECORD_BYTES}",
             bytes.len()
-        ))));
+        )));
     }
     if &bytes[..PROFILE_RECORD_MAGIC.len()] != PROFILE_RECORD_MAGIC {
-        return Ok(Err(reinstall_required(
+        return Err(reinstall_required(
             "the access-profile record is not this appliance's record",
-        )));
+        ));
     }
-    if bytes[40..].iter().any(|byte| *byte != 0) {
-        return Ok(Err(reinstall_required(
+    if bytes[PROFILE_RECORD_RESERVED_OFFSET..]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(reinstall_required(
             "the access-profile record carries bytes outside its closed v2 contract",
-        )));
+        ));
     }
-    Ok(Ok(hex_encode(&bytes[8..40])))
+    Ok(hex_encode(&bytes[PROFILE_RECORD_BINDING]))
 }
 
 fn assert_owner_ceremony_complete() -> Result<Result<(), String>, InternalError> {
@@ -1567,6 +1588,67 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(reason, "test helper exceeded its output bound");
+    }
+
+    fn sealed_record(base: u64, origin: u64, reserve: [u8; 8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(PROFILE_RECORD_BYTES);
+        record.extend_from_slice(PROFILE_RECORD_MAGIC);
+        record.extend_from_slice(&[0xab; 32]);
+        record.extend_from_slice(&base.to_be_bytes());
+        record.extend_from_slice(&origin.to_be_bytes());
+        record.extend_from_slice(&reserve);
+        assert_eq!(record.len(), PROFILE_RECORD_BYTES);
+        record
+    }
+
+    #[test]
+    fn a_record_sealed_with_a_freshness_base_and_origin_is_this_appliances_record() {
+        // The values the lab GX10 carried on 2026-09-13 (medium C36).
+        let binding = profile_binding_from_record(&sealed_record(2408, 1750, [0; 8]))
+            .expect("base and origin are the ceremony's, not a foreign contract");
+        assert_eq!(binding, "ab".repeat(32));
+        assert_eq!(
+            profile_binding_from_record(&sealed_record(0, 0, [0; 8])).unwrap(),
+            binding,
+            "a record sealed before amendment M reads the same binding"
+        );
+    }
+
+    #[test]
+    fn only_the_last_eight_bytes_are_the_closed_reserve() {
+        let mut reserve = [0; 8];
+        reserve[7] = 1;
+        let refusal = profile_binding_from_record(&sealed_record(2408, 1750, reserve))
+            .expect_err("a non-zero reserve is outside the contract");
+        assert!(
+            refusal.contains("outside its closed v2 contract"),
+            "{refusal}"
+        );
+        let short = profile_binding_from_record(&sealed_record(1, 1, [0; 8])[..63])
+            .expect_err("63 bytes are not a record");
+        assert!(short.contains("63 bytes"), "{short}");
+        let mut foreign = sealed_record(1, 1, [0; 8]);
+        foreign[..8].copy_from_slice(b"NI-TPM01");
+        let refusal = profile_binding_from_record(&foreign).expect_err("old magic");
+        assert!(refusal.contains("not this appliance's record"), "{refusal}");
+    }
+
+    #[test]
+    fn the_shell_writer_and_this_reader_close_the_record_at_the_same_byte() {
+        // `record_read` in the shell helper is the WRITER's own reader; the
+        // reserve it requires to be zero starts where this file's does. Two
+        // readers that disagree about that byte refuse each other's records,
+        // which is what happened on 2026-09-13.
+        let source = include_str!("../../../ota/neural-ice-tpm-state.sh");
+        let body = source.split_once("record_read() {").unwrap().1;
+        let body = body.split_once("\n}").unwrap().0;
+        let reserved = body
+            .lines()
+            .find(|line| line.contains("reserved=") && line.contains(".read()["))
+            .expect("record_read slices the reserve it requires to be zero");
+        let offset = reserved.split_once(".read()[").unwrap().1;
+        let offset: usize = offset.split_once(':').unwrap().0.parse().unwrap();
+        assert_eq!(offset, PROFILE_RECORD_RESERVED_OFFSET);
     }
 
     #[test]

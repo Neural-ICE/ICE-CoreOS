@@ -544,7 +544,8 @@ rm -f "$der" "$der.message"
 #               NI_TEST_TPM_COUNTER moves the machine's history under a fixed
 #               anchor, which is the replay this counter exists to refuse.
 #   0x01500005  the write-once access-profile record: v2 magic, then the binding
-#               digest and fixed zeroes. This is the AUTHORITY the
+#               digest, the sealed freshness base and origin (ADR-0015 M, O)
+#               and fixed zeroes. This is the AUTHORITY the
 #               verifier compares the anchor against, so a test can make the TPM
 #               disagree with a perfectly signed anchor.
 out=""
@@ -561,7 +562,7 @@ done
 case "$index" in
   0x01500005)
     if [ "${{NI_TEST_TPM_NO_PROFILE_RECORD:-}}" = 1 ]; then exit 1; fi
-    python3 -c 'import sys; open(sys.argv[1],"wb").write((b"NI-TPM02"+bytes.fromhex(sys.argv[2])).ljust(64, b"\0"))' \
+    python3 -c 'import sys; open(sys.argv[1],"wb").write((b"NI-TPM02"+bytes.fromhex(sys.argv[2])+(2408).to_bytes(8,"big")+(1750).to_bytes(8,"big")).ljust(64, b"\0"))' \
       "$out" "${{NI_TEST_TPM_PROFILE_BINDING:-{profile_binding}}}"
     ;;
   *)
