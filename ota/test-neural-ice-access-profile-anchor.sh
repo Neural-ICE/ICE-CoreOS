@@ -482,9 +482,20 @@ grep -Fq 'test tool override is forbidden in a privileged process' "$SCRIPT" \
   || fail "the tool override is not refused under a privileged process"
 grep -Fq 'die_reinstall' "$SCRIPT" || fail "the helper has no distinct reinstall-required refusal"
 # The domain MUST match the Rust verifier's, byte for byte.
-grep -Fq "readonly ANCHOR_DOMAIN='neural-ice:ota:access-profile-anchor:v1'" "$SCRIPT" \
+#
+# The Rust side composes it from the declared namespace (ADR-0016) instead of
+# spelling it: `<namespace>:<purpose>`. So the two halves are checked
+# separately and then joined — the purpose the verifier declares, prefixed by
+# the shipped namespace, must be exactly the literal this helper signs with.
+#
+# This helper is the remaining half of that pass: it still spells the whole
+# string, so an image built with `NI_NAMESPACE` set would have a verifier and a
+# helper in different domains. The check below is what will say so.
+readonly SHIPPED_NAMESPACE='neural-ice'
+readonly ANCHOR_PURPOSE='ota:access-profile-anchor:v1'
+grep -Fq "readonly ANCHOR_DOMAIN='${SHIPPED_NAMESPACE}:${ANCHOR_PURPOSE}'" "$SCRIPT" \
   || fail "the anchor signing domain changed without the Rust verifier"
-grep -Fq 'b"neural-ice:ota:access-profile-anchor:v1\0"' \
+grep -Fq "const ANCHOR_DOMAIN_PURPOSE: &str = \"${ANCHOR_PURPOSE}\";" \
   "$ROOT/tools/ni-ota-verify/src/access_profile_anchor.rs" \
   || fail "the Rust verifier's anchor domain does not match the helper's"
 

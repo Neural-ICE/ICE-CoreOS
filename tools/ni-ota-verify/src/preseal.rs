@@ -15,7 +15,9 @@ use crate::config::{
     immutable_appliance_variant, immutable_bootstrap_delegation_sha256, immutable_hardware_target,
     immutable_minimum_delegation_seq, Config,
 };
-use crate::delegated::beta::{access_profile_for_variant, ReleaseAuthorization, RELEASE_DOMAIN};
+use crate::delegated::beta::{
+    access_profile_for_variant, ReleaseAuthorization, RELEASE_DOMAIN_PURPOSE,
+};
 use crate::delegated::contract::{
     canonical_hash, encode_base64, ident, parse_canonical, public_key_pem, safe_uint, sha256,
     signature_profile, timestamp, validate_der_signature, ContractError,
@@ -37,7 +39,7 @@ const APPLIANCE_VARIANT: &str = "sealed-lab";
 const ACCESS_PROFILE: &str = "lab-managed";
 const TRUST_POLICY: &str = "neural-ice-secureboot-lab-v1";
 const INSTALLER_SCHEMA: &str = "neural-ice-installer-release-authorization-v2";
-const INSTALLER_DOMAIN: &[u8] = b"neural-ice:installer:release-authorization:v2\0";
+const INSTALLER_DOMAIN_PURPOSE: &str = "installer:release-authorization:v2";
 const MAX_SET: u64 = 16 * 1024;
 const MAX_RELEASE: u64 = 64 * 1024;
 const MAX_BOM: u64 = 128 * 1024;
@@ -483,7 +485,7 @@ fn verify_command(
     let release_sig_bytes = release_sig.read()?;
     if let Err(reason) = verify_signature(
         &release_pem,
-        RELEASE_DOMAIN,
+        &crate::namespace::domain(RELEASE_DOMAIN_PURPOSE),
         &release_bytes,
         &release_sig_bytes,
         operation_store,
@@ -1055,8 +1057,10 @@ fn verify_installer_signature(
     if let Err(reason) = validate_der_signature(der) {
         return Ok(Err(reason));
     }
-    let mut message = Vec::with_capacity(INSTALLER_DOMAIN.len() + payload.len());
-    message.extend_from_slice(INSTALLER_DOMAIN);
+    let mut message = Vec::with_capacity(
+        crate::namespace::domain(INSTALLER_DOMAIN_PURPOSE).len() + payload.len(),
+    );
+    message.extend_from_slice(&crate::namespace::domain(INSTALLER_DOMAIN_PURPOSE));
     message.extend_from_slice(payload);
     let key = store.secure_temp_bytes("installer-key", public_key)?;
     let message = store.secure_temp_bytes("installer-message", &message)?;

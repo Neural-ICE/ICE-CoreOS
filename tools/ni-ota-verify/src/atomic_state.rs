@@ -17,7 +17,8 @@ use crate::config::{
     Config,
 };
 use crate::delegated::beta::{
-    authorized_key, device_compatibility, validate_release, ReleaseAuthorization, RELEASE_DOMAIN,
+    authorized_key, device_compatibility, validate_release, ReleaseAuthorization,
+    RELEASE_DOMAIN_PURPOSE,
 };
 use crate::delegated::contract::{canonical_hash, parse_canonical, public_key_pem, ContractError};
 use crate::delegated::{authenticate_snapshot, freeze, freeze_root, verify_signature};
@@ -251,7 +252,7 @@ fn execute(args: &[String], commit: bool) -> Result<u8, InternalError> {
         };
         if let Err(reason) = verify_signature(
             &release_key,
-            RELEASE_DOMAIN,
+            &crate::namespace::domain(RELEASE_DOMAIN_PURPOSE),
             &release_bytes,
             &release_signature,
             &scratch,

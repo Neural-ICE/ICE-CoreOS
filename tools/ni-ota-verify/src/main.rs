@@ -29,6 +29,7 @@ mod commit;
 mod config;
 mod delegated;
 mod device_policy;
+mod namespace;
 mod preseal;
 mod record;
 mod release_manifest;

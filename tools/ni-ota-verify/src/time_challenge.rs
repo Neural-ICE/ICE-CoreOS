@@ -7,13 +7,13 @@ use crate::config::{
     Config,
 };
 use crate::delegated::beta::{
-    validate_release_for_time_challenge, ReleaseAuthorization, RELEASE_DOMAIN,
+    validate_release_for_time_challenge, ReleaseAuthorization, RELEASE_DOMAIN_PURPOSE,
 };
 use crate::delegated::contract::{
     canonical_hash, parse_canonical, public_key_pem, validate_snapshot, verify_root_binding,
     ContractError, Snapshot,
 };
-use crate::delegated::{freeze_authority, freeze_root, verify_signature, SNAPSHOT_DOMAIN};
+use crate::delegated::{freeze_authority, freeze_root, verify_signature, SNAPSHOT_DOMAIN_PURPOSE};
 use crate::state_v1::{CommandTpm, Store, STATE_NV_INDEX};
 use crate::{parse_flags, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
 
@@ -93,7 +93,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
     if let Err(reason) = verify_signature(
         &root_bytes,
-        SNAPSHOT_DOMAIN,
+        &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
         &snapshot_bytes,
         &snapshot_sig.read()?,
         &scratch,
@@ -128,7 +128,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     if let Err(reason) = verify_signature(
         &release_key,
-        RELEASE_DOMAIN,
+        &crate::namespace::domain(RELEASE_DOMAIN_PURPOSE),
         &release_bytes,
         &release_sig.read()?,
         &scratch,

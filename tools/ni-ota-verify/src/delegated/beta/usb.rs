@@ -14,7 +14,7 @@ use crate::runner;
 use crate::state::{ensure_secure_state_directory, FileStateStore};
 use crate::verify::BomCore;
 
-const ATTESTATION_SET_DOMAIN: &[u8] = b"neural-ice:ota:image-attestation-set:v1\0";
+const ATTESTATION_SET_DOMAIN_PURPOSE: &str = "ota:image-attestation-set:v1";
 
 macro_rules! refuse_try {
     ($expression:expr) => {
@@ -165,7 +165,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     refuse_try!(verify_root_binding(&snapshot, &root_bytes));
     refuse_try!(super::super::verify_signature(
         &root_bytes,
-        super::super::SNAPSHOT_DOMAIN,
+        &crate::namespace::domain(crate::delegated::SNAPSHOT_DOMAIN_PURPOSE),
         &snapshot_bytes,
         &snapshot_sig.read()?,
         &scratch,
@@ -226,7 +226,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     refuse_try!(super::super::verify_signature(
         &release_pem,
-        RELEASE_DOMAIN,
+        &crate::namespace::domain(RELEASE_DOMAIN_PURPOSE),
         &release_bytes,
         &release_sig.read()?,
         &scratch,
@@ -275,7 +275,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     refuse_try!(super::super::verify_signature(
         &image_ci_pem,
-        ATTESTATION_SET_DOMAIN,
+        &crate::namespace::domain(ATTESTATION_SET_DOMAIN_PURPOSE),
         &attestation_bytes,
         &attestation_sig.read()?,
         &scratch,

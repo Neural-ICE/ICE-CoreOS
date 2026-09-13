@@ -24,9 +24,8 @@ use contract::{
     ContractError, Snapshot,
 };
 
-pub(crate) const SNAPSHOT_DOMAIN: &[u8] = b"neural-ice:ota:delegation-snapshot:v1\0";
-pub(crate) const RELEASE_AUTHORIZATION_V2_DOMAIN: &[u8] =
-    b"neural-ice:ota:release-authorization:v2\0";
+pub(crate) const SNAPSHOT_DOMAIN_PURPOSE: &str = "ota:delegation-snapshot:v1";
+pub(crate) const RELEASE_AUTHORIZATION_V2_PURPOSE: &str = "ota:release-authorization:v2";
 const MAX_ARTIFACT: usize = 128 * 1024;
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0x800;
@@ -67,7 +66,7 @@ pub(crate) fn authenticate_snapshot(
     verify_root_binding(&snapshot, immutable_root_pem).map_err(ContractError::Refusal)?;
     match verify_signature(
         immutable_root_pem,
-        SNAPSHOT_DOMAIN,
+        &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
         snapshot_bytes,
         snapshot_signature,
         scratch,
@@ -159,7 +158,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     let signature_bytes = signature.read()?;
     if let Err(reason) = verify_signature(
         &root_bytes,
-        SNAPSHOT_DOMAIN,
+        &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
         &snapshot_bytes,
         &signature_bytes,
         &scratch,

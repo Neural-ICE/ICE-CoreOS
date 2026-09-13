@@ -20,7 +20,7 @@ use crate::delegated::contract::{
     canonical_hash, encode_base64, parse_canonical, public_key_pem, validate_snapshot,
     validate_snapshot_time, verify_root_binding, Snapshot,
 };
-use crate::delegated::{signing_bytes, RELEASE_AUTHORIZATION_V2_DOMAIN, SNAPSHOT_DOMAIN};
+use crate::delegated::{signing_bytes, RELEASE_AUTHORIZATION_V2_PURPOSE, SNAPSHOT_DOMAIN_PURPOSE};
 use crate::{runner, InternalError, EXIT_PASS, EXIT_REFUSE};
 
 pub(crate) const READY_SCHEMA: &str = "neural-ice-seed-closure-ready-v1";
@@ -2168,7 +2168,11 @@ pub(crate) fn verify_seed_with(
         &seed_root.join("delegation-snapshot.json"),
         MAX_DOCUMENT_BYTES,
     )?;
-    let delegation_message = signing_bytes(SNAPSHOT_DOMAIN, &delegation_bytes).map_err(Refusal)?;
+    let delegation_message = signing_bytes(
+        &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
+        &delegation_bytes,
+    )
+    .map_err(Refusal)?;
     let delegation_sig = signature_bytes(&seed_root.join("delegation-snapshot.json.sig"))?;
     verify_or_refuse(
         verify,
@@ -2252,8 +2256,11 @@ pub(crate) fn verify_seed_with(
         .get(&(authorization_key_id, signing_role))
         .ok_or_else(|| Refusal("authorization signing role is not delegated".into()))?;
     let auth_sig = signature_bytes(&seed_root.join("release-authorization.json.sig"))?;
-    let auth_message =
-        signing_bytes(RELEASE_AUTHORIZATION_V2_DOMAIN, &auth_bytes).map_err(Refusal)?;
+    let auth_message = signing_bytes(
+        &crate::namespace::domain(RELEASE_AUTHORIZATION_V2_PURPOSE),
+        &auth_bytes,
+    )
+    .map_err(Refusal)?;
     verify_or_refuse(
         verify,
         release_key,

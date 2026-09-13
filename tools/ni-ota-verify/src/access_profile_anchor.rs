@@ -91,11 +91,11 @@ use crate::delegated::{contract::validate_der_signature, verify_signature};
 use crate::state::FileStateStore;
 use crate::{runner, InternalError};
 
-/// Must equal `ANCHOR_DOMAIN` in `ota/neural-ice-access-profile-anchor.sh`
+/// Must equal `ANCHOR_DOMAIN_PURPOSE` in `ota/neural-ice-access-profile-anchor.sh`
 /// byte for byte, trailing NUL included. Two verifiers of one signature that
 /// disagree about the domain do not both verify it -- they each verify a
 /// different statement.
-const ANCHOR_DOMAIN: &[u8] = b"neural-ice:ota:access-profile-anchor:v1\0";
+const ANCHOR_DOMAIN_PURPOSE: &str = "ota:access-profile-anchor:v1";
 const ANCHOR_SCHEMA: &str = "neural-ice-access-profile-anchor-v1";
 const DEVICE_ROOT_SCHEMA: &str = "neural-ice-device-root-tpm-v1";
 const DEVICE_ROOT_HANDLE: &str = "0x81010005";
@@ -110,7 +110,7 @@ const ANCHOR_SPKI: &str = "access-profile-v1.spki";
 const DEVICE_ROOT_IDENTITY: &str = "device-root-v1.json";
 const OWNER_CEREMONY_EVIDENCE_V1: &str = "owner-ceremony-evidence-v1.json";
 const OWNER_CEREMONY_EVIDENCE_V2: &str = "owner-ceremony-evidence-v2.json";
-const COMPLETION_V2_DOMAIN: &[u8] = b"neural-ice:tpm:owner-ceremony-completion:v2\0";
+const COMPLETION_V2_PURPOSE: &str = "tpm:owner-ceremony-completion:v2";
 const OWNER_STATE_PROFILE: &str = "owner-sealed-ota-state-v1";
 const OWNER_FLOOR_NAME: &str =
     "000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4";
@@ -424,8 +424,8 @@ const PROFILE_RECORD_BINDING: std::ops::Range<usize> = 8..40;
 const PROFILE_RECORD_RESERVED_OFFSET: usize = 56;
 /// Domain separation: the same three words must never hash to a value some other
 /// statement in this tree also produces. Byte-for-byte the shell helper's
-/// `PROFILE_BINDING_DOMAIN`.
-const PROFILE_BINDING_DOMAIN: &[u8] = b"neural-ice:tpm:access-profile-binding:v1";
+/// `PROFILE_BINDING_DOMAIN_PURPOSE`.
+const PROFILE_BINDING_DOMAIN_PURPOSE: &str = "tpm:access-profile-binding:v1";
 /// `policywrite|writedefine|ownerread|authread` as the TPM reports it, with the
 /// bits the TPM sets by itself masked out: WRITELOCKED (0x800), READLOCKED
 /// (0x1000_0000) and WRITTEN (0x2000_0000) describe the index's HISTORY, not its
@@ -612,8 +612,10 @@ fn authenticated_completion(
     let observed_digest = if inspection.completion_version == 1 {
         hex_sha256(&evidence_bytes)
     } else {
-        let mut message = Vec::with_capacity(COMPLETION_V2_DOMAIN.len() + evidence_bytes.len());
-        message.extend_from_slice(COMPLETION_V2_DOMAIN);
+        let mut message = Vec::with_capacity(
+            crate::namespace::domain(COMPLETION_V2_PURPOSE).len() + evidence_bytes.len(),
+        );
+        message.extend_from_slice(&crate::namespace::domain(COMPLETION_V2_PURPOSE));
         message.extend_from_slice(&evidence_bytes);
         hex_sha256(&message)
     };
@@ -1032,7 +1034,7 @@ fn tpm_install_counter(store: &FileStateStore) -> Result<Result<u64, String>, In
 /// Secure Boot trust policy. Byte-for-byte the shell helper's `profile_digest`.
 fn profile_binding_digest(profile: &str, target: &str, policy_id: &str) -> String {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(PROFILE_BINDING_DOMAIN);
+    bytes.extend_from_slice(&crate::namespace::prefix(PROFILE_BINDING_DOMAIN_PURPOSE));
     bytes.push(0);
     bytes.extend_from_slice(profile.as_bytes());
     bytes.push(0);
@@ -1445,9 +1447,13 @@ pub(crate) fn enrolled_access_profile(
     // this in-memory input; the signed message stays DOMAIN || anchor_bytes.
     let mut delegated_payload = anchor_bytes.clone();
     delegated_payload.push(b'\n');
-    if let Err(reason) =
-        verify_signature(&pem, ANCHOR_DOMAIN, &delegated_payload, &signature, store)?
-    {
+    if let Err(reason) = verify_signature(
+        &pem,
+        &crate::namespace::domain(ANCHOR_DOMAIN_PURPOSE),
+        &delegated_payload,
+        &signature,
+        store,
+    )? {
         return Ok(Err(reinstall_required(&format!(
             "the access-profile anchor is not signed by this machine's device root ({reason})"
         ))));
