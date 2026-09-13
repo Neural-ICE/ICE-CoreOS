@@ -2432,17 +2432,41 @@ fn read_regular(path: &Path, mode: u32) -> Result<Vec<u8>, InternalError> {
     Ok(bytes)
 }
 
+/// The whole authenticated reader's budget. See the note at its only use.
+pub(crate) const AUTHENTICATED_OTA_STATUS_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(150);
+
 pub(crate) fn run_authenticated_ota_status(args: &[String]) -> Result<u8, InternalError> {
-    // The owner lifecycle status alone takes 12.6 seconds on physical GB10
-    // hardware. Keep the complete reader bounded at 45 seconds so the existing
-    // 30-second per-helper ceiling remains effective while leaving time for
-    // the independent state captures and retained-preseal checks around it.
-    // The host gate reserves another five seconds for error propagation and
-    // volatile cleanup before it kills the verifier process group.
-    #[cfg(not(feature = "test-path-overrides"))]
-    let operation_timeout = std::time::Duration::from_secs(45);
-    #[cfg(feature = "test-path-overrides")]
-    let operation_timeout = std::time::Duration::from_secs(3);
+    // The budget is the MEASURED cost of this reader on the hardware it runs
+    // on, in the sandbox it runs in, plus margin for the tail.
+    //
+    // It used to be 45 seconds, derived from a 12.6-second owner-lifecycle
+    // status. That measurement was taken outside the licence gate's sandbox,
+    // and the gate is the only caller that matters: measured there on the lab
+    // GX10 on 2026-09-13 (C36, six consecutive runs) the same helper cost 13,
+    // 14, 14, 15, 16 and 28 seconds, and the whole reader 24.0 to 39.9. The
+    // 28-second sample was taken while the appliance was starting its
+    // containers — exactly when the gate runs at boot.
+    //
+    // So the old budget did not refuse a hung appliance; it refused a BUSY
+    // one, on the tail of a distribution whose median sat comfortably inside
+    // it. The gate has no second opinion: when the reader refuses, the
+    // licensed target never starts, the AI stack never comes up, and the
+    // operator reads "authenticated OTA status unavailable" with nothing
+    // behind it. An appliance that boots or does not boot depending on how
+    // busy it was is not a bounded appliance — it is an unbounded one with a
+    // short timeout.
+    //
+    // 150 seconds covers the measured worst case roughly four times over and
+    // still bounds a genuine hang far inside the unit's TimeoutStartSec.
+    // `cfg!` rather than two `#[cfg]` bindings: both arms compile, so the
+    // production budget stays reachable from the test that holds it against
+    // the helper budget instead of reading as dead code under the test feature.
+    let operation_timeout = if cfg!(feature = "test-path-overrides") {
+        std::time::Duration::from_secs(3)
+    } else {
+        AUTHENTICATED_OTA_STATUS_BUDGET
+    };
     crate::runner::with_operation_deadline(operation_timeout, || {
         run_authenticated_ota_status_bounded(args)
     })
@@ -3005,6 +3029,15 @@ pub(crate) fn run_status_helper(
     label: &str,
 ) -> Result<StatusHelperOutput, InternalError> {
     runner::bounded_output(command, None, label)
+}
+
+/// Run a status helper under an explicitly measured budget.
+pub(crate) fn run_status_helper_within(
+    command: &mut Command,
+    label: &str,
+    budget: std::time::Duration,
+) -> Result<StatusHelperOutput, InternalError> {
+    runner::bounded_output_within(command, label, budget)
 }
 
 fn require_owner_profile_marker() -> Result<(), String> {
