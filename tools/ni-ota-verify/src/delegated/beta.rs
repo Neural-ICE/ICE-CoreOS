@@ -24,8 +24,8 @@ mod usb;
 
 pub(crate) use usb::run as run_usb;
 
-pub(crate) const RELEASE_DOMAIN: &[u8] = b"neural-ice:ota:release-authorization:v1\0";
-const RECEIPT_DOMAIN: &[u8] = b"neural-ice:ota:beta-publication-receipt:v1\0";
+pub(crate) const RELEASE_DOMAIN_PURPOSE: &str = "ota:release-authorization:v1";
+const RECEIPT_DOMAIN_PURPOSE: &str = "ota:beta-publication-receipt:v1";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -197,7 +197,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     }
     if let Err(reason) = verify_signature(
         &root_bytes,
-        super::SNAPSHOT_DOMAIN,
+        &crate::namespace::domain(crate::delegated::SNAPSHOT_DOMAIN_PURPOSE),
         &snapshot_bytes,
         &snapshot_sig.read()?,
         &scratch,
@@ -282,7 +282,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     if let Err(reason) = verify_signature(
         &release_pem,
-        RELEASE_DOMAIN,
+        &crate::namespace::domain(RELEASE_DOMAIN_PURPOSE),
         &release_bytes,
         &release_sig.read()?,
         &scratch,
@@ -307,7 +307,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
     };
     if let Err(reason) = verify_signature(
         &receipt_pem,
-        RECEIPT_DOMAIN,
+        &crate::namespace::domain(RECEIPT_DOMAIN_PURPOSE),
         &receipt_bytes,
         &receipt_sig.read()?,
         &scratch,

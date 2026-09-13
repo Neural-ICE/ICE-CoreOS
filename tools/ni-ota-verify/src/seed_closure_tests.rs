@@ -1,5 +1,5 @@
 use super::*;
-use crate::delegated::{signing_bytes, RELEASE_AUTHORIZATION_V2_DOMAIN, SNAPSHOT_DOMAIN};
+use crate::delegated::{signing_bytes, RELEASE_AUTHORIZATION_V2_PURPOSE, SNAPSHOT_DOMAIN_PURPOSE};
 
 fn canonical_json(value: serde_json::Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(&value).unwrap();
@@ -810,7 +810,11 @@ fn fabric_ring_vectors_bind_exact_domain_separated_bytes() {
     )
     .expect("Fabric delegation snapshot");
     canonical_value(&snapshot, "Fabric delegation snapshot").unwrap();
-    let message = signing_bytes(SNAPSHOT_DOMAIN, &snapshot).unwrap();
+    let message = signing_bytes(
+        &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
+        &snapshot,
+    )
+    .unwrap();
     assert_eq!(
         hex_digest(&message),
         index["delegation_snapshot_signing_digest_sha256"]
@@ -819,7 +823,13 @@ fn fabric_ring_vectors_bind_exact_domain_separated_bytes() {
     );
     assert_ne!(hex_digest(&snapshot), hex_digest(&message));
     assert_ne!(
-        hex_digest(&[SNAPSHOT_DOMAIN, snapshot.as_slice()].concat()),
+        hex_digest(
+            &[
+                &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
+                snapshot.as_slice()
+            ]
+            .concat()
+        ),
         hex_digest(&message),
         "the stored LF must not be signed"
     );
@@ -830,7 +840,11 @@ fn fabric_ring_vectors_bind_exact_domain_separated_bytes() {
         )
         .expect("Fabric authorization");
         canonical_value(&authorization, "Fabric authorization").unwrap();
-        let message = signing_bytes(RELEASE_AUTHORIZATION_V2_DOMAIN, &authorization).unwrap();
+        let message = signing_bytes(
+            &crate::namespace::domain(RELEASE_AUTHORIZATION_V2_PURPOSE),
+            &authorization,
+        )
+        .unwrap();
         assert_eq!(
             hex_digest(&message),
             case["authorization_signing_digest_sha256"]
@@ -841,7 +855,13 @@ fn fabric_ring_vectors_bind_exact_domain_separated_bytes() {
         );
         assert_ne!(hex_digest(&authorization), hex_digest(&message));
         assert_ne!(
-            hex_digest(&[RELEASE_AUTHORIZATION_V2_DOMAIN, authorization.as_slice()].concat()),
+            hex_digest(
+                &[
+                    &crate::namespace::domain(RELEASE_AUTHORIZATION_V2_PURPOSE),
+                    authorization.as_slice()
+                ]
+                .concat()
+            ),
             hex_digest(&message),
             "{} signs the terminal LF",
             case["vector_id"].as_str().unwrap()
@@ -1394,10 +1414,17 @@ fn complete_fabric_fixture(base: &Path) -> Option<CompleteFixture> {
         "repository": repository
     });
     let authorization_bytes = canonical_json(authorization);
-    let delegation_message = signing_bytes(SNAPSHOT_DOMAIN, &snapshot_bytes).unwrap();
+    let delegation_message = signing_bytes(
+        &crate::namespace::domain(SNAPSHOT_DOMAIN_PURPOSE),
+        &snapshot_bytes,
+    )
+    .unwrap();
     let delegation_signature = sign_low_s(base, &root_private, "delegation", &delegation_message);
-    let authorization_message =
-        signing_bytes(RELEASE_AUTHORIZATION_V2_DOMAIN, &authorization_bytes).unwrap();
+    let authorization_message = signing_bytes(
+        &crate::namespace::domain(RELEASE_AUTHORIZATION_V2_PURPOSE),
+        &authorization_bytes,
+    )
+    .unwrap();
     let authorization_signature = sign_low_s(
         base,
         &release_private,
@@ -1626,7 +1653,7 @@ fn fabric_delegation_drives_a_complete_verify_seed_with_fixture() {
     mismatched_authorization["boot_trust_policy_sha256"] = serde_json::json!("f".repeat(64));
     let mismatched_authorization_bytes = canonical_json(mismatched_authorization);
     let mismatched_authorization_message = signing_bytes(
-        RELEASE_AUTHORIZATION_V2_DOMAIN,
+        &crate::namespace::domain(RELEASE_AUTHORIZATION_V2_PURPOSE),
         &mismatched_authorization_bytes,
     )
     .unwrap();

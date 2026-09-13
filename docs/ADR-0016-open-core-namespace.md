@@ -51,13 +51,15 @@ the default.**
 1. Every string that identifies the OPERATOR rather than the MECHANISM is
    derived from a single declared namespace, supplied at image-build time.
 2. The namespace has a default equal to the values in use today, so an
-   unconfigured build of this repository produces byte-identical records. This
-   is not a convenience: records already sealed in deployed TPMs carry those
-   bytes, and a change would make installed appliances unverifiable.
-3. Values that are WRITTEN into persistent state — TPM record magics, sealed
-   evidence schemas — are part of the namespace but are **versioned**: an
-   adopter who changes them starts a new lineage and cannot read records sealed
-   under another. The code states that rather than implying it.
+   unconfigured clone builds and runs without being told anything. That is a
+   convenience and nothing more. **There is no deployed fleet**: the only
+   appliances are this project's own, reinstalled routinely and TPM-cleared
+   before each install, so no sealed record anywhere constrains this choice.
+3. Values WRITTEN into persistent state — TPM record magics, sealed evidence
+   schemas — are part of the namespace. An adopter who declares their own
+   starts a separate lineage and cannot read records sealed under another, in
+   either direction. That is what a domain separator is for; it is a property,
+   not an obstacle.
 4. Values only COMPARED at runtime carry no such constraint and follow the
    namespace freely.
 5. Build inputs are documented where an adopter looks — the README and one
@@ -83,5 +85,19 @@ of the brand. The defect of 2026-09-13 — a reserve read at byte 40 where the
 ceremony writes a freshness base — was a layout defect that no test could reach
 while the layout and the brand were the same literals.
 
-The cost is that an adopter who changes the namespace cannot read our records,
-and we cannot read theirs. That is the correct outcome and it is now explicit.
+The cost is that an adopter who declares their own namespace cannot read our
+records, and we cannot read theirs. That is the correct outcome and it is now
+explicit.
+
+**What is done and what is next.** All nine signature domains compose from the
+declared namespace. The schema identifiers and the TPM record magics are the
+remaining pass inside this repository, and they are ordinary work: an earlier
+draft deferred them on the grounds that they are written into deployed
+hardware, which was wrong — there is no deployed fleet, and inventing a
+production constraint to be careful about is its own kind of error.
+
+The PATHS are the one genuinely separate matter. `/usr/lib/neural-ice`,
+`/var/lib/neural-ice` and `/etc/neural-ice` are the interface this OS publishes
+to the product layered on top of it, which mounts and reads them from another
+repository. Renaming them is a two-repository change with a coordinated cut,
+and it must not land while a medium is being cut against the current names.

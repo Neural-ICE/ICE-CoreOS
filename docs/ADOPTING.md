@@ -47,10 +47,8 @@ The domain separators that bind every signature to its purpose, and the schema
 identifiers stamped into every evidence file, identify the *operator*, not the
 mechanism. They are composed from one declared namespace.
 
-Unlike the time issuer, this one has a **default**, and the default is not a
-convenience: those exact bytes are already sealed into deployed TPMs and written
-into evidence files on deployed disks. An unconfigured build must reproduce them
-or those appliances stop verifying.
+Unlike the time issuer, this one has a **default**, so an unconfigured clone
+builds and runs without being told anything.
 
 ```sh
 NI_NAMESPACE=example-org NI_TRUSTED_TIME_ISSUER=time.example.org ./ci/build-image.sh

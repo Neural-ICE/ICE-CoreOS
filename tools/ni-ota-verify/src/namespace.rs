@@ -3,11 +3,14 @@
 //! Every string that identifies the OPERATOR rather than the MECHANISM is
 //! derived from the namespace declared here: the domain separators that bind a
 //! signature to its purpose, and the schema identifiers stamped into every
-//! evidence file. Nine domains and thirty-four schemas shared one prefix as
-//! thirty-four separate literals, which meant an adopter could not build this
-//! OS under their own identity without editing the source — and meant this
-//! deployment's own bench, laboratory and customer appliances all sealed their
-//! records into a single cryptographic domain.
+//! evidence file. Nine signature domains and the schema identifiers shared one
+//! prefix as forty-odd separate literals, which meant an adopter could not
+//! build this OS under their own identity without editing the source — and
+//! meant this deployment's own bench, laboratory and customer appliances all
+//! signed into a single cryptographic domain.
+//!
+//! Every signature domain now composes from here. The schema identifiers are
+//! the remaining pass.
 //!
 //! See `docs/ADR-0016-open-core-namespace.md`.
 //!
@@ -21,15 +24,16 @@
 //!
 //! # Why it defaults instead of being mandatory
 //!
-//! These bytes are already sealed into deployed TPMs and written into evidence
-//! files on deployed disks. An unconfigured build MUST reproduce them or those
-//! appliances stop verifying. So the default is this deployment's value, and
-//! `NI_NAMESPACE` is how somebody else declares theirs.
+//! So an unconfigured clone builds and runs without being told anything. That
+//! is the whole reason — there is no deployed fleet whose sealed records the
+//! default protects, and reading one into this decision would be inventing a
+//! constraint to be careful about.
 //!
-//! Changing it starts a NEW LINEAGE. Records sealed under one namespace cannot
-//! be verified by a build using another, in either direction. That is what a
-//! domain separator is for, and it is why there is no migration: there is
-//! nothing to migrate, only two populations that must not be confused.
+//! Declaring your own starts a SEPARATE LINEAGE. Records sealed under one
+//! namespace cannot be verified by a build using another, in either direction.
+//! That is what a domain separator is for: a property, not an obstacle, and
+//! there is nothing to migrate — only two populations that must not be
+//! confused.
 
 /// The declared namespace. Lowercase, no colon — the separators add those.
 pub(crate) const NAMESPACE: &str = match option_env!("NI_NAMESPACE") {
@@ -45,6 +49,17 @@ pub(crate) fn domain(purpose: &str) -> Vec<u8> {
     bytes.push(b':');
     bytes.extend_from_slice(purpose.as_bytes());
     bytes.push(0);
+    bytes
+}
+
+/// The same, WITHOUT the terminator, for callers that compose their own
+/// separators around it — the access-profile binding hashes
+/// `prefix || 0x00 || profile || 0x00 || …` and supplies every NUL itself.
+pub(crate) fn prefix(purpose: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(NAMESPACE.len() + purpose.len() + 1);
+    bytes.extend_from_slice(NAMESPACE.as_bytes());
+    bytes.push(b':');
+    bytes.extend_from_slice(purpose.as_bytes());
     bytes
 }
 
@@ -91,6 +106,10 @@ mod tests {
         assert_eq!(
             domain("tpm:access-profile-binding:v1"),
             b"neural-ice:tpm:access-profile-binding:v1\0"
+        );
+        assert_eq!(
+            prefix("tpm:access-profile-binding:v1"),
+            b"neural-ice:tpm:access-profile-binding:v1"
         );
         assert_eq!(
             schema("device-root-tpm-v1"),
