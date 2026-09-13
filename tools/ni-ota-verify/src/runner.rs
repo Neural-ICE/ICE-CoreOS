@@ -88,6 +88,21 @@ pub(crate) fn bounded_output(
     bounded_output_with_timeout(command, stdin, label, HELPER_TIMEOUT)
 }
 
+/// Run one helper under a budget this caller MEASURED, not the generic one.
+///
+/// The generic ceiling exists so a helper that hangs cannot hang the gate. It
+/// is not a statement about how long any particular helper takes, and using it
+/// as one turns a slow helper into an intermittent refusal. A caller that
+/// knows its helper's cost on real hardware states it here, beside the
+/// measurement it came from.
+pub(crate) fn bounded_output_within(
+    command: &mut Command,
+    label: &str,
+    budget: Duration,
+) -> Result<BoundedOutput, InternalError> {
+    bounded_output_with_timeout(command, None, label, budget)
+}
+
 fn bounded_output_with_timeout(
     command: &mut Command,
     stdin: Option<Vec<u8>>,

@@ -463,6 +463,34 @@ fn tool(name: &str) -> PathBuf {
     PathBuf::from(format!("/usr/bin/{name}"))
 }
 
+/// What the owner-lifecycle status costs on real hardware, in the sandbox the
+/// licence gate runs it in, with margin for its tail.
+///
+/// `validate_complete` re-reads the sealed record, rebuilds the canonical
+/// completion evidence, verifies the access-profile anchor and runs the
+/// runtime-status reader: several serialized TPM sessions, and the TPM is the
+/// slowest thing on the appliance. Measured on the lab GX10 on 2026-09-13
+/// (C36, six consecutive runs inside the gate's sandbox): 13, 14, 14, 15, 16
+/// and 28 seconds. The 28-second sample was taken while the containers were
+/// starting, which is when the gate runs at boot.
+///
+/// The generic 30-second ceiling therefore sat ON the tail of this helper's
+/// distribution: the gate refused a healthy, licensed appliance whenever it
+/// was busy, and the refusal reads the same as a TPM that is gone.
+const TPM_LIFECYCLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+fn bounded_lifecycle_helper(
+    command: &mut Command,
+) -> Result<Result<crate::state_v1::StatusHelperOutput, String>, InternalError> {
+    let label = "authenticated TPM owner lifecycle";
+    match crate::state_v1::run_status_helper_within(command, label, TPM_LIFECYCLE_BUDGET) {
+        Ok(output) if output.timed_out => Ok(Err(format!("{label} timed out"))),
+        Ok(output) if output.overflowed => Ok(Err(format!("{label} exceeded its output bound"))),
+        Ok(output) => Ok(Ok(output)),
+        Err(error) => Ok(Err(error.0)),
+    }
+}
+
 fn bounded_helper(
     command: &mut Command,
     label: &str,
@@ -496,7 +524,7 @@ fn assert_full_tpm_lifecycle() -> Result<Result<(), String>, InternalError> {
 
     let mut command = Command::new(executable);
     command.arg("status");
-    match bounded_helper(&mut command, "authenticated TPM owner lifecycle")? {
+    match bounded_lifecycle_helper(&mut command)? {
         Ok(output) if output.status.success() => Ok(Ok(())),
         Ok(output) => {
             let detail = String::from_utf8_lossy(&output.stderr);
@@ -1649,6 +1677,42 @@ mod tests {
         let offset = reserved.split_once(".read()[").unwrap().1;
         let offset: usize = offset.split_once(':').unwrap().0.parse().unwrap();
         assert_eq!(offset, PROFILE_RECORD_RESERVED_OFFSET);
+    }
+
+    /// The two budgets must stay in the order that makes both of them mean
+    /// something. A helper budget at or above the operation budget is never
+    /// reached — the operation deadline cuts first and the helper's number
+    /// becomes decoration — and a helper budget under the cost measured on the
+    /// hardware is the defect this pair was corrected for: an appliance that
+    /// refuses its own licence gate when it happens to be busy.
+    #[test]
+    fn the_lifecycle_budget_covers_the_measured_tail_and_fits_the_operation() {
+        // The slowest of six consecutive runs inside the licence gate's
+        // sandbox, lab GX10, 2026-09-13.
+        let measured_worst_case = std::time::Duration::from_secs(28);
+        assert!(
+            TPM_LIFECYCLE_BUDGET >= measured_worst_case * 3,
+            "a budget without margin over the measured tail refuses a busy appliance: \
+         {TPM_LIFECYCLE_BUDGET:?} against {measured_worst_case:?}"
+        );
+        let operation = crate::state_v1::AUTHENTICATED_OTA_STATUS_BUDGET;
+        assert!(
+            TPM_LIFECYCLE_BUDGET < operation,
+            "the operation deadline would cut before the helper budget was ever reached: \
+         {TPM_LIFECYCLE_BUDGET:?} against {operation:?}"
+        );
+        // The lifecycle status dominates the reader but is not all of it: the
+        // same six runs put the whole reader at 24.0 to 39.9 seconds, so
+        // everything around the helper cost at most twelve. That remainder
+        // needs its own margin, or the operation deadline reproduces the
+        // original failure one step further along — cutting the chain while
+        // the helper's generous budget is still unspent.
+        let measured_remainder = std::time::Duration::from_secs(12);
+        assert!(
+            operation >= TPM_LIFECYCLE_BUDGET + measured_remainder * 3,
+            "the reader's remainder has no margin: {operation:?} for \
+         {TPM_LIFECYCLE_BUDGET:?} plus {measured_remainder:?}"
+        );
     }
 
     #[test]
