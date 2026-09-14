@@ -1595,7 +1595,7 @@ snapshot_preseal_from_esp() { # $1=destination
 }
 
 write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated set [$4=source $5=root key value $6=root key source]
-  local state_dir=$1 destination=$2 preseal_set=$3 source root_key root_key_source destination_dir
+  local state_dir=$1 destination=$2 preseal_set=$3 source root_key root_key_source destination_dir sealed_channel
   source="${4:-$VERITY_ROOT_MOUNT/etc/neural-ice/ota.conf}"
   root_key="${5:-$VERITY_ROOT_MOUNT/etc/neural-ice/keys/ota-root.pub}"
   root_key_source="${6:-$root_key}"
@@ -1605,6 +1605,17 @@ write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated
     || die "the verified installer root carries no bounded OTA verifier configuration"
   [[ -f "$root_key_source" && ! -L "$root_key_source" ]] \
     || die "the verified installer root carries no OTA root public key"
+  # 🔴 THE RING THE MEDIUM SEALS MUST REACH THE INSTALLED ota.conf. The installer
+  # already validates `neuralice.device_channel` and records it in
+  # /var/lib/neural-ice/data/release/CHANNEL, but `ni-ota-verify device-policy`
+  # reads the ring from ota.conf ALONE (src/device_policy.rs: applied state, else
+  # config.device_channel). A freshly installed appliance has no applied state,
+  # so an absent key left active_ring None and every OTA was refused with
+  # "durable active ring is outside the enrolled access profile" (bench .67,
+  # 2026-09-14). Two consumers, two files, one of them empty.
+  sealed_channel="${DEVICE_CHANNEL:-}"
+  [[ "$sealed_channel" =~ ^(lab|beta|stable)$ ]] \
+    || die "the preseal verifier configuration needs the sealed device channel"
   destination_dir="$(dirname -- "$destination")"
   [[ -d "$destination_dir" && ! -L "$destination_dir" \
       && ! -e "$destination" && ! -L "$destination" ]] \
@@ -1617,14 +1628,17 @@ write_preseal_verifier_config() { # $1=state dir $2=destination $3=authenticated
   # ota.conf made every registry install of a vanilla image refuse here (bench
   # 2026-09-06). A half-declared pair is still refused; a fully declared pair
   # is kept, and the verifier then decides whether it equals the set.
-  python3 - "$source" "$destination" "$state_dir" "$root_key" "$preseal_set" <<'PRESEAL_CONFIG_PY' \
+  python3 - "$source" "$destination" "$state_dir" "$root_key" "$preseal_set" "$sealed_channel" <<'PRESEAL_CONFIG_PY' \
     || die "cannot create the bounded preseal verifier configuration"
 import json
 import os
 import pathlib
 import stat
 import sys
-source, destination, state_dir, root_key, preseal_set = map(pathlib.Path, sys.argv[1:])
+source, destination, state_dir, root_key, preseal_set = map(pathlib.Path, sys.argv[1:6])
+sealed_channel = sys.argv[6]
+if sealed_channel not in ("lab", "beta", "stable"):
+    raise SystemExit("the sealed device channel is not a release ring")
 
 def bounded_regular(path, maximum):
     before = os.lstat(path)
@@ -1659,7 +1673,8 @@ for mapped in (state_dir, root_key):
 
 lines = bounded_regular(source, 65536).decode("utf-8").splitlines()
 counts = {"root_pubkey": 0, "state_dir": 0,
-          "device_compat_min": 0, "device_compat_max": 0}
+          "device_compat_min": 0, "device_compat_max": 0, "device_channel": 0}
+declared_channel = None
 result = []
 for line in lines:
     stripped = line.strip()
@@ -1670,6 +1685,8 @@ for line in lines:
         line = f"root_pubkey={root_key}"
     elif key == "state_dir":
         line = f"state_dir={state_dir}"
+    elif key == "device_channel":
+        declared_channel = stripped.split("=", 1)[1].strip()
     result.append(line)
 if counts["root_pubkey"] != 1 or counts["state_dir"] != 1:
     raise SystemExit("required OTA verifier configuration keys are absent or duplicated")
@@ -1684,6 +1701,14 @@ if declared == (0, 0):
     result.append(f"device_compat_max={hi}")
 elif declared != (1, 1):
     raise SystemExit("device compat keys are half-declared or duplicated")
+# The medium is the authority on the ring. An image that declares a DIFFERENT one
+# is a contradiction, not a default to silently overwrite.
+if counts["device_channel"] == 0:
+    result.append(f"device_channel={sealed_channel}")
+elif counts["device_channel"] != 1:
+    raise SystemExit("device_channel is declared more than once")
+elif declared_channel != sealed_channel:
+    raise SystemExit("the image declares a device channel this medium does not seal")
 payload = ("\n".join(result) + "\n").encode("utf-8")
 fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 try:

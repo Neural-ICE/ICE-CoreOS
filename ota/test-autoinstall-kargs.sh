@@ -352,21 +352,54 @@ printf 'enforce=0\nroot_pubkey=/etc/neural-ice/keys/ota-root.pub\nstate_dir=/var
   > "$compat_root/etc/neural-ice/ota.conf"
 : > "$compat_root/etc/neural-ice/keys/ota-root.pub"
 printf '{"compat_max":5,"compat_min":5,"schema":"neural-ice-installer-preseal-set-v1"}\n' > "$TMP/preseal-set.json"
-compat_out="$(
-  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+run_preseal_config() { # <destination> <device-channel value or UNSET> [source ota.conf]
+  local destination=$1 channel=$2 source=${3:-}
+  VERITY_ROOT_MOUNT="$compat_root" NI_TEST_CHANNEL="$channel" bash -c '
     set -euo pipefail
     die() { echo "die: $*" >&2; exit 1; }
     source "$1"
-    write_preseal_verifier_config "$2" "$3" "$4"
+    if [[ "$NI_TEST_CHANNEL" != UNSET ]]; then DEVICE_CHANNEL="$NI_TEST_CHANNEL"; fi
+    if [[ -n "${5:-}" ]]; then
+      write_preseal_verifier_config "$2" "$3" "$4" "$5"
+    else
+      write_preseal_verifier_config "$2" "$3" "$4"
+    fi
     cat "$3"
-  ' _ "$TMP/preseal-config.sh" "$TMP/state" "$TMP/verifier.conf" "$TMP/preseal-set.json"
-)" || fail "the preseal verifier config refused a vanilla image whose compat is unset"
+  ' _ "$TMP/preseal-config.sh" "$TMP/state" "$destination" "$TMP/preseal-set.json" "$source"
+}
+
+compat_out="$(run_preseal_config "$TMP/verifier.conf" lab)" \
+  || fail "the preseal verifier config refused a vanilla image whose compat is unset"
 grep -qx 'device_compat_min=5' <<<"$compat_out" \
   || fail "the preseal verifier config did not take device_compat_min from the preseal set"
 grep -qx 'device_compat_max=5' <<<"$compat_out" \
   || fail "the preseal verifier config did not take device_compat_max from the preseal set"
 grep -qx "state_dir=$TMP/state" <<<"$compat_out" \
   || fail "the preseal verifier config did not rebase state_dir"
+
+# 🔴 THE SEALED RING MUST REACH ota.conf. ni-ota-verify device-policy reads the
+# ring from ota.conf alone; with no applied state an absent key made every OTA
+# refuse on a freshly installed appliance (bench .67, 2026-09-14). Assert the
+# property on the real function, not on the prose that describes it.
+grep -qx 'device_channel=lab' <<<"$compat_out" \
+  || fail "the preseal verifier config did not write the sealed device channel"
+[[ "$(grep -cE '^device_channel=' <<<"$compat_out")" = 1 ]] \
+  || fail "the preseal verifier config wrote device_channel more than once"
+
+run_preseal_config "$TMP/verifier-nochannel.conf" UNSET >/dev/null 2>&1 \
+  && fail "the preseal verifier config accepted an unsealed device channel"
+
+printf 'enforce=0\nroot_pubkey=/etc/neural-ice/keys/ota-root.pub\nstate_dir=/var/lib/neural-ice/ota\nhardware_target=nvidia-gb10-arm64\ndevice_channel=lab\n' \
+  > "$TMP/declared-lab.conf"
+declared_out="$(run_preseal_config "$TMP/verifier-declared.conf" lab "$TMP/declared-lab.conf")" \
+  || fail "the preseal verifier config refused an image that declares the ring the medium seals"
+[[ "$(grep -cE '^device_channel=' <<<"$declared_out")" = 1 ]] \
+  || fail "the preseal verifier config duplicated an already declared device_channel"
+
+printf 'enforce=0\nroot_pubkey=/etc/neural-ice/keys/ota-root.pub\nstate_dir=/var/lib/neural-ice/ota\nhardware_target=nvidia-gb10-arm64\ndevice_channel=stable\n' \
+  > "$TMP/declared-stable.conf"
+run_preseal_config "$TMP/verifier-contradiction.conf" lab "$TMP/declared-stable.conf" >/dev/null 2>&1 \
+  && fail "the preseal verifier config accepted an image ring the medium does not seal"
 
 # The authenticated compat range must survive into the installed runtime
 # configuration, not only the installer's /run verifier file. Start from the
@@ -382,7 +415,7 @@ mkdir -p "$(dirname "$installed_root_key")"
 cp "$ROOT/image/bootc-overlay/etc/neural-ice/ota.conf" "$installed_config"
 : > "$installed_root_key"
 runtime_out="$(
-  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+  VERITY_ROOT_MOUNT="$compat_root" DEVICE_CHANNEL=lab bash -c '
     set -euo pipefail
     die() { echo "die: $*" >&2; exit 1; }
     source "$1"
@@ -411,7 +444,7 @@ fi
 
 mv -T -- "$installed_candidate" "$installed_config"
 mapped_out="$(
-  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+  VERITY_ROOT_MOUNT="$compat_root" DEVICE_CHANNEL=lab bash -c '
     set -euo pipefail
     die() { echo "die: $*" >&2; exit 1; }
     source "$1"
@@ -438,7 +471,7 @@ sed -e 's/^#device_compat_min=1$/device_compat_min=4/' \
   -e 's/^#device_compat_max=3$/device_compat_max=5/' \
   "$ROOT/image/bootc-overlay/etc/neural-ice/ota.conf" > "$declared_config"
 declared_out="$(
-  VERITY_ROOT_MOUNT="$compat_root" bash -c '
+  VERITY_ROOT_MOUNT="$compat_root" DEVICE_CHANNEL=lab bash -c '
     set -euo pipefail
     die() { echo "die: $*" >&2; exit 1; }
     source "$1"
@@ -457,7 +490,7 @@ symlink_victim="$TMP/symlink-victim"
 symlink_destination="$TMP/symlink-config"
 printf '%s\n' unchanged > "$symlink_victim"
 ln -s "$symlink_victim" "$symlink_destination"
-if VERITY_ROOT_MOUNT="$compat_root" bash -c '
+if VERITY_ROOT_MOUNT="$compat_root" DEVICE_CHANNEL=lab bash -c '
     set -euo pipefail
     die() { exit 1; }
     source "$1"
@@ -471,7 +504,7 @@ fi
   || fail "the rejected verifier-config symlink write altered its target"
 
 printf 'enforce=0\nroot_pubkey=/x\nstate_dir=/y\ndevice_compat_min=5\n' > "$compat_root/etc/neural-ice/ota.conf"
-if VERITY_ROOT_MOUNT="$compat_root" bash -c '
+if VERITY_ROOT_MOUNT="$compat_root" DEVICE_CHANNEL=lab bash -c '
     set -euo pipefail
     die() { exit 1; }
     source "$1"
