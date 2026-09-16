@@ -3784,34 +3784,44 @@ readonly SEED_VERIFIED_ROOT
 readonly SEED_MANIFEST_SHA256
 
 # --------------------------------------------------------------------------- #
-# 🔴 THE CONTAINER THAT RUNS bootc MUST BE ABLE TO READ ITS SOURCE — PROVED
-# HERE, BEFORE THE WIPE. Hardware, 2026-09-09: phase 4 died AFTER the wipe on
-# `resolving bound image …: OpenImage: overlay: can't stat program
-# "/usr/bin/fuse-overlayfs"`, and the machine was left without an OS.
+# 🔴 THE CONTAINER THAT RUNS bootc MUST BE ABLE TO READ ITS SOURCE — AND EVERY
+# IMAGE ITS SOURCE BINDS — PROVED HERE, BEFORE THE WIPE. Hardware, 2026-09-09:
+# phase 4 died AFTER the wipe on `resolving bound image …: OpenImage: overlay:
+# can't stat program "/usr/bin/fuse-overlayfs"`, and the machine was left
+# without an OS.
 #
-# Two facts behind it. (1) The sealed store and the writable runtime store are
-# fuse-overlayfs stores (§1a, `.has-mount-program`), and the appliance image
-# that runs bootc ships libfuse3 but not the helper: the installer lends its
-# own helper to that one container, read-only. (2) bootc 1.16 resolves the
-# image's logically bound images at install time and no longer offers a skip
-# mode, while this appliance receives those images from the seed store on the
-# data volume (phase 5, `additionalimagestores`): the container therefore sees
-# an EMPTY bound-images.d, mounted over the image's own, which the installed
-# deployment keeps untouched.
+# Three facts behind it. (1) The sealed store and the writable runtime store
+# are fuse-overlayfs stores (§1a, `.has-mount-program`), and the appliance
+# image that runs bootc ships libfuse3 but not the helper: the installer lends
+# its own helper to that one container, read-only. (2) bootc 1.16 reads the
+# logically bound images out of the container it runs in
+# (install.rs, `query_bound_images(&state.container_root)`), resolves each
+# through that container's default containers-storage (boundimage.rs,
+# `containers-storage:<Image=>`) and, once the deployment is written, copies
+# each one into the deployment's own store with `podman image push <ref>
+# containers-storage:[overlay@/run/bootc/storage+…]<ref>` (podstorage.rs) --
+# from the default store, which inside this container is the storage
+# configuration exported below: the writable tmpfs graph plus the sealed
+# medium store as a read-only additional store. (3) Until 2026-09-17 that
+# directory was MASKED with an empty one, the deployment received nothing, and
+# every first boot re-fetched the same 22 images from the seed store: 14
+# minutes of `skopeo copy` per reinstall on the lab GX10 (measured
+# 2026-09-16). The medium now carries them in its sealed store, staged by
+# digest (image/build-installer-root.sh §1b/§2), so bootc's copy is a local
+# one and the appliance boots with them in /usr/lib/bootc/storage.
 #
 # The same flags, mounts and image are then exercised once, non-destructively:
-# the helper runs, the bound-images view is empty, and the source reference is
-# readable through the container's storage — the exact three things phase 4
-# needs. A refusal here costs nothing.
+# the helper runs, EVERY `Image=` under the container's own bound-images.d is
+# read back through the container's storage at the exact digest its quadlet
+# pins, and the source reference is readable — the things phase 4 needs, in
+# the order bootc needs them. One bound image missing from the sealed store is
+# a refusal here, with the target disk untouched, naming the first one.
 # --------------------------------------------------------------------------- #
 readonly BOOTC_HELPER_FUSE_OVERLAYFS=/usr/bin/fuse-overlayfs
-readonly BOOTC_BOUND_IMAGES_MASK=/run/neural-ice-installer/bootc-bound-images-masked
+readonly BOOTC_BOUND_IMAGE_LIST=/run/neural-ice-installer/bootc-bound-images.list
 [[ -x "$BOOTC_HELPER_FUSE_OVERLAYFS" && ! -L "$BOOTC_HELPER_FUSE_OVERLAYFS" ]] \
   || die "bootc-container-source-unreadable: the installer has no $BOOTC_HELPER_FUSE_OVERLAYFS to lend the bootc container"
-rm -rf -- "$BOOTC_BOUND_IMAGES_MASK"
-install -d -m 0555 "$BOOTC_BOUND_IMAGES_MASK"
-[[ -z "$(ls -A -- "$BOOTC_BOUND_IMAGES_MASK")" ]] \
-  || die "bootc-container-source-unreadable: the bound-images mask directory is not empty"
+BOOTC_BOUND_IMAGE_COUNT=0
 # `run --pull=never --rm --privileged` is audited verbatim by
 # ota/test-autoinstall-kargs.sh: the container is never a registry pull.
 bootc_container_base_args=(
@@ -3825,7 +3835,6 @@ bootc_container_base_args=(
   -v "$INSTALLER_STORAGE_CONF:/etc/containers/storage.conf:ro"
   -v "$INSTALLER_STORAGE_DROPINS:/etc/containers/storage.conf.d:ro"
   -v "$BOOTC_HELPER_FUSE_OVERLAYFS:$BOOTC_HELPER_FUSE_OVERLAYFS:ro"
-  -v "$BOOTC_BOUND_IMAGES_MASK:/usr/lib/bootc/bound-images.d:ro"
   # THE INSTALLER'S SIGNATURE POLICY, NOT THE APPLIANCE'S. bootc fetches its
   # source through a skopeo proxy INSIDE this container, under the container's
   # /etc/containers/policy.json -- the appliance's strict one (default reject,
@@ -3853,9 +3862,30 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
     -v "$BOOTC_PROBE_DIR:/run/ni-probe" \
     "$STORE_IMAGE_NAME" sh -c '
       r=/run/ni-probe/result
-      [ -z "$(ls -A /usr/lib/bootc/bound-images.d)" ] || { echo "bound-images.d is not masked" > "$r"; exit 1; }
       /usr/bin/fuse-overlayfs --version >/dev/null 2>&1 || { echo "fuse-overlayfs does not run in the bootc container" > "$r"; exit 1; }
       grep -q "insecureAcceptAnything" /etc/containers/policy.json || { echo "the policy inside the bootc container is the appliance strict one and would reject the containers-storage source" > "$r"; exit 1; }
+      # Every bound image, as bootc will read it: the bound-images.d of this
+      # container, one digest-pinned Image= per quadlet, read back through
+      # the storage of this container as the manifest bytes whose SHA-256 is
+      # the pinned digest -- the value bootc records when it resolves it.
+      n=0; : > /run/ni-probe/bound-refs
+      for spec in /usr/lib/bootc/bound-images.d/*.image /usr/lib/bootc/bound-images.d/*.container; do
+        case "$spec" in *"*"*) continue ;; esac
+        [ -e "$spec" ] || { echo "bound image link ${spec##*/} is dangling; bootc would fail on it after the wipe" > "$r"; exit 1; }
+        ref="$(sed -n "s/^Image=//p" "$spec" | head -n 1 | tr -d "[:space:]")"
+        case "$ref" in
+          *@sha256:????????????????????????????????????????????????????????????????) ;;
+          *) echo "bound image ${spec##*/} is not digest-pinned (${ref:-no Image=}); the install cannot prove it present" > "$r"; exit 1 ;;
+        esac
+        want="${ref##*@sha256:}"
+        got="$(skopeo inspect --raw "containers-storage:$ref" 2>/run/ni-probe/skopeo.err | sha256sum | cut -c1-64)"
+        if [ "$got" != "$want" ]; then
+          echo "bound image $ref is not in the sealed store at its pinned digest (store answers ${got:-nothing}: $(head -c 200 /run/ni-probe/skopeo.err | tr "\n" " ")); the medium was cut without it" > "$r"; exit 1
+        fi
+        echo "$ref" >> /run/ni-probe/bound-refs
+        n=$((n + 1))
+      done
+      echo "$n" > /run/ni-probe/bound-count
       if ! skopeo inspect --raw "$1" >/dev/null 2>/run/ni-probe/skopeo.err; then
         echo "the source is not readable through the bootc container storage: $(head -c 300 /run/ni-probe/skopeo.err | tr "\n" " ")" > "$r"; exit 1
       fi
@@ -3863,10 +3893,22 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
     </dev/null >/dev/null 2>"$BOOTC_PROBE_DIR/podman.err" || true
   result="$(cat "$BOOTC_PROBE_DIR/result" 2>/dev/null || true)"
   [[ "$result" == BOOTC-CONTAINER-SOURCE-OK ]] \
-    || die "bootc-container-source-unreadable: the container that will run bootc cannot read ${source} (${result:-$(head -c 300 "$BOOTC_PROBE_DIR/podman.err" 2>/dev/null | tr '\n' ' ')}); nothing has been written to the target disk"
-  log "bootc container proved before the wipe: fuse-overlayfs lent, bound images masked (seed store provides them), source ${source} readable"
+    || die "bootc-container-source-unreadable: the container that will run bootc cannot read ${source} or one of its bound images (${result:-$(head -c 300 "$BOOTC_PROBE_DIR/podman.err" 2>/dev/null | tr '\n' ' ')}); nothing has been written to the target disk"
+  bound_count="$(head -c 16 -- "$BOOTC_PROBE_DIR/bound-count" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$bound_count" =~ ^[0-9]{1,4}$ ]] \
+    || die "bootc-container-source-unreadable: the pre-wipe probe reported no bound image count; nothing has been written to the target disk"
+  # The list the readback after phase 4 is checked against: what THIS probe
+  # proved present, copied out of the probe directory the next probe removes.
+  rm -f -- "$BOOTC_BOUND_IMAGE_LIST"
+  head -c 65536 -- "$BOOTC_PROBE_DIR/bound-refs" > "$BOOTC_BOUND_IMAGE_LIST" 2>/dev/null \
+    || die "bootc-container-source-unreadable: the pre-wipe probe left no bound image list"
+  [[ "$(grep -c . "$BOOTC_BOUND_IMAGE_LIST" || true)" == "$bound_count" ]] \
+    || die "bootc-container-source-unreadable: the pre-wipe probe's bound image list does not match its count"
+  BOOTC_BOUND_IMAGE_COUNT=$bound_count
+  log "bootc container proved before the wipe: fuse-overlayfs lent, ${bound_count} bound images present in the sealed store at their pinned digests (bootc copies them into the deployment), source ${source} readable"
 }
 assert_bootc_container_reads_source "$source_imgref"
+readonly BOOTC_BOUND_IMAGE_COUNT
 
 # LAB MEDIUM ONLY: THE PREVIOUS FIRST BOOT'S OWN WORDS, READ BEFORE THE WIPE.
 # The installed appliance holds its network until the TPM ceremony succeeds,
@@ -4157,7 +4199,8 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
 fi
 heartbeat_start "bootc install to-filesystem"
 # The SAME container the pre-wipe proof exercised (bootc_container_base_args:
-# store, storage config, lent fuse-overlayfs helper, masked bound images).
+# store, storage config, lent fuse-overlayfs helper, the image's own bound
+# images resolvable in the sealed store).
 podman "${bootc_container_base_args[@]}" --log-driver=passthrough-tty \
   --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
   "$STORE_IMAGE_NAME" \
@@ -4179,6 +4222,27 @@ podman "${bootc_container_base_args[@]}" --log-driver=passthrough-tty \
     "$TGT" \
   || die "bootc install to-filesystem failed"
 bg_stop
+# THE COPY LANDED, READ OFF THE TARGET. bootc's exit status covers its own
+# `podman image push` of each bound image, but the appliance boots on what is
+# in ostree/bootc/storage (the physical path behind /usr/lib/bootc/storage,
+# bootc store/mod.rs BOOTC_ROOT), not on a status. Every reference the
+# pre-wipe probe proved present must be named by the deployment's store index
+# before this install is allowed to reboot into it: a deployment missing one
+# would pull it from the registry at first boot, which is the 14 minutes this
+# medium exists to remove -- or, offline, would refuse to start the unit.
+_bootc_store_index="$TGT/ostree/bootc/storage/overlay-images/images.json"
+if (( BOOTC_BOUND_IMAGE_COUNT > 0 )); then
+  [[ -f "$_bootc_store_index" ]] \
+    || die "bootc reported success but the deployment has no bound image store at ostree/bootc/storage; the ${BOOTC_BOUND_IMAGE_COUNT} bound images were not copied"
+  while IFS= read -r _bound_ref; do
+    [[ -n "$_bound_ref" ]] || continue
+    grep -Fq -- "\"${_bound_ref}\"" "$_bootc_store_index" \
+      || die "the deployment's bound image store does not name ${_bound_ref}; bootc did not copy it from the sealed store"
+  done < "$BOOTC_BOUND_IMAGE_LIST"
+  log "bound images copied into the deployment: ${BOOTC_BOUND_IMAGE_COUNT}/${BOOTC_BOUND_IMAGE_COUNT} named in ostree/bootc/storage (no first-boot pull)"
+else
+  log "the appliance image binds no images; nothing for bootc to copy"
+fi
 
 # --------------------------------------------------------------------------- #
 # 5a) Firmware boot-menu hygiene (docs/INSTALLER-UX-HARDENING.md):

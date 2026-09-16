@@ -326,8 +326,18 @@ jobs:
           # actually broke. Each line below corresponds to a defect that reached
           # a build host on 2026-08-19.
           f=image/Containerfile.installer
+          # The installer ROOT drops the links because bootc-image-builder runs
+          # `bootc install` from it and resolves them against a store that has
+          # nothing (2026-08-19). The APPLIANCE image in the sealed store keeps
+          # its links and, since 2026-09-17, the store carries the images they
+          # name: that half is asserted by image/test-build-installer-root.sh
+          # (§4d) and by the pre-wipe probe contract in ota/test-autoinstall-kargs.sh.
           grep -q 'rm -rf /usr/lib/bootc/bound-images.d' "$f" \
-            || { echo "::error::the installer must drop the appliance bound-image links, or bootc-image-builder cannot write the medium"; exit 1; }
+            || { echo "::error::the installer root must drop the appliance bound-image links, or bootc-image-builder cannot write the medium; the appliance image in the sealed store keeps its links and the store carries their images"; exit 1; }
+          grep -q 'the sealed store also carries the 22 images they name' "$f" \
+            || { echo "::error::the installer recipe no longer states where the appliance's bound images come from at install"; exit 1; }
+          ! grep -q 'bootc-bound-images-masked' ota/neural-ice-autoinstall.sh \
+            || { echo "::error::the installer masks the appliance's bound images again; bootc must copy them from the sealed store at install"; exit 1; }
           grep -q 'neural-ice-policy-strict.json' "$f" \
             || { echo "::error::the strict container policy must be preserved for the autoinstaller to restore onto the target"; exit 1; }
           grep -q "insecureAcceptAnything" "$f" \

@@ -306,35 +306,41 @@ RUN set -euxo pipefail; \
     # idempotent first-boot/runtime attestation.
     systemctl enable neural-ice-autoinstall.service neural-ice-device-root.service
 
-# The base may be a composed APPLIANCE image, which carries bound-image links in
-# /usr/lib/bootc/bound-images.d (ICE-Fabric #293). `bootc install to-filesystem`
-# resolves them while writing this medium, against an image store that only
-# exists on an INSTALLED system, and the media build dies:
+# THE APPLIANCE'S BOUND-IMAGE LINKS ARE DROPPED FROM THIS ROOT, AND ONLY FROM
+# THIS ROOT. The base may be a composed APPLIANCE image, which links its 22
+# logically bound images from /usr/lib/bootc/bound-images.d (ICE-Fabric issue
+# 293). bootc-image-builder writes this medium with `bootc install
+# to-filesystem` run FROM THIS IMAGE (image/build-installer-usb.sh, the
+# `bootc-image-builder --type raw` step), and bootc resolves those links out of
+# the container it runs in, against that container's storage (bootc v1.16.13
+# install.rs, `query_bound_images(&state.container_root)`). With the links
+# present the media build died on 2026-08-19:
 #
 #   resolving bound image …/working-memory@sha256:…: can't stat imageStore dir
 #   /var/lib/neural-ice/data/seed-store: no such file or directory
 #
-# The preloaded path never hit this because it stages a seed store of its own, so
-# the defect only surfaces on the LIGHT medium -- the architecture we are moving
-# to (no models embedded, ADR-0040).
+# Everything bib writes from this root is then overwritten by the sealed
+# payload (review 2026-09-01, P0 #2), so nothing this root resolves or fails to
+# resolve ever reaches an appliance. The 22 .image quadlets under
+# /usr/share/containers/systemd/neural-ice-bound-images/ stay in this root;
+# only the links go, and only here.
 #
-# ⚠️ WHAT THIS COSTS, precisely. That directory holds SYMLINKS into
-# /usr/share/containers/systemd/neural-ice-bound-images/, and those 22 .image
-# quadlets are NOT removed -- verified on the built installer image: 0 entries in
-# bound-images.d, 22 quadlets still present. So the installed appliance keeps
-# every image definition and podman still manages them. What is lost is the bootc
-# LIFECYCLE COUPLING #293 established: an OS rollback no longer rolls back the
-# application bytes with it.
-#
-# 🔴 That is a real deviation, not a no-op, and it lands on the INSTALLED system:
-# the autoinstaller writes the deployment from this medium's own image
-# (--source-imgref containers-storage:localhost/bootc), not from TARGET_IMGREF,
-# which is only recorded as the future OTA origin. An earlier revision of this
-# comment claimed the opposite and was wrong.
-#
-# It is accepted for a lab appliance whose rollbacks are supervised, and it is
-# closed by making the medium install the APPLIANCE image rather than its own --
-# which needs that image staged on the medium, and is the next change here.
+# WHAT IS NOT DROPPED, AND WHERE THE IMAGES COME FROM (2026-09-17). The
+# installed appliance is NOT written from this root: the autoinstaller installs
+# `containers-storage:localhost/bootc`, the APPLIANCE image staged in the
+# medium's sealed store (image/build-installer-root.sh, "THE STORE MUST HOLD THE
+# EXACT ORIGINAL HOST"), from a container of that same image. That image keeps
+# its 22 links, and the sealed store also carries the 22 images they name,
+# staged by digest from a registry and read back at that digest before the
+# medium is cut (build-installer-root.sh §1b/§2). bootc resolves the links
+# inside that container, copies each image from the sealed store into the
+# deployment's own store (/usr/lib/bootc/storage), and the appliance boots with
+# them present: no first-boot pull (14 minutes of `skopeo copy` per reinstall
+# on the lab GX10, measured 2026-09-16), and the OS/application lifecycle
+# coupling issue 293 established is kept. The installer proves every link
+# resolvable in the sealed store before its first destructive write
+# (ota/neural-ice-autoinstall.sh, assert_bootc_container_reads_source) and
+# reads the copy back off the target before it reboots.
 RUN rm -rf /usr/lib/bootc/bound-images.d
 # THE INSTALLER NEVER HANDS ITS CONSOLE TO THE GPU. The appliance base loads
 # nvidia_drm with KMS and its fbdev console so the installed system's TUI runs on

@@ -15,13 +15,25 @@
 #   root-image    the dm-verity-protected installer root (a squashfs of the
 #                 installer image, ~10 GiB)
 #   root-hash     its dm-verity hash tree
-#   store-image   a squashfs of the containers-storage the install reads FROM,
-#                 registered read-only and installed from in place (~10 GiB)
+#   store-image   a squashfs of the containers-storage the install reads FROM:
+#                 the appliance image (~10 GiB) AND, since 2026-09-17, the 22
+#                 images it binds to itself (~22 GiB, one of ~19 GB), which
+#                 bootc copies into the deployment at install instead of the
+#                 appliance pulling them at first boot
 #   store-hash    its dm-verity hash tree
 #
 # It ALSO has to be big enough, while bib runs, for the ostree deployment bib
-# writes here and this build then overwrites. 24 GiB covers both. The PRELOADED
+# writes here and this build then overwrites. 48 GiB covers both. The PRELOADED
 # seed lives in a SEPARATE ni-seed partition, not here.
+#
+# 🔴 THIS FILE IS NOT WHAT THE PRODUCER SELECTS BY DEFAULT. The pinned bib
+# rejects customizations.filesystem for raw builds, so image/build-installer-
+# usb.sh runs with image/config-installer-default-size.toml (empty), lets bib
+# size the raw at twice the installer image (a 10 GiB raw for the 0.60.1
+# medium), then GROWS bib's data partition to the measured sealed payload
+# with sfdisk before its fit refusal (grow_raw_payload_partition). This file
+# is kept for a bib that accepts the customization (CONFIG=… selects it): the
+# figure below is then the floor, and the grow step still applies above it.
 [[customizations.filesystem]]
 mountpoint = "/"
-minsize = "24 GiB"
+minsize = "48 GiB"

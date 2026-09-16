@@ -3,19 +3,31 @@
 # bench, against a loop-device target laid out exactly as the installer lays out
 # the appliance disk (ESP vfat, boot ext4, sysroot xfs, mounted at one target
 # with --rbind/--make-rshared), from the SAME container, with the SAME mounts
-# the installer gives it: the lent fuse-overlayfs helper, the masked
-# bound-images.d and the installer's permissive signature policy.
+# the installer gives it: the lent fuse-overlayfs helper, the installer's
+# permissive signature policy, and the image's OWN bound-images.d -- unmasked
+# since 2026-09-17, so bootc resolves every logically bound image through the
+# container's storage and copies it into the target's /usr/lib/bootc/storage
+# (bootc v1.16.13 install.rs:1927, podstorage.rs:471).
 #
 # 2026-09-09: this run reproduced, in 30 s, the hardware refusal of attempt 14
 # ("Running image containers-storage:[...] is rejected by policy") and proved
 # the fix in 44 s ("Installation complete!"). Nothing here touches a real disk,
 # a TPM or the network beyond the local container storage.
 #
+# WHAT IT PROVES NOW, in addition: that the copy happens. Before the run, every
+# `Image=` the appliance links -- read from inside a container of the image,
+# which is the view bootc has -- is required in the bench host's container
+# storage at its pinned digest (that storage stands in for the medium's sealed
+# store, which the installer registers as an additional image store). After the
+# run, the target's ostree/bootc/storage must name every one of them, or the
+# rehearsal fails. A missing image is refused up front with the exact command
+# that stages it, rather than as a bootc failure minutes in.
+#
 # Usage (root, on a bench host whose container storage holds the appliance):
 #   image/bench-rehearse-phase4.sh --image <appliance ref@digest> \
-#       --pcr-policy-signature <json> --pcr-policy-key <pem> [--work-dir DIR] [--size 40G]
+#       --pcr-policy-signature <json> --pcr-policy-key <pem> [--work-dir DIR] [--size 60G]
 set -euo pipefail
-IMAGE='' SIG='' KEY='' WORK=/var/tmp/ni-phase4-rehearsal SIZE=40G
+IMAGE='' SIG='' KEY='' WORK=/var/tmp/ni-phase4-rehearsal SIZE=60G
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image) IMAGE=$2; shift 2 ;;
@@ -28,14 +40,46 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$IMAGE" && -f "$SIG" && -f "$KEY" ]] || { echo "usage: --image REF --pcr-policy-signature FILE --pcr-policy-key FILE" >&2; exit 2; }
 [[ "$(id -u)" -eq 0 ]] || { echo "loop devices and mounts need root" >&2; exit 2; }
-[[ "$SIZE" =~ ^[0-9]+[GM]$ ]] || { echo "--size must be like 40G" >&2; exit 2; }
-for tool in podman losetup sgdisk mkfs.fat mkfs.ext4 mkfs.xfs blkid udevadm; do
+[[ "$SIZE" =~ ^[0-9]+[GM]$ ]] || { echo "--size must be like 60G" >&2; exit 2; }
+for tool in podman skopeo losetup sgdisk mkfs.fat mkfs.ext4 mkfs.xfs blkid udevadm; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 2; }
 done
 [[ -x /usr/bin/fuse-overlayfs ]] || { echo "the bench host must have /usr/bin/fuse-overlayfs to lend, as the installer does" >&2; exit 2; }
 podman image exists "$IMAGE" || { echo "the appliance image is not in the local container storage: $IMAGE" >&2; exit 2; }
 
 rm -rf -- "$WORK"; install -d -m 0700 "$WORK"; TGT="$WORK/target"; install -d "$TGT"
+
+# The bound images, exactly as bootc will read them: the container's own
+# /usr/lib/bootc/bound-images.d, one Image= per quadlet. Read from inside the
+# image because the appliance links with absolute targets that only resolve
+# there. Every one must be digest-pinned and present in this host's storage at
+# that digest, or the run is refused before a loop device exists.
+BOUND_LIST="$WORK/bound-images.list"
+podman run --rm --pull=never --net=none --entrypoint /bin/sh "$IMAGE" -c '
+  for spec in /usr/lib/bootc/bound-images.d/*.image /usr/lib/bootc/bound-images.d/*.container; do
+    case "$spec" in *"*"*) continue ;; esac
+    [ -e "$spec" ] || { echo "dangling bound image link: $spec" >&2; exit 1; }
+    sed -n "s/^Image=//p" "$spec" | head -n 1 | tr -d "[:space:]"; echo
+  done' > "$BOUND_LIST" \
+  || { echo "cannot read the appliance image's bound images" >&2; exit 2; }
+sed -i '/^$/d' "$BOUND_LIST"
+BOUND_EXPECTED="$(grep -c . "$BOUND_LIST" || true)"
+while IFS= read -r ref; do
+  [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] \
+    || { echo "bound image is not digest-pinned, cannot be proved present: $ref" >&2; exit 2; }
+  want="${ref##*@sha256:}"
+  if ! podman image exists "$ref"; then
+    echo "bound image missing from this host's container storage: $ref" >&2
+    echo "stage it exactly as the medium builder does, from the mirror, by digest:" >&2
+    echo "  skopeo copy --preserve-digests --src-cert-dir <mirror-ca-dir> --src-no-creds docker://registry.neural-ice.local:5055/${ref#*/} containers-storage:${ref}" >&2
+    exit 2
+  fi
+  got="$(skopeo inspect --raw "containers-storage:$ref" | sha256sum | cut -c1-64)"
+  [[ "$got" == "$want" ]] \
+    || { echo "this host's storage serves $ref as sha256:$got, not its pinned digest; bootc would refuse it" >&2; exit 2; }
+done < "$BOUND_LIST"
+echo "== ${BOUND_EXPECTED} bound images declared by the appliance, all present in this host's storage at their pinned digests"
+
 LOOP=''
 cleanup() {
   umount -R "$TGT" 2>/dev/null || true
@@ -59,7 +103,6 @@ printf 'schema=1\npcr7_sha256=%s\npolicy_pcr_sha256=%s\navailable_policy_pcr_sha
   > "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr7-at-install.txt"
 mount --rbind "$TGT" "$TGT"; mount --make-rshared "$TGT"
 SYS_UUID="$(blkid -s UUID -o value "${LOOP}p3")"; BOOT_UUID="$(blkid -s UUID -o value "${LOOP}p2")"
-install -d -m 0555 "$WORK/bound-images-mask"
 # The installer's medium policy: permissive; the source was authorised before
 # the wipe by the installer itself (release authorization + signature).
 printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$WORK/policy.json"
@@ -70,7 +113,6 @@ podman --cgroup-manager=cgroupfs --events-backend=file run --pull=never --rm --p
   --net=host --pid=host --security-opt label=type:unconfined_t \
   -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
   -v /usr/bin/fuse-overlayfs:/usr/bin/fuse-overlayfs:ro \
-  -v "$WORK/bound-images-mask:/usr/lib/bootc/bound-images.d:ro" \
   -v "$WORK/policy.json:/etc/containers/policy.json:ro" \
   --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
   "$IMAGE" bootc install to-filesystem --skip-fetch-check \
@@ -83,7 +125,27 @@ rc=$?
 set -e
 echo "bootc rc=$rc in $((SECONDS - start))s; log: $WORK/bootc.log"
 tail -n 8 "$WORK/bootc.log" | cut -c1-200
-if (( rc == 0 )) && [[ -d "$TGT/ostree/deploy" && -f "$TGT/boot/efi/EFI/BOOT/BOOTAA64.EFI" || -d "$TGT/boot/efi/EFI/BOOT" ]]; then
+# THE COPY, READ OFF THE TARGET: the physical path behind /usr/lib/bootc/storage
+# (bootc store/mod.rs, BOOTC_ROOT = ostree/bootc). Every declared reference
+# must be named by the deployment's store index -- the same readback the
+# installer performs after its phase 4.
+BOUND_COPIED=0
+INDEX="$TGT/ostree/bootc/storage/overlay-images/images.json"
+if [[ -f "$INDEX" ]]; then
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    if grep -Fq -- "\"$ref\"" "$INDEX"; then
+      BOUND_COPIED=$((BOUND_COPIED + 1))
+    else
+      echo "NOT COPIED: $ref"
+    fi
+  done < "$BOUND_LIST"
+elif (( BOUND_EXPECTED > 0 )); then
+  echo "the target has no bound image store at ostree/bootc/storage"
+fi
+echo "bound images copied into the target: ${BOUND_COPIED}/${BOUND_EXPECTED}"
+if (( rc == 0 && BOUND_COPIED == BOUND_EXPECTED )) \
+  && [[ -d "$TGT/ostree/deploy" && -f "$TGT/boot/efi/EFI/BOOT/BOOTAA64.EFI" || -d "$TGT/boot/efi/EFI/BOOT" ]]; then
   echo "PHASE4_REHEARSAL_OK"
 else
   echo "PHASE4_REHEARSAL_FAILED"; exit 1
