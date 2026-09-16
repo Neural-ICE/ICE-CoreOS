@@ -51,6 +51,12 @@ PROFILE=$(path /usr/lib/neural-ice/access-policy)
 POLICY=$(path /usr/lib/neural-ice/signed-boot-trust-policy-id)
 MODEL_HELPER=$(path /usr/libexec/neural-ice-model-cache-contract)
 CONTENT_CACHE_HELPER=$(path /usr/libexec/neural-ice-content-cache-contract)
+# The OS-side bootc store. `bootc install` copies the medium's logically bound
+# images into it, and every quadlet lists it FIRST in its
+# --storage-opt=additionalimagestore= (the seed store comes second). Handed to
+# the engine with the quadlets' spelling, symlink included (bootc points it
+# under /sysroot): the runtime and this script must name the same store.
+OS_IMAGE_STORE=$(path /usr/lib/bootc/storage)
 
 [[ -f $POINTER && ! -L $POINTER ]] || exit 0
 IFS= read -r closure < "$POINTER"
@@ -212,13 +218,51 @@ with plan_path.open("wb") as handle:
             handle.write(value.encode("ascii") + b"\0")
 PY
 
+# An image the OS image already carries is proven, not copied. Measured on the
+# lab GX10, 2026-09-16: the skopeo copies of the closure's images took 14 of
+# the 31 minutes of first boot. The medium now carries them as bootc logically
+# bound images and `bootc install` places them in the OS-side store, which the
+# quadlets already read. The proof is the same digest-exact read-back the copy
+# path ends with (skopeo inspect of repository@root, Digest == the signed
+# root), aimed at that store. `podman image exists` is name-based and would
+# count a wrong image as present; it is not used. The read opens the candidate
+# store as primary (writable, its own runroot) with the OS store as an
+# additional image store -- the quadlets' own access path. A read-only store
+# cannot be the primary (skopeo wants its storage.lock there: "read-only file
+# system"), and an absent store directory is a hard skopeo error rather than a
+# miss, hence the -d guard. Measured 2026-09-17 (skopeo 1.21) with the store
+# on a read-only bind mount: exact hit -> Digest is the root; wrong digest or
+# wrong repository -> "does not resolve to an image ID"; the strict system
+# policy and the seed-import policy both let the inspect through; not one
+# mtime, ctime or mode changed in the store. Anything but an exact hit falls
+# back to the copy below. The read initialises the candidate store's metadata
+# directories, so it runs under the store's umask (022), like the copy.
+os_image_carries() { # <repository> <root digest> -> 0 when the OS store holds exactly that image
+  local repository=$1 import_root=$2 observed
+  [[ -d $OS_IMAGE_STORE ]] || return 1
+  observed=$( umask 022 && skopeo inspect \
+      "containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot:overlay.imagestore=${OS_IMAGE_STORE}]${repository}@${import_root}" \
+      | python3 -c 'import json,sys; raw=sys.stdin.read(); print(json.loads(raw).get("Digest", "") if raw.strip() else "")' ) \
+    || return 1
+  [[ $observed == "$import_root" ]]
+}
+
 imported=0
+copied=0
+carried=0
 while IFS= read -r -d '' layout \
   && IFS= read -r -d '' repository \
   && IFS= read -r -d '' tag \
   && IFS= read -r -d '' artifact_key \
   && IFS= read -r -d '' import_root; do
   if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]]; then
+    if os_image_carries "$repository" "$import_root"; then
+      echo "neural-ice-seed-import: $artifact_key is carried by the OS image at $import_root" >&2
+      carried=$((carried + 1))
+      imported=$((imported + 1))
+      continue
+    fi
+    echo "neural-ice-seed-import: $artifact_key is not carried by the OS image; importing it" >&2
     destination="containers-storage:[overlay@${candidate}/seed-store/graphroot+${candidate}/seed-store/runroot]${repository}:${tag}"
     # Import this host's platform. containers-storage rejects --all for an
     # index; skopeo retains the original index digest as a local repo digest.
@@ -238,11 +282,16 @@ while IFS= read -r -d '' layout \
       'import json,sys; value=json.load(sys.stdin); print(value.get("Digest", ""))') \
       || die "cannot read back imported artifact $artifact_key"
     [[ $observed == "$import_root" ]] || die "imported artifact read-back digest differs for $artifact_key"
+    copied=$((copied + 1))
   fi
   imported=$((imported + 1))
 done < "$plan"
 ((imported > 0)) || die "closure has no importable artifact"
-if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]]; then
+# The layer-root gate reads what a copy wrote. A run whose every image the OS
+# image carries copied nothing: its store holds only the metadata the presence
+# reads initialised, no layer, and must not be refused for it -- that refusal
+# would land ~25 minutes later, after the model and cache work.
+if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]] && ((copied > 0)); then
   # Refuse, before anything is published, a store whose layer roots the
   # containers' own users could not traverse (the failure above would otherwise
   # surface only as a dead service after first boot).
@@ -348,9 +397,14 @@ durable_boundary content-caches
 durable_boundary hf-cache
 
 if [[ ${NI_SEED_IMPORT_DRY_RUN:-0} == 0 ]]; then
-  chcon -R -t container_ro_file_t "$candidate/seed-store/graphroot" 2>/dev/null \
-    || chcon -R -t container_file_t "$candidate/seed-store/graphroot" \
-    || die "cannot label imported container store"
+  # The container label is for the layer content the containers read. A store
+  # that received no copy holds no layer: like the shipped empty generation it
+  # keeps the volume's own label, which podman reads as root.
+  if ((copied > 0)); then
+    chcon -R -t container_ro_file_t "$candidate/seed-store/graphroot" 2>/dev/null \
+      || chcon -R -t container_file_t "$candidate/seed-store/graphroot" \
+      || die "cannot label imported container store"
+  fi
   restorecon -RF "$candidate/content" "$candidate/models" "$candidate/content-caches" \
     "$candidate/hf-cache" \
     || die "cannot relabel offline generation"
@@ -358,8 +412,12 @@ fi
 sync -f "$candidate"
 durable_boundary relabel
 
-printf 'schema=neural-ice-offline-generation-v1\nrelease_closure_sha256=%s\nrelease_manifest_sha256=%s\nimported_artifacts=%s\n' \
-  "$closure" "$manifest" "$imported" > "$candidate/READY"
+# imported_artifacts counts every image of the closure made usable by this
+# generation; carried_by_os_image is the part of it proven present in the OS
+# store and therefore not copied. The two *_sha256 lines are what the fast
+# path above greps; nothing before them moves.
+printf 'schema=neural-ice-offline-generation-v1\nrelease_closure_sha256=%s\nrelease_manifest_sha256=%s\nimported_artifacts=%s\ncarried_by_os_image=%s\n' \
+  "$closure" "$manifest" "$imported" "$carried" > "$candidate/READY"
 sync -f "$candidate/READY"
 sync -f "$candidate"
 durable_boundary ready
