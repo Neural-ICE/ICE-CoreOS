@@ -88,8 +88,8 @@ STORE_SOURCE_REF="${STORE_SOURCE_REF:-}"
 STORE_SOURCE_CERT_DIR="${STORE_SOURCE_CERT_DIR:-}"
 # The registry (`host[:port]`) the host image's BOUND images are staged from,
 # by digest, keeping the repository path their quadlets name: an `Image=`
-# of registry.neural-ice.ch/neural-ice/x@sha256:D is read from
-# docker://<registry>/neural-ice/x@sha256:D. Defaults to the registry of
+# of <authority>/<namespace>/x@sha256:D is read from
+# docker://<registry>/<namespace>/x@sha256:D. Defaults to the registry of
 # STORE_SOURCE_REF, which on the bench is the LAN mirror. It exists for the
 # same reason STORE_SOURCE_REF does: a containers-storage source cannot
 # reproduce a digest ("would require changing layer representation",

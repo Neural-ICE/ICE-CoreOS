@@ -583,8 +583,8 @@ bound_manifest() { # $1=repository -> writes the registry object, prints its dig
 }
 BOUND_A_DIGEST="$(bound_manifest working-memory)"
 BOUND_B_DIGEST="$(bound_manifest model-runtime-gb10)"
-BOUND_A="registry.neural-ice.ch/neural-ice/working-memory@sha256:$BOUND_A_DIGEST"
-BOUND_B="registry.neural-ice.ch/neural-ice/model-runtime-gb10@sha256:$BOUND_B_DIGEST"
+BOUND_A="registry.example.test/neural-ice/working-memory@sha256:$BOUND_A_DIGEST"
+BOUND_B="registry.example.test/neural-ice/model-runtime-gb10@sha256:$BOUND_B_DIGEST"
 declare_bound_images() { # $1=host root, rest: <unit>=<Image= reference>
   local root=$1 pair name ref
   shift
@@ -678,7 +678,7 @@ store_content() { sed -E 's#  .*/store/#  store/#' "$1"; }
   || fail "two builds of one host image with bound images produced different stores"
 # A tag-pinned bound image cannot be proved present: refused before any copy.
 declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" \
-  "model-runtime=registry.neural-ice.ch/neural-ice/model-runtime-gb10:latest"
+  "model-runtime=registry.example.test/neural-ice/model-runtime-gb10:latest"
 out="$(bound_build "$TMP/bound-tag" 2>&1)" && fail "a tag-pinned bound image was staged"
 grep -Fq 'not a digest-pinned registry reference' <<<"$out" \
   || fail "the tag refusal is not named: $out"
