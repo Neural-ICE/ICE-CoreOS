@@ -648,12 +648,16 @@ printf 'a sealed store, for the purposes of this suite\n' > "$CACHE_STORE_IMG"
 CACHE_STORE_SHA="$(sha256sum "$CACHE_STORE_IMG" | awk '{print tolower($1)}')"
 CACHE_STORE_BYTES="$(wc -c < "$CACHE_STORE_IMG" | tr -d '[:space:]')"
 CACHE_STORE_VERITY="$(printf '%064d' 4)"
+# The digest of the bound image list the store was cut around (2026-09-17):
+# recorded so a reuse can refuse a store cut around another list.
+CACHE_STORE_BOUND_LIST="$(printf '%064d' 7)"
 cache_stage() { cache_run -- medium_cache_stage_store "$cache_key_value" "$CACHE_STORE_IMG"; }
 cache_finalize() { # $1=the store SHA-256 to record (the real one, or a sabotaged fact)
   cache_run -- medium_cache_finalize_store "$cache_key_value" "$cache_key_baseline" \
     "$1" "$CACHE_STORE_BYTES" "$BASE_ID_FIXTURE" \
     "sha256:$(printf '%064d' 3)" localhost/bootc "$CACHE_STORE_VERITY" \
-    "$(printf 'f%.0s' {1..64})" 6e657572-616c-4963-9e69-6e7374616c6c
+    "$(printf 'f%.0s' {1..64})" 6e657572-616c-4963-9e69-6e7374616c6c \
+    "$CACHE_STORE_BOUND_LIST"
 }
 BASE_ID_FIXTURE="$(printf '%064d' 2)"
 cache_stage || fail "staging a cache entry failed"
@@ -674,6 +678,8 @@ cache_facts="$(cache_run -- medium_cache_read_entry "$cache_key_value" 2>/dev/nu
   || fail "the entry does not hand back the verity root hash a reuse is checked against"
 [ "$(sed -n 's/^store_image_id=//p' <<<"$cache_facts")" = "$BASE_ID_FIXTURE" ] \
   || fail "the entry does not hand back the store image identity"
+[ "$(sed -n 's/^store_bound_images_sha256=//p' <<<"$cache_facts")" = "$CACHE_STORE_BOUND_LIST" ] \
+  || fail "the entry does not hand back the bound image list a reuse is checked against"
 
 # 🔴 SABOTAGE A -- THE RECORD. An entry whose provenance document is altered is
 # refused, and it is refused BY NAME. This is the half of the cache the producer
@@ -722,6 +728,11 @@ cache_refuses "field 'store_image_manifest_digest' is missing or malformed"
 cache_restore
 cache_sabotage 'document["store_image_bytes"] = 12'
 cache_refuses "field 'store_image_bytes' is missing or malformed"
+# An entry from before the store carried the bound images records no list; it
+# is refused here by the reader, and again by the builder if it ever got there.
+cache_restore
+cache_sabotage 'del document["store_bound_images_sha256"]'
+cache_refuses "field 'store_bound_images_sha256' is missing or malformed"
 cache_restore
 printf 'not json at all\n' > "$cache_entry/entry.json"
 cache_refuses 'unreadable provenance document'
@@ -758,6 +769,7 @@ for cache_extra in 1 2 3 4 5; do
     "$CACHE_STORE_SHA" "$CACHE_STORE_BYTES" "$BASE_ID_FIXTURE" \
     "sha256:$(printf '%064d' 3)" localhost/bootc "$CACHE_STORE_VERITY" \
     "$(printf 'f%.0s' {1..64})" 6e657572-616c-4963-9e69-6e7374616c6c \
+    "$CACHE_STORE_BOUND_LIST" \
     || fail "finalizing filler entry $cache_extra failed"
   # `entry.json` mtime orders the eviction, so the fillers must not share one.
   touch -d "2026-09-0${cache_extra}T00:00:00Z" "$CACHE/store/sealed-store/$cache_extra_key/entry.json"
