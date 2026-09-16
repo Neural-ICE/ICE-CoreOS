@@ -39,7 +39,7 @@ before …): the first thing that broke is the one to report.
 | Storage       | `systemd-cryptsetup@data.service` + data mount state                                    |
 | Device trust  | ceremony `activating` → "TPM owner ceremony running (elapsed)"; `active` → "device trust: sealed" |
 | Network       | management NIC (`interface-name=` of `mgmt-*.nmconnection`, else on-board `enP<d>s<d>`), `operstate`, first IPv4, receive rate and total from `/sys/class/net/*/statistics/rx_bytes` deltas (physical interfaces only) |
-| Images        | N/M: `Image=` references declared in `/usr/lib/bootc/bound-images.d`, `/usr/share/containers/systemd`, `/etc/containers/systemd`, counted present when their digest (or name) appears in `overlay-images/images.json` of the graphroot or of the seed store |
+| Images        | N/M: `Image=` references declared in `/usr/lib/bootc/bound-images.d`, `/usr/share/containers/systemd`, `/etc/containers/systemd`, counted present when their digest (or name) appears in `overlay-images/images.json` of the graphroot, of the bootc bound-image store (`/usr/lib/bootc/storage`, the store `bootc install` fills from the medium) or of the seed store |
 | Core services | fixed list below; `active`, or `inactive` with a failed `Condition*=`, counts as done   |
 | READY         | ceremony active, network up with address, N = M, every core service done               |
 

@@ -139,7 +139,8 @@ allowed=(
   /usr/lib/neural-ice/release-image /usr/lib/bootc/bound-images.d /usr/share/containers/systemd
   /etc/containers/systemd /etc/NetworkManager/system-connections /etc/neural-ice/ota.conf
   /var/lib/neural-ice/data/release/CHANNEL /var/lib/neural-ice/data/seed-store/current/overlay-images/images.json
-  /var/lib/containers/storage/overlay-images/images.json /sys/class/net /sys/class/dmi/id
+  /var/lib/containers/storage/overlay-images/images.json /usr/lib/bootc/storage/overlay-images/images.json
+  /sys/class/net /sys/class/dmi/id
   /proc/cmdline /proc/sys/kernel/hostname /sys/class/tty/console/active /dev /dev/null
 )
 while IFS= read -r found; do
@@ -335,6 +336,25 @@ expect "$out" '[ OK ]  Core services   5/5 active' "all core services active"
 expect "$out" 'READY -- login available.' "READY line"
 [[ "$(grep -c 'READY -- login available' <<<"$out")" -eq 1 ]] || fail "READY with linger 0 must exit after one frame, got: $out"
 expect "$(serial_out)" 'neural-ice-status: READY -- login available' "serial READY marker for the QEMU harness"
+
+# 3d-bis. an image the bootc bound-image store carries counts as present. The
+# store is a symlink (bootc points /usr/lib/bootc/storage under /sysroot) and
+# is read through it; a store holding another digest counts for nothing.
+make_fixture
+set_state neural-ice-firstboot-tpm-ceremony.service loaded active exited
+set_state NetworkManager.service loaded active running
+set_state neural-ice-payload-apply.service loaded active exited
+set_state avahi-daemon.service loaded active running
+set_state neural-ice-agentic-core.service loaded active running
+mkdir -p "$FX/root/sysroot/ostree/bootc/storage/overlay-images"
+ln -s ../../../sysroot/ostree/bootc/storage "$FX/root/usr/lib/bootc/storage"
+printf '[{"digest":"sha256:%064d"}]\n' 3 > "$FX/root/sysroot/ostree/bootc/storage/overlay-images/images.json"
+out="$(run_screen 1 0)"
+expect "$out" 'Images          1/2 present' "a bootc store holding another digest counts for nothing"
+printf '[{"digest":"sha256:%064d"}]\n' 2 > "$FX/root/sysroot/ostree/bootc/storage/overlay-images/images.json"
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+expect "$out" '[ OK ]  Images          2/2 present' "an image carried by the bootc store, read through the symlink, is present"
+expect "$out" 'READY -- login available.' "READY with the second image only in the bootc store"
 
 # 3e. a tty1 owner is active -> exit immediately, draw nothing.
 set_state 'getty@tty1.service' loaded active running

@@ -30,6 +30,24 @@ if [ "${ASSERT_STORAGE_CONTRACT:-0}" = 1 ]; then
       printf copied > "$COPY_MARKER"
       exit 0 ;;
     inspect)
+      case "${2:-}" in
+        containers-storage:\[overlay@*+*:overlay.imagestore=*\]*@*)
+          # The presence read: the candidate store as primary, the OS store as
+          # an additional image store, by repository@digest. Shaped on real
+          # skopeo 1.21 (2026-09-17): an absent store directory is a hard error
+          # (exit 1), a miss is "does not resolve to an image ID" (exit 2).
+          os_store="${2#*:overlay.imagestore=}"; os_store="${os_store%%\]*}"
+          [ "$os_store" = "$OS_STORE" ] || { echo "presence read names another store: $os_store" >&2; exit 50; }
+          case "${2%%+*}" in
+            containers-storage:\[overlay@*/offline-generations/.*.staging/seed-store/graphroot) ;;
+            *) echo "presence read does not open the candidate store as primary: $2" >&2; exit 51 ;;
+          esac
+          [ -d "$os_store" ] || { echo "overlay: can't stat imageStore dir $os_store" >&2; exit 1; }
+          printf '%s\n' "${2##*@}" >> "$PROBE_MARKER"
+          [ -n "${OS_STORE_DIGEST:-}" ] || { echo "reference \"$2\" does not resolve to an image ID" >&2; exit 2; }
+          printf '{"Digest":"%s"}\n' "$OS_STORE_DIGEST"
+          exit 0 ;;
+      esac
       [ -f "$COPY_MARKER" ] || exit 44
       case "${2:-}" in
         *@"$EXPECTED_IMPORT_DIGEST")
@@ -332,10 +350,21 @@ fi
 # reproduces the measured --all refusal and index-vs-tag digest distinction.
 # Relabel commands are stubs because this is an unprivileged filesystem fixture;
 # native Skopeo/Podman and SELinux qualification remain separate checks.
-for command in chcon restorecon; do
-  printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/$command"
-  chmod 0755 "$FAKEBIN/$command"
-done
+printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/restorecon"
+# chcon records what it was asked to label: the store label is for copied
+# layer content and must not be applied to a store nothing was copied into.
+cat > "$FAKEBIN/chcon" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CHCON_LOG"
+exit 0
+EOF
+chmod 0755 "$FAKEBIN/restorecon" "$FAKEBIN/chcon"
+# The OS-side bootc store the presence read consults, at the quadlets' path.
+# It exists on every storage run below unless a case removes it; the fake
+# records every presence read in PROBE_MARKER and answers OS_STORE_DIGEST
+# when that is set, "does not resolve" otherwise.
+export OS_STORE="$ROOT/usr/lib/bootc/storage" PROBE_MARKER="$ROOT/probed" CHCON_LOG="$ROOT/chcon.log"
+mkdir -p "$OS_STORE"
 storage_closure=$(printf storage-success | sha256sum | awk '{print $1}')
 cp -a -- "$source" "$data/release/$storage_closure"
 printf 'sha256:%s\n' "$storage_closure" > "$data/release/CLOSURE"
@@ -345,6 +374,11 @@ PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+# The OS store was consulted for exactly the signed root before the copy, did
+# not hold it, and the copy went ahead: nothing carried, the store labelled.
+test "$(cat "$PROBE_MARKER")" = "sha256:$blob"
+grep -Fqx 'carried_by_os_image=0' "$data/OFFLINE-READY"
+grep -Fq -- "offline-generations/.$storage_closure.staging/seed-store/graphroot" "$CHCON_LOG"
 # Published views are clones (FICLONE) of the staged objects where the volume
 # supports them and byte copies elsewhere -- never hard links: the cache
 # contracts require every staged object to stay a single-link regular file.
@@ -394,4 +428,54 @@ fi
 test -f "$ROOT/copied"
 test "offline-generations/$storage_closure" = "$(readlink "$data/offline-current")"
 
-echo "seed-firstboot-import: 27 cases passed"
+# No OS store on this image (real skopeo fails hard on an absent store
+# directory): no presence read at all, every image is copied.
+absent_closure=$(printf os-store-absent | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$absent_closure"
+printf 'sha256:%s\n' "$absent_closure" > "$data/release/CLOSURE"
+rm -- "$ROOT/copied" "$PROBE_MARKER"
+mv -- "$OS_STORE" "$OS_STORE.away"
+PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" \
+  EXPECTED_IMPORT_DIGEST="sha256:$blob" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+  image/firstboot/neural-ice-seed-import.sh
+mv -- "$OS_STORE.away" "$OS_STORE"
+test ! -e "$PROBE_MARKER"
+test -f "$ROOT/copied"
+test "offline-generations/$absent_closure" = "$(readlink "$data/offline-current")"
+grep -Fqx 'carried_by_os_image=0' "$data/OFFLINE-READY"
+
+# The OS store answers with ANOTHER digest for the signed root: not a proof,
+# the copy runs and its own read-back publishes the generation.
+other_closure=$(printf os-store-other-digest | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$other_closure"
+printf 'sha256:%s\n' "$other_closure" > "$data/release/CLOSURE"
+rm -- "$ROOT/copied"
+PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" OS_STORE_DIGEST=sha256:wrong \
+  EXPECTED_IMPORT_DIGEST="sha256:$blob" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+  image/firstboot/neural-ice-seed-import.sh
+test -f "$ROOT/copied"
+test "offline-generations/$other_closure" = "$(readlink "$data/offline-current")"
+grep -Fqx 'carried_by_os_image=0' "$data/OFFLINE-READY"
+grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+
+# The OS store holds the signed root at its exact digest: nothing is copied,
+# the READY receipt says so, and a run that copied nothing passes the gates
+# that read what a copy writes (layer roots, store label).
+carried_closure=$(printf os-store-carries | sha256sum | awk '{print $1}')
+cp -a -- "$source" "$data/release/$carried_closure"
+printf 'sha256:%s\n' "$carried_closure" > "$data/release/CLOSURE"
+rm -- "$ROOT/copied" "$PROBE_MARKER"
+PATH="$FAKEBIN:$PATH" ASSERT_STORAGE_CONTRACT=1 COPY_MARKER="$ROOT/copied" OS_STORE_DIGEST="sha256:$blob" \
+  EXPECTED_IMPORT_DIGEST="sha256:$blob" NI_SEED_IMPORT_ROOT="$ROOT" NI_SEED_IMPORT_DRY_RUN=0 \
+  image/firstboot/neural-ice-seed-import.sh
+test ! -e "$ROOT/copied"
+test "$(cat "$PROBE_MARKER")" = "sha256:$blob"
+test "offline-generations/$carried_closure" = "$(readlink "$data/offline-current")"
+grep -Fqx 'imported_artifacts=1' "$data/OFFLINE-READY"
+grep -Fqx 'carried_by_os_image=1' "$data/OFFLINE-READY"
+grep -Fqx "release_closure_sha256=$carried_closure" "$data/OFFLINE-READY"
+test ! -e "$data/offline-current/seed-store/graphroot/overlay"
+! grep -Fq -- "offline-generations/.$carried_closure.staging/seed-store/graphroot" "$CHCON_LOG" \
+  || { echo "a store nothing was copied into was labelled as imported layer content" >&2; exit 1; }
+
+echo "seed-firstboot-import: 31 cases passed"

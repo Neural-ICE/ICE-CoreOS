@@ -253,7 +253,8 @@ fmt_duration() { # <seconds> -> "2m13s"
 # ---------------------------------------------------------------------------
 # Images: M = distinct `Image=` references the image declares (bound images
 # and Quadlets), N = how many of them are present in containers-storage
-# (graphroot or the read-only seed store), judged on digest when pinned.
+# (graphroot, the bootc bound-image store or the read-only seed store), judged
+# on digest when pinned.
 # ---------------------------------------------------------------------------
 declare -A IMAGE_REFS=()
 collect_image_refs() {
@@ -269,8 +270,14 @@ collect_image_refs() {
                    "$(path /usr/share/containers/systemd)" "$(path /etc/containers/systemd)" \
                    -maxdepth 3 -type f \( -name '*.image' -o -name '*.container' \) -print0 2>/dev/null || true)
 }
+# Three stores, the quadlets' own lookup order: the graphroot, the bootc
+# bound-image store `bootc install` fills from the medium (a symlink under
+# /sysroot; read through it, never resolved), and the seed store first boot
+# publishes. Since the medium carries the images, a first boot counts them
+# present from the bootc store before seed-import has run at all.
 STORAGE_INDEXES=(
   "$(path /var/lib/containers/storage/overlay-images/images.json)"
+  "$(path /usr/lib/bootc/storage/overlay-images/images.json)"
   "$(path /var/lib/neural-ice/data/seed-store/current/overlay-images/images.json)"
 )
 image_present() { # <ref>
