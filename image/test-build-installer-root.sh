@@ -753,14 +753,15 @@ grep -Fq 'grow_raw_payload_partition "$RAW" "$PAYLOAD_BYTES"' "$USB" \
   || fail "the media producer does not grow bib's payload partition to the measured payload"
 grow_line="$(grep -n 'grow_raw_payload_partition "$RAW" "$PAYLOAD_BYTES"' "$USB" | head -1 | cut -d: -f1)"
 fit_line="$(grep -n 'PAYLOADPART_BYTES >= PAYLOAD_BYTES' "$USB" | head -1 | cut -d: -f1)"
-[ -n "$grow_line" ] && [ -n "$fit_line" ] && [ "$grow_line" -lt "$fit_line" ] \
+[[ -n "$grow_line" && -n "$fit_line" && "$grow_line" -lt "$fit_line" ]] \
   || fail "the raw is grown at line ${grow_line:-none}, not before the fit refusal at line ${fit_line:-none}"
 if command -v sfdisk >/dev/null 2>&1; then
   GROW_FN="$(awk '/^grow_raw_payload_partition\(\) \{/,/^}$/' "$USB")"
   [ -n "$GROW_FN" ] || fail "the media producer has no grow_raw_payload_partition function to lift"
   # The producer drives it under sudo, on bib's root-owned raw; the lifted
-  # function is what invokes this shim, which shellcheck cannot see.
-  # shellcheck disable=SC2329
+  # function is what invokes this shim, which shellcheck cannot see (SC2329
+  # on 0.11, SC2317 on the CI runner's 0.10).
+  # shellcheck disable=SC2329,SC2317
   sudo() { "$@"; }
   eval "$GROW_FN"
   table_of() { # node, start, PARTUUID and name of every partition: what must NOT change
