@@ -362,7 +362,10 @@ prepare_fixture() {
 
 run_ceremony() { # $1=script, optional $2=access-policy path
   local script=$1 access_policy=${2:-$MARKERS/access-policy}
+  # This suite exercises the historical full lifecycle; pin the strict posture
+  # so it is not silenced by the ADR-0050 lab-trust relaxed default (lever B).
   env NI_FIRSTBOOT_TPM_TESTING=1 \
+    NEURALICE_SEALED_OTA_STATE="${NI_CEREMONY_POSTURE:-strict}" \
     NI_FIRSTBOOT_TPM_TEST_VALIDATE_FILE_METADATA=1 \
     NI_FIRSTBOOT_TPM_TEST_STATE_DIR="$STATE" \
     NI_FIRSTBOOT_TPM_TEST_STATE="$TOOLS/tpm-state" \

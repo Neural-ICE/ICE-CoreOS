@@ -320,7 +320,12 @@ PY
   cryptsetup token import --token-id 0 --json-file "$FB_RUN/data-token.json" "$FB_DATA_LUKS" >/dev/null
 }
 firstboot() {
+  # This suite qualifies the historical full TPM lifecycle (v1 and owner-profile
+  # completion). Pin the strict posture so it is not silenced by the ADR-0050
+  # lab-trust relaxed default (lever B); the relaxed fail-open is proved
+  # independently by ota/test-firstboot-ceremony-failopen.sh.
   env NI_FIRSTBOOT_TPM_TESTING=1 \
+    NEURALICE_SEALED_OTA_STATE="${NI_CEREMONY_POSTURE:-strict}" \
     NI_FIRSTBOOT_TPM_TEST_STATE_DIR="$FB_STATE" \
     NI_FIRSTBOOT_TPM_TEST_STATE="$FB_TOOLS/tpm-state" \
     NI_FIRSTBOOT_TPM_TEST_DEVICE_ROOT="$FB_TOOLS/device-root" \
