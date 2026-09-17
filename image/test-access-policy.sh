@@ -317,12 +317,14 @@ done
 # The autoinstaller must LOAD every library it reasons with. A missing one would
 # surface as "command not found" mid-install rather than as a refusal before any
 # disk write. `hardware-identity` joined the list when the hardware target
-# stopped being a word compared with a copy of itself.
-for _lib in access-policy hardware-identity installer-payload installer-ssh-key installer-trust release-authorization; do
+# stopped being a word compared with a copy of itself. `bound-images` joined it when the medium started
+# carrying the appliance's bound images as layouts the installer copies
+# (2026-09-17): a missing copy library is a deployment without its images.
+for _lib in access-policy bound-images hardware-identity installer-payload installer-ssh-key installer-trust release-authorization; do
   grep -Fq "source \"\$NEURALICE_INSTALLER_LIB_DIR/${_lib}.sh\"" "$AUTOINSTALL" \
     || fail "the autoinstaller does not load ${_lib}.sh"
 done
-grep -Fq 'for _ni_lib in access-policy hardware-identity installer-payload installer-ssh-key installer-trust release-authorization; do' \
+grep -Fq 'for _ni_lib in access-policy bound-images hardware-identity installer-payload installer-ssh-key installer-trust release-authorization; do' \
   "$AUTOINSTALL" \
   || fail "the autoinstaller does not require every access library before it reasons about access"
 

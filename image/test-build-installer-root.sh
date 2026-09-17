@@ -12,7 +12,8 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/ni-installer-root.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-TOOLS="$TMP/tools"; ROOTFS="$TMP/rootfs"; mkdir -p "$TOOLS" "$ROOTFS"
+TOOLS="$TMP/tools"; ROOTFS="$TMP/rootfs"; HOST_ROOTFS="$TMP/host-rootfs"
+mkdir -p "$TOOLS" "$ROOTFS" "$HOST_ROOTFS"
 ln -sf "$(command -v sha256sum)" "$TOOLS/sha256sum"
 ln -sf "$(command -v xargs)" "$TOOLS/xargs" 2>/dev/null || true
 cat > "$TOOLS/mountpoint" <<'EOF'
@@ -40,6 +41,10 @@ make_rootfs() {
     > "$ROOTFS/usr/lib/neural-ice/keys/release-authorization.pub"
   printf '%s\n' "$(printf 'devicetree:nvidia,gb10' | sha256sum | awk '{print $1}')" \
     > "$ROOTFS/usr/lib/neural-ice/hardware-identity/nvidia-gb10-arm64.fingerprints"
+  # The HOST image the store holds, mounted separately by the builder to read
+  # what it binds to itself. A vanilla host binds nothing: an empty
+  # bound-images.d, which is what a base bootc image ships.
+  rm -rf "$HOST_ROOTFS"; mkdir -p "$HOST_ROOTFS/usr/lib/bootc/bound-images.d"
 }
 make_rootfs
 
@@ -73,7 +78,8 @@ case "\$1 \$2 \$3" in
     esac ;;
   *)
     case "\$1 \$2" in
-      "image mount") printf '%s\n' "$ROOTFS" ;;
+      "image mount")
+        if [[ "\$3" == "sha256:$HOST_IMAGE_ID" ]]; then printf '%s\n' "$HOST_ROOTFS"; else printf '%s\n' "$ROOTFS"; fi ;;
       "image umount") : ;;
       *) exit 2 ;;
     esac ;;
@@ -380,8 +386,13 @@ EOF
 chmod +x "$TOOLS/skopeo"
 build "$TMP/identity" >/dev/null || fail "the honest build failed after the identity mutations"
 manifest="$TMP/identity/installer-root.img.manifest"
-grep -qx "schema=neural-ice-installer-root-manifest-v4" "$manifest" \
+grep -qx "schema=neural-ice-installer-root-manifest-v5" "$manifest" \
   || fail "the manifest schema did not move with the identity contract"
+# A vanilla host binds nothing, and the manifest says so rather than omitting it.
+grep -qx 'store_bound_image_count=0' "$manifest" \
+  || fail "the manifest does not record that the host binds no images"
+grep -qx "store_bound_images_sha256=$(printf '' | sha256sum | awk '{print $1}')" "$manifest" \
+  || fail "the manifest does not record the digest of the (empty) bound image list"
 grep -qx "installer_image_id=$IMAGE_ID" "$manifest" \
   || fail "the manifest does not record the immutable image the root was sealed from"
 grep -qx "store_image_id=$HOST_IMAGE_ID" "$manifest" \
@@ -547,6 +558,370 @@ grep -Fq "grep -Fq -- '--panic-on-corruption'" "$INSTALLER_CONTAINERFILE" \
   || fail "the installer image build does not prove the required verity option exists"
 grep -Fq 'test -s /usr/lib/systemd/boot/efi/linuxaa64.efi.stub' "$INSTALLER_CONTAINERFILE" \
   || fail "the installer image build does not prove the ARM64 UKI stub is present"
+
+# --------------------------------------------------------------------------- #
+# 4d) THE BOUND IMAGES THE HOST DECLARES ARE ON THE MEDIUM, AS OCI LAYOUTS THE
+#     INSTALL CAN COPY. bootc's own install-time copy (`podman image push`
+#     from a containers-storage) cannot land a digest-pinned image -- proved on
+#     the bench 2026-09-17 (image/lib/bound-images.sh) -- so the store carries
+#     each image as a layout: the index under `list` (its bytes hash to the
+#     pinned digest) and the appliance's platform instance under `system`,
+#     staged by digest from a registry and verified before the extent freezes,
+#     and recorded so a cached store cut without them is refused. Until
+#     2026-09-17 the installer hid the directory from bootc and every reinstall
+#     paid 14 minutes of first-boot `skopeo copy` (lab GX10).
+#
+#     REAL skopeo does the layout work here: the mock only translates the
+#     registry reference into the fixture layout that stands for the registry
+#     (a multi-arch index with a linux/arm64 and a linux/amd64 instance), and
+#     keeps mocking the host image's own store copy as before.
+# --------------------------------------------------------------------------- #
+make_rootfs
+ln -sf "$(command -v cp)" "$TOOLS/cp" # the reuse path places the extent with the builder's cp
+REAL_SKOPEO="$(command -v skopeo || true)"
+[ -n "$REAL_SKOPEO" ] || fail "skopeo is required for the bound-image layout cases (CI installs it)"
+REGISTRY="$TMP/registry"; rm -rf "$REGISTRY"; mkdir -p "$REGISTRY"
+# A registry object: an OCI layout carrying a multi-arch index under the tag
+# `list`, two tiny gzip layers per instance. Prints the index digest.
+bound_fixture() { # $1=repository $2=output layout dir
+  python3 - "$2" "$1" <<'PY'
+import gzip, hashlib, io, json, os, sys, tarfile
+out, repo = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.join(out, "blobs", "sha256"), exist_ok=True)
+def put(data, media):
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    with open(os.path.join(out, "blobs", "sha256", digest[7:]), "wb") as handle:
+        handle.write(data)
+    return {"mediaType": media, "digest": digest, "size": len(data)}
+def layer(name, arch):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        payload = f"{repo} {name} {arch}\n".encode()
+        info = tarfile.TarInfo(name=f"{name}-{arch}.txt"); info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    raw = buffer.getvalue()
+    return put(gzip.compress(raw, mtime=0), "application/vnd.oci.image.layer.v1.tar+gzip"), "sha256:" + hashlib.sha256(raw).hexdigest()
+instances = []
+for arch in ("arm64", "amd64"):
+    layers, diff_ids = zip(*(layer(name, arch) for name in ("base", "app")))
+    config = put(json.dumps({"architecture": arch, "os": "linux", "rootfs": {"type": "layers", "diff_ids": list(diff_ids)}, "config": {}}, sort_keys=True).encode(), "application/vnd.oci.image.config.v1+json")
+    manifest = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config, "layers": list(layers)}, sort_keys=True).encode(), "application/vnd.oci.image.manifest.v1+json")
+    manifest["platform"] = {"os": "linux", "architecture": arch}
+    instances.append(manifest)
+index = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": instances}, sort_keys=True).encode(), "application/vnd.oci.image.index.v1+json")
+index["annotations"] = {"org.opencontainers.image.ref.name": "list"}
+with open(os.path.join(out, "index.json"), "w") as handle:
+    json.dump({"schemaVersion": 2, "manifests": [index]}, handle)
+with open(os.path.join(out, "oci-layout"), "w") as handle:
+    json.dump({"imageLayoutVersion": "1.0.0"}, handle)
+print(index["digest"][7:])
+PY
+}
+bound_registry_object() { # $1=repository -> stages the object under its own digest, prints the digest
+  local digest
+  digest="$(bound_fixture "$1" "$TMP/fixture-$1")" || fail "cannot build the $1 fixture"
+  rm -rf "${REGISTRY:?}/$digest"; mv "$TMP/fixture-$1" "$REGISTRY/$digest"
+  printf '%s' "$digest"
+}
+BOUND_A_DIGEST="$(bound_registry_object working-memory)"
+BOUND_B_DIGEST="$(bound_registry_object model-runtime-gb10)"
+BOUND_A="registry.example.test/neural-ice/working-memory@sha256:$BOUND_A_DIGEST"
+BOUND_B="registry.example.test/neural-ice/model-runtime-gb10@sha256:$BOUND_B_DIGEST"
+declare_bound_images() { # $1=host root, rest: <unit>=<Image= reference>
+  local root=$1 pair name ref
+  shift
+  rm -rf "$root/usr/lib/bootc/bound-images.d" "$root/usr/share/containers/systemd/neural-ice-bound-images"
+  mkdir -p "$root/usr/lib/bootc/bound-images.d" "$root/usr/share/containers/systemd/neural-ice-bound-images"
+  for pair in "$@"; do
+    name="${pair%%=*}"; ref="${pair#*=}"
+    printf '[Image]\nImage=%s\n' "$ref" \
+      > "$root/usr/share/containers/systemd/neural-ice-bound-images/$name.image"
+    # The appliance links with ABSOLUTE targets, which only resolve inside the mount.
+    ln -s "/usr/share/containers/systemd/neural-ice-bound-images/$name.image" \
+      "$root/usr/lib/bootc/bound-images.d/$name.image"
+  done
+}
+declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
+# The skopeo mock: anything involving an `oci:` reference is the real skopeo,
+# with docker://mirror.test:5055/<path>@sha256:<d> translated into the fixture
+# layout registered under <d> (and the registry-only --src-* options dropped);
+# a missing fixture is a registry that lacks the object. The host image's
+# store copy stays mocked as before.
+cat > "$TOOLS/skopeo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MOCK_STATE/skopeo.args"
+case "$*" in
+  *oci:*)
+    args=(); skip=0
+    for arg in "$@"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi
+      case "$arg" in
+        --src-cert-dir) skip=1 ;;
+        --src-no-creds) ;;
+        docker://mirror.test:5055/*)
+          digest="${arg##*@sha256:}"
+          [ -d "${MOCK_REGISTRY:?}/$digest" ] || { echo "mock registry: no object $arg" >&2; exit 1; }
+          args+=("oci:${MOCK_REGISTRY}/${digest}:list") ;;
+        *) args+=("$arg") ;;
+      esac
+    done
+    exec "${REAL_SKOPEO:?}" "${args[@]}" ;;
+esac
+last="${*: -1}"
+store="${last#*overlay@}"; store="${store%%+*}"
+if [ "$1" = inspect ]; then cat "${MOCK_SOURCE_MANIFEST_FILE:?}"; exit 0; fi
+name="${last##*]}"
+mkdir -p "$store/overlay-images" "$store/overlay-layers" "$store/overlay"
+src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}"
+printf '[{"id":"%s","names":["%s:latest"]}]\n' "${MOCK_STORE_IMAGE_ID:-$src}" "$name" \
+  > "$store/overlay-images/images.json"
+printf 'staged\n' > "$store/overlay-layers/layers.json"
+EOF
+chmod +x "$TOOLS/skopeo"
+MIRROR="docker://mirror.test:5055"
+bound_build() { # $1=output dir, rest=env overrides
+  local out=$1; shift
+  build "$out" MOCK_REGISTRY="$REGISTRY" REAL_SKOPEO="$REAL_SKOPEO" \
+    BOUND_IMAGE_SOURCE_REGISTRY="mirror.test:5055" "$@"
+}
+bound_build "$TMP/bound" >/dev/null || fail "a host image binding two staged images was refused"
+# The host image is what the list is read from: mounted by its immutable ID.
+grep -Fq "image mount sha256:$HOST_IMAGE_ID" "$TMP/bound/podman.args" \
+  || fail "the bound image list is not read from a mount of the host image itself"
+# Two copies per image, from the registry, digests preserved: the index alone
+# under `list`, then the arm64 instance -- the hardware target's architecture,
+# not the build host's -- under `system`.
+grep -Fq "copy --preserve-digests --multi-arch index-only --src-no-creds $MIRROR/neural-ice/working-memory@sha256:$BOUND_A_DIGEST oci:" \
+  "$TMP/bound/skopeo.args" \
+  || fail "the index of the first bound image was not staged alone from the registry with digests preserved"
+grep -Fq -- "--override-os linux --override-arch arm64 copy --preserve-digests --multi-arch system --src-no-creds $MIRROR/neural-ice/model-runtime-gb10@sha256:$BOUND_B_DIGEST oci:" \
+  "$TMP/bound/skopeo.args" \
+  || fail "the instance of the second bound image was not staged for the hardware target's architecture"
+! grep -Fq -- '--multi-arch all' "$TMP/bound/skopeo.args" \
+  || fail "a bound image was staged with every platform's blobs"
+# The layouts are inside the store tree the squashfs freezes, keyed by digest,
+# and the store's own image index holds the host and nothing else.
+grep -q "neural-ice-bound-images/$BOUND_A_DIGEST/index.json$" "$TMP/bound/installer-store.img" \
+  || fail "the first bound image's layout is not inside the sealed store tree"
+grep -q "neural-ice-bound-images/$BOUND_B_DIGEST/blobs/sha256/" "$TMP/bound/installer-store.img" \
+  || fail "the second bound image's blobs are not inside the sealed store tree"
+manifest="$TMP/bound/installer-root.img.manifest"
+grep -qx 'store_bound_image_count=2' "$manifest" \
+  || fail "the manifest does not record how many bound images the store carries"
+BOUND_LIST_SHA="$(printf '%s\n%s\n' "$BOUND_B" "$BOUND_A" | LC_ALL=C sort | sha256sum | awk '{print $1}')"
+grep -qx "store_bound_images_sha256=$BOUND_LIST_SHA" "$manifest" \
+  || fail "the manifest does not record the digest of the sorted bound image list"
+# Determinism holds with bound images: two builds, one store. The mock
+# mksquashfs records the source PATH of every file, which carries the random
+# work directory; the real one records none, so the paths are normalised.
+bound_build "$TMP/bound-again" >/dev/null || fail "the second bound build failed"
+store_content() { sed -E 's#  .*/store/#  store/#' "$1"; }
+[ "$(store_content "$TMP/bound/installer-store.img")" = "$(store_content "$TMP/bound-again/installer-store.img")" ] \
+  || fail "two builds of one host image with bound images produced different stores"
+# A tag-pinned bound image cannot be proved present: refused before any copy.
+declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" \
+  "model-runtime=registry.example.test/neural-ice/model-runtime-gb10:latest"
+out="$(bound_build "$TMP/bound-tag" 2>&1)" && fail "a tag-pinned bound image was staged"
+grep -Fq 'not a digest-pinned registry reference' <<<"$out" \
+  || fail "the tag refusal is not named: $out"
+[ ! -s "$TMP/bound-tag/skopeo.args" ] \
+  || fail "skopeo ran for a host whose bound images could not be read"
+# A dangling link is a bootc failure after the wipe; here it is a build refusal.
+declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
+rm -f "$HOST_ROOTFS/usr/share/containers/systemd/neural-ice-bound-images/model-runtime.image"
+out="$(bound_build "$TMP/bound-dangling" 2>&1)" && fail "a dangling bound image link was accepted"
+grep -Fq 'which the host image does not carry' <<<"$out" \
+  || fail "the dangling-link refusal is not named: $out"
+declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
+# A registry that lacks one of them is a build refusal, not a medium.
+mv "$REGISTRY/$BOUND_B_DIGEST" "$TMP/parked-b"
+out="$(bound_build "$TMP/bound-missing" 2>&1)" && fail "a store missing a bound image was sealed"
+grep -Fq "cannot stage bound image $BOUND_B" <<<"$out" \
+  || fail "the missing-image refusal does not name the image: $out"
+[ ! -s "$TMP/bound-missing/installer-store.img" ] \
+  || fail "a store image was produced despite the missing bound image"
+# A registry serving OTHER bytes under the pinned digest -- another image's
+# index -- is caught by the layout verification: the `list` tag is not the pin.
+OTHER_DIGEST="$(bound_fixture something-else "$REGISTRY/$BOUND_B_DIGEST")" || fail "cannot build the impostor fixture"
+[ "$OTHER_DIGEST" != "$BOUND_B_DIGEST" ] || fail "the impostor fixture collides with the real one"
+out="$(bound_build "$TMP/bound-tampered" 2>&1)" \
+  && fail "a bound image whose index does not hash to the pinned digest was sealed"
+grep -Fq "not the pinned sha256:$BOUND_B_DIGEST" <<<"$out" \
+  || fail "the digest-mismatch refusal is not named: $out"
+rm -rf "${REGISTRY:?}/$BOUND_B_DIGEST"; mv "$TMP/parked-b" "$REGISTRY/$BOUND_B_DIGEST"
+# An image published for ONE platform only pins its manifest, not an index
+# (the GB10 runtimes, bench 2026-09-17): accepted when its config says
+# linux/arm64, refused when it says another platform.
+bound_single_fixture() { # $1=repository $2=arch $3=output layout dir -> prints the manifest digest
+  python3 - "$3" "$1" "$2" <<'PY'
+import gzip, hashlib, io, json, os, sys, tarfile
+out, repo, arch = sys.argv[1:]
+os.makedirs(os.path.join(out, "blobs", "sha256"), exist_ok=True)
+def put(data, media):
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    with open(os.path.join(out, "blobs", "sha256", digest[7:]), "wb") as handle:
+        handle.write(data)
+    return {"mediaType": media, "digest": digest, "size": len(data)}
+buffer = io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w") as tar:
+    payload = f"{repo} {arch}\n".encode()
+    info = tarfile.TarInfo(name="only.txt"); info.size = len(payload)
+    tar.addfile(info, io.BytesIO(payload))
+raw = buffer.getvalue()
+layer = put(gzip.compress(raw, mtime=0), "application/vnd.oci.image.layer.v1.tar+gzip")
+config = put(json.dumps({"architecture": arch, "os": "linux", "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(raw).hexdigest()]}, "config": {}}, sort_keys=True).encode(), "application/vnd.oci.image.config.v1+json")
+manifest = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config, "layers": [layer]}, sort_keys=True).encode(), "application/vnd.oci.image.manifest.v1+json")
+manifest["annotations"] = {"org.opencontainers.image.ref.name": "list"}
+with open(os.path.join(out, "index.json"), "w") as handle:
+    json.dump({"schemaVersion": 2, "manifests": [manifest]}, handle)
+with open(os.path.join(out, "oci-layout"), "w") as handle:
+    json.dump({"imageLayoutVersion": "1.0.0"}, handle)
+print(manifest["digest"][7:])
+PY
+}
+BOUND_C_DIGEST="$(bound_single_fixture model-runtime-gb10 arm64 "$TMP/fixture-single")" || fail "cannot build the single-platform fixture"
+rm -rf "${REGISTRY:?}/$BOUND_C_DIGEST"; mv "$TMP/fixture-single" "$REGISTRY/$BOUND_C_DIGEST"
+BOUND_C="registry.example.test/neural-ice/model-runtime-gb10@sha256:$BOUND_C_DIGEST"
+declare_bound_images "$HOST_ROOTFS" "model-runtime=$BOUND_C"
+bound_build "$TMP/bound-single" >/dev/null || fail "a bound image published for arm64 only was refused"
+grep -qx 'store_bound_image_count=1' "$TMP/bound-single/installer-root.img.manifest" \
+  || fail "the single-platform bound image was not counted"
+BOUND_D_DIGEST="$(bound_single_fixture model-runtime-x86 amd64 "$TMP/fixture-single-amd64")" || fail "cannot build the amd64-only fixture"
+rm -rf "${REGISTRY:?}/$BOUND_D_DIGEST"; mv "$TMP/fixture-single-amd64" "$REGISTRY/$BOUND_D_DIGEST"
+declare_bound_images "$HOST_ROOTFS" "model-runtime=registry.example.test/neural-ice/model-runtime-x86@sha256:$BOUND_D_DIGEST"
+out="$(bound_build "$TMP/bound-single-amd64" 2>&1)" \
+  && fail "a bound image published for amd64 only was sealed onto an arm64 medium"
+grep -Fq 'is linux/amd64, not linux/arm64' <<<"$out" \
+  || fail "the wrong-platform refusal is not named: $out"
+declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
+# The layout the medium carries copies into a containers-storage under the
+# pinned reference -- the step the installer performs after bootc -- with the
+# real skopeo. A store write needs a user namespace; where the sandbox has
+# none, the bench proof (2026-09-17, appliance skopeo 1.23) stands alone.
+# shellcheck source=image/lib/bound-images.sh
+. "$ROOT/image/lib/bound-images.sh"
+IMPORT_STORE="$TMP/import-store"; mkdir -p "$IMPORT_STORE" "$IMPORT_STORE.run"
+# The copy is a real skopeo write into a containers-storage. Rootless, that
+# needs a user namespace, which this sandbox and the ubuntu-24.04 runner both
+# refuse; and the runner is x86_64, so the copy names the arm64 platform as
+# the installer does, or skopeo would look for an instance the layout does
+# not carry (CI 2026-09-17: "the layout could not be copied")
+# -- it also refuses ("Error during unshare(...): Operation not permitted", 2026-09-17);
+# root needs none. So the case runs rootless where it can, under `sudo -n`
+# where the runner grants it (as the ssh-key suite's root seam already does),
+# and is skipped OUT LOUD only where neither exists -- never in CI, which sets
+# NI_INSTALLER_ROOT_REQUIRE_IMPORT=1. The suite's mocks are not involved: the
+# real skopeo stages the layout as the builder does and copies it as the
+# installer does.
+IMPORT_CASE="$TMP/import-case.sh"
+cat > "$IMPORT_CASE" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "$ROOT/image/lib/bound-images.sh"
+NI_BOUND_IMAGES_SKOPEO="$REAL_SKOPEO"
+ERR="$TMP/import-case.err"; : > "\$ERR"; "$REAL_SKOPEO" --version >> "\$ERR" 2>&1
+rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout"
+mkdir -p "$TMP/import-store" "$TMP/import-store.run"
+ni_bound_image_stage_layout "oci:$REGISTRY/$BOUND_A_DIGEST:list" "$TMP/bound-work-layout" arm64 >>"\$ERR" 2>&1 \
+  || { echo "cannot stage the layout for the import case" >&2; exit 1; }
+ni_bound_image_import "$TMP/bound-work-layout" "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" arm64 >>"\$ERR" 2>&1 \
+  || { echo "the layout could not be copied into a containers-storage under the pinned reference" >&2; exit 1; }
+[ "\$("$REAL_SKOPEO" inspect --raw "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" | sha256sum | cut -c1-64)" = "$BOUND_A_DIGEST" ] \
+  || { echo "the imported image does not answer to the pinned index digest" >&2; exit 1; }
+grep -Fq "\"$BOUND_A\"" "$TMP/import-store/vfs-images/images.json" \
+  || { echo "the target store does not name the imported image by its pinned reference" >&2; exit 1; }
+echo IMPORT_CASE_OK
+EOF
+chmod 0755 "$IMPORT_CASE"
+import_probe_ok=0
+if "$REAL_SKOPEO" copy "oci:$REGISTRY/$BOUND_A_DIGEST:list" "containers-storage:[vfs@$TMP/import-probe+$TMP/import-probe.run]localhost/import-probe:1" \
+    >/dev/null 2>"$TMP/import-probe.err"; then
+  import_probe_ok=1
+fi
+if [ "$import_probe_ok" = 1 ]; then
+  out="$(bash "$IMPORT_CASE" 2>&1)" || fail "the layout-to-store import failed rootless: $out"
+elif sudo -n true 2>/dev/null; then
+  import_rc=0
+  out="$(sudo -n bash "$IMPORT_CASE" 2>&1)" || import_rc=$?
+  # Root wrote these: root removes them, whatever the verdict. Handing them
+  # back is not enough -- c/storage creates layer directories mode 0555, and
+  # the suite's own trap then fails on their contents and turns a green run
+  # into exit 1 (CI 2026-09-17). Only the stderr file is kept, for the message.
+  sudo -n chown "$(id -u):$(id -g)" "$TMP/import-case.err" 2>/dev/null || true
+  sudo -n rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout" 2>/dev/null || true
+  [ "$import_rc" = 0 ] \
+    || fail "the layout-to-store import failed under sudo: $out; skopeo said: $(grep -v '^$' "$TMP/import-case.err" 2>/dev/null | tail -n 4 | tr '\n' ' ' | cut -c1-600)"
+  echo "    (rootless containers-storage unavailable here -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-80); the import case ran under sudo)"
+elif [ "${NI_INSTALLER_ROOT_REQUIRE_IMPORT:-0}" = 1 ]; then
+  fail "this environment can write a containers-storage neither rootless ($(tail -n 1 "$TMP/import-probe.err" | cut -c1-80)) nor under sudo, and the import case may not be skipped here"
+else
+  echo "    (this environment cannot write a containers-storage -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-120); the layout-to-store import is proved on the bench and in CI)"
+fi
+[ "$import_probe_ok" = 0 ] || grep -Fq IMPORT_CASE_OK <<<"$out" || fail "the rootless import case did not report success"
+
+make_rootfs
+
+# --------------------------------------------------------------------------- #
+# 4e) THE RAW GROWS TO THE PAYLOAD. bib sizes its raw at twice the container
+#     (a 10 GiB raw for the 0.60.1 medium) and the pinned bib rejects filesystem
+#     sizing for raw builds; a store carrying ~22 GiB of bound images does not
+#     fit that. The producer grows bib's LAST partition -- the one the sealed
+#     payload overwrites -- to the measured payload BEFORE its fit refusal,
+#     with sfdisk on the raw file: every other partition, every PARTUUID and
+#     every name stay as bib wrote them, and the backup GPT follows the new
+#     end. The function is lifted verbatim and driven on a real GPT.
+# --------------------------------------------------------------------------- #
+USB="$ROOT/image/build-installer-usb.sh"
+grep -Fq 'grow_raw_payload_partition "$RAW" "$PAYLOAD_BYTES"' "$USB" \
+  || fail "the media producer does not grow bib's payload partition to the measured payload"
+grow_line="$(grep -n 'grow_raw_payload_partition "$RAW" "$PAYLOAD_BYTES"' "$USB" | head -1 | cut -d: -f1)"
+fit_line="$(grep -n 'PAYLOADPART_BYTES >= PAYLOAD_BYTES' "$USB" | head -1 | cut -d: -f1)"
+[[ -n "$grow_line" && -n "$fit_line" && "$grow_line" -lt "$fit_line" ]] \
+  || fail "the raw is grown at line ${grow_line:-none}, not before the fit refusal at line ${fit_line:-none}"
+if command -v sfdisk >/dev/null 2>&1; then
+  GROW_FN="$(awk '/^grow_raw_payload_partition\(\) \{/,/^}$/' "$USB")"
+  [ -n "$GROW_FN" ] || fail "the media producer has no grow_raw_payload_partition function to lift"
+  # The producer drives it under sudo, on bib's root-owned raw; the lifted
+  # function is what invokes this shim, which shellcheck cannot see (SC2329
+  # on 0.11, SC2317 on the CI runner's 0.10).
+  # shellcheck disable=SC2329,SC2317
+  sudo() { "$@"; }
+  eval "$GROW_FN"
+  table_of() { # node, start, PARTUUID and name of every partition: what must NOT change
+    sfdisk --json "$1" | python3 -c '
+import json, sys
+table = json.load(sys.stdin)["partitiontable"]
+for part in table["partitions"]:
+    print(part["node"], part["start"], part["uuid"], part.get("name", ""))'
+  }
+  last_bytes_of() {
+    sfdisk --json "$1" | python3 -c '
+import json, sys
+table = json.load(sys.stdin)["partitiontable"]
+last = sorted(table["partitions"], key=lambda part: part["start"])[-1]
+print(last["size"] * table.get("sectorsize", 512))'
+  }
+  RAWFX="$TMP/grow.raw"; truncate -s 64M "$RAWFX"
+  printf 'label: gpt\n,8M,U\n,8M,L\n,,L\n' | sfdisk --quiet "$RAWFX" >/dev/null 2>&1 \
+    || fail "cannot lay out the raw fixture"
+  sfdisk --part-label "$RAWFX" 3 ni-fixture-data >/dev/null 2>&1 || fail "cannot name the fixture partition"
+  table_before="$(table_of "$RAWFX")"; size_before="$(stat -c %s "$RAWFX")"
+  grow_raw_payload_partition "$RAWFX" $((30 * 1024 * 1024)) >/dev/null 2>&1 \
+    || fail "a payload that already fits was refused"
+  [ "$(stat -c %s "$RAWFX")" = "$size_before" ] || fail "a payload that already fits grew the raw"
+  grow_raw_payload_partition "$RAWFX" $((100 * 1024 * 1024)) >/dev/null 2>&1 \
+    || fail "the raw could not be grown for a larger payload"
+  last_bytes="$(last_bytes_of "$RAWFX")"
+  [ "$last_bytes" -ge $((100 * 1024 * 1024)) ] \
+    || fail "the grown payload partition holds $last_bytes bytes, less than the payload"
+  [ "$table_before" = "$(table_of "$RAWFX")" ] \
+    || fail "growing the payload partition moved a partition, changed a PARTUUID or renamed one"
+  sfdisk --verify "$RAWFX" >/dev/null 2>&1 \
+    || fail "the grown raw does not verify: the backup GPT did not follow the new end"
+  unset -f sudo
+else
+  echo "    (sfdisk unavailable here: the raw grow is asserted on the producer's source only)"
+fi
 
 # --------------------------------------------------------------------------- #
 # 5) THE OVERRIDE MUST NOT BE A PRODUCTION BYPASS, and the producer must call it.
@@ -733,6 +1108,7 @@ if [ -z "$REUSE_SHA" ] || [ -z "$REUSE_BYTES" ]; then
   fail "the full build recorded no store size and digest to reuse"
 fi
 
+EMPTY_LIST_SHA="$(printf '' | sha256sum | awk '{print $1}')"
 reuse_build() { # $1=output dir, rest=env overrides
   local out=$1; shift
   build "$out" \
@@ -742,6 +1118,7 @@ reuse_build() { # $1=output dir, rest=env overrides
     STORE_IMAGE_REUSE_IMAGE_ID="$HOST_IMAGE_ID" \
     STORE_IMAGE_REUSE_MANIFEST_DIGEST="$HOST_MANIFEST" \
     STORE_IMAGE_REUSE_NAME="localhost/bootc" \
+    STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256="$EMPTY_LIST_SHA" \
     "$@"
 }
 
@@ -822,18 +1199,27 @@ out="$(reuse_build "$TMP/reuse-other-name" \
   && fail "a reusable store offering the image under another name was sealed"
 grep -Fq 'but this build installs from' <<<"$out" \
   || fail "the other-name refusal is not named: $out"
+out="$(reuse_build "$TMP/reuse-other-bound" \
+  STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256="$(printf '%064d' 9)" 2>&1)" \
+  && fail "a reusable store recorded around another bound image list was sealed"
+grep -Fq 'records bound images' <<<"$out" \
+  || fail "the other-bound-list refusal is not named: $out"
 
 # A HALF-DESCRIBED EXTENT IS REFUSED IN BOTH DIRECTIONS: a path with no facts is
 # bytes nothing accounts for, and facts with no path describe nothing.
 out="$(reuse_build "$TMP/reuse-half" STORE_IMAGE_REUSE_SHA256= 2>&1)" \
   && fail "a store reuse with no recorded digest was accepted"
-grep -Fq 'requires all six of' <<<"$out" \
+grep -Fq 'requires all seven of' <<<"$out" \
   || fail "the half-tuple refusal is not named: $out"
+out="$(reuse_build "$TMP/reuse-six" STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256= 2>&1)" \
+  && fail "the six-value tuple of a store cut before the bound images were carried was accepted"
+grep -Fq 'requires all seven of' <<<"$out" \
+  || fail "the six-value-tuple refusal is not named: $out"
 out="$(build "$TMP/reuse-facts-only" \
   STORE_IMAGE_REUSE_SHA256="$REUSE_SHA" \
   STORE_IMAGE_REUSE_BYTES="$REUSE_BYTES" 2>&1)" \
   && fail "recorded facts with no extent were accepted"
-grep -Fq 'requires all six of' <<<"$out" \
+grep -Fq 'requires all seven of' <<<"$out" \
   || fail "the facts-without-extent refusal is not named: $out"
 
 # A SYMLINK IS NOT AN EXTENT. The reuse input is read by a privileged process;
@@ -861,6 +1247,12 @@ grep -Fq 'medium_cache_require_dir' "$USB" \
   || fail "the media producer never validates the cache directory"
 grep -Fq 'STORE_IMAGE_REUSE="$(medium_cache_entry_dir "$MEDIUM_CACHE_STORE_KEY")/installer-store.img"' "$USB" \
   || fail "the media producer does not hand the sealed root builder the cached extent"
+grep -Fq 'STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256="$(sed -n '"'"'s/^store_bound_images_sha256=//p'"'"' <<<"$medium_cache_entry_facts")"' "$USB" \
+  || fail "the media producer does not hand the builder the bound image list a cache entry records"
+grep -Fq '"store_bound_images_sha256": HEX64,' "$USB" \
+  || fail "the media producer's cache reader does not require the recorded bound image list"
+grep -Fq 'BOUND_IMAGE_SOURCE_REGISTRY="$BOUND_IMAGE_SOURCE_REGISTRY"' "$USB" \
+  || fail "the media producer does not pass the bound image registry to the store builder"
 grep -Fq 'medium_cache_assert_reused_verity "$STORE_VERITY_HASH" "$MEDIUM_CACHE_STORE_VERITY_HASH"' "$USB" \
   || fail "the media producer does not compare the recomputed store verity root hash with the cache entry"
 grep -Fq 'medium_cache_finalize_store' "$USB" \

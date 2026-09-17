@@ -60,6 +60,10 @@ STORE_STORAGE_NAME="${STORE_STORAGE_NAME:-}"
 # Optional registry source for the medium's image store (see build-installer-root.sh).
 STORE_SOURCE_REF="${STORE_SOURCE_REF:-}"
 STORE_SOURCE_CERT_DIR="${STORE_SOURCE_CERT_DIR:-}"
+# Optional registry (`host[:port]`) the appliance's logically bound images are
+# staged from, by digest; defaults to the registry STORE_SOURCE_REF names
+# (see build-installer-root.sh, BOUND_IMAGE_SOURCE_REGISTRY).
+BOUND_IMAGE_SOURCE_REGISTRY="${BOUND_IMAGE_SOURCE_REGISTRY:-}"
 # bib output (root-owned, ~40 GiB) lives OUTSIDE the checkout so it never
 # pollutes the workspace (a root-owned file there breaks the next CI checkout).
 OUT="${OUT:-${RUNNER_TEMP:-/var/tmp}/ice-coreos-bib}"
@@ -241,11 +245,12 @@ ni_step_summary() { # the table a bench run can be read off
 # 🔴 THE CONTENT CACHE, AND EXACTLY WHAT IT IS ALLOWED TO SKIP (FAB-0057 P1.7).
 #
 # Between two media cut for one edit of the installer root, the SEALED STORE is
-# byte-identical: it is a containers-storage holding exactly $BASE_IMAGE, and
-# $BASE_IMAGE is a digest. Producing it costs a `skopeo copy` of ~8 GiB plus a
-# single-threaded `mksquashfs -comp zstd -Xcompression-level 19` over the
-# result, and that work is repeated in full for a change it cannot possibly
-# depend on.
+# byte-identical: it is a containers-storage holding exactly $BASE_IMAGE and the
+# images $BASE_IMAGE binds to itself, every one of them a digest. Producing it
+# costs a `skopeo copy` of ~8 GiB for the host plus ~22 GiB of bound images
+# (2026-09-17), then a single-threaded `mksquashfs -comp zstd -Xcompression-
+# level 19` over the result, and that work is repeated in full for a change it
+# cannot possibly depend on.
 #
 # The cache is OFF unless MEDIUM_BUILD_CACHE_DIR names a directory: with it
 # unset this file behaves byte-for-byte as before, which is the only way a cache
@@ -267,8 +272,9 @@ ni_step_summary() { # the table a bench run can be read off
 #      (never the source: a source hashed and then swapped is a hash of nothing)
 #      and refuses unless it equals the recorded size and SHA-256;
 #   4. the identity the entry records -- config ID, platform manifest digest,
-#      store image name -- must equal the identity THIS build resolved live from
-#      $BASE_IMAGE with podman, moments earlier;
+#      store image name, and the digest of the bound image list -- must equal
+#      the identity THIS build resolved live from $BASE_IMAGE with podman,
+#      moments earlier (the list is read out of a mount of $BASE_IMAGE itself);
 #   5. image/build-installer-payload.sh then runs UNCHANGED on those bytes, so
 #      `veritysetup format` recomputes the store's dm-verity root hash from
 #      them, and that recomputed hash must equal the one the entry records.
@@ -286,7 +292,10 @@ ni_step_summary() { # the table a bench run can be read off
 # supported way to prove a medium from nothing.
 # --------------------------------------------------------------------------- #
 MEDIUM_BUILD_CACHE_DIR="${MEDIUM_BUILD_CACHE_DIR:-}"
-MEDIUM_BUILD_CACHE_MAX_ENTRIES="${MEDIUM_BUILD_CACHE_MAX_ENTRIES:-4}"
+# Two, not four, since the store carries the bound images: an entry is the
+# host plus ~22 GiB of images under zstd, and the lab builder's disk has
+# already reached 94 % once (memory, disk saturation).
+MEDIUM_BUILD_CACHE_MAX_ENTRIES="${MEDIUM_BUILD_CACHE_MAX_ENTRIES:-2}"
 MEDIUM_BUILD_CACHE_SCHEMA="neural-ice-medium-build-cache-entry-v1"
 MEDIUM_BUILD_CACHE_KEY_SCHEMA="neural-ice-medium-build-cache-key-v1"
 # Set by the flow below: the key of this build's sealed store, the entry that
@@ -453,6 +462,7 @@ if document.get("key") != key:
 required = {
     "store_image_sha256": HEX64,
     "store_image_id": HEX64,
+    "store_bound_images_sha256": HEX64,
     "store_verity_hash": HEX64,
     "store_image_manifest_digest": re.compile(r"^sha256:[0-9a-f]{64}$"),
     "store_image_name": re.compile(r"^[a-z0-9]([a-z0-9._/-]{0,126}[a-z0-9])?$"),
@@ -504,7 +514,8 @@ import sys
 import time
 
 (path, schema, key, key_document, uid, image_sha256, image_bytes, image_id,
- manifest_digest, image_name, verity_hash, verity_salt, verity_uuid) = sys.argv[1:]
+ manifest_digest, image_name, verity_hash, verity_salt, verity_uuid,
+ bound_images_sha256) = sys.argv[1:]
 document = {
     "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "created_by_uid": int(uid),
@@ -513,6 +524,7 @@ document = {
     "kind": "sealed-store",
     "producer": "image/build-installer-usb.sh",
     "schema": schema,
+    "store_bound_images_sha256": bound_images_sha256,
     "store_image_bytes": image_bytes,
     "store_image_id": image_id,
     "store_image_manifest_digest": manifest_digest,
@@ -530,13 +542,14 @@ PY
     || medium_cache_die "cannot publish the cache entry's provenance document"
 }
 
-# BOUND THE CACHE. Entries are ~8 GiB each, so an unbounded cache fills the
-# build host's disk and the next build fails on ENOSPC in the middle of a
-# `veritysetup format`. The newest MEDIUM_BUILD_CACHE_MAX_ENTRIES survive,
-# ordered by the mtime of the provenance document -- i.e. by when the entry
-# became reusable, not by when its bytes were copied.
+# BOUND THE CACHE. Entries were ~8 GiB each and now carry the bound images as
+# well, so an unbounded cache fills the build host's disk and the next build
+# fails on ENOSPC in the middle of a `veritysetup format`. The newest
+# MEDIUM_BUILD_CACHE_MAX_ENTRIES survive, ordered by the mtime of the
+# provenance document -- i.e. by when the entry became reusable, not by when
+# its bytes were copied.
 #
-# An UNFINISHED entry is the residue of an interrupted build and costs ~8 GiB,
+# An UNFINISHED entry is the residue of an interrupted build and costs as much,
 # so it is evicted too -- but only once it is older than six hours. A media
 # build takes 22-35 minutes on the bench (FAB-0057, measured 2026-09-09), so
 # that bound cannot reach the staged entry of a build running beside this one,
@@ -1257,6 +1270,7 @@ if [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]]; then
         STORE_IMAGE_REUSE_IMAGE_ID="$(sed -n 's/^store_image_id=//p' <<<"$medium_cache_entry_facts")"
         STORE_IMAGE_REUSE_MANIFEST_DIGEST="$(sed -n 's/^store_image_manifest_digest=//p' <<<"$medium_cache_entry_facts")"
         STORE_IMAGE_REUSE_NAME="$(sed -n 's/^store_image_name=//p' <<<"$medium_cache_entry_facts")"
+        STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256="$(sed -n 's/^store_bound_images_sha256=//p' <<<"$medium_cache_entry_facts")"
       )
       echo "    reusing the cached sealed store (re-hashed and re-identified below; its verity root hash is recomputed from the bytes at the payload step)"
     fi
@@ -1274,6 +1288,7 @@ sudo env \
   STORE_MANIFEST_DIGEST="$BASE_MANIFEST_DIGEST" \
   STORE_SOURCE_REF="$STORE_SOURCE_REF" \
   STORE_SOURCE_CERT_DIR="$STORE_SOURCE_CERT_DIR" \
+  BOUND_IMAGE_SOURCE_REGISTRY="$BOUND_IMAGE_SOURCE_REGISTRY" \
   "${MEDIUM_CACHE_STORE_REUSE_ARGS[@]}" \
   bash "$REPO_ROOT/image/build-installer-root.sh" \
   || { echo "ERROR: cannot build the sealed installer root and store" >&2; exit 1; }
@@ -1298,6 +1313,15 @@ SEALED_STORE_SHA256="$(sed -n 's/^store_image_sha256=//p' "$SEALED_ROOT_MANIFEST
 SEALED_STORE_BYTES="$(sed -n 's/^store_image_bytes=//p' "$SEALED_ROOT_MANIFEST")"
 [[ "$SEALED_STORE_SHA256" =~ ^[0-9a-f]{64}$ && "$SEALED_STORE_BYTES" =~ ^[1-9][0-9]*$ ]] \
   || { echo "ERROR: the sealed root manifest records no usable store image size and digest" >&2; exit 1; }
+# What the store binds, as the builder derived it from $BASE_IMAGE itself and
+# staged it (build-installer-root.sh §1b/§2): recorded into the cache entry so
+# a later build can refuse a store cut around another list, and said here so
+# the build log states how many images bootc will copy at install.
+SEALED_STORE_BOUND_COUNT="$(sed -n 's/^store_bound_image_count=//p' "$SEALED_ROOT_MANIFEST")"
+SEALED_STORE_BOUND_SHA256="$(sed -n 's/^store_bound_images_sha256=//p' "$SEALED_ROOT_MANIFEST")"
+[[ "$SEALED_STORE_BOUND_COUNT" =~ ^[0-9]{1,4}$ && "$SEALED_STORE_BOUND_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: the sealed root manifest records no usable bound image count and list digest" >&2; exit 1; }
+echo "    bound images in the sealed store: ${SEALED_STORE_BOUND_COUNT} (list sha256 ${SEALED_STORE_BOUND_SHA256})"
 if [[ -n "$MEDIUM_CACHE_STORE_HIT" ]]; then
   # The reused entry has already been re-hashed by image/build-installer-root.sh
   # against the value recorded in the entry. Reading the manifest back here says
@@ -1418,7 +1442,8 @@ elif [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]]; then
     "$SEALED_STORE_SHA256" "$SEALED_STORE_BYTES" "$BASE_IMAGE_ID" \
     "$BASE_MANIFEST_DIGEST" "$STORE_IMAGE_NAME" "$STORE_VERITY_HASH" \
     "$(sed -n 's/^verity_salt=//p' "$PAYLOAD_MANIFEST")" \
-    "$(sed -n 's/^verity_uuid=//p' "$PAYLOAD_MANIFEST")"
+    "$(sed -n 's/^verity_uuid=//p' "$PAYLOAD_MANIFEST")" \
+    "$SEALED_STORE_BOUND_SHA256"
   medium_cache_prune "$MEDIUM_CACHE_STORE_KEY"
   echo "    cache: entry ${MEDIUM_CACHE_STORE_KEY:0:16}… is now reusable (store verity ${STORE_VERITY_HASH})"
 fi
@@ -1714,6 +1739,51 @@ assert_installer_tag_unmoved "the bootc-image-builder run"
 
 RAW="$OUT/image/disk.raw"
 [[ -f "$RAW" ]] || { echo "ERROR: raw not produced ($RAW)" >&2; exit 1; }
+
+# --------------------------------------------------------------------------- #
+# 🔴 THE RAW GROWS TO THE PAYLOAD, BEFORE THE FIT REFUSAL. bib sizes its raw at
+# twice the container it installs (a 10 GiB raw for the 0.60.1 medium) and the
+# pinned bib rejects customizations.filesystem for raw builds, so nothing above
+# lets this build ask for a data partition the size of the sealed payload. With
+# the store carrying the appliance's bound images (~22 GiB before compression,
+# 2026-09-17) the payload no longer fits what bib chose. The data partition is
+# the LAST one on the raw and the payload overwrites it entirely below, so it
+# is grown in place on the raw FILE with sfdisk, as bib left it: the file is
+# extended, the backup GPT is moved to the new end, and only that partition's
+# size changes -- start, type, PARTUUID and name (later renamed
+# ni-installer-payload) stay as bib wrote them; the ESP and boot partition are
+# untouched. Nothing is guessed: the target is the measured payload size, and
+# the fit check below still decides.
+# --------------------------------------------------------------------------- #
+grow_raw_payload_partition() { # $1=raw file $2=bytes the last partition must hold
+  local raw=$1 need=$2 facts number start size sector_size have want
+  facts="$(sudo sfdisk --json -- "$raw" | python3 -c '
+import json, sys
+table = json.load(sys.stdin)["partitiontable"]
+parts = sorted(table["partitions"], key=lambda part: part["start"])
+last = parts[-1]
+print(last["node"][len(table["device"]):].lstrip("p"), last["start"], last["size"], table.get("sectorsize", 512))
+')" || return 1
+  read -r number start size sector_size <<<"$facts"
+  [[ "$number" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && "$sector_size" =~ ^[0-9]+$ ]] \
+    || return 1
+  have=$(( size * sector_size ))
+  if (( have >= need )); then
+    echo "    payload partition ${number}: ${have} bytes as bib sized it; the ${need}-byte sealed payload fits"
+    return 0
+  fi
+  # The new end: the partition's start plus the payload, plus 2 MiB for the
+  # backup GPT and alignment, rounded up to a MiB. sfdisk's `+` then gives the
+  # partition everything up to the relocated backup table.
+  want=$(( start * sector_size + need + 2 * 1024 * 1024 ))
+  want=$(( (want + 1048575) / 1048576 * 1048576 ))
+  sudo truncate -s "$want" -- "$raw" || return 1
+  sudo sfdisk --quiet --relocate gpt-bak-std -- "$raw" || return 1
+  printf ', +\n' | sudo sfdisk --quiet --no-reread --no-tell-kernel -N "$number" -- "$raw" || return 1
+  echo "    payload partition ${number} grown: bib sized it ${have} bytes, the sealed payload is ${need}; the raw is now ${want} bytes"
+}
+grow_raw_payload_partition "$RAW" "$PAYLOAD_BYTES" \
+  || { echo "ERROR: cannot grow BIB's raw data partition to the ${PAYLOAD_BYTES}-byte sealed payload" >&2; exit 1; }
 
 # --------------------------------------------------------------------------- #
 # REPLACE WHAT bib PRODUCED.
