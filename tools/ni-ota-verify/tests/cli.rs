@@ -2447,8 +2447,12 @@ fn commit_refuses_media_era_baseline_without_mutating_it() {
     let cfg = fx.write_config(1, "");
     fx.seed_legacy_applied(6, &"c".repeat(64));
     let before = fs::read(fx.path("state/applied.json")).unwrap();
+    // `strict` posture (ADR-0050 lever C): the media-era refusal is byte-identical
+    // to the pre-relaxation behaviour. The `relaxed` default is exercised by
+    // `commit_relaxed_proceeds_on_media_era_baseline_and_logs_marker`.
     let (code, _, stderr) = run(Command::new(BIN)
         .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NEURALICE_SEALED_OTA_STATE", "strict")
         .arg("commit")
         .args(["--bom".as_ref(), bom.as_os_str()])
         .args(["--config".as_ref(), cfg.as_os_str()]));
@@ -2547,8 +2551,12 @@ fn commit_refuses_to_seed_when_tpm_anchoring_is_configured() {
     let fx = Fixture::new("tpm-anchored-seed");
     let bom = fx.write_bom("0.44.7", 7);
     let cfg = fx.write_config(1, "nv_index=0x01500001\n");
+    // `strict` posture (ADR-0050 lever C): unseeded-under-TPM-anchoring refuses
+    // exactly as before the relaxation. The `relaxed` default is exercised by
+    // `commit_relaxed_proceeds_on_unseeded_tpm_anchored_state_and_logs_marker`.
     let (code, _, stderr) = run(Command::new(BIN)
         .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NEURALICE_SEALED_OTA_STATE", "strict")
         .arg("commit")
         .args(["--bom".as_ref(), bom.as_os_str()])
         .args(["--config".as_ref(), cfg.as_os_str()]));
@@ -2558,6 +2566,105 @@ fn commit_refuses_to_seed_when_tpm_anchoring_is_configured() {
         "{stderr}"
     );
     assert!(stderr.contains("bootstrap"), "{stderr}");
+    assert!(!fx.path("state/applied.json").exists());
+}
+
+// --- ADR-0050 lever C: MVP 1.0 "lab-trust" sealed-baseline relaxation ---------
+//
+// `NEURALICE_SEALED_OTA_STATE=relaxed` (the default) drops the anti-rollback /
+// sealed-baseline commit gate (TPM usages #3/#4) that bricked appliance `.67`
+// between trains on 2026-09-17: a commit no longer refuses purely because the
+// applied state is unseeded or was recorded by a media-era verifier. Ring
+// monotonicity, incoming-BOM integrity and corrupt-state protection stay fatal.
+
+/// (a) An unseeded state under configured TPM anchoring — the exact `.67` wall —
+/// PROCEEDS under the relaxed default: the commit seeds a media-independent
+/// baseline and logs the relaxation marker, instead of refusing.
+#[test]
+fn commit_relaxed_proceeds_on_unseeded_tpm_anchored_state_and_logs_marker() {
+    let fx = Fixture::new("relaxed-unseeded-tpm");
+    let bom = fx.write_bom("0.44.7", 7);
+    let cfg = fx.write_config(1, "nv_index=0x01500001\n");
+    // No NEURALICE_SEALED_OTA_STATE env at all: relaxed is the MVP 1.0 default.
+    let (code, receipt, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env_remove("NEURALICE_SEALED_OTA_STATE")
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(code, 0, "relaxed default must proceed: {stderr}");
+    assert_eq!(receipt["committed"], true);
+    assert_eq!(receipt["bundle_seq"], 7);
+    assert!(
+        stderr.contains("RELAXED sealed-baseline gate")
+            && stderr.contains("ADR-0050 lever C")
+            && stderr.contains("unseeded while TPM anchoring is configured"),
+        "relaxation marker missing: {stderr}"
+    );
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bundle_seq"], 7);
+    assert_eq!(applied["bom_format"], "media-independent-v1");
+}
+
+/// (a) A media-era applied baseline (no format marker) PROCEEDS under the relaxed
+/// default: the implicit migration is performed (marker written) and the marker
+/// is logged, instead of refusing.
+#[test]
+fn commit_relaxed_proceeds_on_media_era_baseline_and_logs_marker() {
+    let fx = Fixture::new("relaxed-media-era");
+    let bom = fx.write_bom("0.44.8", 8);
+    let cfg = fx.write_config(1, "");
+    fx.seed_legacy_applied(6, &"c".repeat(64));
+    let (code, receipt, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NEURALICE_SEALED_OTA_STATE", "relaxed")
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()]));
+    assert_eq!(
+        code, 0,
+        "relaxed must proceed over a media-era baseline: {stderr}"
+    );
+    assert_eq!(receipt["bundle_seq"], 8);
+    assert!(
+        stderr.contains("RELAXED sealed-baseline gate")
+            && stderr.contains("ADR-0050 lever C")
+            && stderr.contains("media-era verifier"),
+        "relaxation marker missing: {stderr}"
+    );
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fx.path("state/applied.json")).unwrap()).unwrap();
+    assert_eq!(applied["bundle_seq"], 8, "baseline advanced");
+    assert_eq!(
+        applied["bom_format"], "media-independent-v1",
+        "the migrated baseline carries the media-independent marker"
+    );
+}
+
+/// (c) KEEP path: a ring DOWNGRADE is still refused even under the relaxed
+/// posture — ring monotonicity is orthogonal to the sealed-baseline relaxation.
+#[test]
+fn commit_relaxed_still_refuses_ring_downgrade() {
+    let fx = Fixture::new("relaxed-ring-downgrade");
+    let bom = fx.write_bom("0.67.0", 67);
+    let cfg = fx.write_config(1, "device_channel=lab\n");
+    let (code, _, stderr) = run(Command::new(BIN)
+        .env("NI_OTA_HARDWARE_TARGET_FILE", fx.path("hardware-target"))
+        .env("NEURALICE_SEALED_OTA_STATE", "relaxed")
+        .arg("commit")
+        .args(["--bom".as_ref(), bom.as_os_str()])
+        .args(["--config".as_ref(), cfg.as_os_str()])
+        .args(["--active-ring", "beta", "--previous-ring", "stable"]));
+    assert_eq!(
+        code, 1,
+        "ring downgrade must stay fatal in relaxed: {stderr}"
+    );
+    assert!(stderr.contains("downgrade is forbidden"), "{stderr}");
+    assert!(
+        !stderr.contains("RELAXED sealed-baseline gate"),
+        "ring downgrade must not be routed through the sealed-baseline relaxation: {stderr}"
+    );
     assert!(!fx.path("state/applied.json").exists());
 }
 
