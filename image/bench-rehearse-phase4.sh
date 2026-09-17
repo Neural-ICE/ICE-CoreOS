@@ -188,7 +188,7 @@ if (( rc == 0 )); then
       -v "$WORK/target-storage.conf:/etc/containers/storage.conf:ro" \
       -v "$WORK/policy.json:/etc/containers/policy.json:ro" \
       --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
-      "$IMAGE" skopeo copy --preserve-digests "oci:${dir}:${NI_BOUND_IMAGES_LIST_TAG}" "containers-storage:${ref}" \
+      "$IMAGE" skopeo --override-os linux --override-arch "$ARCH" copy --preserve-digests "oci:${dir}:${NI_BOUND_IMAGES_LIST_TAG}" "containers-storage:${ref}" \
       >> "$WORK/copy.log" 2>&1; then
       echo "   copied in $((SECONDS - t0))s: $ref"
     else

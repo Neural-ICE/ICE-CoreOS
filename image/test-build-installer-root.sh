@@ -803,7 +803,10 @@ declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BO
 IMPORT_STORE="$TMP/import-store"; mkdir -p "$IMPORT_STORE" "$IMPORT_STORE.run"
 # The copy is a real skopeo write into a containers-storage. Rootless, that
 # needs a user namespace, which this sandbox and the ubuntu-24.04 runner both
-# refuse ("Error during unshare(...): Operation not permitted", 2026-09-17);
+# refuse; and the runner is x86_64, so the copy names the arm64 platform as
+# the installer does, or skopeo would look for an instance the layout does
+# not carry (CI 2026-09-17: "the layout could not be copied")
+# -- it also refuses ("Error during unshare(...): Operation not permitted", 2026-09-17);
 # root needs none. So the case runs rootless where it can, under `sudo -n`
 # where the runner grants it (as the ssh-key suite's root seam already does),
 # and is skipped OUT LOUD only where neither exists -- never in CI, which sets
@@ -816,11 +819,12 @@ cat > "$IMPORT_CASE" <<EOF
 set -euo pipefail
 . "$ROOT/image/lib/bound-images.sh"
 NI_BOUND_IMAGES_SKOPEO="$REAL_SKOPEO"
+ERR="$TMP/import-case.err"; : > "\$ERR"; "$REAL_SKOPEO" --version >> "\$ERR" 2>&1
 rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout"
 mkdir -p "$TMP/import-store" "$TMP/import-store.run"
-ni_bound_image_stage_layout "oci:$REGISTRY/$BOUND_A_DIGEST:list" "$TMP/bound-work-layout" arm64 >/dev/null 2>&1 \
+ni_bound_image_stage_layout "oci:$REGISTRY/$BOUND_A_DIGEST:list" "$TMP/bound-work-layout" arm64 >>"\$ERR" 2>&1 \
   || { echo "cannot stage the layout for the import case" >&2; exit 1; }
-ni_bound_image_import "$TMP/bound-work-layout" "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" >/dev/null 2>&1 \
+ni_bound_image_import "$TMP/bound-work-layout" "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" arm64 >>"\$ERR" 2>&1 \
   || { echo "the layout could not be copied into a containers-storage under the pinned reference" >&2; exit 1; }
 [ "\$("$REAL_SKOPEO" inspect --raw "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" | sha256sum | cut -c1-64)" = "$BOUND_A_DIGEST" ] \
   || { echo "the imported image does not answer to the pinned index digest" >&2; exit 1; }
@@ -837,8 +841,12 @@ fi
 if [ "$import_probe_ok" = 1 ]; then
   out="$(bash "$IMPORT_CASE" 2>&1)" || fail "the layout-to-store import failed rootless: $out"
 elif sudo -n true 2>/dev/null; then
-  out="$(sudo -n bash "$IMPORT_CASE" 2>&1)" || fail "the layout-to-store import failed under sudo: $out"
-  sudo -n rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout" 2>/dev/null || true
+  import_rc=0
+  out="$(sudo -n bash "$IMPORT_CASE" 2>&1)" || import_rc=$?
+  # Root wrote these; hand them back so the suite's own trap can remove them.
+  sudo -n chown -R "$(id -u):$(id -g)" "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout" "$TMP/import-case.err" 2>/dev/null || true
+  [ "$import_rc" = 0 ] \
+    || fail "the layout-to-store import failed under sudo: $out; skopeo said: $(grep -v '^$' "$TMP/import-case.err" 2>/dev/null | tail -n 4 | tr '\n' ' ' | cut -c1-600)"
   echo "    (rootless containers-storage unavailable here -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-80); the import case ran under sudo)"
 elif [ "${NI_INSTALLER_ROOT_REQUIRE_IMPORT:-0}" = 1 ]; then
   fail "this environment can write a containers-storage neither rootless ($(tail -n 1 "$TMP/import-probe.err" | cut -c1-80)) nor under sudo, and the import case may not be skipped here"

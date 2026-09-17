@@ -242,7 +242,9 @@ phase5_line="$(grep -n '^phase 5 ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 [[ -n "$bootc_line" && -n "$import_line" && -n "$readback_line" && -n "$phase5_line" \
    && "$bootc_line" -lt "$import_line" && "$import_line" -lt "$readback_line" && "$readback_line" -lt "$phase5_line" ]] \
   || fail "the bound-image copy (line ${import_line:-none}) and readback (${readback_line:-none}) are not between bootc install (${bootc_line:-none}) and phase 5 (${phase5_line:-none})"
-grep -Fq '      skopeo copy --preserve-digests' "$AUTOINSTALL" \
+grep -Fq '      skopeo --override-os linux --override-arch "$BOOTC_BOUND_IMAGE_ARCH"' "$AUTOINSTALL" \
+  || fail "the bound-image copy does not name the appliance's platform; skopeo would select the installer host's"
+grep -Fq '        copy --preserve-digests' "$AUTOINSTALL" \
   || fail "the bound-image copy does not preserve digests"
 grep -Fq '"containers-storage:${_bound_ref}"' "$AUTOINSTALL" \
   || fail "the bound-image copy does not land under the exact reference the quadlet names"

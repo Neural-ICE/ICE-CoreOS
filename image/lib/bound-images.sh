@@ -181,10 +181,13 @@ PY
 
 # Copy one layout into a containers-storage under the exact reference the
 # quadlet names. $1=layout directory $2=destination (a full
-# `containers-storage:[…]<repo>@sha256:<index>` reference). The source is the
-# `list` tag, so the copy's top-level manifest is the index and the digested
-# destination is accepted.
+# `containers-storage:[…]<repo>@sha256:<index>` reference) $3=the appliance's
+# OCI architecture. The source is the `list` tag, so the copy's top-level
+# manifest is the index and the digested destination is accepted. The
+# platform is named explicitly: skopeo would otherwise select the instance
+# of the machine it runs on, and the layout carries one platform's blobs
+# only (the suite runs on x86_64 runners, the medium is cut for arm64).
 ni_bound_image_import() {
-  "$NI_BOUND_IMAGES_SKOPEO" copy --preserve-digests \
-    "oci:${1}:${NI_BOUND_IMAGES_LIST_TAG}" "$2"
+  "$NI_BOUND_IMAGES_SKOPEO" --override-os linux --override-arch "$3" \
+    copy --preserve-digests "oci:${1}:${NI_BOUND_IMAGES_LIST_TAG}" "$2"
 }

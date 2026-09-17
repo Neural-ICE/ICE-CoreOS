@@ -4312,7 +4312,8 @@ if (( BOOTC_BOUND_IMAGE_COUNT > 0 )); then
     podman "${bootc_store_container_args[@]}" --log-driver=passthrough-tty \
       --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
       "$STORE_IMAGE_NAME" \
-      skopeo copy --preserve-digests \
+      skopeo --override-os linux --override-arch "$BOOTC_BOUND_IMAGE_ARCH" \
+        copy --preserve-digests \
         "oci:${_bound_dir}:${NI_BOUND_IMAGES_LIST_TAG}" \
         "containers-storage:${_bound_ref}" \
       || die "copying bound image ${_bound_ref} into the deployment's store failed"
