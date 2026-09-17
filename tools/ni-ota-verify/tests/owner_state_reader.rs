@@ -1603,3 +1603,516 @@ fn deterministic_source_swap_during_authentication_is_detected_on_refusal() {
     assert_eq!(fs::read(&watched).unwrap(), b"after\n");
     assert_eq!(fs::read_dir(&fixture.scratch).unwrap().count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The OTA transaction window (ICE-Fabric issue 665).
+//
+// Measured on .67, 2026-09-17 02:07–02:13 CEST, OTA 0.61.0 → 0.61.2: booted
+// onto the staged target, phase `finalizing`, the licence gate ran this verb,
+// the verb refused (booted ≠ applied), the gate stayed closed, the required
+// `licensed-plane` probe timed out after 180 s and the engine rolled back.
+// These tests hold the window open for exactly that shape and closed for
+// every other.
+// ---------------------------------------------------------------------------
+
+const TARGET_INDEX: &str =
+    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+const TARGET_CHILD: &str =
+    "sha256:9999999999999999999999999999999999999999999999999999999999999999";
+const TARGET_SEED: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const PREVIOUS_SEED: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const ACTIVATED_BOOT: &str = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+const PREPARED_BOOT: &str = "11111111-2222-3333-4444-555555555555";
+const HELD_STATUS: &[u8] = b"{\"committed_generation\":null,\"completion_version\":2,\"enforce_ready_verified\":false,\"profile\":\"owner-sealed-ota-state-v1\",\"schema\":\"neural-ice-authenticated-ota-status-v1\"}\n";
+
+struct PristineOwner {
+    fixture: Fixture,
+    profile: PathBuf,
+    payload: PathBuf,
+    ostree: OstreeFixture,
+    boot_id: PathBuf,
+}
+
+/// The pristine owner appliance of `public_owner_pristine_status_is_exact_and_read_only`,
+/// booted on its applied baseline, with a boot identity file beside it.
+fn install_pristine_owner(name: &str) -> PristineOwner {
+    let fixture = Fixture::new(name, "");
+    let access = install_access_profile(&fixture, "lab-managed");
+    let (receipt_sha, set_sha) = install_owner_preseal(&fixture);
+    install_completion_v2(&fixture, &access, &receipt_sha, &set_sha);
+    let public = owner_public(
+        "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "policywrite|authread|ownerread|no_da|nt=extend",
+    );
+    install_read_only_tpm(&fixture, &access, &public, None, 5);
+    let profile = fixture.root.join("ota-state-profile");
+    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o444);
+    let payload = fixture.root.join("PAYLOAD_ID");
+    write_mode(&payload, format!("{PREVIOUS_SEED}\n").as_bytes(), 0o644);
+    let ostree = install_ostree_fixture(&fixture);
+    let boot_id = fixture.root.join("boot_id");
+    fs::write(&boot_id, format!("{ACTIVATED_BOOT}\n")).unwrap();
+    PristineOwner {
+        fixture,
+        profile,
+        payload,
+        ostree,
+        boot_id,
+    }
+}
+
+impl PristineOwner {
+    fn command(&self) -> Command {
+        let mut command =
+            owner_status_command(&self.fixture, &self.profile, &self.payload, &self.ostree);
+        command
+            .env(
+                "NI_OTA_OWNER_STATE_HELPER",
+                self.fixture.root.join("owner-state"),
+            )
+            .env("NI_OTA_AUTH_STATUS_BOOT_ID", &self.boot_id);
+        command
+    }
+
+    fn run(&self) -> Output {
+        self.command().output().unwrap()
+    }
+
+    /// Reboot the fixture onto the transaction's target: the origin names the
+    /// target image, the commit imported another manifest, the booted image
+    /// carries the target seed.
+    fn boot_target(&self) {
+        self.boot_image(&format!("{OWNER_REPOSITORY}@{TARGET_INDEX}"));
+        fs::write(&self.ostree.metadata, format!("'{TARGET_CHILD}'\n")).unwrap();
+        write_mode(&self.payload, format!("{TARGET_SEED}\n").as_bytes(), 0o644);
+    }
+
+    fn boot_image(&self, image: &str) {
+        write_mode(
+            &self.ostree.origin,
+            format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{image}\n")
+                .as_bytes(),
+            0o644,
+        );
+    }
+
+    fn transaction_dir(&self) -> PathBuf {
+        self.fixture.state.join("transaction")
+    }
+
+    fn state_json(&self) -> PathBuf {
+        self.transaction_dir().join("state.json")
+    }
+
+    /// The transaction directory as the engine's `prepare` leaves it: mode
+    /// 0700, five mode-0600 regular files, `state.json` last.
+    fn install_transaction(&self, state: &Value) {
+        let directory = self.transaction_dir();
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        write_mode(
+            &directory.join("aliases.tsv"),
+            b"chat\tprevious\tnext\n",
+            0o600,
+        );
+        write_mode(&directory.join("entitlements.txt"), b"ICE-CORE\n", 0o600);
+        write_mode(
+            &directory.join("bom.json"),
+            b"{\"train\":\"0.61.2\"}\n",
+            0o600,
+        );
+        write_mode(
+            &directory.join("previous-bom.json"),
+            b"{\"train\":\"0.61.0\"}\n",
+            0o600,
+        );
+        self.write_state(state);
+    }
+
+    fn write_state(&self, state: &Value) {
+        let mut bytes = serde_json::to_vec(state).unwrap();
+        bytes.push(b'\n');
+        write_mode(&self.state_json(), &bytes, 0o600);
+    }
+}
+
+/// `neural-ice-ota-transaction.sh cmd_prepare` … `cmd_finalize`: the state
+/// of train 0.61.2 departing from the fixture's applied 0.61.0 baseline.
+fn engine_state(phase: &str) -> Value {
+    json!({
+        "schema_version": 3,
+        "phase": phase,
+        "train": "0.61.2",
+        "channel": "lab",
+        "previous_ring": "lab",
+        "ring_state_migration": false,
+        "hardware_target": "nvidia-gb10-arm64",
+        "target_seed_ref": TARGET_SEED,
+        "target_os_ref": format!("{OWNER_REPOSITORY}@{TARGET_INDEX}"),
+        "previous_seed_ref": PREVIOUS_SEED,
+        "previous_os_ref": format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"),
+        "prepared_boot_id": PREPARED_BOOT,
+        "activated_boot_id": ACTIVATED_BOOT,
+        "rollback_boot_id": null,
+        "activation_attempts": 1,
+        "finalize_attempts": 1,
+        "commit_attempts": 0,
+        "rollback_attempts": 0
+    })
+}
+
+fn assert_held(owner: &PristineOwner, output: &Output, before: &[ObservedTreeEntry], phase: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, HELD_STATUS);
+    assert_eq!(
+        output.stderr,
+        format!("ni-ota-verify: authenticated OTA status HELD inside OTA transaction window: phase {phase} of train 0.61.2\n").as_bytes()
+    );
+    assert_eq!(observe_tree(&owner.fixture.state), before);
+    assert_eq!(fs::read_dir(&owner.fixture.scratch).unwrap().count(), 0);
+}
+
+fn assert_window_refused(
+    owner: &PristineOwner,
+    output: &Output,
+    before: &[ObservedTreeEntry],
+    reason: &str,
+) {
+    assert_owner_status_refused(&owner.fixture, output, before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(reason), "expected {reason:?} in: {stderr}");
+}
+
+#[test]
+fn held_status_is_answered_inside_the_ota_transaction_window() {
+    let owner = install_pristine_owner("tx-window");
+    // Booted on the target with no transaction at all: the divergence has
+    // nothing to explain it. This is the pre-fix refusal, kept verbatim.
+    owner.boot_target();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "booted deployment differs from authenticated preseal baseline; not a held OTA transaction window: no durable OTA transaction",
+    );
+
+    for phase in ["activated", "finalizing", "committing"] {
+        owner.install_transaction(&engine_state(phase));
+        let before = observe_tree(&owner.fixture.state);
+        let output = owner.run();
+        assert_held(&owner, &output, &before, phase);
+        let calls = fs::read_to_string(&owner.fixture.calls).unwrap();
+        assert!(!calls.contains("FORBIDDEN"), "{calls}");
+    }
+
+    // The framing the licence gate re-canonicalises and compares byte for
+    // byte: one object, sorted keys, no spaces, exactly one LF.
+    let output = owner.run();
+    let parsed: Value = serde_json::from_slice(&output.stdout[..output.stdout.len() - 1]).unwrap();
+    assert_eq!(canonical(&parsed), output.stdout);
+    assert!(!output.stdout.ends_with(b"\n\n"));
+    assert_eq!(parsed["enforce_ready_verified"], json!(false));
+    assert_eq!(parsed["committed_generation"], Value::Null);
+
+    // Keys the engine appends in flight are not a schema change.
+    let mut in_flight = engine_state("finalizing");
+    in_flight["data_snapshot"] = "taken".into();
+    owner.install_transaction(&in_flight);
+    let before = observe_tree(&owner.fixture.state);
+    assert_held(&owner, &owner.run(), &before, "finalizing");
+
+    // Back on the applied baseline with the transaction still on disk
+    // (the engine has not archived it yet): the baseline answers on its own,
+    // the transaction is not consulted and nothing is said on stderr.
+    owner.boot_image(&format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"));
+    fs::write(&owner.ostree.metadata, format!("'{OWNER_CHILD}'\n")).unwrap();
+    write_mode(
+        &owner.payload,
+        format!("{PREVIOUS_SEED}\n").as_bytes(),
+        0o644,
+    );
+    let before = observe_tree(&owner.fixture.state);
+    let output = owner.run();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, HELD_STATUS);
+    assert!(output.stderr.is_empty());
+    assert_eq!(observe_tree(&owner.fixture.state), before);
+}
+
+#[test]
+fn ota_transaction_window_refuses_a_booted_system_that_is_not_its_target() {
+    let owner = install_pristine_owner("tx-not-target");
+    owner.install_transaction(&engine_state("finalizing"));
+
+    // A third image: neither the applied baseline nor the target.
+    owner.boot_target();
+    owner.boot_image(&format!("{OWNER_REPOSITORY}@sha256:{}", "3".repeat(64)));
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: booted deployment is not the OTA transaction target",
+    );
+
+    // The target image by tag, not by the digest the engine staged.
+    owner.boot_image(&format!("{OWNER_REPOSITORY}:0.61.2"));
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: booted deployment is not the OTA transaction target",
+    );
+
+    // The applied image with the target's payload: the baseline refuses on
+    // the payload, and the window refuses on the image.
+    owner.boot_image(&format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"));
+    fs::write(&owner.ostree.metadata, format!("'{OWNER_CHILD}'\n")).unwrap();
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "running PAYLOAD_ID differs from authenticated preseal baseline; not a held OTA transaction window: booted deployment is not the OTA transaction target",
+    );
+
+    // The target image with the applied payload.
+    owner.boot_target();
+    write_mode(
+        &owner.payload,
+        format!("{PREVIOUS_SEED}\n").as_bytes(),
+        0o644,
+    );
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: running PAYLOAD_ID is not the OTA transaction target seed",
+    );
+
+    // The target, but in another boot than the one that activated it.
+    owner.boot_target();
+    fs::write(&owner.boot_id, format!("{PREPARED_BOOT}\n")).unwrap();
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction was not activated in this boot",
+    );
+    fs::write(&owner.boot_id, b"not-a-boot-id\n").unwrap();
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: boot identity is malformed",
+    );
+    fs::write(&owner.boot_id, format!("{ACTIVATED_BOOT}\n")).unwrap();
+
+    // A transaction that departs from some other applied baseline.
+    let mut foreign_previous = engine_state("finalizing");
+    foreign_previous["previous_os_ref"] =
+        format!("{OWNER_REPOSITORY}@sha256:{}", "1".repeat(64)).into();
+    owner.write_state(&foreign_previous);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction does not depart from the authenticated applied baseline",
+    );
+    let mut foreign_seed = engine_state("finalizing");
+    foreign_seed["previous_seed_ref"] = "2".repeat(40).into();
+    owner.write_state(&foreign_seed);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction does not depart from the authenticated applied baseline",
+    );
+
+    // Another hardware target than the immutable one.
+    let mut other_hardware = engine_state("finalizing");
+    other_hardware["hardware_target"] = "nvidia-gb10-x86_64".into();
+    owner.write_state(&other_hardware);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction names another hardware target",
+    );
+
+    // Back to the exact window: still answered, so the refusals above were
+    // each earned by the one thing they changed.
+    owner.write_state(&engine_state("finalizing"));
+    let before = observe_tree(&owner.fixture.state);
+    assert_held(&owner, &owner.run(), &before, "finalizing");
+}
+
+#[test]
+fn ota_transaction_outside_its_health_window_refuses_as_before() {
+    let owner = install_pristine_owner("tx-phase");
+    owner.boot_target();
+    for phase in [
+        "prepared",
+        "pending_reboot",
+        "activating",
+        "rollback_armed",
+        "completed",
+        "rolled_back",
+        "recovery_required",
+        "aborted",
+    ] {
+        let mut state = engine_state(phase);
+        if matches!(phase, "rollback_armed" | "recovery_required") {
+            state["failure_reason"] = "health_timeout".into();
+        }
+        owner.install_transaction(&state);
+        let before = observe_tree(&owner.fixture.state);
+        assert_window_refused(
+            &owner,
+            &owner.run(),
+            &before,
+            &format!("not a held OTA transaction window: OTA transaction phase {phase} is not a health window"),
+        );
+    }
+    let mut unknown = engine_state("finalizing");
+    unknown["phase"] = "health_window".into();
+    owner.install_transaction(&unknown);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction state is outside the engine's schema",
+    );
+}
+
+#[test]
+fn tampered_ota_transaction_refuses_the_whole_status() {
+    let owner = install_pristine_owner("tx-tampered");
+    owner.boot_target();
+    owner.install_transaction(&engine_state("finalizing"));
+    let state_json = owner.state_json();
+    let directory = owner.transaction_dir();
+
+    // A world-readable state file is refused by the persistent snapshot
+    // itself, before any profile is selected: the status is not answered at
+    // all, held or otherwise.
+    fs::set_permissions(&state_json, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "persistent OTA state has unsafe mode/owner/type metadata; expected 0600",
+    );
+    fs::set_permissions(&state_json, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A group-accessible directory, likewise.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "persistent OTA state has unsafe mode/owner/type metadata; expected 0700",
+    );
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // A symlinked state file: never followed (the snapshot opens it with
+    // O_NOFOLLOW and the kernel answers ELOOP).
+    let saved = owner.fixture.root.join("state.json.saved");
+    fs::rename(&state_json, &saved).unwrap();
+    symlink(&saved, &state_json).unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "Too many levels of symbolic links",
+    );
+    fs::remove_file(&state_json).unwrap();
+    fs::rename(&saved, &state_json).unwrap();
+
+    // A symlinked transaction directory: never followed either.
+    let saved_directory = owner.fixture.root.join("transaction.saved");
+    fs::rename(&directory, &saved_directory).unwrap();
+    symlink(&saved_directory, &directory).unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "Too many levels of symbolic links",
+    );
+    fs::remove_file(&directory).unwrap();
+    fs::rename(&saved_directory, &directory).unwrap();
+
+    // A directory named `transaction` that the engine did not assemble.
+    fs::remove_file(directory.join("bom.json")).unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction lacks its bom.json",
+    );
+    write_mode(
+        &directory.join("bom.json"),
+        b"{\"train\":\"0.61.2\"}\n",
+        0o600,
+    );
+
+    // Another schema, a truncated document, a document that is not the
+    // engine's object.
+    let mut schema = engine_state("finalizing");
+    schema["schema_version"] = 2.into();
+    owner.write_state(&schema);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction state is outside the engine's schema",
+    );
+    write_mode(
+        &state_json,
+        b"{\"schema_version\":3,\"phase\":\"finali",
+        0o600,
+    );
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction state is malformed",
+    );
+    write_mode(&state_json, b"[]\n", 0o600);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "not a held OTA transaction window: OTA transaction state is malformed",
+    );
+
+    // The exact window again: every refusal above was the tampering's own.
+    owner.write_state(&engine_state("finalizing"));
+    let before = observe_tree(&owner.fixture.state);
+    assert_held(&owner, &owner.run(), &before, "finalizing");
+}
