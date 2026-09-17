@@ -146,6 +146,34 @@ pub(crate) fn immutable_bootstrap_delegation_sha256() -> Result<String, Internal
     })
 }
 
+/// MVP 1.0 "lab-trust" posture switch (ADR-0050 lever C).
+///
+/// `NEURALICE_SEALED_OTA_STATE` selects whether the OTA commit path keeps
+/// enforcing the anti-rollback / sealed-baseline coupling (TPM usages #3 and #4):
+///
+///   * `relaxed` (DEFAULT for MVP 1.0) — an applied state that is unseeded, or
+///     was recorded by a media-era verifier, no longer BLOCKS a commit. The
+///     coupling is logged to stderr and the commit proceeds on the caller's
+///     health gate alone. This is what unblocks an appliance stuck between
+///     trains (`.67`, 2026-09-17) without a reinstall.
+///   * `strict` — today's behaviour, byte-identical: those states refuse.
+///
+/// This is a STACK posture, never a channel: it is read from the process
+/// environment, not from the signed config. Unlike [`Config::enforce`], whose
+/// bias is deliberately fail-closed, this switch is fail-OPEN by ADR decision
+/// for the shippable MVP: anything other than an explicit `strict` is `relaxed`.
+/// Ring monotonicity, incoming-BOM integrity and corrupt-state protection are
+/// NOT governed by this switch — they stay fatal in both postures.
+pub(crate) fn sealed_ota_state_relaxed() -> bool {
+    match std::env::var_os("NEURALICE_SEALED_OTA_STATE") {
+        Some(value) => !value
+            .to_string_lossy()
+            .trim()
+            .eq_ignore_ascii_case("strict"),
+        None => true,
+    }
+}
+
 pub(crate) struct Config {
     /// false = shadow for non-authority rollout checks; authenticity, signed
     /// bindings, target/ring, anti-rollback and bundle identity still exit 1;

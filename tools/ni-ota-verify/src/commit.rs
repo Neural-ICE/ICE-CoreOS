@@ -2,12 +2,20 @@
 //! passes (plan §0 last step). P3 adds the TPM NV write here, behind the same
 //! `AppliedStateStore` seam.
 //!
-//! No shadow semantics: commit mutates the anti-rollback baseline, so a
-//! refusal always exits nonzero regardless of the enforce flag.
+//! No shadow semantics: commit mutates the anti-rollback baseline, so a policy
+//! refusal always exits nonzero regardless of the enforce flag. The one
+//! exception is the MVP 1.0 "lab-trust" posture (ADR-0050 lever C): when
+//! `NEURALICE_SEALED_OTA_STATE=relaxed` (the default) the sealed-baseline
+//! coupling — refusing a commit purely because the applied state is unseeded or
+//! was recorded by a media-era verifier (TPM usages #3/#4) — is logged to stderr
+//! and the commit PROCEEDS on the caller's health gate alone. Ring monotonicity,
+//! incoming-BOM integrity and corrupt-state protection stay fatal in both
+//! postures; `NEURALICE_SEALED_OTA_STATE=strict` restores the original
+//! byte-identical refusals.
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{immutable_hardware_target, Config};
+use crate::config::{immutable_hardware_target, sealed_ota_state_relaxed, Config};
 use crate::state::{AppliedState, AppliedStateStore, FileStateStore, StateRead};
 use crate::verify::{applied_state_path, BomCore};
 use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_REFUSE};
@@ -73,6 +81,24 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         eprintln!("ni-ota-verify: commit REFUSED: {why}");
         Ok(EXIT_REFUSE)
     };
+    // ADR-0050 lever C — MVP 1.0 "lab-trust" posture. In `relaxed` (the default)
+    // the sealed-baseline coupling (an unseeded or media-era applied state, TPM
+    // usages #3/#4) no longer blocks a commit: it is logged and the commit
+    // proceeds on the caller's health gate, which is what unblocks an appliance
+    // stuck between trains (the .67 wall) without a reinstall. `strict` keeps the
+    // original byte-identical refusals. Ring monotonicity, incoming-BOM integrity
+    // and corrupt-state protection are NOT governed by this switch.
+    let relaxed = sealed_ota_state_relaxed();
+    let relax_sealed_baseline = |why: String| -> Option<Result<u8, InternalError>> {
+        if relaxed {
+            eprintln!(
+                "ni-ota-verify: commit RELAXED sealed-baseline gate (NEURALICE_SEALED_OTA_STATE=relaxed, ADR-0050 lever C): {why}"
+            );
+            None
+        } else {
+            Some(refuse(why))
+        }
+    };
     if let Err(reason) = bom.require_media_independent() {
         return refuse(reason);
     }
@@ -99,10 +125,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
         // floors must not let commit mint a fresh media-independent marker.
         Ok(StateRead::Unseeded) => {
             if cfg.nv_index.is_some() {
-                return refuse(format!(
+                if let Some(result) = relax_sealed_baseline(format!(
                     "state at {} is unseeded while TPM anchoring is configured — baseline seeding belongs to the verified bootstrap path; reinstall from verified final media (ADR-0012)",
                     store.describe()
-                ));
+                )) {
+                    return result;
+                }
             }
             if active_ring.is_some() && active_ring != previous_ring {
                 return refuse("an unseeded state cannot claim a ring promotion".into());
@@ -113,10 +141,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, InternalError> {
                 ring_to_commit = applied.active_ring.clone();
             }
             if !applied.is_media_independent() {
-                return refuse(format!(
+                if let Some(result) = relax_sealed_baseline(format!(
                     "applied baseline at {} was recorded by a media-era verifier (no media-independent format marker) — implicit migration is unsupported; reinstall from verified final media (ADR-0012)",
                     store.describe()
-                ));
+                )) {
+                    return result;
+                }
             }
             if bom.bundle_seq < applied.bundle_seq {
                 return refuse(format!(
