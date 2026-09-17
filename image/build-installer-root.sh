@@ -31,23 +31,16 @@
 # THE STORE ALSO CARRIES WHAT THE HOST IMAGE BINDS TO ITSELF (2026-09-17). A
 # composed appliance image declares its logically bound images as digest-pinned
 # quadlets linked from /usr/lib/bootc/bound-images.d (ICE-Fabric issue 293; 22
-# of them, ~22 GiB, one of ~19 GB). `bootc install to-filesystem` reads that
-# directory out of the container it runs in (bootc v1.16.13 install.rs:1927,
-# `query_bound_images(&state.container_root)`), resolves every entry through
-# the container's default containers-storage (boundimage.rs, `containers-
-# storage:<Image=>`) and then copies each one into the target's own store with
-# `podman image push <ref> containers-storage:[overlay@/run/bootc/storage+…]`
-# (podstorage.rs:471-490) -- from the DEFAULT store, which on the medium is
-# this sealed one, registered read-only. bootc's documentation states the
-# contract in one line: "For installation, logically bound images must be
-# present in the default container store when invoking bootc install. These
-# images will be copied into the target system and will be present directly at
-# boot." (docs/src/logically-bound-images.md). Until now the installer HID that
-# directory from bootc, and every reinstall paid 14 minutes of first-boot
-# `skopeo copy` for the same 22 images (lab GX10, measured 2026-09-16). So the
-# store staged here holds the host image AND every image the host binds, each
-# staged by digest from a registry and re-read from the store at that digest
-# before the extent is frozen.
+# of them, ~22 GiB, one of ~19 GB). Until now the installer HID that directory
+# from bootc, and every reinstall paid 14 minutes of first-boot `skopeo copy`
+# for the same 22 images (lab GX10, measured 2026-09-16). The store staged here
+# therefore carries every image the host binds -- NOT as images in the
+# containers-storage, which bootc's own install-time copy cannot consume for a
+# digest-pinned reference (proved on the bench, see image/lib/bound-images.sh),
+# but as one OCI LAYOUT per image, staged by digest from a registry and
+# verified before the extent is frozen. The installer copies them into the
+# deployment's own store at install (ota/neural-ice-autoinstall.sh, phase 4),
+# and the appliance boots with them in /usr/lib/bootc/storage.
 #
 # DETERMINISM IS A REVIEWABILITY REQUIREMENT, as in build-installer-uki.sh: two
 # builds of the same image must produce the same bytes, or nobody can tell a
@@ -56,6 +49,9 @@
 set -euo pipefail
 
 die() { echo "build-installer-root: ERROR: $*" >&2; exit 1; }
+
+# shellcheck source=image/lib/bound-images.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bound-images.sh"
 
 # THE IMAGE, AS AN IMMUTABLE ID (review 2026-09-01, P1 #1). This used to take a
 # local TAG. A tag is a mutable pointer, so resolving either the derived live
@@ -348,18 +344,27 @@ ROOT_IMAGE_BYTES="$(wc -c < "$ROOT_IMAGE_OUT" | tr -d '[:space:]')"
 
 # --------------------------------------------------------------------------- #
 # 1b) WHAT THE HOST IMAGE BINDS TO ITSELF, read from the host image and from
-#     nowhere else. bootc reads /usr/lib/bootc/bound-images.d out of the
-#     container it installs from -- which on the medium is this host image
+#     nowhere else. The installer reads /usr/lib/bootc/bound-images.d out of
+#     the container that runs bootc -- which on the medium is this host image
 #     (ota/neural-ice-autoinstall.sh, `$STORE_IMAGE_NAME`), not the installer
 #     root: the installer root drops those links so that bootc-image-builder
 #     can write the medium (image/Containerfile.installer). The list is
 #     therefore taken from a mount of the host image itself, symlinks resolved
 #     inside that mount, every entry required to be digest-pinned: a tag is a
-#     name that cannot be proved present, and bootc would resolve it against
-#     whatever the store answers.
+#     name that cannot be proved present.
+#
+#     The layouts carry ONE platform's blobs: the appliance's, read off the
+#     installer root's hardware target (`nvidia-gb10-arm64` -> arm64), never
+#     off the build host, whose architecture is not a fact about the medium.
 # --------------------------------------------------------------------------- #
-BOUND_IMAGE_REF_GRAMMAR='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]+([._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}$'
-readonly BOUND_IMAGE_REF_GRAMMAR
+BOUND_IMAGE_ARCH="${BOUND_IMAGE_ARCH:-}"
+if [[ -z "$BOUND_IMAGE_ARCH" ]]; then
+  BOUND_IMAGE_ARCH="$(tr -d '[:space:]' < "$ROOTFS/usr/lib/neural-ice/hardware-target")"
+  BOUND_IMAGE_ARCH="${BOUND_IMAGE_ARCH##*-}"
+fi
+[[ "$BOUND_IMAGE_ARCH" =~ ^(arm64|amd64)$ ]] \
+  || die "the hardware target names no architecture the bound images can be staged for: '$BOUND_IMAGE_ARCH' (arm64 or amd64)"
+readonly BOUND_IMAGE_ARCH
 read_bound_image_refs() { # $1=mounted host image root -> sorted unique refs, one per line
   local root=$1 dir="$1/usr/lib/bootc/bound-images.d" spec target ref count
   [[ -d "$dir" ]] || return 0
@@ -380,7 +385,7 @@ read_bound_image_refs() { # $1=mounted host image root -> sorted unique refs, on
     [[ "$count" == 1 ]] \
       || die "the bound image ${spec##*/} declares $count Image= lines; exactly one names an image"
     ref="$(sed -n 's/^Image=//p' "$target" | tr -d '[:space:]')"
-    [[ "$ref" =~ $BOUND_IMAGE_REF_GRAMMAR ]] \
+    [[ "$ref" =~ $NI_BOUND_IMAGE_REF_GRAMMAR ]] \
       || die "the bound image ${spec##*/} names '$ref', which is not a digest-pinned registry reference; a tag cannot be proved present in the store"
     printf '%s\n' "$ref"
   done | LC_ALL=C sort -u
@@ -513,16 +518,18 @@ grep -Fq "\"$STORE_IMAGE_NAME:" "$STORE_TREE/overlay-images/images.json" 2>/dev/
   || die "the staged image store does not name ${STORE_IMAGE_NAME}"
 
 # --------------------------------------------------------------------------- #
-# 🔴 THE BOUND IMAGES, STAGED BY DIGEST AND RE-READ AT THAT DIGEST. Each one
-# lands under the exact reference its quadlet names, because that reference is
-# what bootc opens (`containers-storage:<Image=>`). The source is the registry,
-# never a local store (see BOUND_IMAGE_SOURCE_REGISTRY), and `--preserve-
-# digests` keeps the manifest bytes the digest names. The readback is the
-# proof that matters: `skopeo inspect --raw` on the staged store returns the
-# manifest the store will serve, and its SHA-256 must be the pinned digest --
-# the same value bootc computes when it resolves the image before the wipe.
-# A missing or mismatching image is a build refusal, not a medium that
-# installs an appliance pulling 22 GiB at first boot.
+# 🔴 THE BOUND IMAGES, STAGED BY DIGEST AS OCI LAYOUTS AND VERIFIED. Each one
+# lands under $STORE_TREE/neural-ice-bound-images/<index digest>, as the two
+# skopeo copies image/lib/bound-images.sh describes: the index under the tag
+# `list` (its bytes hash to the pinned digest) and the appliance's platform
+# instance under `system`. The source is the registry, never a local store
+# (see BOUND_IMAGE_SOURCE_REGISTRY), and `--preserve-digests` keeps every
+# manifest byte the digests name. The verification is the proof the installer
+# repeats before the wipe: the `list` tag IS the pinned index, the index names
+# one instance for the appliance's architecture, the `system` tag IS that
+# instance, and its config and layers are all present. A missing or
+# mismatching image is a build refusal, not a medium whose every install pulls
+# 22 GiB at first boot.
 # --------------------------------------------------------------------------- #
 BOUND_COPY_SOURCE_ARGS=()
 if (( ${#BOUND_IMAGE_REFS[@]} > 0 )); then
@@ -534,40 +541,35 @@ if (( ${#BOUND_IMAGE_REFS[@]} > 0 )); then
   fi
   BOUND_COPY_SOURCE_ARGS+=(--src-no-creds)
 fi
+NI_BOUND_IMAGES_SKOPEO="$(tool skopeo)"
+NI_BOUND_IMAGES_PYTHON="$(tool python3)"
 for bound_ref in "${BOUND_IMAGE_REFS[@]}"; do
   bound_source="docker://${BOUND_IMAGE_SOURCE_REGISTRY}/${bound_ref#*/}"
   bound_digest="${bound_ref##*@sha256:}"
-  echo "    bound image: ${bound_ref} <- ${bound_source}"
-  "$(tool skopeo)" copy \
-    --preserve-digests \
-    "${BOUND_COPY_SOURCE_ARGS[@]}" \
-    "$bound_source" \
-    "containers-storage:[overlay@${STORE_TREE}+${WORK}/runroot]${bound_ref}" \
-    || die "cannot stage bound image ${bound_ref} from ${bound_source} into the medium image store"
-  staged_digest="$("$(tool skopeo)" inspect --raw \
-      "containers-storage:[overlay@${STORE_TREE}+${WORK}/runroot]${bound_ref}" \
-    | head -c 4194304 | "$(tool sha256sum)" | awk '{print tolower($1)}')" \
-    || die "the staged image store cannot read back bound image ${bound_ref}"
-  [[ "$staged_digest" == "$bound_digest" ]] \
-    || die "the staged image store serves bound image ${bound_ref} as sha256:${staged_digest}, not the digest its quadlet pins; refusing to seal a store bootc would refuse at install"
+  bound_dir="$(ni_bound_image_layout_dir "$STORE_TREE" "$bound_ref")"
+  echo "    bound image: ${bound_ref} <- ${bound_source} (linux/${BOUND_IMAGE_ARCH})"
+  ni_bound_image_stage_layout "$bound_source" "$bound_dir" "$BOUND_IMAGE_ARCH" "${BOUND_COPY_SOURCE_ARGS[@]}" \
+    || die "cannot stage bound image ${bound_ref} from ${bound_source} as a layout on the medium"
+  bound_defect="$(ni_bound_image_verify_layout "$bound_dir" "$bound_digest" "$BOUND_IMAGE_ARCH")" \
+    || die "the staged layout for bound image ${bound_ref} is not what the install copies: ${bound_defect}; refusing to seal a medium whose install would fail after the wipe"
 done
 
 # --------------------------------------------------------------------------- #
-# 🔴 THE STORE MUST HOLD THE EXACT ORIGINAL HOST, AND NOTHING IT CANNOT
-# ACCOUNT FOR. The live installer root is a derived image, while
-# preseal/current_os_ref authorize BASE_IMAGE. Staging the derived installer
-# here would produce a verity-valid medium whose local source can never satisfy
-# that authorization. containers-storage records config IDs, but that alone is
-# insufficient because a different manifest can reuse the same config. Require
-# exactly one image answering to the store name, with the selected host config
-# ID; require every bound reference to be named by a staged image; refuse any
-# image that is neither. Then ask the destination store itself for the host's
+# 🔴 THE STORE MUST HOLD THE EXACT ORIGINAL HOST, AND NOTHING ELSE. The live
+# installer root is a derived image, while preseal/current_os_ref authorize
+# BASE_IMAGE. Staging the derived installer here would produce a verity-valid
+# medium whose local source can never satisfy that authorization.
+# containers-storage records config IDs, but that alone is insufficient
+# because a different manifest can reuse the same config. Require exactly one
+# image answering to the store name, with the selected host config ID, and no
+# other image record at all (the bound images are layouts beside the store,
+# not records in it). Then ask the destination store itself for the host's
 # preserved platform-manifest digest.
 # --------------------------------------------------------------------------- #
 STORE_IMAGE_ID="$("$(tool python3)" -c '
 import json, sys
 document = json.load(open(sys.argv[1]))
-store_name, bound = sys.argv[2], sys.argv[3:]
+store_name = sys.argv[2]
 if not isinstance(document, list):
     raise SystemExit("the staged image store record is not a list")
 entries = [entry for entry in document if isinstance(entry, dict)]
@@ -577,15 +579,10 @@ hosts = [entry for entry in entries
          if any(name == store_name or name.startswith(store_name + ":") for name in names(entry))]
 if len(hosts) != 1:
     raise SystemExit(f"the staged image store names {store_name} on {len(hosts)} images; a sealed medium carries exactly one")
-missing = [ref for ref in bound if not any(ref in names(entry) for entry in entries)]
-if missing:
-    raise SystemExit(f"the staged image store does not name bound image {missing[0]}")
-strays = [entry for entry in entries
-          if entry is not hosts[0] and not any(name in bound for name in names(entry))]
-if strays:
-    raise SystemExit(f"the staged image store holds {len(strays)} image(s) that are neither the host nor one of its bound images; a sealed medium carries nothing it cannot account for")
+if len(entries) != 1:
+    raise SystemExit(f"the staged image store holds {len(entries)} images; a sealed medium carries exactly one")
 print(str(hosts[0].get("id", "")).lower())
-' "$STORE_TREE/overlay-images/images.json" "$STORE_IMAGE_NAME" "${BOUND_IMAGE_REFS[@]}")" \
+' "$STORE_TREE/overlay-images/images.json" "$STORE_IMAGE_NAME")" \
   || die "the staged image store records no single immutable host image ID"
 [[ "$STORE_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] \
   || die "the staged image store records '$STORE_IMAGE_ID', which is not an immutable image ID"

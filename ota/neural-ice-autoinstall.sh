@@ -859,12 +859,14 @@ NEURALICE_INSTALLER_LIB_DIR="$(ni_path NEURALICE_INSTALLER_LIB_DIR /usr/lib/neur
 # is actually wrong. Say it plainly: this installer cannot reason about that
 # image's access posture, so it installs nothing. Fail-closed, before any disk
 # write. No compatibility shim — nothing is in production (ADR-0014).
-for _ni_lib in access-policy hardware-identity installer-payload installer-ssh-key installer-trust release-authorization; do
+for _ni_lib in access-policy bound-images hardware-identity installer-payload installer-ssh-key installer-trust release-authorization; do
   [[ -f "$NEURALICE_INSTALLER_LIB_DIR/${_ni_lib}.sh" ]] \
     || die "the source image predates the immutable access policy (missing ${NEURALICE_INSTALLER_LIB_DIR}/${_ni_lib}.sh); refusing to install"
 done
 # shellcheck source=image/lib/access-policy.sh
 source "$NEURALICE_INSTALLER_LIB_DIR/access-policy.sh"
+# shellcheck source=image/lib/bound-images.sh
+source "$NEURALICE_INSTALLER_LIB_DIR/bound-images.sh"
 # shellcheck source=image/lib/hardware-identity.sh
 source "$NEURALICE_INSTALLER_LIB_DIR/hardware-identity.sh"
 # shellcheck source=image/lib/installer-payload.sh
@@ -3794,34 +3796,47 @@ readonly SEED_MANIFEST_SHA256
 # are fuse-overlayfs stores (§1a, `.has-mount-program`), and the appliance
 # image that runs bootc ships libfuse3 but not the helper: the installer lends
 # its own helper to that one container, read-only. (2) bootc 1.16 reads the
-# logically bound images out of the container it runs in
-# (install.rs, `query_bound_images(&state.container_root)`), resolves each
-# through that container's default containers-storage (boundimage.rs,
-# `containers-storage:<Image=>`) and, once the deployment is written, copies
-# each one into the deployment's own store with `podman image push <ref>
-# containers-storage:[overlay@/run/bootc/storage+…]<ref>` (podstorage.rs) --
-# from the default store, which inside this container is the storage
-# configuration exported below: the writable tmpfs graph plus the sealed
-# medium store as a read-only additional store. (3) Until 2026-09-17 that
-# directory was MASKED with an empty one, the deployment received nothing, and
-# every first boot re-fetched the same 22 images from the seed store: 14
-# minutes of `skopeo copy` per reinstall on the lab GX10 (measured
-# 2026-09-16). The medium now carries them in its sealed store, staged by
-# digest (image/build-installer-root.sh §1b/§2), so bootc's copy is a local
-# one and the appliance boots with them in /usr/lib/bootc/storage.
+# logically bound images out of the container it runs in (install.rs,
+# `query_bound_images(&state.container_root)`) and, once the deployment is
+# written, copies each one into the deployment's own store with `podman image
+# push <ref> containers-storage:[overlay@/run/bootc/storage+…]<ref>`
+# (podstorage.rs). That copy cannot land a DIGEST-PINNED image out of a
+# containers-storage source -- libimage hands it an ID-only reference whose
+# top-level manifest is the platform instance, and a store serves layers
+# uncompressed so the manifest must be rewritten, which c/image refuses under
+# a digested destination (bench .63, 2026-09-17: 22/22 staged, 0/22 copied,
+# `Digest of source image's manifest would not match destination reference`;
+# the full account is in image/lib/bound-images.sh). (3) Until 2026-09-17
+# that directory was MASKED with an empty one, the deployment received
+# nothing, and every first boot re-fetched the same 22 images from the seed
+# store: 14 minutes of `skopeo copy` per reinstall on the lab GX10 (measured
+# 2026-09-16).
+#
+# So the medium carries every bound image as an OCI LAYOUT in its sealed store
+# (image/build-installer-root.sh §1b/§2), phase 4 runs bootc with
+# `--bound-images=skip`, and THIS SCRIPT copies each layout into the
+# deployment's own store right after bootc has created it -- with the same
+# c/image + c/storage writer bootc would have used, from a source that serves
+# the original compressed blobs, so the digested destination is accepted.
 #
 # The same flags, mounts and image are then exercised once, non-destructively:
 # the helper runs, EVERY `Image=` under the container's own bound-images.d is
-# read back through the container's storage at the exact digest its quadlet
-# pins, and the source reference is readable — the things phase 4 needs, in
-# the order bootc needs them. One bound image missing from the sealed store is
-# a refusal here, with the target disk untouched, naming the first one.
+# read and required to be digest-pinned, and the source reference is readable.
+# Then, on the sealed store as this installer mounted it, every layout those
+# references name is verified the way the copy needs it (list tag = pinned
+# index, one instance for this machine's architecture, config and layers
+# present). A layout missing or incomplete is ONE refusal here, with the target
+# disk untouched, naming EVERY image concerned -- not the first one per
+# attempt.
 # --------------------------------------------------------------------------- #
 readonly BOOTC_HELPER_FUSE_OVERLAYFS=/usr/bin/fuse-overlayfs
 readonly BOOTC_BOUND_IMAGE_LIST=/run/neural-ice-installer/bootc-bound-images.list
 [[ -x "$BOOTC_HELPER_FUSE_OVERLAYFS" && ! -L "$BOOTC_HELPER_FUSE_OVERLAYFS" ]] \
   || die "bootc-container-source-unreadable: the installer has no $BOOTC_HELPER_FUSE_OVERLAYFS to lend the bootc container"
 BOOTC_BOUND_IMAGE_COUNT=0
+BOOTC_BOUND_IMAGE_ARCH="$(ni_bound_image_arch)" \
+  || die "bootc-container-source-unreadable: this machine's architecture ($(uname -m)) is not one the medium stages bound images for"
+readonly BOOTC_BOUND_IMAGE_ARCH
 # `run --pull=never --rm --privileged` is audited verbatim by
 # ota/test-autoinstall-kargs.sh: the container is never a registry pull.
 bootc_container_base_args=(
@@ -3864,24 +3879,19 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
       r=/run/ni-probe/result
       /usr/bin/fuse-overlayfs --version >/dev/null 2>&1 || { echo "fuse-overlayfs does not run in the bootc container" > "$r"; exit 1; }
       grep -q "insecureAcceptAnything" /etc/containers/policy.json || { echo "the policy inside the bootc container is the appliance strict one and would reject the containers-storage source" > "$r"; exit 1; }
-      # Every bound image, as bootc will read it: the bound-images.d of this
-      # container, one digest-pinned Image= per quadlet, read back through
-      # the storage of this container as the manifest bytes whose SHA-256 is
-      # the pinned digest -- the value bootc records when it resolves it.
+      # Every bound image, as the install will copy it: the bound-images.d of
+      # this container, one digest-pinned Image= per quadlet. The layouts they
+      # name are verified on the host, after this probe, against the store as
+      # the installer mounted it.
       n=0; : > /run/ni-probe/bound-refs
       for spec in /usr/lib/bootc/bound-images.d/*.image /usr/lib/bootc/bound-images.d/*.container; do
         case "$spec" in *"*"*) continue ;; esac
-        [ -e "$spec" ] || { echo "bound image link ${spec##*/} is dangling; bootc would fail on it after the wipe" > "$r"; exit 1; }
+        [ -e "$spec" ] || { echo "bound image link ${spec##*/} is dangling; the deployment would carry a link to nothing" > "$r"; exit 1; }
         ref="$(sed -n "s/^Image=//p" "$spec" | head -n 1 | tr -d "[:space:]")"
         case "$ref" in
           *@sha256:????????????????????????????????????????????????????????????????) ;;
           *) echo "bound image ${spec##*/} is not digest-pinned (${ref:-no Image=}); the install cannot prove it present" > "$r"; exit 1 ;;
         esac
-        want="${ref##*@sha256:}"
-        got="$(skopeo inspect --raw "containers-storage:$ref" 2>/run/ni-probe/skopeo.err | sha256sum | cut -c1-64)"
-        if [ "$got" != "$want" ]; then
-          echo "bound image $ref is not in the sealed store at its pinned digest (store answers ${got:-nothing}: $(head -c 200 /run/ni-probe/skopeo.err | tr "\n" " ")); the medium was cut without it" > "$r"; exit 1
-        fi
         echo "$ref" >> /run/ni-probe/bound-refs
         n=$((n + 1))
       done
@@ -3905,10 +3915,32 @@ assert_bootc_container_reads_source() { # $1=source imgref bootc will be given
   [[ "$(grep -c . "$BOOTC_BOUND_IMAGE_LIST" || true)" == "$bound_count" ]] \
     || die "bootc-container-source-unreadable: the pre-wipe probe's bound image list does not match its count"
   BOOTC_BOUND_IMAGE_COUNT=$bound_count
-  log "bootc container proved before the wipe: fuse-overlayfs lent, ${bound_count} bound images present in the sealed store at their pinned digests (bootc copies them into the deployment), source ${source} readable"
+  log "bootc container proved before the wipe: fuse-overlayfs lent, ${bound_count} bound images declared, source ${source} readable"
 }
 assert_bootc_container_reads_source "$source_imgref"
 readonly BOOTC_BOUND_IMAGE_COUNT
+# EVERY LAYOUT, VERIFIED ON THE SEALED STORE BEFORE THE WIPE -- and every
+# defect reported in ONE refusal. The bench's first rehearsal refused one
+# image per attempt and each attempt cost a container start; an operator
+# re-cutting a medium needs the whole list once.
+assert_bound_image_layouts_present() { # reads $BOOTC_BOUND_IMAGE_LIST
+  local ref dir defect missing='' count=0
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    [[ "$ref" =~ $NI_BOUND_IMAGE_REF_GRAMMAR ]] \
+      || die "bootc-container-source-unreadable: the probe reported a bound image reference this installer cannot use: ${ref}"
+    dir="$(ni_bound_image_layout_dir "$STORE_MOUNT" "$ref")"
+    if defect="$(ni_bound_image_verify_layout "$dir" "${ref##*@sha256:}" "$BOOTC_BOUND_IMAGE_ARCH")"; then
+      count=$((count + 1))
+    else
+      missing+="${missing:+; }${ref}: ${defect:-unreadable layout}"
+    fi
+  done < "$BOOTC_BOUND_IMAGE_LIST"
+  [[ -z "$missing" ]] \
+    || die "bootc-container-source-unreadable: the sealed store does not carry every bound image the appliance declares, as the install must copy it (linux/${BOOTC_BOUND_IMAGE_ARCH}); nothing has been written to the target disk. Missing or incomplete: ${missing}"
+  log "bound image layouts verified on the sealed store before the wipe: ${count}/${BOOTC_BOUND_IMAGE_COUNT} (index pinned, linux/${BOOTC_BOUND_IMAGE_ARCH} instance complete)"
+}
+assert_bound_image_layouts_present
 
 # LAB MEDIUM ONLY: THE PREVIOUS FIRST BOOT'S OWN WORDS, READ BEFORE THE WIPE.
 # The installed appliance holds its network until the TPM ceremony succeeds,
@@ -4199,13 +4231,18 @@ if [[ "$SEALED_ACCESS_PROFILE" == lab-managed ]]; then
 fi
 heartbeat_start "bootc install to-filesystem"
 # The SAME container the pre-wipe proof exercised (bootc_container_base_args:
-# store, storage config, lent fuse-overlayfs helper, the image's own bound
-# images resolvable in the sealed store).
+# store, storage config, lent fuse-overlayfs helper).
+# --bound-images=skip: bootc's own copy of the bound images cannot consume a
+# digest-pinned image out of a containers-storage (image/lib/bound-images.sh);
+# this script copies them from the medium's layouts right after, below. The
+# value is hidden from `--help` in bootc 1.16.6 but parsed (install.rs,
+# BoundImagesOpt::Skip; proved on the bench 2026-09-17).
 podman "${bootc_container_base_args[@]}" --log-driver=passthrough-tty \
   --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
   "$STORE_IMAGE_NAME" \
   bootc install to-filesystem \
     --skip-fetch-check \
+    --bound-images=skip \
     --source-imgref "$source_imgref" \
     --target-imgref "$IMGREF" \
     --root-mount-spec "UUID=$SYS_FS_UUID" \
@@ -4222,22 +4259,83 @@ podman "${bootc_container_base_args[@]}" --log-driver=passthrough-tty \
     "$TGT" \
   || die "bootc install to-filesystem failed"
 bg_stop
-# THE COPY LANDED, READ OFF THE TARGET. bootc's exit status covers its own
-# `podman image push` of each bound image, but the appliance boots on what is
-# in ostree/bootc/storage (the physical path behind /usr/lib/bootc/storage,
-# bootc store/mod.rs BOOTC_ROOT), not on a status. Every reference the
-# pre-wipe probe proved present must be named by the deployment's store index
-# before this install is allowed to reboot into it: a deployment missing one
-# would pull it from the registry at first boot, which is the 14 minutes this
-# medium exists to remove -- or, offline, would refuse to start the unit.
+
+# --------------------------------------------------------------------------- #
+# 4b) THE BOUND IMAGES, COPIED INTO THE DEPLOYMENT'S OWN STORE. bootc created
+#     and labelled ostree/bootc/storage (the physical path behind
+#     /usr/lib/bootc/storage, bootc store/mod.rs BOOTC_ROOT) before it returned
+#     (install.rs, `get_ensure_imgstore` precedes the bound-image step even
+#     under skip). Each layout is copied from the sealed store with skopeo,
+#     inside the same container bootc ran in, so the writer is the appliance's
+#     own c/image + c/storage and the files land exactly as bootc's `podman
+#     image push` would have written them -- except that the target store is
+#     opened through a storage configuration of its own: overlay, no mount
+#     program, no additional stores. The installer's configuration names
+#     fuse-overlayfs for the medium's fuse-built stores; the deployment's store
+#     is written natively, the way `bootc upgrade` will keep writing it on the
+#     appliance.
+# --------------------------------------------------------------------------- #
+readonly BOOTC_TARGET_STORAGE_CONF="$INSTALLER_STORAGE_ROOT/bootc-target-storage.conf"
+readonly BOOTC_TARGET_STORE_RUNROOT=/run/neural-ice-bootc-store-runroot
+cat > "$BOOTC_TARGET_STORAGE_CONF" <<EOF
+[storage]
+driver = "overlay"
+runroot = "$BOOTC_TARGET_STORE_RUNROOT"
+graphroot = "$TGT/ostree/bootc/storage"
+EOF
+# The base args, with the installer's storage configuration swapped for the
+# target store's; every other mount and flag is the one phase 4 ran with.
+bootc_store_container_args=()
+for _arg in "${bootc_container_base_args[@]}"; do
+  if [[ "$_arg" == "$INSTALLER_STORAGE_CONF:/etc/containers/storage.conf:ro" ]]; then
+    bootc_store_container_args+=("$BOOTC_TARGET_STORAGE_CONF:/etc/containers/storage.conf:ro")
+  else
+    bootc_store_container_args+=("$_arg")
+  fi
+done
+readonly -a bootc_store_container_args
+if (( BOOTC_BOUND_IMAGE_COUNT > 0 )); then
+  [[ -d "$TGT/ostree/bootc/storage" ]] \
+    || die "bootc reported success but created no bound image store at ostree/bootc/storage; nothing to copy the ${BOOTC_BOUND_IMAGE_COUNT} bound images into"
+  # bootc finalizes the target with `mount -o remount,ro` (install.rs,
+  # finalize_filesystem) -- at the superblock, so every later writer sees it
+  # read-only, in the container and on this host alike (bench .63, 2026-09-17:
+  # `open …/storage.lock: read-only file system`, 0/22 copied). Phase 6 remounts
+  # for its own writes; the copy needs it now.
+  mount -o remount,rw "$TGT" \
+    || die "cannot remount the deployment read-write to copy the bound images into it"
+  heartbeat_start "copying ${BOOTC_BOUND_IMAGE_COUNT} bound images into the deployment"
+  _copied=0
+  while IFS= read -r _bound_ref; do
+    [[ -n "$_bound_ref" ]] || continue
+    _bound_dir="$(ni_bound_image_layout_dir "$STORE_MOUNT" "$_bound_ref")"
+    podman "${bootc_store_container_args[@]}" --log-driver=passthrough-tty \
+      --mount "type=bind,source=$TGT,target=$TGT,bind-propagation=rshared" \
+      "$STORE_IMAGE_NAME" \
+      skopeo copy --preserve-digests \
+        "oci:${_bound_dir}:${NI_BOUND_IMAGES_LIST_TAG}" \
+        "containers-storage:${_bound_ref}" \
+      || die "copying bound image ${_bound_ref} into the deployment's store failed"
+    _copied=$((_copied + 1))
+    log "bound image ${_copied}/${BOOTC_BOUND_IMAGE_COUNT} copied into the deployment: ${_bound_ref}"
+  done < "$BOOTC_BOUND_IMAGE_LIST"
+  bg_stop
+fi
+
+# THE COPY LANDED, READ OFF THE TARGET. The appliance boots on what is in
+# ostree/bootc/storage, not on an exit status. Every reference the pre-wipe
+# probe listed must be named by the deployment's store index before this
+# install is allowed to reboot into it: a deployment missing one would pull
+# it from the registry at first boot, which is the 14 minutes this medium
+# exists to remove -- or, offline, would refuse to start the unit.
 _bootc_store_index="$TGT/ostree/bootc/storage/overlay-images/images.json"
 if (( BOOTC_BOUND_IMAGE_COUNT > 0 )); then
   [[ -f "$_bootc_store_index" ]] \
-    || die "bootc reported success but the deployment has no bound image store at ostree/bootc/storage; the ${BOOTC_BOUND_IMAGE_COUNT} bound images were not copied"
+    || die "the deployment has no bound image store index at ostree/bootc/storage after the copy; the ${BOOTC_BOUND_IMAGE_COUNT} bound images did not land"
   while IFS= read -r _bound_ref; do
     [[ -n "$_bound_ref" ]] || continue
     grep -Fq -- "\"${_bound_ref}\"" "$_bootc_store_index" \
-      || die "the deployment's bound image store does not name ${_bound_ref}; bootc did not copy it from the sealed store"
+      || die "the deployment's bound image store does not name ${_bound_ref} after the copy"
   done < "$BOOTC_BOUND_IMAGE_LIST"
   log "bound images copied into the deployment: ${BOOTC_BOUND_IMAGE_COUNT}/${BOOTC_BOUND_IMAGE_COUNT} named in ostree/bootc/storage (no first-boot pull)"
 else

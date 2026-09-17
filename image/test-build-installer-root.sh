@@ -560,29 +560,71 @@ grep -Fq 'test -s /usr/lib/systemd/boot/efi/linuxaa64.efi.stub' "$INSTALLER_CONT
   || fail "the installer image build does not prove the ARM64 UKI stub is present"
 
 # --------------------------------------------------------------------------- #
-# 4d) THE BOUND IMAGES THE HOST DECLARES ARE IN THE STORE, AT THEIR DIGESTS.
-#     bootc reads /usr/lib/bootc/bound-images.d out of the container it
-#     installs from and copies each `Image=` from the DEFAULT store into the
-#     target (bootc v1.16.13 install.rs:1927, podstorage.rs:471). On the medium
-#     that default store is the sealed one, so it must carry them: staged by
-#     digest from a registry, read back at that digest before the extent
-#     freezes, and recorded so a cached store cut without them is refused.
-#     Until 2026-09-17 the installer hid the directory from bootc and every
-#     reinstall paid 14 minutes of first-boot `skopeo copy` (lab GX10).
+# 4d) THE BOUND IMAGES THE HOST DECLARES ARE ON THE MEDIUM, AS OCI LAYOUTS THE
+#     INSTALL CAN COPY. bootc's own install-time copy (`podman image push`
+#     from a containers-storage) cannot land a digest-pinned image -- proved on
+#     the bench 2026-09-17 (image/lib/bound-images.sh) -- so the store carries
+#     each image as a layout: the index under `list` (its bytes hash to the
+#     pinned digest) and the appliance's platform instance under `system`,
+#     staged by digest from a registry and verified before the extent freezes,
+#     and recorded so a cached store cut without them is refused. Until
+#     2026-09-17 the installer hid the directory from bootc and every reinstall
+#     paid 14 minutes of first-boot `skopeo copy` (lab GX10).
+#
+#     REAL skopeo does the layout work here: the mock only translates the
+#     registry reference into the fixture layout that stands for the registry
+#     (a multi-arch index with a linux/arm64 and a linux/amd64 instance), and
+#     keeps mocking the host image's own store copy as before.
 # --------------------------------------------------------------------------- #
 make_rootfs
 ln -sf "$(command -v cp)" "$TOOLS/cp" # the reuse path places the extent with the builder's cp
+REAL_SKOPEO="$(command -v skopeo || true)"
+[ -n "$REAL_SKOPEO" ] || fail "skopeo is required for the bound-image layout cases (CI installs it)"
 REGISTRY="$TMP/registry"; rm -rf "$REGISTRY"; mkdir -p "$REGISTRY"
-bound_manifest() { # $1=repository -> writes the registry object, prints its digest
-  local body digest
-  printf -v body '{"schemaVersion":2,"config":{"digest":"sha256:%s"},"layers":[],"repository":"%s"}' \
-    "$(printf 'bound-config-%s' "$1" | sha256sum | awk '{print $1}')" "$1"
-  digest="$(printf '%s' "$body" | sha256sum | awk '{print $1}')"
-  printf '%s' "$body" > "$REGISTRY/$digest"
+# A registry object: an OCI layout carrying a multi-arch index under the tag
+# `list`, two tiny gzip layers per instance. Prints the index digest.
+bound_fixture() { # $1=repository $2=output layout dir
+  python3 - "$2" "$1" <<'PY'
+import gzip, hashlib, io, json, os, sys, tarfile
+out, repo = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.join(out, "blobs", "sha256"), exist_ok=True)
+def put(data, media):
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    with open(os.path.join(out, "blobs", "sha256", digest[7:]), "wb") as handle:
+        handle.write(data)
+    return {"mediaType": media, "digest": digest, "size": len(data)}
+def layer(name, arch):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        payload = f"{repo} {name} {arch}\n".encode()
+        info = tarfile.TarInfo(name=f"{name}-{arch}.txt"); info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    raw = buffer.getvalue()
+    return put(gzip.compress(raw, mtime=0), "application/vnd.oci.image.layer.v1.tar+gzip"), "sha256:" + hashlib.sha256(raw).hexdigest()
+instances = []
+for arch in ("arm64", "amd64"):
+    layers, diff_ids = zip(*(layer(name, arch) for name in ("base", "app")))
+    config = put(json.dumps({"architecture": arch, "os": "linux", "rootfs": {"type": "layers", "diff_ids": list(diff_ids)}, "config": {}}, sort_keys=True).encode(), "application/vnd.oci.image.config.v1+json")
+    manifest = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config, "layers": list(layers)}, sort_keys=True).encode(), "application/vnd.oci.image.manifest.v1+json")
+    manifest["platform"] = {"os": "linux", "architecture": arch}
+    instances.append(manifest)
+index = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": instances}, sort_keys=True).encode(), "application/vnd.oci.image.index.v1+json")
+index["annotations"] = {"org.opencontainers.image.ref.name": "list"}
+with open(os.path.join(out, "index.json"), "w") as handle:
+    json.dump({"schemaVersion": 2, "manifests": [index]}, handle)
+with open(os.path.join(out, "oci-layout"), "w") as handle:
+    json.dump({"imageLayoutVersion": "1.0.0"}, handle)
+print(index["digest"][7:])
+PY
+}
+bound_registry_object() { # $1=repository -> stages the object under its own digest, prints the digest
+  local digest
+  digest="$(bound_fixture "$1" "$TMP/fixture-$1")" || fail "cannot build the $1 fixture"
+  rm -rf "${REGISTRY:?}/$digest"; mv "$TMP/fixture-$1" "$REGISTRY/$digest"
   printf '%s' "$digest"
 }
-BOUND_A_DIGEST="$(bound_manifest working-memory)"
-BOUND_B_DIGEST="$(bound_manifest model-runtime-gb10)"
+BOUND_A_DIGEST="$(bound_registry_object working-memory)"
+BOUND_B_DIGEST="$(bound_registry_object model-runtime-gb10)"
 BOUND_A="registry.example.test/neural-ice/working-memory@sha256:$BOUND_A_DIGEST"
 BOUND_B="registry.example.test/neural-ice/model-runtime-gb10@sha256:$BOUND_B_DIGEST"
 declare_bound_images() { # $1=host root, rest: <unit>=<Image= reference>
@@ -600,69 +642,69 @@ declare_bound_images() { # $1=host root, rest: <unit>=<Image= reference>
   done
 }
 declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
-# The skopeo mock, registry-aware: a copy from docker://<registry>/<path>@<digest>
-# stages the registry object under the destination name; `inspect --raw` on a
-# staged reference returns the bytes the store holds. Host copies behave as
-# before (one entry, images.json reset), bound copies append an entry.
+# The skopeo mock: anything involving an `oci:` reference is the real skopeo,
+# with docker://mirror.test:5055/<path>@sha256:<d> translated into the fixture
+# layout registered under <d> (and the registry-only --src-* options dropped);
+# a missing fixture is a registry that lacks the object. The host image's
+# store copy stays mocked as before.
 cat > "$TOOLS/skopeo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_STATE/skopeo.args"
+case "$*" in
+  *oci:*)
+    args=(); skip=0
+    for arg in "$@"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi
+      case "$arg" in
+        --src-cert-dir) skip=1 ;;
+        --src-no-creds) ;;
+        docker://mirror.test:5055/*)
+          digest="${arg##*@sha256:}"
+          [ -d "${MOCK_REGISTRY:?}/$digest" ] || { echo "mock registry: no object $arg" >&2; exit 1; }
+          args+=("oci:${MOCK_REGISTRY}/${digest}:list") ;;
+        *) args+=("$arg") ;;
+      esac
+    done
+    exec "${REAL_SKOPEO:?}" "${args[@]}" ;;
+esac
 last="${*: -1}"
 store="${last#*overlay@}"; store="${store%%+*}"
-if [ "$1" = inspect ]; then
-  case "$last" in
-    containers-storage:\[overlay@*)
-      name="${last##*]}"; cat "$store/manifests/${name##*@sha256:}" 2>/dev/null || exit 1 ;;
-    *) cat "${MOCK_SOURCE_MANIFEST_FILE:?}" ;;
-  esac
-  exit 0
-fi
+if [ "$1" = inspect ]; then cat "${MOCK_SOURCE_MANIFEST_FILE:?}"; exit 0; fi
 name="${last##*]}"
-mkdir -p "$store/overlay-images" "$store/overlay-layers" "$store/overlay" "$store/manifests"
-case "$name" in
-  *@sha256:*)
-    source=""
-    for arg in "$@"; do case "$arg" in docker://*) source=$arg ;; esac; done
-    [ -f "${MOCK_REGISTRY:?}/${source##*@sha256:}" ] \
-      || { echo "mock registry: no object ${source}" >&2; exit 1; }
-    cp "$MOCK_REGISTRY/${source##*@sha256:}" "$store/manifests/${name##*@sha256:}"
-    python3 - "$store/overlay-images/images.json" "$name" <<'PY'
-import hashlib, json, sys
-path, name = sys.argv[1:]
-with open(path) as handle:
-    entries = json.load(handle)
-entries.append({"id": hashlib.sha256(name.encode()).hexdigest(), "names": [name]})
-with open(path, "w") as handle:
-    json.dump(entries, handle)
-PY
-    ;;
-  *)
-    src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}"
-    printf '[{"id":"%s","names":["%s:latest"]}]\n' "${MOCK_STORE_IMAGE_ID:-$src}" "$name" \
-      > "$store/overlay-images/images.json"
-    printf 'staged\n' > "$store/overlay-layers/layers.json"
-    ;;
-esac
+mkdir -p "$store/overlay-images" "$store/overlay-layers" "$store/overlay"
+src="${MOCK_NAMED_IMAGE_ID:-$EXPECTED_STORE_IMAGE_ID}"
+printf '[{"id":"%s","names":["%s:latest"]}]\n' "${MOCK_STORE_IMAGE_ID:-$src}" "$name" \
+  > "$store/overlay-images/images.json"
+printf 'staged\n' > "$store/overlay-layers/layers.json"
 EOF
 chmod +x "$TOOLS/skopeo"
 MIRROR="docker://mirror.test:5055"
 bound_build() { # $1=output dir, rest=env overrides
   local out=$1; shift
-  build "$out" MOCK_REGISTRY="$REGISTRY" BOUND_IMAGE_SOURCE_REGISTRY="mirror.test:5055" "$@"
+  build "$out" MOCK_REGISTRY="$REGISTRY" REAL_SKOPEO="$REAL_SKOPEO" \
+    BOUND_IMAGE_SOURCE_REGISTRY="mirror.test:5055" "$@"
 }
 bound_build "$TMP/bound" >/dev/null || fail "a host image binding two staged images was refused"
 # The host image is what the list is read from: mounted by its immutable ID.
 grep -Fq "image mount sha256:$HOST_IMAGE_ID" "$TMP/bound/podman.args" \
   || fail "the bound image list is not read from a mount of the host image itself"
-# Staged by digest, from the registry, with digests preserved, under the EXACT
-# reference the quadlet names -- which is what bootc will open.
-grep -Fq "copy --preserve-digests --src-no-creds $MIRROR/neural-ice/working-memory@sha256:$BOUND_A_DIGEST containers-storage:[overlay@" \
+# Two copies per image, from the registry, digests preserved: the index alone
+# under `list`, then the arm64 instance -- the hardware target's architecture,
+# not the build host's -- under `system`.
+grep -Fq "copy --preserve-digests --multi-arch index-only --src-no-creds $MIRROR/neural-ice/working-memory@sha256:$BOUND_A_DIGEST oci:" \
   "$TMP/bound/skopeo.args" \
-  || fail "the first bound image was not staged by digest from the registry with digests preserved"
-grep -Fq "]$BOUND_B" "$TMP/bound/skopeo.args" \
-  || fail "the second bound image was not staged under the reference its quadlet names"
-[ "$(grep -c 'inspect --raw containers-storage:\[overlay@' "$TMP/bound/skopeo.args")" = 2 ] \
-  || fail "not every bound image was read back from the staged store at its digest"
+  || fail "the index of the first bound image was not staged alone from the registry with digests preserved"
+grep -Fq -- "--override-os linux --override-arch arm64 copy --preserve-digests --multi-arch system --src-no-creds $MIRROR/neural-ice/model-runtime-gb10@sha256:$BOUND_B_DIGEST oci:" \
+  "$TMP/bound/skopeo.args" \
+  || fail "the instance of the second bound image was not staged for the hardware target's architecture"
+! grep -Fq -- '--multi-arch all' "$TMP/bound/skopeo.args" \
+  || fail "a bound image was staged with every platform's blobs"
+# The layouts are inside the store tree the squashfs freezes, keyed by digest,
+# and the store's own image index holds the host and nothing else.
+grep -q "neural-ice-bound-images/$BOUND_A_DIGEST/index.json$" "$TMP/bound/installer-store.img" \
+  || fail "the first bound image's layout is not inside the sealed store tree"
+grep -q "neural-ice-bound-images/$BOUND_B_DIGEST/blobs/sha256/" "$TMP/bound/installer-store.img" \
+  || fail "the second bound image's blobs are not inside the sealed store tree"
 manifest="$TMP/bound/installer-root.img.manifest"
 grep -qx 'store_bound_image_count=2' "$manifest" \
   || fail "the manifest does not record how many bound images the store carries"
@@ -692,19 +734,97 @@ grep -Fq 'which the host image does not carry' <<<"$out" \
   || fail "the dangling-link refusal is not named: $out"
 declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
 # A registry that lacks one of them is a build refusal, not a medium.
-rm -f "$REGISTRY/$BOUND_B_DIGEST"
+mv "$REGISTRY/$BOUND_B_DIGEST" "$TMP/parked-b"
 out="$(bound_build "$TMP/bound-missing" 2>&1)" && fail "a store missing a bound image was sealed"
 grep -Fq "cannot stage bound image $BOUND_B" <<<"$out" \
   || fail "the missing-image refusal does not name the image: $out"
 [ ! -s "$TMP/bound-missing/installer-store.img" ] \
   || fail "a store image was produced despite the missing bound image"
-# A registry serving OTHER bytes under the pinned digest: the readback catches it.
-printf '{"tampered":true}' > "$REGISTRY/$BOUND_B_DIGEST"
+# A registry serving OTHER bytes under the pinned digest -- another image's
+# index -- is caught by the layout verification: the `list` tag is not the pin.
+OTHER_DIGEST="$(bound_fixture something-else "$REGISTRY/$BOUND_B_DIGEST")" || fail "cannot build the impostor fixture"
+[ "$OTHER_DIGEST" != "$BOUND_B_DIGEST" ] || fail "the impostor fixture collides with the real one"
 out="$(bound_build "$TMP/bound-tampered" 2>&1)" \
-  && fail "a bound image whose bytes do not hash to the pinned digest was sealed"
-grep -Fq 'not the digest its quadlet pins' <<<"$out" \
+  && fail "a bound image whose index does not hash to the pinned digest was sealed"
+grep -Fq "not the pinned sha256:$BOUND_B_DIGEST" <<<"$out" \
   || fail "the digest-mismatch refusal is not named: $out"
-bound_manifest model-runtime-gb10 >/dev/null
+rm -rf "${REGISTRY:?}/$BOUND_B_DIGEST"; mv "$TMP/parked-b" "$REGISTRY/$BOUND_B_DIGEST"
+# An image published for ONE platform only pins its manifest, not an index
+# (the GB10 runtimes, bench 2026-09-17): accepted when its config says
+# linux/arm64, refused when it says another platform.
+bound_single_fixture() { # $1=repository $2=arch $3=output layout dir -> prints the manifest digest
+  python3 - "$3" "$1" "$2" <<'PY'
+import gzip, hashlib, io, json, os, sys, tarfile
+out, repo, arch = sys.argv[1:]
+os.makedirs(os.path.join(out, "blobs", "sha256"), exist_ok=True)
+def put(data, media):
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    with open(os.path.join(out, "blobs", "sha256", digest[7:]), "wb") as handle:
+        handle.write(data)
+    return {"mediaType": media, "digest": digest, "size": len(data)}
+buffer = io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w") as tar:
+    payload = f"{repo} {arch}\n".encode()
+    info = tarfile.TarInfo(name="only.txt"); info.size = len(payload)
+    tar.addfile(info, io.BytesIO(payload))
+raw = buffer.getvalue()
+layer = put(gzip.compress(raw, mtime=0), "application/vnd.oci.image.layer.v1.tar+gzip")
+config = put(json.dumps({"architecture": arch, "os": "linux", "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(raw).hexdigest()]}, "config": {}}, sort_keys=True).encode(), "application/vnd.oci.image.config.v1+json")
+manifest = put(json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config, "layers": [layer]}, sort_keys=True).encode(), "application/vnd.oci.image.manifest.v1+json")
+manifest["annotations"] = {"org.opencontainers.image.ref.name": "list"}
+with open(os.path.join(out, "index.json"), "w") as handle:
+    json.dump({"schemaVersion": 2, "manifests": [manifest]}, handle)
+with open(os.path.join(out, "oci-layout"), "w") as handle:
+    json.dump({"imageLayoutVersion": "1.0.0"}, handle)
+print(manifest["digest"][7:])
+PY
+}
+BOUND_C_DIGEST="$(bound_single_fixture model-runtime-gb10 arm64 "$TMP/fixture-single")" || fail "cannot build the single-platform fixture"
+rm -rf "${REGISTRY:?}/$BOUND_C_DIGEST"; mv "$TMP/fixture-single" "$REGISTRY/$BOUND_C_DIGEST"
+BOUND_C="registry.example.test/neural-ice/model-runtime-gb10@sha256:$BOUND_C_DIGEST"
+declare_bound_images "$HOST_ROOTFS" "model-runtime=$BOUND_C"
+bound_build "$TMP/bound-single" >/dev/null || fail "a bound image published for arm64 only was refused"
+grep -qx 'store_bound_image_count=1' "$TMP/bound-single/installer-root.img.manifest" \
+  || fail "the single-platform bound image was not counted"
+BOUND_D_DIGEST="$(bound_single_fixture model-runtime-x86 amd64 "$TMP/fixture-single-amd64")" || fail "cannot build the amd64-only fixture"
+rm -rf "${REGISTRY:?}/$BOUND_D_DIGEST"; mv "$TMP/fixture-single-amd64" "$REGISTRY/$BOUND_D_DIGEST"
+declare_bound_images "$HOST_ROOTFS" "model-runtime=registry.example.test/neural-ice/model-runtime-x86@sha256:$BOUND_D_DIGEST"
+out="$(bound_build "$TMP/bound-single-amd64" 2>&1)" \
+  && fail "a bound image published for amd64 only was sealed onto an arm64 medium"
+grep -Fq 'is linux/amd64, not linux/arm64' <<<"$out" \
+  || fail "the wrong-platform refusal is not named: $out"
+declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BOUND_B"
+# The layout the medium carries copies into a containers-storage under the
+# pinned reference -- the step the installer performs after bootc -- with the
+# real skopeo. A store write needs a user namespace; where the sandbox has
+# none, the bench proof (2026-09-17, appliance skopeo 1.23) stands alone.
+# shellcheck source=image/lib/bound-images.sh
+. "$ROOT/image/lib/bound-images.sh"
+IMPORT_STORE="$TMP/import-store"; mkdir -p "$IMPORT_STORE" "$IMPORT_STORE.run"
+# The probe: can THIS environment write a rootless containers-storage at all?
+# A sandbox without user-namespace mappings cannot ("Error during unshare"),
+# and a skip there is said out loud; CI sets NI_INSTALLER_ROOT_REQUIRE_IMPORT=1
+# so the case can never be skipped where the toolchain is complete.
+import_probe_ok=1
+"$REAL_SKOPEO" copy "oci:$REGISTRY/$BOUND_A_DIGEST:list" "containers-storage:[vfs@$TMP/import-probe+$TMP/import-probe.run]localhost/import-probe:1" \
+  >/dev/null 2>"$TMP/import-probe.err" || import_probe_ok=0
+if [ "$import_probe_ok" = 0 ] && [ "${NI_INSTALLER_ROOT_REQUIRE_IMPORT:-0}" = 1 ]; then
+  fail "this environment cannot write a containers-storage, and the import case may not be skipped here: $(tail -n 1 "$TMP/import-probe.err")"
+fi
+if [ "$import_probe_ok" = 1 ]; then
+  # The builder's work tree is gone; the layout is re-staged from the fixture
+  # exactly as the builder stages it, then copied as the installer copies it.
+  ni_bound_image_stage_layout "oci:$REGISTRY/$BOUND_A_DIGEST:list" "$TMP/bound-work-layout" arm64 >/dev/null 2>&1 \
+    || fail "cannot stage the layout for the import case"
+  ni_bound_image_import "$TMP/bound-work-layout" "containers-storage:[vfs@$IMPORT_STORE+$IMPORT_STORE.run]$BOUND_A" >/dev/null 2>&1 \
+    || fail "the layout could not be copied into a containers-storage under the pinned reference"
+  [ "$("$REAL_SKOPEO" inspect --raw "containers-storage:[vfs@$IMPORT_STORE+$IMPORT_STORE.run]$BOUND_A" | sha256sum | cut -c1-64)" = "$BOUND_A_DIGEST" ] \
+    || fail "the imported image does not answer to the pinned index digest"
+  grep -Fq "\"$BOUND_A\"" "$IMPORT_STORE/vfs-images/images.json" \
+    || fail "the target store does not name the imported image by its pinned reference"
+else
+  echo "    (this environment cannot write a containers-storage -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-120); the layout-to-store import is proved on the bench and in CI)"
+fi
 # No registry to stage from: refused, and the refusal names what to set. A
 # containers-storage source cannot reproduce the digests (2026-09-09).
 out="$(build "$TMP/bound-no-registry" MOCK_REGISTRY="$REGISTRY" 2>&1)" \

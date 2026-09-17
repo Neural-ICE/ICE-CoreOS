@@ -215,23 +215,41 @@ readout_wipe_line="$(grep -nE '^[[:space:]]*wipefs -a "\$target"' "$AUTOINSTALL"
   || fail "the appliance's bound images are masked from bootc again; the deployment would boot without them"
 ! grep -Fq ':/usr/lib/bootc/bound-images.d:ro' "$AUTOINSTALL" \
   || fail "something is still mounted over the bootc container's bound-images.d"
-grep -Fq 'got="$(skopeo inspect --raw "containers-storage:$ref" 2>/run/ni-probe/skopeo.err | sha256sum | cut -c1-64)"' "$AUTOINSTALL" \
-  || fail "the pre-wipe probe does not read every bound image back from the sealed store at its digest"
+# bootc's own copy cannot land a digest-pinned image out of a containers-storage
+# (bench 2026-09-17): phase 4 skips it, and the installer copies each image
+# from the OCI layout the medium carries, with the shared library.
+grep -Fq 'source "$NEURALICE_INSTALLER_LIB_DIR/bound-images.sh"' "$AUTOINSTALL" \
+  || fail "the installer does not source the bound-image library the medium builder uses"
+grep -Fq -- '    --bound-images=skip' "$AUTOINSTALL" \
+  || fail "phase 4 lets bootc attempt its own bound-image copy, which fails after the wipe"
 grep -Fq 'echo "$n" > /run/ni-probe/bound-count' "$AUTOINSTALL" \
-  || fail "the pre-wipe probe does not report how many bound images it proved"
-grep -Fq 'is not in the sealed store at its pinned digest' "$AUTOINSTALL" \
-  || fail "a bound image missing from the sealed store is not a named refusal"
-probe_line="$(grep -n '^assert_bootc_container_reads_source "\$source_imgref"$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+  || fail "the pre-wipe probe does not report how many bound images the appliance declares"
+grep -Fq 'ni_bound_image_verify_layout "$dir" "${ref##*@sha256:}" "$BOOTC_BOUND_IMAGE_ARCH"' "$AUTOINSTALL" \
+  || fail "the pre-wipe proof does not verify every bound image layout on the sealed store"
+grep -Fq 'Missing or incomplete: ${missing}' "$AUTOINSTALL" \
+  || fail "a layout missing from the sealed store is not refused with the whole list named"
+probe_line="$(grep -n '^assert_bound_image_layouts_present$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 [[ -n "$probe_line" && -n "$readout_wipe_line" && "$probe_line" -lt "$readout_wipe_line" ]] \
-  || fail "the bound-image proof at line ${probe_line:-none} does not precede the wipe at line ${readout_wipe_line:-none}"
-# ...and what bootc copied is read off the target's own store index, for every
-# reference the probe proved, between phase 4 and phase 5.
+  || fail "the bound-image layout proof at line ${probe_line:-none} does not precede the wipe at line ${readout_wipe_line:-none}"
+# ...the copy runs after bootc, from the layouts, into the target's own store,
+# through a storage configuration without the installer's mount program; and
+# what landed is read off the target's store index, for every reference the
+# probe listed, between phase 4 and phase 5.
 bootc_line="$(grep -n '^  bootc install to-filesystem \\$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+import_line="$(grep -n '^        "oci:${_bound_dir}:${NI_BOUND_IMAGES_LIST_TAG}" \\$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 readback_line="$(grep -n '^_bootc_store_index="\$TGT/ostree/bootc/storage/overlay-images/images.json"$' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 phase5_line="$(grep -n '^phase 5 ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
-[[ -n "$bootc_line" && -n "$readback_line" && -n "$phase5_line" \
-   && "$bootc_line" -lt "$readback_line" && "$readback_line" -lt "$phase5_line" ]] \
-  || fail "the bound-image readback (line ${readback_line:-none}) is not between bootc install (${bootc_line:-none}) and phase 5 (${phase5_line:-none})"
+[[ -n "$bootc_line" && -n "$import_line" && -n "$readback_line" && -n "$phase5_line" \
+   && "$bootc_line" -lt "$import_line" && "$import_line" -lt "$readback_line" && "$readback_line" -lt "$phase5_line" ]] \
+  || fail "the bound-image copy (line ${import_line:-none}) and readback (${readback_line:-none}) are not between bootc install (${bootc_line:-none}) and phase 5 (${phase5_line:-none})"
+grep -Fq '      skopeo copy --preserve-digests' "$AUTOINSTALL" \
+  || fail "the bound-image copy does not preserve digests"
+grep -Fq '"containers-storage:${_bound_ref}"' "$AUTOINSTALL" \
+  || fail "the bound-image copy does not land under the exact reference the quadlet names"
+grep -Fq 'graphroot = "$TGT/ostree/bootc/storage"' "$AUTOINSTALL" \
+  || fail "the bound-image copy does not target the deployment's own store"
+grep -Fq 'bootc_store_container_args+=("$BOOTC_TARGET_STORAGE_CONF:/etc/containers/storage.conf:ro")' "$AUTOINSTALL" \
+  || fail "the bound-image copy runs under the installer's fuse-overlayfs storage configuration instead of the target store's own"
 grep -Fq 'grep -Fq -- "\"${_bound_ref}\"" "$_bootc_store_index"' "$AUTOINSTALL" \
   || fail "the post-install readback does not require each proved reference in the deployment's store"
 grep -Fq 'done < "$BOOTC_BOUND_IMAGE_LIST"' "$AUTOINSTALL" \

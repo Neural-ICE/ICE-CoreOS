@@ -249,7 +249,7 @@ jobs:
             image/build-seed-v2.sh image/firstboot/neural-ice-firstboot-sshkey.sh image/firstboot/neural-ice-seed-import.sh \
             image/firstboot/neural-ice-status-screen.sh image/installer/neural-ice-installer-failure.sh \
             image/installer/neural-ice-installer-runtime-generator.sh image/installer/neural-ice-live-diagnostics.sh image/installer/neural-ice-sealed-cmdline-grammar.sh \
-            image/lib/access-policy.sh image/lib/hardware-identity.sh image/lib/installer-payload.sh image/lib/tpm2-nv-public.sh \
+            image/lib/access-policy.sh image/lib/bound-images.sh image/lib/hardware-identity.sh image/lib/installer-payload.sh image/lib/tpm2-nv-public.sh \
             image/lib/installer-ssh-key.sh image/lib/installer-trust.sh image/lib/preloaded-output-set.sh \
             image/lib/preloaded-sizing.sh image/lib/release-authorization.sh image/lib/signing-trust.sh \
             image/policy/render-container-policy.sh image/test-access-policy.sh image/test-build-installer-root.sh \
@@ -336,6 +336,8 @@ jobs:
             || { echo "::error::the installer root must drop the appliance bound-image links, or bootc-image-builder cannot write the medium; the appliance image in the sealed store keeps its links and the store carries their images"; exit 1; }
           grep -q 'the sealed store also carries the 22 images they name' "$f" \
             || { echo "::error::the installer recipe no longer states where the appliance's bound images come from at install"; exit 1; }
+          grep -q 'COPY image/lib/bound-images.sh /usr/lib/neural-ice/lib/bound-images.sh' "$f" \
+            || { echo "::error::the installer would inherit the base image's bound-image library instead of this revision's"; exit 1; }
           ! grep -q 'bootc-bound-images-masked' ota/neural-ice-autoinstall.sh \
             || { echo "::error::the installer masks the appliance's bound images again; bootc must copy them from the sealed store at install"; exit 1; }
           grep -q 'neural-ice-policy-strict.json' "$f" \
@@ -418,7 +420,7 @@ jobs:
           ./image/test-signing-trust.sh
           ./image/test-installer-trust.sh
           ./image/test-release-authorization.sh
-          ./image/test-build-installer-root.sh
+          NI_INSTALLER_ROOT_REQUIRE_IMPORT=1 ./image/test-build-installer-root.sh
           ./image/test-installer-payload.sh
           ./image/test-installer-uki.sh
           # The tty1 boot status screen: ungated by the ceremony on purpose, so its

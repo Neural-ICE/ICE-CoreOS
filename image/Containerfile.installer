@@ -122,6 +122,7 @@ RUN bash -euxo pipefail -c '\
 # destructive-path program. BASE_IMAGE can legitimately be older than this
 # derived installer, so never inherit these callees while replacing the caller.
 COPY image/lib/access-policy.sh /usr/lib/neural-ice/lib/access-policy.sh
+COPY image/lib/bound-images.sh /usr/lib/neural-ice/lib/bound-images.sh
 COPY image/lib/hardware-identity.sh /usr/lib/neural-ice/lib/hardware-identity.sh
 COPY image/lib/installer-payload.sh /usr/lib/neural-ice/lib/installer-payload.sh
 COPY image/lib/installer-ssh-key.sh /usr/lib/neural-ice/lib/installer-ssh-key.sh
@@ -247,6 +248,7 @@ RUN set -euxo pipefail; \
       /usr/lib/neural-ice/installer-failure-policy \
       /usr/lib/neural-ice/registry-authorisation.py; \
     chmod 0444 /usr/lib/neural-ice/lib/access-policy.sh \
+      /usr/lib/neural-ice/lib/bound-images.sh \
       /usr/lib/neural-ice/lib/hardware-identity.sh \
       /usr/lib/neural-ice/lib/installer-payload.sh \
       /usr/lib/neural-ice/lib/installer-ssh-key.sh \
@@ -330,17 +332,19 @@ RUN set -euxo pipefail; \
 # `containers-storage:localhost/bootc`, the APPLIANCE image staged in the
 # medium's sealed store (image/build-installer-root.sh, "THE STORE MUST HOLD THE
 # EXACT ORIGINAL HOST"), from a container of that same image. That image keeps
-# its 22 links, and the sealed store also carries the 22 images they name,
-# staged by digest from a registry and read back at that digest before the
-# medium is cut (build-installer-root.sh §1b/§2). bootc resolves the links
-# inside that container, copies each image from the sealed store into the
-# deployment's own store (/usr/lib/bootc/storage), and the appliance boots with
-# them present: no first-boot pull (14 minutes of `skopeo copy` per reinstall
-# on the lab GX10, measured 2026-09-16), and the OS/application lifecycle
-# coupling issue 293 established is kept. The installer proves every link
-# resolvable in the sealed store before its first destructive write
-# (ota/neural-ice-autoinstall.sh, assert_bootc_container_reads_source) and
-# reads the copy back off the target before it reboots.
+# its 22 links, and the sealed store also carries the 22 images they name, as
+# OCI layouts staged by digest from a registry and verified before the medium
+# is cut (build-installer-root.sh §1b/§2, image/lib/bound-images.sh -- bootc's
+# own install-time copy cannot consume a digest-pinned image out of a
+# containers-storage, proved on the bench 2026-09-17). The installer runs
+# bootc with `--bound-images=skip`, copies each layout into the deployment's
+# own store (/usr/lib/bootc/storage) itself, and the appliance boots with them
+# present: no first-boot pull (14 minutes of `skopeo copy` per reinstall on
+# the lab GX10, measured 2026-09-16), and the OS/application lifecycle
+# coupling issue 293 established is kept. The installer proves every layout
+# complete before its first destructive write (ota/neural-ice-autoinstall.sh,
+# assert_bootc_container_reads_source) and reads the copy back off the target
+# before it reboots.
 RUN rm -rf /usr/lib/bootc/bound-images.d
 # THE INSTALLER NEVER HANDS ITS CONSOLE TO THE GPU. The appliance base loads
 # nvidia_drm with KMS and its fbdev console so the installed system's TUI runs on
