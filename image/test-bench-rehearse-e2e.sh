@@ -208,13 +208,13 @@ echo "== the sealed command line: values by key, shapes enforced"
 cat > "$TMP/inspect.txt" <<'EOF'
 inspect-installer-media: OK
   EFI authority   : EFI/BOOT/BOOTAA64.EFI (the only bootable file on the medium)
-  sealed cmdline  : neuralice.trust=neural-ice-installer-trust-v1 neuralice.device_channel=lab neuralice.imgref=registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:ff13e6e2751f992098d638191a147c1dcf3c025132e11e12dac9b15a461e6da9 neuralice.sshkey=c3NoLWVkMjU1MTkgQUFBQQo= neuralice.pcr_policy_seq=1109 neuralice.mirror=192.168.178.63:5055 neuralice.mirror_generation=12 neuralice.seed_closure=721c677cb681b04739e9f9a36464cd92ba55f72d46ad1b96fa0b277559645ea9 neuralice.seed_source=mirror
+  sealed cmdline  : neuralice.trust=neural-ice-installer-trust-v1 neuralice.device_channel=lab neuralice.imgref=registry.example.test/neural-ice/neural-ice-appliance@sha256:ff13e6e2751f992098d638191a147c1dcf3c025132e11e12dac9b15a461e6da9 neuralice.sshkey=c3NoLWVkMjU1MTkgQUFBQQo= neuralice.pcr_policy_seq=1109 neuralice.mirror=192.168.178.63:5055 neuralice.mirror_generation=12 neuralice.seed_closure=721c677cb681b04739e9f9a36464cd92ba55f72d46ad1b96fa0b277559645ea9 neuralice.seed_source=mirror
 EOF
 [[ "$(ni_e2e_sealed_value "$TMP/inspect.txt" seed_closure)" == 721c677cb681b04739e9f9a36464cd92ba55f72d46ad1b96fa0b277559645ea9 ]] || fail "seed_closure"
 [[ "$(ni_e2e_sealed_value "$TMP/inspect.txt" mirror)" == 192.168.178.63:5055 ]] || fail "mirror"
 [[ "$(ni_e2e_sealed_value "$TMP/inspect.txt" device_channel)" == lab ]] || fail "device_channel"
 [[ "$(ni_e2e_sealed_value "$TMP/inspect.txt" pcr_policy_seq)" == 1109 ]] || fail "pcr_policy_seq"
-[[ "$(ni_e2e_sealed_value "$TMP/inspect.txt" imgref)" == registry.neural-ice.ch/neural-ice/neural-ice-appliance@sha256:ff13e6e2751f992098d638191a147c1dcf3c025132e11e12dac9b15a461e6da9 ]] || fail "imgref"
+[[ "$(ni_e2e_sealed_value "$TMP/inspect.txt" imgref)" == registry.example.test/neural-ice/neural-ice-appliance@sha256:ff13e6e2751f992098d638191a147c1dcf3c025132e11e12dac9b15a461e6da9 ]] || fail "imgref"
 ni_e2e_sealed_value "$TMP/inspect.txt" seed_source >/dev/null 2>&1 && fail "a key without a shape was accepted"
 ni_e2e_sealed_value "$TMP/inspect.txt" preseal >/dev/null 2>&1 && fail "an absent key was accepted"
 sed 's/neuralice.seed_closure=721c/neuralice.seed_closure=ZZZZ/' "$TMP/inspect.txt" > "$TMP/inspect-bad.txt"
