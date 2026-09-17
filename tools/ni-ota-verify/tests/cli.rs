@@ -2044,6 +2044,81 @@ fn verify_creates_commit_compatible_secure_state_dir() {
 }
 
 #[test]
+fn verify_records_its_verdict_in_the_mode_the_authenticated_snapshot_accepts() {
+    // ICE-CoreOS issue 208, measured on .67 2026-09-17 00:35: one
+    // `--check-only` left `644 root last-verdict.json` in a state directory
+    // whose every other entry is 0600, and `authenticated-ota-status` — which
+    // snapshots the directory as a unit — refused it, closing the licence
+    // gate on the next boot. The verdict file is a peer of applied.json and
+    // must be written like one.
+    let fx = Fixture::new("verify-verdict-mode");
+    fx.write_bom("0.44.7", 7);
+    fx.write_record("0.44.7", "stable", 7);
+    fx.write_sig("bom.sig", true);
+    fx.write_sig("record.sig", true);
+    let cfg = fx.write_config(0, "device_compat_min=1\ndevice_compat_max=3\n");
+
+    let (code, _, stderr) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 0, "{stderr}");
+    let verdict = fx.path("state/last-verdict.json");
+    let metadata = fs::symlink_metadata(&verdict).unwrap();
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+    let bytes = fs::read(&verdict).unwrap();
+    assert!(bytes.ends_with(b"}\n") && !bytes.ends_with(b"\n\n"));
+    let recorded: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(recorded["verdict"], "pass");
+    let leftovers: Vec<_> = fs::read_dir(fx.path("state"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "last-verdict.json")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp debris beside the verdict: {leftovers:?}"
+    );
+
+    // A second verify replaces the verdict through the same path: still 0600,
+    // still one link, never a truncate-in-place of a wider file.
+    let (code, _, stderr) = run(&mut fx.verify_cmd(&cfg));
+    assert_eq!(code, 0, "{stderr}");
+    let metadata = fs::symlink_metadata(&verdict).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+
+    // The authenticated reader snapshots state_dir BEFORE it touches any TPM
+    // helper. With the verdict in place it gets past that gate (and refuses
+    // later, on this fixture's absent TPM); widened to 0644 it is refused at
+    // the gate itself, with the message .67 showed.
+    let scratch = fx.path("run");
+    fs::create_dir(&scratch).unwrap();
+    fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).unwrap();
+    let status = |fx: &Fixture| {
+        let out = Command::new(BIN)
+            .arg("authenticated-ota-status")
+            .env("NI_OTA_AUTH_STATUS_CONFIG", &cfg)
+            .env("NI_OTA_AUTH_STATUS_SCRATCH_ROOT", &scratch)
+            .env("NI_OTA_TPM2_NVREADPUBLIC", fx.path("no-such-tpm-tool"))
+            .output()
+            .unwrap();
+        assert_ne!(out.status.code(), Some(0));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let stderr = status(&fx);
+    assert!(
+        !stderr.contains("unsafe mode/owner/type metadata"),
+        "the reader refused its own verdict file: {stderr}"
+    );
+    fs::set_permissions(&verdict, fs::Permissions::from_mode(0o644)).unwrap();
+    let stderr = status(&fx);
+    assert!(
+        stderr.contains("persistent OTA state has unsafe mode/owner/type metadata; expected 0600"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn verify_never_repairs_or_writes_through_an_insecure_state_dir() {
     let permissive = Fixture::new("verify-permissive-state-dir");
     permissive.write_bom("0.44.7", 7);
