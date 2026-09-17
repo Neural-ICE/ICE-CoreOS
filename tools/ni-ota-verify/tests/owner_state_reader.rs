@@ -2377,3 +2377,569 @@ fn a_tampered_or_incomplete_applied_state_refuses_the_status() {
     let before = observe_tree(&owner.fixture.state);
     assert_answered_silently(&owner, &before);
 }
+
+// ---------------------------------------------------------------------------
+// `bootstrap-from-preseal` (ICE-CoreOS issue 206).
+//
+// Measured on .67, 2026-09-17, after the C37 medium reinstall: the first-boot
+// ceremony authenticated the preseal baseline and wrote no applied state;
+// `verify` answered `FAIL unseeded`, `commit` refused to seed, `bootstrap`
+// demanded a cosign BOM signature the sealed medium never carries. A manual
+// root-key signature at 00:45 seeded bundle_seq 22 and the gate passed
+// (anti_rollback 26 > 22). These tests hold the verb that makes that hand
+// ceremony unnecessary — and hold it closed for every other shape.
+// ---------------------------------------------------------------------------
+
+struct FirstBoot {
+    fixture: Fixture,
+    profile: PathBuf,
+    payload: PathBuf,
+    ostree: OstreeFixture,
+    receipt_sha: String,
+    set_sha: String,
+}
+
+/// The appliance as the installer leaves it for its first boot: preseal
+/// inputs and receipt under state_dir, owner anchor defined and pristine,
+/// booted on the sealed target, no applied state, no completion evidence.
+fn install_first_boot(name: &str) -> FirstBoot {
+    let fixture = Fixture::new(name, "");
+    let access = install_access_profile(&fixture, "lab-managed");
+    let (receipt_sha, set_sha) = install_owner_preseal(&fixture);
+    let public = owner_public(
+        "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "policywrite|authread|ownerread|no_da|nt=extend",
+    );
+    install_read_only_tpm(&fixture, &access, &public, None, 5);
+    // The sealed device channel the installer writes into ota.conf.
+    let mut config = fs::read_to_string(&fixture.config).unwrap();
+    config.push_str("device_channel=lab\n");
+    fs::write(&fixture.config, config).unwrap();
+    let profile = fixture.root.join("ota-state-profile");
+    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o444);
+    let payload = fixture.root.join("PAYLOAD_ID");
+    write_mode(
+        &payload,
+        b"cccccccccccccccccccccccccccccccccccccccc\n",
+        0o644,
+    );
+    let ostree = install_ostree_fixture(&fixture);
+    FirstBoot {
+        fixture,
+        profile,
+        payload,
+        ostree,
+        receipt_sha,
+        set_sha,
+    }
+}
+
+impl FirstBoot {
+    fn input(&self, name: &str) -> PathBuf {
+        self.fixture.state.join("preseal-input-v1").join(name)
+    }
+
+    fn seed_command(&self) -> Command {
+        self.seed_command_expecting_set(&self.set_sha)
+    }
+
+    fn seed_command_expecting_set(&self, set_sha: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ni-ota-verify"));
+        command
+            .arg("bootstrap-from-preseal")
+            .arg("--set")
+            .arg(self.input("preseal-set.json"))
+            .arg("--snapshot")
+            .arg(self.input("delegation-snapshot.json"))
+            .arg("--snapshot-sig")
+            .arg(self.input("delegation-snapshot.sig"))
+            .arg("--release")
+            .arg(self.input("ota-release-authorization.json"))
+            .arg("--release-sig")
+            .arg(self.input("ota-release-authorization.sig"))
+            .arg("--bom")
+            .arg(self.input("bom.json"))
+            .arg("--installer-authorization")
+            .arg(self.input("installer-release-authorization-v2.json"))
+            .arg("--installer-authorization-sig")
+            .arg(self.input("installer-release-authorization-v2.sig"))
+            .args(["--expected-set-sha256", set_sha])
+            .args(["--expected-receipt-sha256", &self.receipt_sha])
+            .arg("--receipt")
+            .arg(self.fixture.state.join("preseal/receipt.json"))
+            .arg("--scratch-dir")
+            .arg(&self.fixture.scratch)
+            .arg("--config")
+            .arg(&self.fixture.config)
+            .env("NI_OTA_COSIGN", self.fixture.root.join("cosign"))
+            .env(
+                "NI_OTA_HARDWARE_TARGET_FILE",
+                self.fixture.root.join("hardware-target"),
+            )
+            .env(
+                "NI_OTA_APPLIANCE_VARIANT_FILE",
+                self.fixture.root.join("appliance-variant"),
+            )
+            .env(
+                "NI_OTA_MIN_DELEGATION_SEQ_FILE",
+                self.fixture.root.join("min-delegation-seq"),
+            )
+            .env(
+                "NI_OTA_BOOTSTRAP_DELEGATION_SHA256_FILE",
+                self.fixture.root.join("bootstrap-delegation-sha256"),
+            )
+            .env(
+                "NI_OTA_TPM2_NVREADPUBLIC",
+                self.fixture.root.join("tpm2_nvreadpublic-success"),
+            )
+            .env("NI_OTA_TPM2_NVDEFINE", &self.fixture.forbidden)
+            .env("NI_OTA_TPM2_NVEXTEND", &self.fixture.forbidden)
+            .env("NI_OTA_TPM2_NVWRITE", &self.fixture.forbidden)
+            .env("NI_OTA_TPM2_NVWRITELOCK", &self.fixture.forbidden)
+            .env("NI_OTA_TPM2_NVUNDEFINE", &self.fixture.forbidden)
+            .env("NI_OTA_TPM2_CLEAR", &self.fixture.forbidden)
+            .env("NI_OTA_TPM2_CHANGEAUTH", &self.fixture.forbidden)
+            .env("NI_OTA_AUTH_STATUS_PROFILE_MARKER", &self.profile)
+            .env("NI_OTA_AUTH_STATUS_OSTREE", &self.ostree.command)
+            .env(
+                "NI_OTA_AUTH_STATUS_DEPLOY_ROOT",
+                &self.ostree.deployment_root,
+            )
+            .env("NI_OTA_AUTH_STATUS_PAYLOAD_ID", &self.payload);
+        command
+    }
+
+    fn seed(&self) -> Output {
+        self.seed_command().output().unwrap()
+    }
+
+    fn applied(&self) -> PathBuf {
+        self.fixture.state.join("applied.json")
+    }
+
+    fn applied_bom(&self) -> PathBuf {
+        self.fixture.state.join("applied.bom.json")
+    }
+
+    /// The persistent tree minus the state lock, whose ctime moves on every
+    /// locking (chmod restates 0600) without any content or mode change.
+    fn tree(&self) -> Vec<ObservedTreeEntry> {
+        observe_tree(&self.fixture.state)
+            .into_iter()
+            .filter(|entry| entry.relative != Path::new(".applied.json.lock"))
+            .collect()
+    }
+}
+
+fn assert_seed_refused(boot: &FirstBoot, output: &Output, reason: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("bootstrap-from-preseal REFUSED: {reason}")),
+        "expected {reason:?} in: {stderr}"
+    );
+    let calls = fs::read_to_string(&boot.fixture.calls).unwrap_or_default();
+    assert!(!calls.contains("FORBIDDEN"), "{calls}");
+}
+
+#[test]
+fn first_boot_seeds_the_applied_baseline_from_the_preseal_receipt() {
+    let boot = install_first_boot("seed-nominal");
+    assert!(!boot.applied().exists());
+    let bom = fs::read(boot.input("bom.json")).unwrap();
+
+    let output = boot.seed();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        receipt,
+        json!({
+            "bootstrapped": true, "source": "preseal-receipt", "idempotent": false,
+            "train": "0.50.9-lab.20260905", "bundle_seq": 5, "ring": "lab",
+            "os_ref": format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"),
+            "seed_ref": "cccccccccccccccccccccccccccccccccccccccc",
+            "bom_sha256": hash(&bom)
+        })
+    );
+    let calls = fs::read_to_string(&boot.fixture.calls).unwrap();
+    assert!(!calls.contains("FORBIDDEN"), "{calls}");
+    assert!(
+        !calls.contains("nvdefine") && !calls.contains("nvwrite"),
+        "the seeding must not touch the TPM: {calls}"
+    );
+
+    // The applied state `bootstrap` would have written, plus the BOM copy
+    // the engine requires beside it, every one a root-owned 0600 regular
+    // file — the mode the authenticated snapshot accepts.
+    for (name, expected_mode) in [
+        ("applied.json", 0o600),
+        ("applied.format.v1.json", 0o600),
+        ("applied.bom.json", 0o600),
+    ] {
+        let metadata = fs::symlink_metadata(boot.fixture.state.join(name)).unwrap();
+        assert!(metadata.file_type().is_file(), "{name}");
+        assert_eq!(metadata.mode() & 0o7777, expected_mode, "{name}");
+        assert_eq!(metadata.nlink(), 1, "{name}");
+    }
+    let applied: Value = serde_json::from_slice(&fs::read(boot.applied()).unwrap()).unwrap();
+    assert_eq!(
+        applied,
+        json!({"bundle_seq": 5, "bom_sha256": hash(&bom), "bom_format": "media-independent-v1", "active_ring": "lab"})
+    );
+    assert_eq!(fs::read(boot.applied_bom()).unwrap(), bom);
+    let debris: Vec<_> = fs::read_dir(&boot.fixture.state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(debris.is_empty(), "{debris:?}");
+
+    // Exactly idempotent: the same verb again changes nothing on disk.
+    let before = boot.tree();
+    let again = boot.seed();
+    assert_eq!(
+        again.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(receipt["idempotent"], json!(true));
+    assert_eq!(receipt["bundle_seq"], json!(5));
+    assert_eq!(boot.tree(), before);
+
+    // The ceremony completes; the authenticated reader still answers the
+    // pristine status with the applied state beside the receipt.
+    let access = install_access_profile(&boot.fixture, "lab-managed");
+    install_completion_v2(&boot.fixture, &access, &boot.receipt_sha, &boot.set_sha);
+    let status = run_owner_status(&boot.fixture, &boot.profile, &boot.payload, &boot.ostree);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(status.stdout, b"{\"committed_generation\":null,\"completion_version\":2,\"enforce_ready_verified\":false,\"profile\":\"owner-sealed-ota-state-v1\",\"schema\":\"neural-ice-authenticated-ota-status-v1\"}\n");
+
+    // THE MEASURED GAP, CLOSED: the v1 OTA gate `verify`, in enforce mode,
+    // now finds a seeded baseline and passes the sealed train itself
+    // (equal seq, equal BOM bytes) — with no cosign signature of the BOM
+    // by anybody's hand; the channel record and the BOM are signed by the
+    // fixture's real root key, as a release would be. The v1 record grammar
+    // knows beta and stable only (lab rides the delegated verbs), so the
+    // gate is exercised with a stable record; the applied ring is the
+    // engine's business, not this verdict's.
+    let root_key = boot.fixture.root.join("ota-root.key");
+    let record = canonical(&json!({
+        "assigned_at":"2026-09-05T00:00:00Z","bundle_digest":format!("sha256:{}", "d".repeat(64)),
+        "bundle_seq":5,"channel":"stable","hardware_target":"nvidia-gb10-arm64","key_version":1,
+        "schema_version":2,"train":"0.50.9-lab.20260905"
+    }));
+    let record_path = boot.fixture.root.join("record.json");
+    fs::write(&record_path, &record).unwrap();
+    let bom_sig = boot.fixture.root.join("bom.sig");
+    let record_sig = boot.fixture.root.join("record.sig");
+    fs::write(
+        &bom_sig,
+        base64(&sign(&root_key, b"", &bom, &boot.fixture.root, "gate-bom")),
+    )
+    .unwrap();
+    fs::write(
+        &record_sig,
+        base64(&sign(
+            &root_key,
+            b"",
+            &record,
+            &boot.fixture.root,
+            "gate-record",
+        )),
+    )
+    .unwrap();
+    let verify = Command::new(env!("CARGO_BIN_EXE_ni-ota-verify"))
+        .arg("verify")
+        .arg("--bom")
+        .arg(boot.input("bom.json"))
+        .arg("--bom-sig")
+        .arg(&bom_sig)
+        .arg("--record")
+        .arg(&record_path)
+        .arg("--record-sig")
+        .arg(&record_sig)
+        .args(["--bundle-digest", &format!("sha256:{}", "d".repeat(64))])
+        .args(["--device-channel", "stable", "--device-compat", "5,5"])
+        .arg("--config")
+        .arg(&boot.fixture.config)
+        .env("NI_OTA_COSIGN", boot.fixture.root.join("cosign"))
+        .env(
+            "NI_OTA_HARDWARE_TARGET_FILE",
+            boot.fixture.root.join("hardware-target"),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        verify.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let verdict: Value =
+        serde_json::from_slice(verify.stdout.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+    assert_eq!(verdict["verdict"], json!("pass"), "{verdict}");
+    let checks = verdict["checks"].as_array().unwrap();
+    let check = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no {name} check in {verdict}"))
+    };
+    assert_eq!(check("anti_rollback")["ok"], json!(true), "{verdict}");
+    assert!(
+        checks
+            .iter()
+            .all(|check| check["name"] != json!("unseeded")),
+        "the gate still reports an unseeded baseline: {verdict}"
+    );
+}
+
+#[test]
+fn bootstrap_from_preseal_refuses_a_booted_system_that_is_not_the_receipt_target() {
+    let boot = install_first_boot("seed-not-target");
+    let before = boot.tree();
+    write_mode(
+        &boot.ostree.origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@sha256:{}\n",
+            "e".repeat(64)
+        )
+        .as_bytes(),
+        0o644,
+    );
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "running system: booted deployment differs from authenticated preseal baseline",
+    );
+    assert_eq!(boot.tree(), before);
+    assert!(!boot.applied().exists() && !boot.applied_bom().exists());
+
+    // The right image with another payload: the seed marker is part of the
+    // identity, exactly as the ceremony binds it.
+    write_mode(
+        &boot.ostree.origin,
+        format!(
+            "[origin]\ncontainer-image-reference=ostree-unverified-registry:{OWNER_REPOSITORY}@{OWNER_INDEX}\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    write_mode(
+        &boot.payload,
+        format!("{}\n", "e".repeat(40)).as_bytes(),
+        0o644,
+    );
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "running system: running PAYLOAD_ID differs from authenticated preseal baseline",
+    );
+    assert!(!boot.applied().exists() && !boot.applied_bom().exists());
+}
+
+#[test]
+fn bootstrap_from_preseal_refuses_a_tampered_set_and_a_foreign_bom() {
+    let boot = install_first_boot("seed-tampered");
+    let set_path = boot.input("preseal-set.json");
+    let authentic = fs::read(&set_path).unwrap();
+
+    // One field of the set changed: the set no longer hashes to the sealed
+    // value the ceremony passes — the retained verification's own refusal.
+    let mut set: Value = serde_json::from_slice(&authentic).unwrap();
+    set["train"] = "0.50.10-lab.20260917".into();
+    write_mode(&set_path, &canonical(&set), 0o600);
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "preseal baseline: preseal set differs from the signed UKI hash",
+    );
+    // …and with the tampered hash offered as the expected one, the signed
+    // release authorization no longer binds the set.
+    let tampered_hash = hash(&canonical(&set));
+    let output = boot
+        .seed_command_expecting_set(&tampered_hash)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("preseal baseline:"));
+    write_mode(&set_path, &authentic, 0o600);
+    assert!(!boot.applied().exists() && !boot.applied_bom().exists());
+
+    // A BOM whose bytes are not the ones the receipt hashes.
+    let bom_path = boot.input("bom.json");
+    let authentic_bom = fs::read(&bom_path).unwrap();
+    let mut foreign = authentic_bom.clone();
+    foreign.push(b'\n');
+    write_mode(&bom_path, &foreign, 0o600);
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "preseal baseline: preseal BOM hash binding is invalid",
+    );
+    write_mode(&bom_path, &authentic_bom, 0o600);
+    assert!(!boot.applied().exists() && !boot.applied_bom().exists());
+}
+
+#[test]
+fn bootstrap_from_preseal_never_overwrites_a_different_applied_state() {
+    let boot = install_first_boot("seed-existing");
+    let bom = fs::read(boot.input("bom.json")).unwrap();
+    // A baseline already seeded at another sequence (the .67 shape after the
+    // hand ceremony would be seq 22 against a receipt at 22 — equal, a no-op;
+    // this is the unequal one).
+    write_mode(
+        &boot.applied(),
+        &canonical(
+            &json!({"bundle_seq": 4, "bom_sha256": "1".repeat(64), "bom_format": "media-independent-v1", "active_ring": "lab"}),
+        ),
+        0o600,
+    );
+    let before = boot.tree();
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "applied state already exists with a different baseline",
+    );
+    assert_eq!(boot.tree(), before);
+    assert!(!boot.applied_bom().exists());
+
+    // Same sequence and hash, other ring: still a different baseline.
+    write_mode(
+        &boot.applied(),
+        &canonical(
+            &json!({"bundle_seq": 5, "bom_sha256": hash(&bom), "bom_format": "media-independent-v1", "active_ring": "beta"}),
+        ),
+        0o600,
+    );
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "applied state already exists with a different baseline",
+    );
+    assert!(!boot.applied_bom().exists());
+
+    // The exact baseline without its BOM copy (a crash between the two
+    // writes, or a hand-seeded state): the copy is published, the state kept.
+    write_mode(
+        &boot.applied(),
+        &canonical(
+            &json!({"bundle_seq": 5, "bom_sha256": hash(&bom), "bom_format": "media-independent-v1", "active_ring": "lab"}),
+        ),
+        0o600,
+    );
+    let output = boot.seed();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["idempotent"], json!(true));
+    assert_eq!(fs::read(boot.applied_bom()).unwrap(), bom);
+
+    // An applied BOM copy that is not the receipt's BOM is never replaced.
+    write_mode(&boot.applied_bom(), b"{\"train\":\"other\"}\n", 0o600);
+    assert_seed_refused(&boot, &boot.seed(), "existing applied BOM");
+    assert_eq!(
+        fs::read(boot.applied_bom()).unwrap(),
+        b"{\"train\":\"other\"}\n"
+    );
+}
+
+#[test]
+fn bootstrap_from_preseal_requires_a_pristine_anchor_and_the_sealed_channel() {
+    let boot = install_first_boot("seed-anchor");
+    let before = boot.tree();
+
+    // The owner anchor already written: this is no longer a first boot.
+    let written = owner_public(
+        "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56",
+        "policywrite|authread|ownerread|no_da|nt=extend|written",
+    );
+    let public = boot.fixture.root.join("tpm2_nvreadpublic-success");
+    let pristine_script = fs::read_to_string(&public).unwrap();
+    let written_script = pristine_script.replace(
+        "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56",
+    );
+    assert_ne!(pristine_script, written_script);
+    let _ = written;
+    write_mode(
+        &public,
+        written_script
+            .replace(
+                "policywrite|authread|ownerread|no_da|nt=extend",
+                "policywrite|authread|ownerread|no_da|nt=extend|written",
+            )
+            .as_bytes(),
+        0o755,
+    );
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "owner OTA anchor: owner OTA anchor is already written",
+    );
+    write_mode(&public, pristine_script.as_bytes(), 0o755);
+
+    // The anchor absent altogether (an installer that never presealed).
+    write_mode(&public, b"#!/bin/sh\nexit 1\n", 0o755);
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "owner OTA anchor: TPM NV02 public state is absent or unreadable",
+    );
+    write_mode(&public, pristine_script.as_bytes(), 0o755);
+
+    // No sealed device channel in ota.conf: the applied ring cannot be
+    // guessed (issue 201/202 class), so nothing is seeded.
+    let config = fs::read_to_string(&boot.fixture.config).unwrap();
+    fs::write(
+        &boot.fixture.config,
+        config.replace("device_channel=lab\n", ""),
+    )
+    .unwrap();
+    assert_seed_refused(&boot, &boot.seed(), "ota.conf names no device_channel");
+    fs::write(
+        &boot.fixture.config,
+        config.replace("device_channel=lab\n", "device_channel=beta\n"),
+    )
+    .unwrap();
+    assert_seed_refused(
+        &boot,
+        &boot.seed(),
+        "sealed device channel 'beta' differs from the receipt ring 'lab'",
+    );
+    fs::write(&boot.fixture.config, config).unwrap();
+    assert_eq!(boot.tree(), before);
+    assert!(!boot.applied().exists() && !boot.applied_bom().exists());
+
+    // Everything restored: the seeding proceeds, so each refusal above was
+    // earned by the one thing it changed.
+    let output = boot.seed();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

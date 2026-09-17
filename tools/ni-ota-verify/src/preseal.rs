@@ -148,8 +148,10 @@ pub(crate) struct VerifiedPreseal {
     pub(crate) target_os_ref: String,
     pub(crate) target_os_manifest_digest: String,
     pub(crate) seed_ref: String,
-    /// The BOM bytes the receipt authenticates: an applied state at the
-    /// receipt's sequence must name exactly this BOM.
+    /// The signed train, ring and BOM bytes the receipt authenticates —
+    /// what `bootstrap-from-preseal` seeds the applied state from.
+    pub(crate) train: String,
+    pub(crate) ring: String,
     pub(crate) bom_sha256: String,
 }
 
@@ -650,6 +652,8 @@ fn verify_command(
         target_os_ref: receipt.target_os_ref.clone(),
         target_os_manifest_digest: installer.image_manifest_digest.clone(),
         seed_ref: receipt.seed_ref.clone(),
+        train: receipt.train.clone(),
+        ring: receipt.ring.clone(),
         bom_sha256: receipt.bom_sha256.clone(),
     };
     let created = match &mode {

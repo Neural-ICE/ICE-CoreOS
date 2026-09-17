@@ -3186,6 +3186,21 @@ fn baseline_divergence(baseline: &RunningBaseline, running: &RunningSystem) -> O
     None
 }
 
+/// The running system must BE the preseal target — no transaction window
+/// can explain a difference. This is what `bootstrap-from-preseal` binds on
+/// the first boot: the receipt's image and seed, observed by the inspector
+/// the authenticated status uses, re-read after the comparison.
+pub(crate) fn verify_running_is_preseal_target(
+    value: &crate::preseal::VerifiedPreseal,
+) -> Result<(), String> {
+    let paths = running_system_paths();
+    let running = observe_running_system(&paths)?;
+    if let Some(divergence) = baseline_divergence(&RunningBaseline::preseal(value), &running) {
+        return Err(divergence);
+    }
+    reobserve_running_system(&paths, &running)
+}
+
 fn verify_running_baseline(
     state_dir: &Path,
     value: &crate::preseal::VerifiedPreseal,
@@ -3629,6 +3644,29 @@ pub(crate) fn run_status_helper_within(
     budget: std::time::Duration,
 ) -> Result<StatusHelperOutput, InternalError> {
     runner::bounded_output_within(command, label, budget)
+}
+
+/// The owner OTA anchor exactly as a first boot must find it before the
+/// applied baseline is seeded: the owner-sealed profile, defined, never
+/// written. Reads NV public areas only; nothing here defines or writes.
+pub(crate) fn owner_anchor_pristine() -> Result<Result<(), String>, InternalError> {
+    if let Err(reason) = require_owner_profile_marker() {
+        return Ok(Err(reason));
+    }
+    let public = match read_state_public()? {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    Ok(match select_state_profile(&public) {
+        Ok(StateProfile::OwnerSealedV1 { written: false }) => Ok(()),
+        Ok(StateProfile::OwnerSealedV1 { written: true }) => {
+            Err("owner OTA anchor is already written".into())
+        }
+        Ok(StateProfile::RetainedPlatformV1) => {
+            Err("TPM OTA state is the historical platform profile, not the owner-sealed one".into())
+        }
+        Err(reason) => Err(reason),
+    })
 }
 
 fn require_owner_profile_marker() -> Result<(), String> {
@@ -6449,6 +6487,8 @@ mod tests {
             target_os_ref: image.clone(),
             target_os_manifest_digest: digest.into(),
             seed_ref: "fabric-seed-revision".into(),
+            train: "0.50.9-lab.20260905".into(),
+            ring: "lab".into(),
             bom_sha256: "e".repeat(64),
         };
         // No transaction under this state directory: a divergence has nothing
