@@ -41,6 +41,7 @@ on:
       # parser suite. Named here on purpose.
       - "image/bench-rehearse-medium.sh"
       - "image/bench-rehearse-phase4.sh"
+      - "image/bench-rehearse-e2e.sh"
       - "image/build-installer-usb.sh"
       - "image/lib/installer-ssh-key.sh"
       - "image/lib/access-policy.sh"
@@ -260,6 +261,7 @@ jobs:
             image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
             image/test-preloaded-sizing.sh image/qualify-installer-qemu.sh image/test-qualify-installer-qemu.sh \
             image/bench-rehearse-medium.sh image/bench-rehearse-phase4.sh image/test-bench-rehearse-medium.sh \
+            image/bench-rehearse-e2e.sh image/test-bench-rehearse-e2e.sh \
             image/test-registry-authorisation.sh image/test-release-authorization.sh \
             image/test-seed-closure.sh image/test-seed-firstboot-import.sh image/test-wait-online-budget.sh image/test-signing-trust.sh image/test-status-screen.sh image/test-tpm-ceremony-systemd.sh \
             image/test-tpm-policy-initramfs.sh \
@@ -469,6 +471,10 @@ jobs:
           # boots a VM and runs only on the GB10 bench; this is the part of it
           # that decides what the evidence MEANS, so it is proved here.
           ./image/test-bench-rehearse-medium.sh
+          # The end-to-end bench rehearsal (medium -> install -> first boot ->
+          # onboarding -> OTA): its receipt schema, phase order, the readers of
+          # the appliance's own JSON surfaces and its refusals, offline.
+          ./image/test-bench-rehearse-e2e.sh
           ./image/test-content-cache-contract.py
           ./image/test-seed-firstboot-import.sh
           ./image/test-wait-online-budget.sh
