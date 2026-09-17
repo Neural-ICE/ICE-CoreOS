@@ -17,6 +17,13 @@ RequiresMountsFor=/var/lib/neural-ice/ota
 Type=oneshot
 ExecStart=/usr/libexec/neural-ice-firstboot-tpm-ceremony
 RemainAfterExit=yes
+# ADR-0050 lab-trust, lever B (MVP 1.0): the sealed OTA-state / preseal
+# attestation (TPM point #4) is fail-open in the relaxed posture, so a preseal
+# refusal logs and lets the boot proceed instead of dropping to
+# emergency.target (the .67 brick, 2026-09-17). Override to strict to re-harden
+# (a drop-in with Environment=NEURALICE_SEALED_OTA_STATE=strict). Every other
+# trust anchor (Secure Boot, LUKS/SRK/device-root, root) stays enforced.
+Environment=NEURALICE_SEALED_OTA_STATE=relaxed
 UMask=0077
 # ProtectSystem=strict remounts /run read-only except RuntimeDirectory and
 # ReadWritePaths. The ceremony execs device-root, tpm-state, access-profile

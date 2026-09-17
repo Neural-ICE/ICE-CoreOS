@@ -60,6 +60,17 @@ else
   readonly VALIDATE_FILE_METADATA=1
 fi
 
+# ADR-0050 lab-trust, lever B (MVP 1.0).  NEURALICE_SEALED_OTA_STATE selects the
+# runtime trust posture for the sealed OTA-state (ADR-0050 TPM point #4, the
+# preseal attestation): `strict` is the historical, byte-identical behaviour;
+# `relaxed` (the MVP default) is fail-open -- the ceremony still enforces every
+# other trust anchor but does NOT refuse the boot on a sealed-OTA-state/preseal
+# verification failure.  The systemd unit sets it and it stays overridable to
+# strict there.  Any other value is a fail-closed configuration error.
+readonly SEALED_OTA_STATE="${NEURALICE_SEALED_OTA_STATE:-relaxed}"
+[[ "$SEALED_OTA_STATE" == relaxed || "$SEALED_OTA_STATE" == strict ]] \
+  || die "NEURALICE_SEALED_OTA_STATE must be relaxed or strict"
+
 readonly INTENT="$STATE_DIR/owner-ceremony-intent-v1"
 readonly INSTALL_IDENTITY="$STATE_DIR/owner-ceremony-install-identity-v1.json"
 readonly DEVICE_ROOT="$STATE_DIR/device-root-v1.json"
@@ -196,6 +207,23 @@ done
   || die "cannot read the persistent SRK Name"
 "$TPM2_READPUBLIC" -Q -c 0x81010005 -n "$WORK/device-root.name" >/dev/null \
   || die "cannot read the persistent device-root Name"
+
+# ADR-0050 lab-trust, lever B: every KEEP trust anchor above has passed --
+# run-as-root/helper structure, the closed installer intent, the persistent
+# device root and SRK (Secure Boot chain), the LUKS2 TPM contract (TPM point
+# #2) and the persistent object Names.  In the relaxed posture the sealed
+# OTA-state / preseal attestation (TPM point #4) is NOT the trust anchor, so
+# log and let the boot proceed instead of entering the preseal
+# verify/seed/validate block below.  On 2026-09-17 appliance .67 `die`d in that
+# block on a preseal refusal, tripping the unit's OnFailure=emergency.target and
+# dropping the appliance into emergency mode (root locked).  Exit 0 keeps this
+# oneshot `active (success)` so its Requires=/After= consumers (sshd, network,
+# licensed) proceed -- the whole point of the lever.  `strict` runs the
+# historical block below unchanged.
+if [[ "$SEALED_OTA_STATE" == relaxed ]]; then
+  printf 'neural-ice-firstboot-tpm-ceremony: sealed OTA-state verification RELAXED (ADR-0050 lab-trust); skipping preseal attestation\n' >&2
+  exit 0
+fi
 
 build_evidence() { # $1=TPM state snapshot
   python3 - "$1" "$INSTALL_IDENTITY" "$WORK/system-luks-evidence.json" \
