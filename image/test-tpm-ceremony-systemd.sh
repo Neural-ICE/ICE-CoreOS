@@ -27,6 +27,22 @@ grep -qx 'After=neural-ice-firstboot-tpm-ceremony.service' "$DROPIN" || fail "ga
 grep -qx 'OnFailure=emergency.target' "$UNIT" || fail "ceremony failure does not enter recovery"
 grep -qx 'OnFailureJobMode=isolate' "$UNIT" || fail "ceremony failure does not isolate recovery"
 grep -qx 'RequiredBy=multi-user.target' "$UNIT" || fail "multi-user readiness does not require ceremony success"
+# ICE-CoreOS issue 206: the first boot seeds the v1 applied baseline from the
+# authenticated preseal receipt, before the one-time TPM mutation. The
+# behaviour is measured by ci/test-swtpm-monotonic-state.sh against a real
+# SWTPM; this holds the call site and its ordering in the script text.
+grep -q 'bootstrap-from-preseal' "$CEREMONY" \
+  || fail "ceremony never seeds the applied baseline from the preseal receipt"
+grep -Fqx "  seed_applied_baseline \"\$receipt_hash\" \"\$set_hash\"" "$CEREMONY" \
+  || fail "ceremony does not seed the applied baseline from the authenticated receipt and set hashes"
+python3 - "$CEREMONY" <<'PY' || fail "applied-baseline seeding is not ordered after verify_preseal_initial and before ceremony-prepare-v2"
+import sys
+text = open(sys.argv[1]).read()
+initial = text.index('initial_metadata="$(verify_preseal_initial)"')
+seed = text.index('seed_applied_baseline "$receipt_hash" "$set_hash"')
+prepare = text.index('ceremony-prepare-v2 "$ACCESS_PROFILE"')
+raise SystemExit(0 if initial < seed < prepare else 1)
+PY
 grep -qx 'DefaultDependencies=no' "$UNIT" \
   || fail "ceremony default dependencies would After=basic and cycle with sshd.socket"
 grep -qx 'After=local-fs.target' "$UNIT" \

@@ -564,6 +564,16 @@ case "\$1" in
     fi
     exit 0
     ;;
+  bootstrap-from-preseal)
+    # ICE-CoreOS issue 206: the first boot seeds the applied baseline from
+    # the receipt, with the retained verification's inputs. Record the call
+    # and its binding flags; refuse on demand so the ceremony's fail-closed
+    # ordering (before any TPM mutation) is measured, not assumed.
+    printf '%s\n' "\$1" >> "$TMP/preseal-calls"
+    printf '%s\n' "\$*" > "$TMP/seed-args"
+    [ ! -e "$TMP/seed-refuse" ] || exit 1
+    exit 0
+    ;;
   *) exit 97 ;;
 esac
 EOF
@@ -607,13 +617,33 @@ expect_refusal "owner ceremony accepted a different booted manifest" firstboot
 [[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
   || fail "booted-image mismatch mutated owner TPM state"
 rm -f "$TMP/bootc-mismatch"
+# A refused applied-baseline seeding dies AFTER the candidate is
+# authenticated and BEFORE ceremony-prepare-v2: the TPM stays exactly
+# preseal-prepared and the next boot retries the whole ceremony.
+: > "$TMP/seed-refuse"
+expect_refusal "owner ceremony continued past a refused applied-baseline seeding" firstboot
+[[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+  || fail "refused applied-baseline seeding mutated owner TPM state"
+mapfile -t preseal_calls < "$TMP/preseal-calls"
+[[ "${preseal_calls[*]}" == "verify-preseal-baseline bootstrap-from-preseal" ]] \
+  || fail "the applied baseline was not seeded right after the candidate was authenticated: ${preseal_calls[*]}"
+rm -f "$TMP/seed-refuse" "$TMP/preseal-calls"
 firstboot >/dev/null || fail "owner-profile firstboot ceremony did not complete"
 mapfile -t preseal_calls < "$TMP/preseal-calls"
-[[ "${preseal_calls[*]}" == "verify-preseal-baseline verify-preseal-baseline" ]] \
-  || fail "owner ceremony did not authenticate the installed candidate before and after finalization"
+[[ "${preseal_calls[*]}" == "verify-preseal-baseline bootstrap-from-preseal verify-preseal-baseline" ]] \
+  || fail "owner ceremony did not authenticate the installed candidate, seed the applied baseline, and re-authenticate after finalization: ${preseal_calls[*]}"
+seed_args="$(cat "$TMP/seed-args")"
+set_hash="$(sha256sum "$FB_STATE/preseal-input-v1/preseal-set.json" | awk '{print $1}')"
+receipt_hash="$(sha256sum "$FB_STATE/preseal/receipt.json" | awk '{print $1}')"
+for expected in "--receipt $FB_STATE/preseal/receipt.json" "--expected-set-sha256 $set_hash" \
+  "--expected-receipt-sha256 $receipt_hash" "--bom $FB_STATE/preseal-input-v1/bom.json" \
+  "--config $FB_OTA_CONFIG"; do
+  [[ "$seed_args" == *"$expected"* ]] \
+    || fail "applied-baseline seeding was not bound to the authenticated preseal inputs: $seed_args"
+done
 [[ "$(firstboot status)" == complete ]] || fail "owner-profile completion did not validate"
 mapfile -t preseal_calls < "$TMP/preseal-calls"
-[[ "${preseal_calls[*]}" == "verify-preseal-baseline verify-preseal-baseline verify-retained-preseal-baseline" ]] \
+[[ "${preseal_calls[*]}" == "verify-preseal-baseline bootstrap-from-preseal verify-preseal-baseline verify-retained-preseal-baseline" ]] \
   || fail "later owner status did not use the retained nonpublishing verifier"
 cp "$FB_STATE/owner-ceremony-evidence-v2.json" "$TMP/authenticated-owner-evidence-v2.json"
 printf '{"attacker":"pathname replacement"}\n' > "$TMP/replacement-completion-evidence.json"

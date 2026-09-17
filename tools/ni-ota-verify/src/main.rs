@@ -31,6 +31,7 @@ mod delegated;
 mod device_policy;
 mod namespace;
 mod preseal;
+mod preseal_bootstrap;
 mod record;
 mod release_manifest;
 mod runner;
@@ -60,6 +61,15 @@ const USAGE: &str = "usage:
                           --current-seed-ref <40-hex-commit>
                           [--config /etc/neural-ice/ota.conf]
                           [--device-compat <min,max>] [--applied-state <path>]
+  ni-ota-verify bootstrap-from-preseal --set <path>
+                       --snapshot <path> --snapshot-sig <path>
+                       --release <path> --release-sig <path> --bom <path>
+                       --installer-authorization <path>
+                       --installer-authorization-sig <path>
+                       --expected-set-sha256 <64hex>
+                       --expected-receipt-sha256 <64hex>
+                       --receipt <path> --scratch-dir </run/private-work>
+                       [--config /etc/neural-ice/ota.conf]
   ni-ota-verify commit --bom <path> [--active-ring <lab|beta|stable>
                        --previous-ring <lab|beta|stable>]
                        [--config /etc/neural-ice/ota.conf] [--applied-state <path>]
@@ -151,6 +161,7 @@ fn run() -> u8 {
     let result = match args.first().map(String::as_str) {
         Some("verify") => verify::run(&args[1..]),
         Some("bootstrap") => bootstrap::run(&args[1..]),
+        Some("bootstrap-from-preseal") => preseal_bootstrap::run(&args[1..]),
         Some("commit") => commit::run(&args[1..]),
         Some("commit-state-v2") => atomic_state::run(&args[1..]),
         Some("guard-state-v2") => atomic_state::guard(&args[1..]),

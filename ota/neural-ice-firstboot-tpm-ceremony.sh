@@ -342,6 +342,38 @@ PY
   printf '%s %s %s\n' "$receipt_hash" "$set_hash" "$floor"
 }
 
+# THE RECEIPT BECOMES THE APPLIED BASELINE HERE, ON THE FIRST BOOT.
+#
+# Measured on .67, 2026-09-17, after the C37 medium reinstall (ICE-CoreOS
+# issue 206): this ceremony authenticated the preseal baseline and stopped.
+# Nothing wrote applied.json, so the OTA controller answered `FAIL unseeded`,
+# `commit` refused to seed and `bootstrap` demanded a cosign BOM signature
+# the sealed medium never carries (v2 covers the BOM through the release
+# authorization). A human with the root key signed the BOM by hand at 00:45
+# to seed bundle_seq 22; only then did the gate pass (anti_rollback 26 > 22).
+#
+# The verb re-verifies the same eight signed inputs the retained validation
+# re-verifies at every boot, requires the booted deployment to be the
+# receipt's target, requires the owner anchor to be exactly as the installer
+# left it, and writes what `bootstrap` writes plus the applied BOM copy the
+# engine requires. It touches no NV index. It runs BEFORE ceremony-prepare-v2
+# so that a refusal here dies before the one-time TPM mutation and the next
+# boot retries the whole ceremony from the same preseal-prepared state.
+seed_applied_baseline() { # expected receipt hash, set hash
+  "$OTA_VERIFY" bootstrap-from-preseal \
+    --set "$PRESEAL_INPUT/preseal-set.json" \
+    --snapshot "$PRESEAL_INPUT/delegation-snapshot.json" \
+    --snapshot-sig "$PRESEAL_INPUT/delegation-snapshot.sig" \
+    --release "$PRESEAL_INPUT/ota-release-authorization.json" \
+    --release-sig "$PRESEAL_INPUT/ota-release-authorization.sig" \
+    --bom "$PRESEAL_INPUT/bom.json" \
+    --installer-authorization "$PRESEAL_INPUT/installer-release-authorization-v2.json" \
+    --installer-authorization-sig "$PRESEAL_INPUT/installer-release-authorization-v2.sig" \
+    --expected-set-sha256 "$2" --expected-receipt-sha256 "$1" \
+    --receipt "$PRESEAL_RECEIPT" --scratch-dir "$WORK" --config "$OTA_CONFIG" >/dev/null \
+    || die "cannot seed the applied OTA baseline from the authenticated preseal receipt"
+}
+
 verify_preseal_retained() { # expected receipt hash, set hash
   require_preseal_inputs
   "$OTA_VERIFY" verify-retained-preseal-baseline \
@@ -489,6 +521,7 @@ if owner_profile_supported; then
   initial_metadata="$(verify_preseal_initial)" \
     || die "cannot authenticate the installed candidate before owner ceremony"
   read -r receipt_hash set_hash baseline_floor <<<"$initial_metadata"
+  seed_applied_baseline "$receipt_hash" "$set_hash"
 else
   [[ "$provisioning" == virgin || "$provisioning" == pcr-policy-activated ]] \
     || die "historical first boot requires an exact legacy provisioning state"

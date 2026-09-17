@@ -955,7 +955,7 @@ fn validate_trusted_owner(label: &str, uid: u32) -> Result<(), String> {
     }
 }
 
-fn sync_directory(dir: &Path) -> Result<(), InternalError> {
+pub(crate) fn sync_directory(dir: &Path) -> Result<(), InternalError> {
     open_directory_chain(dir)?
         .sync_all()
         .map_err(|error| InternalError(format!("cannot sync state dir {}: {error}", dir.display())))
