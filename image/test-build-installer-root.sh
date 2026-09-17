@@ -843,8 +843,12 @@ if [ "$import_probe_ok" = 1 ]; then
 elif sudo -n true 2>/dev/null; then
   import_rc=0
   out="$(sudo -n bash "$IMPORT_CASE" 2>&1)" || import_rc=$?
-  # Root wrote these; hand them back so the suite's own trap can remove them.
-  sudo -n chown -R "$(id -u):$(id -g)" "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout" "$TMP/import-case.err" 2>/dev/null || true
+  # Root wrote these: root removes them, whatever the verdict. Handing them
+  # back is not enough -- c/storage creates layer directories mode 0555, and
+  # the suite's own trap then fails on their contents and turns a green run
+  # into exit 1 (CI 2026-09-17). Only the stderr file is kept, for the message.
+  sudo -n chown "$(id -u):$(id -g)" "$TMP/import-case.err" 2>/dev/null || true
+  sudo -n rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout" 2>/dev/null || true
   [ "$import_rc" = 0 ] \
     || fail "the layout-to-store import failed under sudo: $out; skopeo said: $(grep -v '^$' "$TMP/import-case.err" 2>/dev/null | tail -n 4 | tr '\n' ' ' | cut -c1-600)"
   echo "    (rootless containers-storage unavailable here -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-80); the import case ran under sudo)"
