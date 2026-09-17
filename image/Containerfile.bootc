@@ -506,6 +506,10 @@ COPY image/payload/neural-ice-payload-apply.service /usr/lib/systemd/system/neur
 # in ICE-Console. It is NOT part of this open-core OS — ICE-Fabric composes it
 # onto this vanilla base (derivation FROM this image + the TUI layer). This repo
 # builds a generic OS: a normal login getty owns tty1 (see below).
+# Which wired port is the management port: ONE rule, shared by hostname-init,
+# the installer medium's resolve-only avahi and (through /run) the tty1 screen.
+# The shipped mgmt-onboard.nmconnection states the same rule for NetworkManager.
+COPY image/mdns/neural-ice-mgmt-port.sh /usr/local/bin/neural-ice-mgmt-port
 # Deterministic hostname/mDNS name from the management NIC MAC (ni-coreos-<mac4>).
 # The unit ships in the /etc overlay; avahi (installed above) publishes the name.
 COPY image/mdns/neural-ice-hostname-init.sh /usr/local/bin/neural-ice-hostname-init.sh
@@ -583,6 +587,7 @@ RUN set -euxo pipefail; \
                /usr/local/bin/neural-ice-status-screen.sh \
                /usr/libexec/neural-ice-model-cache-contract \
                /usr/libexec/neural-ice-content-cache-contract \
+               /usr/local/bin/neural-ice-mgmt-port \
                /usr/local/bin/neural-ice-hostname-init.sh \
                /usr/local/bin/neural-ice-dhcp-retry.sh \
                /usr/local/bin/neural-ice-payload-apply.sh; \

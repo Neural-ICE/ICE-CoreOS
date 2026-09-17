@@ -1,0 +1,40 @@
+[connection]
+# Management port: the built-in copper NIC, selected by DEVICE, not by name.
+# DHCP -> guarantees admin/SSH access even if the ConnectX-7 is down/bricked.
+#
+# No `interface-name=` here on purpose (ICE-CoreOS issue 215): pinned to
+# `enP7s7`, the GX10's port, this profile matched nothing on a QEMU virt guest
+# (`enp0s1`), so the KVM bench had no network, no seed and no sshd at first
+# boot. The [match] block below is the same rule /usr/local/bin/neural-ice-mgmt-port
+# applies to /sys/class/net (hostname, avahi pin, link-local fallback): keep the
+# two in step, the linklocal test pins both.
+id=mgmt-onboard
+type=ethernet
+autoconnect=true
+autoconnect-priority=100
+
+[match]
+# Wired, predictable names (GX10: enP7s7; QEMU virt: enp0s1; classic: eth0).
+interface-name=en*;eth*
+# `!x` is a mandatory negative match (nm-settings-nmcli(5), match.interface-name).
+# The ConnectX-7 fabric ports carry their own pinned profiles (cx7-port0/1) and
+# must never take the management role, cable or not.
+driver=!mlx5_core
+# A USB dongle is never the management port: the hostname derives from this
+# port's MAC and must not follow whatever is plugged into the box. udev ID_PATH
+# of a USB NIC reads `pci-…-usb-…`; of a built-in PCI NIC `pci-<domain>:<bus>:…`.
+path=!*-usb-*
+
+[ethernet]
+
+[ipv4]
+method=auto
+
+[ipv6]
+# No IPv6 on the appliance (Owner decision, 2026-09-11). With method=auto on a
+# LAN without an IPv6 router, NetworkManager held the interface in ip-check for
+# 51 s (router solicitation, then a 45 s DHCPv6 transaction) before declaring
+# startup complete -- 0.1 s after nm-online's 60 s timeout, so
+# NetworkManager-wait-online failed and every unit After=network-online.target
+# waited a minute for nothing (lab GX10, first boot C27, 2026-09-10).
+method=disabled

@@ -38,19 +38,20 @@ if [[ -n "${NI_INSTALLER_GENERATOR_TESTING:-}" ]]; then
   # The two inputs of the mDNS branch are required only where that branch is
   # reached: a suite that never seals a `.local` mirror need not provide them,
   # and one that does and forgets them fails THERE, loudly, with avahi masked.
-  readonly NM_CONN_DIR="${NI_INSTALLER_GENERATOR_TEST_NM_CONN_DIR:-}"
+  readonly MGMT_PORT_TOOL="${NI_INSTALLER_GENERATOR_TEST_MGMT_PORT_TOOL:-}"
   readonly MDNS_RUN_DIR="${NI_INSTALLER_GENERATOR_TEST_MDNS_RUN_DIR:-}"
 else
   readonly CMDLINE_FILE=/proc/cmdline
   # Staged by image/Containerfile.installer next to the access policy it is a
   # sibling of: one immutable /usr, one definition of the sealed grammar.
   readonly GRAMMAR_FILE=/usr/lib/neural-ice/sealed-cmdline-grammar.sh
-  # The appliance's NetworkManager profiles, inherited by the installer image
-  # from its base and served from the dm-verity root at generator time (the
-  # overlay's tmpfs upper is still empty: nothing has run yet that could write
-  # to it). `mgmt-*.nmconnection` names the management port, by the same rule
-  # image/mdns/neural-ice-hostname-init.sh pins the appliance's own avahi to.
-  readonly NM_CONN_DIR=/etc/NetworkManager/system-connections
+  # The appliance's management-port rule, inherited by the installer image from
+  # its base and served from the dm-verity root (image/mdns/neural-ice-mgmt-port.sh:
+  # first built-in wired port, never a USB dongle nor a ConnectX port — the same
+  # rule the appliance's own avahi is pinned with). A generator runs before udev
+  # has named a single NIC, so the port is resolved when the resolver STARTS,
+  # by this tool as ExecStartPre=, not here.
+  readonly MGMT_PORT_TOOL=/usr/local/bin/neural-ice-mgmt-port
   # Where the resolve-only avahi configuration is generated. Under /run, like
   # everything else this generator writes; a directory of its own because
   # /run/neural-ice-installer is created 0700 by the installer for material a
@@ -399,30 +400,17 @@ mirror_host_is_mdns_name() { # $1=host[:port] -> 0 when the host is a `.local` m
   [[ "$host" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+local$ ]]
 }
 
-management_interfaces() { # -> comma-joined interface names of mgmt-*.nmconnection, or 1
-  local profile name
-  local -a names=()
-  shopt -s nullglob
-  for profile in "$NM_CONN_DIR"/mgmt-*.nmconnection; do
-    name="$(sed -n 's/^interface-name=//p' "$profile" | head -1)"
-    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || continue
-    names+=("$name")
-  done
-  shopt -u nullglob
-  (( ${#names[@]} > 0 )) || return 1
-  local IFS=,
-  printf '%s' "${names[*]}"
-}
-
 request_mirror_mdns_resolution() { # $1=sealed mirror host[:port]
-  local mirror=$1 interfaces
-  [[ -n "$NM_CONN_DIR" && -n "$MDNS_RUN_DIR" ]] \
+  local mirror=$1
+  [[ -n "$MGMT_PORT_TOOL" && -n "$MDNS_RUN_DIR" ]] \
     || die "the sealed mirror ${mirror} is an mDNS name but the resolver inputs are unset (test overrides missing); avahi stays masked"
-  interfaces="$(management_interfaces)" \
-    || die "the sealed mirror ${mirror} is an mDNS name but no mgmt-*.nmconnection profile names a management port to resolve it on; avahi stays masked"
+  [[ -f "$MGMT_PORT_TOOL" && -x "$MGMT_PORT_TOOL" ]] \
+    || die "the sealed mirror ${mirror} is an mDNS name but ${MGMT_PORT_TOOL} (the management-port rule) is not an executable on this medium; avahi stays masked"
   install -d -m 0755 "$MDNS_RUN_DIR"
   # Every value below is a directive avahi-daemon.conf(5) documents. The daemon
   # reads this file as root before dropping to `avahi`; it holds no secret.
+  # `allow-interfaces=` is deliberately ABSENT here: it is inserted under
+  # [server] by the ExecStartPre= below, once udev has named the ports.
   cat > "$MDNS_RUN_DIR/avahi-daemon.conf" <<CONF
 # Neural ICE installer medium, generated into /run only.
 #
@@ -434,7 +422,6 @@ request_mirror_mdns_resolution() { # $1=sealed mirror host[:port]
 use-ipv4=yes
 use-ipv6=no
 enable-dbus=no
-allow-interfaces=${interfaces}
 disallow-other-stacks=no
 ratelimit-interval-usec=1000000
 ratelimit-burst=1000
@@ -472,9 +459,14 @@ CONF
 # ExecStart= is reset and pointed at the resolve-only configuration this
 # generator wrote; Type=dbus is replaced because that configuration turns the
 # D-Bus interface off (avahi-resolve uses the unix socket, not the bus).
+# ExecStartPre= pins that configuration to the management port by the
+# appliance's own rule, at start time — a generator runs before udev has named
+# any NIC. No built-in wired port: the pre-start fails, avahi does not start,
+# and the installer produces its named refusal (mirror-name-unresolvable).
 [Service]
 Type=simple
 BusName=
+ExecStartPre=${MGMT_PORT_TOOL} --pin-avahi ${MDNS_RUN_DIR}/avahi-daemon.conf
 ExecStart=
 ExecStart=/usr/sbin/avahi-daemon --syslog --file=${MDNS_RUN_DIR}/avahi-daemon.conf
 ExecReload=

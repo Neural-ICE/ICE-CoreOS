@@ -4,16 +4,20 @@
 #
 # Sets the persistent system hostname to `ni-coreos-<XXXX>`, where <XXXX> is the
 # last two octets (4 lowercase hex chars) of the RJ45 management NIC's MAC. The
-# management NIC is chosen DETERMINISTICALLY from its NetworkManager connection
-# profile (interface-name in mgmt-*.nmconnection), never from kernel enumeration
-# order, so a box with several NICs always names itself from the same physical
-# port across reboots and reinstalls.
+# management NIC is chosen DETERMINISTICALLY by neural-ice-mgmt-port (sourced
+# below): the first built-in wired port by name, never a USB dongle, never a
+# ConnectX port — the same rule the shipped NetworkManager profile
+# (mgmt-onboard.nmconnection, [match]) applies — so a box with several NICs
+# always names itself from the same physical port across reboots and reinstalls,
+# and the GX10 (enP7s7) and the KVM bench (enp0s1) both name themselves.
 #
 # It also (re)publishes the short hostname to /run/neural-ice/mdns-hostname — the
 # runtime contract the console TUI reads to derive the access URL
-# (https://<hostname>.local). /run is tmpfs, so this runs on EVERY boot (ordered
-# before avahi-daemon) to repopulate the file; the hostnamectl call is a no-op
-# once the static hostname already matches.
+# (https://<hostname>.local) — and the selected port to
+# /run/neural-ice/mgmt-interface, which the tty1 status screen reads. /run is
+# tmpfs, so this runs on EVERY boot (ordered before avahi-daemon) to repopulate
+# the files; the hostnamectl call is a no-op once the static hostname already
+# matches.
 #
 # mDNS `.local` publication is performed by avahi-daemon, which follows the
 # system hostname set here. Any SERVICE advertisement is an application
@@ -30,6 +34,7 @@ readonly NM_CONN_DIR="${NEURAL_ICE_NM_CONN_DIR:-/etc/NetworkManager/system-conne
 readonly SYS_NET="${NEURAL_ICE_SYS_NET:-/sys/class/net}"
 readonly RUN_DIR="${NEURAL_ICE_RUN_DIR:-/run/neural-ice}"
 readonly MDNS_FILE="${RUN_DIR}/mdns-hostname"
+readonly MGMT_IFACE_FILE="${RUN_DIR}/mgmt-interface"
 readonly AVAHI_CONF="${NEURAL_ICE_AVAHI_CONF:-/etc/avahi/avahi-daemon.conf}"
 readonly ETC_HOSTNAME="${NEURAL_ICE_ETC_HOSTNAME:-/etc/hostname}"
 readonly ETC_HOSTS="${NEURAL_ICE_ETC_HOSTS:-/etc/hosts}"
@@ -38,19 +43,31 @@ readonly LL_NET="169.254"
 
 log() { echo "neural-ice-hostname-init: $*"; }
 
+# The management-port rule and the avahi pin live in ONE file, shared with the
+# installer medium's resolve-only avahi (ExecStartPre=) — see that file's header.
+# Sourcing exposes mgmt_interface and pin_avahi_interface and changes no shell
+# option here; NEURAL_ICE_MGMT_PORT_LIB is a test seam, the default is the path
+# image/Containerfile.bootc installs the script at.
+readonly MGMT_PORT_LIB="${NEURAL_ICE_MGMT_PORT_LIB:-/usr/local/bin/neural-ice-mgmt-port}"
+if [ ! -r "$MGMT_PORT_LIB" ]; then
+    log "ERROR: cannot read the management-port rule at $MGMT_PORT_LIB"
+    exit 1
+fi
+# shellcheck source=image/mdns/neural-ice-mgmt-port.sh
+. "$MGMT_PORT_LIB"
+
 # Pin avahi to the management NIC so mDNS advertises ONLY that port's routable
-# LAN address. Without this, avahi publishes every interface — the podman
-# bridges (podman1 -> 10.89.0.1), the per-container veth link-locals, and
-# loopback — so `<hostname>.local` resolves to a SET of addresses and a client
-# routinely picks an unreachable one (the .72 bring-up hit exactly this: the mac
-# could not reach the appliance until avahi was pinned). We run before
-# avahi-daemon, so setting the config here needs no restart. Idempotent.
+# LAN address (why: see pin_avahi_interface in neural-ice-mgmt-port). We run
+# before avahi-daemon, so setting the config here needs no restart. Idempotent.
 configure_avahi_interface() {
     local iface="$1"
     [ -f "$AVAHI_CONF" ] || { log "WARN: $AVAHI_CONF missing, skipping mDNS interface pin"; return 0; }
-    sed -i -E '/^\[server\]/,/^\[/ { /^allow-interfaces=/d }' "$AVAHI_CONF"
-    sed -i -E "/^\[server\]/a allow-interfaces=${iface}" "$AVAHI_CONF"
-    log "pinned avahi mDNS to management interface: $iface"
+    if pin_avahi_interface "$AVAHI_CONF" "$iface"; then
+        log "pinned avahi mDNS to management interface: $iface"
+    else
+        log "WARN: could not pin avahi to $iface in $AVAHI_CONF"
+        return 1
+    fi
 }
 
 # IPv4 link-local address DERIVED from the same two MAC octets as the hostname:
@@ -196,32 +213,6 @@ reload_networkmanager() {
     fi
 }
 
-# Deterministically resolve the RJ45 management interface name.
-#   1. The interface-name pinned in the management NM profile (mgmt-*.nmconnection)
-#      — the canonical source of truth for "which physical port is management".
-#   2. Fallback for a vanilla install without that profile: the on-board 1GbE
-#      port matches enP<d>s<d> and, unlike the ConnectX QSFP ports (enp1s0f0np0,
-#      ...), carries no PCIe function suffix (fN).
-mgmt_interface() {
-    local conn iface name cand
-    for conn in "${NM_CONN_DIR}"/mgmt-*.nmconnection; do
-        [ -e "$conn" ] || continue
-        iface="$(sed -n 's/^interface-name=//p' "$conn" | head -1)"
-        if [ -n "$iface" ]; then
-            echo "$iface"
-            return 0
-        fi
-    done
-    for cand in "${SYS_NET}"/enP*s*; do
-        [ -e "$cand" ] || continue
-        name="$(basename "$cand")"
-        [[ "$name" =~ f[0-9] ]] && continue
-        echo "$name"
-        return 0
-    done
-    return 1
-}
-
 # Last two octets (4 lowercase hex chars) of the interface MAC.
 mac_suffix() {
     local addr="${SYS_NET}/$1/address" mac
@@ -234,21 +225,28 @@ mac_suffix() {
 main() {
     local iface suffix desired current
 
-    iface="$(mgmt_interface)" || { log "ERROR: no management interface found"; exit 1; }
+    iface="$(mgmt_interface)" \
+        || { log "ERROR: no management interface found (no built-in wired port in ${SYS_NET}: USB dongles and ConnectX ports never qualify)"; exit 1; }
     suffix="$(mac_suffix "$iface")" || { log "ERROR: cannot read MAC for $iface"; exit 1; }
     desired="${PREFIX}-${suffix}"
     log "management interface=$iface mac-suffix=$suffix hostname=$desired"
 
-    # 1) Runtime contract for the console TUI + the avahi NIC pin FIRST. These
-    #    must land on EVERY boot even if hostname persistence below hiccups —
-    #    on the first enforcing boot of the .72 GB10 (2026-07-13) a failed
-    #    hostnamectl aborted the script mid-way and the TUI showed a bare IP
-    #    while the avahi pin was skipped. Publish, then persist.
+    # 1) Runtime contracts (the console TUI reads the hostname, the tty1 status
+    #    screen reads the port) + the avahi NIC pin FIRST. These must land on
+    #    EVERY boot even if hostname persistence below hiccups — on the first
+    #    enforcing boot of the .72 GB10 (2026-07-13) a failed hostnamectl
+    #    aborted the script mid-way and the TUI showed a bare IP while the
+    #    avahi pin was skipped. Publish, then persist.
     install -d -m 0755 "$RUN_DIR"
     printf '%s\n' "$desired" > "$MDNS_FILE"
     chmod 0644 "$MDNS_FILE"
     log "published short hostname to $MDNS_FILE"
-    configure_avahi_interface "$iface"
+    printf '%s\n' "$iface" > "$MGMT_IFACE_FILE"
+    chmod 0644 "$MGMT_IFACE_FILE"
+    log "published management interface to $MGMT_IFACE_FILE"
+    # Fatal, as it always was: an unpinned avahi publishes every interface and
+    # `<hostname>.local` becomes unusable — a failed unit (NI-E05) says so.
+    configure_avahi_interface "$iface" || { log "ERROR: avahi not pinned to $iface"; exit 1; }
 
     # Reachability on a DHCP-less link. Deliberately non-fatal: on the first
     # enforcing boot of the .72 (2026-07-13) a failing step aborted this script

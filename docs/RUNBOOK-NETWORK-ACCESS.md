@@ -18,12 +18,39 @@ NetworkManager carries two profiles on that one port:
 
 | profile | priority | IPv4 | when it activates |
 |---|---|---|---|
-| `mgmt-<iface>` | 100 | `auto` (DHCP) | whenever a DHCP server answers |
+| `mgmt-onboard` | 100 | `auto` (DHCP) | whenever a DHCP server answers |
 | `fallback-<iface>` | 10 | `manual`, `169.254.x.y/16` | only when the DHCP profile cannot |
 
 The fallback profile is **rendered at every boot** by
 `neural-ice-hostname-init.sh`, before NetworkManager starts. The management
 profile is never modified.
+
+### Which port is "the management port"
+
+By **device, never by name** (ICE-CoreOS issue 215: the profile used to pin
+`interface-name=enP7s7`, the GX10's port, and a QEMU `virt` guest — `enp0s1` —
+had no network, no seed and no sshd at first boot). One rule, stated twice in
+two vocabularies that the linklocal test keeps in step:
+
+| rule | `mgmt-onboard.nmconnection` (`[match]`) | `neural-ice-mgmt-port` (`/sys/class/net`) |
+|---|---|---|
+| a wired port with a predictable name | `interface-name=en*;eth*` | name `en*` or `eth*` |
+| a real device | (NetworkManager only matches real devices) | `device/` link present |
+| **never a USB dongle** | `path=!*-usb-*` (udev `ID_PATH`) | device path has no `/usbN/` element |
+| **never a ConnectX port** | `driver=!mlx5_core` | `device/driver` is not `mlx5_core` |
+| tie-break | NetworkManager's own choice among matching devices | first name in C-locale order |
+
+GX10: `enP7s7` (r8169). KVM bench: `enp0s1` (virtio_net). Both name themselves.
+A USB dongle never takes the role, present or alone: the hostname derives from
+this port's MAC and must not follow whatever is plugged into the box (a box with
+only a dongle fails `neural-ice-hostname-init` loudly, NI-E05). The shipped
+hardware leaves exactly one candidate; a second built-in port would be a new
+hardware target to declare in the rule, not to guess at boot.
+
+`neural-ice-hostname-init` publishes the selected port to
+`/run/neural-ice/mgmt-interface` (read by the tty1 status screen); the installer
+medium pins its resolve-only avahi with the same tool
+(`neural-ice-mgmt-port --pin-avahi`, as `ExecStartPre=`).
 
 ### Why a separate profile and not a setting
 

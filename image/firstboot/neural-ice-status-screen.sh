@@ -31,7 +31,7 @@
 #   /usr/lib/bootc/bound-images.d/            image inventory (bound images)
 #   /usr/share/containers/systemd/            image inventory (Quadlets)
 #   /etc/containers/systemd/                  image inventory (Quadlets)
-#   /etc/NetworkManager/system-connections/   mgmt-*.nmconnection, interface-name= ONLY
+#   /run/neural-ice/mgmt-interface            management port, published by hostname-init
 #   /etc/neural-ice/ota.conf                  device_channel= fallback
 #   /var/lib/neural-ice/data/release/CHANNEL  device channel
 #   /var/lib/neural-ice/data/seed-store/current/overlay-images/images.json
@@ -192,26 +192,23 @@ dmi() { sanitize "$(read_first_line "$(path /sys/class/dmi/id/"$1")")" "${2:-40}
 hostname_now() { sanitize "$(read_first_line "$(path /proc/sys/kernel/hostname)")" 40; }
 
 # ---------------------------------------------------------------------------
-# Network: the management NIC, resolved exactly like neural-ice-hostname-init
-# (the interface-name pinned in mgmt-*.nmconnection, else the on-board enP<d>s<d>
-# port without a PCIe function suffix); receive rate from rx_bytes deltas.
+# Network: the management NIC as neural-ice-hostname-init selected it (one rule,
+# in /usr/local/bin/neural-ice-mgmt-port: first built-in wired port, never a USB
+# dongle nor a ConnectX port), read from the runtime contract it publishes on
+# every boot. This screen does not re-derive the port and reads no NetworkManager
+# profile: an empty answer means hostname-init has not run yet, or failed —
+# which the core-services line and NI-E05 already say. Receive rate from
+# rx_bytes deltas.
 # ---------------------------------------------------------------------------
 SYS_NET=$(path /sys/class/net)
-NM_CONN_DIR=$(path /etc/NetworkManager/system-connections)
+MGMT_IFACE_FILE=$(path /run/neural-ice/mgmt-interface)
 mgmt_interface() {
-  local conn iface cand name
-  for conn in "$NM_CONN_DIR"/mgmt-*.nmconnection; do
-    [[ -e $conn ]] || continue
-    iface=$(sed -n 's/^interface-name=//p' "$conn" | head -1)
-    if [[ -n $iface ]]; then printf '%s' "$iface"; return 0; fi
-  done
-  for cand in "$SYS_NET"/enP*s*; do
-    [[ -e $cand ]] || continue
-    name=${cand##*/}
-    [[ $name =~ f[0-9] ]] && continue
-    printf '%s' "$name"; return 0
-  done
-  return 1
+  local iface
+  iface=$(sanitize "$(read_first_line "$MGMT_IFACE_FILE")" 15)
+  # A kernel interface name, nothing that could walk a path or reach `ip` as an
+  # option; and it must exist, or the contract is stale.
+  [[ $iface =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$ && -e $SYS_NET/$iface ]] || return 1
+  printf '%s' "$iface"
 }
 # Sum of rx_bytes over every physical (non-loopback, non-virtual) interface;
 # the management NIC first when it is known. Pull traffic may enter through a
@@ -477,7 +474,7 @@ while :; do
   elif unit_unknown "$UNIT_NETWORK"; then
     net_mark="wait"; net_text="probing..."
   elif [[ -z $iface ]]; then
-    net_mark="wait"; net_text="no management interface found"
+    net_mark="wait"; net_text="waiting for the management port (hostname-init)"
   else
     oper=$(iface_operstate "$iface")
     addr=$(iface_ipv4 "$iface")
