@@ -3848,6 +3848,23 @@ fn capture_directory(
         if entries.len() >= STATUS_MAX_FILES {
             return Err("persistent OTA state exceeds its file-count bound".into());
         }
+        // Two paths under the state root are NOT owner-sealed state and must not
+        // be attested: `fetch` (the downloaded channel record + BOM, separately
+        // signature-verified on use) and the `data-snapshot` sub-directory of a
+        // transaction (the pre-OTA data-DB backup, large by design). Attesting
+        // them made authenticated-ota-status refuse on mode/size and gated the
+        // licence plane and model-fetch (appliance .67, 0.61.0 -> 0.61.4 OTA,
+        // 2026-09-17). The transaction's own state (state.json, boms) IS read by
+        // the status and stays walked.
+        if (depth == 0 && name.to_str() == Some("fetch"))
+            || (name.to_str() == Some("data-snapshot")
+                && matches!(
+                    relative.to_str(),
+                    Some("transaction") | Some("transaction.previous")
+                ))
+        {
+            continue;
+        }
         let path = relative.join(&name);
         match open_status_directory_at(directory, &name) {
             Ok(child) => {
@@ -5304,6 +5321,62 @@ mod tests {
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
         assert_eq!(std::fs::read(state.join("stable")).unwrap(), b"stable\n");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "test-path-overrides")]
+    #[test]
+    fn transient_ota_working_dirs_are_excluded_from_status_capture() {
+        // Regression: `fetch/` (downloaded channel record + BOM, 0644) and a
+        // transaction's `data-snapshot/` (pre-OTA data-DB backup, > 1 MiB) live
+        // under the state root but are NOT owner-sealed state. Attesting them
+        // made authenticated-ota-status refuse on mode/size and gated the licence
+        // plane and model-fetch (appliance .67, 0.61.0 -> 0.61.4 OTA,
+        // 2026-09-17). The transaction's own state stays attested.
+        let root = std::env::temp_dir().join(format!("ni-status-transient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Sealed-state files (0600) that MUST still be captured.
+        write_file(&root.join("applied.json"), b"{}\n");
+        let txn = root.join("transaction");
+        std::fs::create_dir(&txn).unwrap();
+        std::fs::set_permissions(&txn, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_file(&txn.join("state.json"), b"{}\n");
+        // A `data-snapshot/` under the transaction with an oversized 0644 blob.
+        let snap = txn.join("data-snapshot");
+        std::fs::create_dir(&snap).unwrap();
+        std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let big = snap.join("1");
+        std::fs::write(&big, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A `fetch/` cache with a 0644 file.
+        let fetch = root.join("fetch");
+        std::fs::create_dir(&fetch).unwrap();
+        std::fs::set_permissions(&fetch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let f = fetch.join("bundle.bom.json");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let entries = capture_persistent_tree(&root, None).unwrap().unwrap();
+        let has = |p: &str| entries.keys().any(|k| k == std::path::Path::new(p));
+        assert!(has("applied.json"), "sealed file not captured");
+        assert!(
+            has("transaction/state.json"),
+            "transaction state not captured"
+        );
+        assert!(
+            !entries.keys().any(|k| k.starts_with("fetch")),
+            "fetch/ leaked: {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !entries
+                .keys()
+                .any(|k| k.starts_with("transaction/data-snapshot")),
+            "data-snapshot leaked: {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
