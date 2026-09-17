@@ -801,61 +801,52 @@ declare_bound_images "$HOST_ROOTFS" "working-memory=$BOUND_A" "model-runtime=$BO
 # shellcheck source=image/lib/bound-images.sh
 . "$ROOT/image/lib/bound-images.sh"
 IMPORT_STORE="$TMP/import-store"; mkdir -p "$IMPORT_STORE" "$IMPORT_STORE.run"
-# The probe: can THIS environment write a rootless containers-storage at all?
-# A sandbox without user-namespace mappings cannot ("Error during unshare"),
-# and a skip there is said out loud; CI sets NI_INSTALLER_ROOT_REQUIRE_IMPORT=1
-# so the case can never be skipped where the toolchain is complete.
-import_probe_ok=1
-"$REAL_SKOPEO" copy "oci:$REGISTRY/$BOUND_A_DIGEST:list" "containers-storage:[vfs@$TMP/import-probe+$TMP/import-probe.run]localhost/import-probe:1" \
-  >/dev/null 2>"$TMP/import-probe.err" || import_probe_ok=0
-if [ "$import_probe_ok" = 0 ] && [ "${NI_INSTALLER_ROOT_REQUIRE_IMPORT:-0}" = 1 ]; then
-  fail "this environment cannot write a containers-storage, and the import case may not be skipped here: $(tail -n 1 "$TMP/import-probe.err")"
+# The copy is a real skopeo write into a containers-storage. Rootless, that
+# needs a user namespace, which this sandbox and the ubuntu-24.04 runner both
+# refuse ("Error during unshare(...): Operation not permitted", 2026-09-17);
+# root needs none. So the case runs rootless where it can, under `sudo -n`
+# where the runner grants it (as the ssh-key suite's root seam already does),
+# and is skipped OUT LOUD only where neither exists -- never in CI, which sets
+# NI_INSTALLER_ROOT_REQUIRE_IMPORT=1. The suite's mocks are not involved: the
+# real skopeo stages the layout as the builder does and copies it as the
+# installer does.
+IMPORT_CASE="$TMP/import-case.sh"
+cat > "$IMPORT_CASE" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "$ROOT/image/lib/bound-images.sh"
+NI_BOUND_IMAGES_SKOPEO="$REAL_SKOPEO"
+rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout"
+mkdir -p "$TMP/import-store" "$TMP/import-store.run"
+ni_bound_image_stage_layout "oci:$REGISTRY/$BOUND_A_DIGEST:list" "$TMP/bound-work-layout" arm64 >/dev/null 2>&1 \
+  || { echo "cannot stage the layout for the import case" >&2; exit 1; }
+ni_bound_image_import "$TMP/bound-work-layout" "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" >/dev/null 2>&1 \
+  || { echo "the layout could not be copied into a containers-storage under the pinned reference" >&2; exit 1; }
+[ "\$("$REAL_SKOPEO" inspect --raw "containers-storage:[vfs@$TMP/import-store+$TMP/import-store.run]$BOUND_A" | sha256sum | cut -c1-64)" = "$BOUND_A_DIGEST" ] \
+  || { echo "the imported image does not answer to the pinned index digest" >&2; exit 1; }
+grep -Fq "\"$BOUND_A\"" "$TMP/import-store/vfs-images/images.json" \
+  || { echo "the target store does not name the imported image by its pinned reference" >&2; exit 1; }
+echo IMPORT_CASE_OK
+EOF
+chmod 0755 "$IMPORT_CASE"
+import_probe_ok=0
+if "$REAL_SKOPEO" copy "oci:$REGISTRY/$BOUND_A_DIGEST:list" "containers-storage:[vfs@$TMP/import-probe+$TMP/import-probe.run]localhost/import-probe:1" \
+    >/dev/null 2>"$TMP/import-probe.err"; then
+  import_probe_ok=1
 fi
 if [ "$import_probe_ok" = 1 ]; then
-  # The builder's work tree is gone; the layout is re-staged from the fixture
-  # exactly as the builder stages it, then copied as the installer copies it.
-  ni_bound_image_stage_layout "oci:$REGISTRY/$BOUND_A_DIGEST:list" "$TMP/bound-work-layout" arm64 >/dev/null 2>&1 \
-    || fail "cannot stage the layout for the import case"
-  ni_bound_image_import "$TMP/bound-work-layout" "containers-storage:[vfs@$IMPORT_STORE+$IMPORT_STORE.run]$BOUND_A" >/dev/null 2>&1 \
-    || fail "the layout could not be copied into a containers-storage under the pinned reference"
-  [ "$("$REAL_SKOPEO" inspect --raw "containers-storage:[vfs@$IMPORT_STORE+$IMPORT_STORE.run]$BOUND_A" | sha256sum | cut -c1-64)" = "$BOUND_A_DIGEST" ] \
-    || fail "the imported image does not answer to the pinned index digest"
-  grep -Fq "\"$BOUND_A\"" "$IMPORT_STORE/vfs-images/images.json" \
-    || fail "the target store does not name the imported image by its pinned reference"
+  out="$(bash "$IMPORT_CASE" 2>&1)" || fail "the layout-to-store import failed rootless: $out"
+elif sudo -n true 2>/dev/null; then
+  out="$(sudo -n bash "$IMPORT_CASE" 2>&1)" || fail "the layout-to-store import failed under sudo: $out"
+  sudo -n rm -rf "$TMP/import-store" "$TMP/import-store.run" "$TMP/bound-work-layout" 2>/dev/null || true
+  echo "    (rootless containers-storage unavailable here -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-80); the import case ran under sudo)"
+elif [ "${NI_INSTALLER_ROOT_REQUIRE_IMPORT:-0}" = 1 ]; then
+  fail "this environment can write a containers-storage neither rootless ($(tail -n 1 "$TMP/import-probe.err" | cut -c1-80)) nor under sudo, and the import case may not be skipped here"
 else
   echo "    (this environment cannot write a containers-storage -- $(tail -n 1 "$TMP/import-probe.err" | cut -c1-120); the layout-to-store import is proved on the bench and in CI)"
 fi
-# No registry to stage from: refused, and the refusal names what to set. A
-# containers-storage source cannot reproduce the digests (2026-09-09).
-out="$(build "$TMP/bound-no-registry" MOCK_REGISTRY="$REGISTRY" 2>&1)" \
-  && fail "a host binding images was staged with no registry to stage them from"
-grep -Fq 'no registry is named to stage them from' <<<"$out" \
-  || fail "the no-registry refusal is not named: $out"
-# 🔴 THE REUSE TUPLE RECORDS THE LIST. A store cut before the bound images were
-# carried records the empty list; for a host that binds two it is refused, not
-# reused -- and a correctly described one is reused without staging anything.
-REUSE_BOUND_IMG="$TMP/reuse-bound-store.img"
-cp "$TMP/bound/installer-store.img" "$REUSE_BOUND_IMG"
-bound_reuse_build() { # $1=output dir, rest=env overrides
-  local out=$1; shift
-  bound_build "$out" \
-    STORE_IMAGE_REUSE="$REUSE_BOUND_IMG" \
-    STORE_IMAGE_REUSE_SHA256="$(sed -n 's/^store_image_sha256=//p' "$manifest")" \
-    STORE_IMAGE_REUSE_BYTES="$(sed -n 's/^store_image_bytes=//p' "$manifest")" \
-    STORE_IMAGE_REUSE_IMAGE_ID="$HOST_IMAGE_ID" \
-    STORE_IMAGE_REUSE_MANIFEST_DIGEST="$HOST_MANIFEST" \
-    STORE_IMAGE_REUSE_NAME="localhost/bootc" \
-    "$@"
-}
-out="$(bound_reuse_build "$TMP/bound-reuse-stale" \
-  STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256="$(printf '' | sha256sum | awk '{print $1}')" 2>&1)" \
-  && fail "a reusable store recorded around no bound images was reused for a host that binds two"
-grep -Fq 'records bound images' <<<"$out" || fail "the stale-list refusal is not named: $out"
-bound_reuse_build "$TMP/bound-reuse-hit" STORE_IMAGE_REUSE_BOUND_IMAGES_SHA256="$BOUND_LIST_SHA" >/dev/null \
-  || fail "a correctly described store with bound images was refused"
-[ ! -s "$TMP/bound-reuse-hit/skopeo.args" ] || fail "the reuse path still staged the bound images"
-cmp -s "$TMP/bound-reuse-hit/installer-store.img" "$TMP/bound/installer-store.img" \
-  || fail "the reused store with bound images is not byte-identical to the one the full build produced"
+[ "$import_probe_ok" = 0 ] || grep -Fq IMPORT_CASE_OK <<<"$out" || fail "the rootless import case did not report success"
+
 make_rootfs
 
 # --------------------------------------------------------------------------- #

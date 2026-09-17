@@ -117,6 +117,7 @@ jobs:
             image/build-preloaded.sh \
             image/lib/installer-ssh-key.sh \
             image/lib/access-policy.sh \
+            image/lib/bound-images.sh \
             image/lib/hardware-identity.sh \
             image/lib/installer-payload.sh \
             image/lib/installer-trust.sh \
@@ -163,6 +164,7 @@ jobs:
             image/build-preloaded.sh \
             image/lib/installer-ssh-key.sh \
             image/lib/access-policy.sh \
+            image/lib/bound-images.sh \
             image/lib/hardware-identity.sh \
             image/lib/installer-payload.sh \
             image/lib/installer-trust.sh \
