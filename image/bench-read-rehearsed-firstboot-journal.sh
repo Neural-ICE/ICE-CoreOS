@@ -51,7 +51,10 @@ done
 medium=$work_dir/medium.qcow2; target=$work_dir/target.qcow2
 [[ -f "$medium" ]] || die "$medium is absent: the rehearsal was not run with --medium-overlay, so no escrow exists"
 [[ -f "$target" ]] || die "$target is absent"
-! pgrep -f "[q]emu-system-aarch64.*$work_dir" >/dev/null || die "a QEMU guest still owns $work_dir"
+# Anchored to the guest's own argv: an unanchored pattern also matched the
+# CALLER when it was a `ssh ... bash -c` line that named both the emulator and
+# the work directory (measured 2026-09-17), and refused with no guest running.
+! pgrep -f "^qemu-system-aarch64 .*$work_dir" >/dev/null || die "a QEMU guest still owns $work_dir"
 for tool in qemu-nbd cryptsetup lsblk findmnt journalctl partprobe shred; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
