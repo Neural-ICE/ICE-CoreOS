@@ -37,8 +37,15 @@
 
 /// The declared namespace. Lowercase, no colon — the separators add those.
 pub(crate) const NAMESPACE: &str = match option_env!("NI_NAMESPACE") {
-    Some(declared) => declared,
-    None => "neural-ice",
+    // An EMPTY value is treated as unconfigured, not as an empty namespace.
+    // Buildah injects a declared `ARG NI_NAMESPACE=` into the build env as the
+    // empty string, so `option_env!` sees `Some("")` even for an unconfigured
+    // build. The ADR-0016 contract is that an unconfigured build reproduces the
+    // sealed `neural-ice` bytes byte-for-byte; `Some("")` must therefore fall
+    // through to the default, or every signature made under `neural-ice:` (every
+    // deployed TPM, every prior-train preseal) fails to verify across an OTA.
+    Some(declared) if !declared.is_empty() => declared,
+    _ => "neural-ice",
 };
 
 /// A signature domain: `<namespace>:<purpose>` with the NUL these payloads
@@ -180,5 +187,19 @@ mod tests {
             "these declare a vocabulary the namespace does not own:\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod namespace_default_tests {
+    use super::domain;
+    #[test]
+    fn empty_namespace_falls_back_to_neural_ice() {
+        // Regression: a build where NI_NAMESPACE leaks in as "" must still
+        // produce the sealed `neural-ice:` domain, or OTA across a train that
+        // signed under `neural-ice:` refuses every preseal signature
+        // (appliance .67, 0.61.0 -> 0.61.3, 2026-09-17).
+        let d = domain("ota:delegation-snapshot:v1");
+        assert_eq!(&d, b"neural-ice:ota:delegation-snapshot:v1\0");
     }
 }
