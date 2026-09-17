@@ -2974,20 +2974,214 @@ fn reobserve_running_system(
     Ok(())
 }
 
-/// `None` when the running system IS the authenticated applied baseline;
-/// otherwise the refusal it earns on its own.
-fn baseline_divergence(
+/// Where the authenticated running baseline comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BaselineSource {
+    /// The sealed preseal receipt: the installer's train, authenticated by
+    /// the signed set, release authorization and installer authorization.
+    Preseal,
+    /// A train the transaction engine committed after a passed health
+    /// window: `applied.json` + `applied.bom.json`, newer than the receipt.
+    Applied,
+}
+
+impl BaselineSource {
+    fn name(self) -> &'static str {
+        match self {
+            BaselineSource::Preseal => "preseal",
+            BaselineSource::Applied => "applied",
+        }
+    }
+}
+
+/// The authenticated baseline the running system is bound to: the LATEST of
+/// the preseal receipt and the committed applied state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunningBaseline {
+    source: BaselineSource,
+    bundle_seq: u64,
+    os_ref: String,
+    /// The per-arch OSTree manifest digest, known for the preseal through the
+    /// signed installer authorization. A committed BOM names its image by the
+    /// index digest alone, so the applied baseline has none to compare.
+    manifest_digest: Option<String>,
+    seed_ref: String,
+}
+
+impl RunningBaseline {
+    fn preseal(value: &crate::preseal::VerifiedPreseal) -> Self {
+        RunningBaseline {
+            source: BaselineSource::Preseal,
+            bundle_seq: value.bundle_seq,
+            os_ref: value.target_os_ref.clone(),
+            manifest_digest: Some(value.target_os_manifest_digest.clone()),
+            seed_ref: value.seed_ref.clone(),
+        }
+    }
+}
+
+const APPLIED_STATE_MAX_BYTES: usize = 64 * 1024;
+const APPLIED_BOM_MAX_BYTES: usize = 1024 * 1024;
+
+/// The applied state as `bootstrap` and `commit` write it, read from the
+/// persistent snapshot without the store's directory-chain walk: the
+/// snapshot's own metadata gate already ran on every entry, and this read
+/// re-checks the file itself (regular, 0600, one link, root when root).
+fn read_applied_state(state_dir: &Path) -> Result<Option<crate::state::AppliedState>, String> {
+    let path = state_dir.join("applied.json");
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let bytes = read_noatime_regular(&path, 0o600, APPLIED_STATE_MAX_BYTES)
+        .map_err(|error| format!("applied state is unreadable: {}", error.0))?;
+    let state: crate::state::AppliedState = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("applied state is malformed: {error}"))?;
+    Ok(Some(state))
+}
+
+/// THE BASELINE MOVES WITH THE COMMIT.
+///
+/// Before this, the running system was compared to the PRESEAL baseline
+/// only — the installer's train, forever. An OTA that reached `completed`
+/// committed `applied.json` (+ `applied.bom.json`, the engine's copy of the
+/// committed BOM) and archived its transaction; the NEXT reboot therefore
+/// had no transaction window, a booted deployment that was the committed
+/// train, and a preseal that named the installed one: "booted deployment
+/// differs from authenticated preseal baseline", licence gate closed, on
+/// every OTA'd appliance at its second boot (ICE-Fabric PR 667 report, gap
+/// E1). The same shape hits `previous_health` after a rollback onto a
+/// deployment that was itself the product of an earlier OTA.
+///
+/// The authenticated baseline is therefore the latest of the two:
+///
+/// * no applied state, or an applied state at the receipt's sequence naming
+///   the receipt's BOM (what `bootstrap-from-preseal` and a hand `bootstrap`
+///   of the sealed BOM write): the preseal, exactly as before, manifest
+///   digest included;
+/// * an applied state ABOVE the receipt's sequence: the committed BOM beside
+///   it, hashed against `applied.bom_sha256`, its OS reference and seed
+///   reference the identity the running system must carry. The anchor this
+///   rides on is the one `commit` established: the receipt's sequence IS the
+///   owner floor sealed in the completion evidence (verified above), and the
+///   applied sequence must not sit below it;
+/// * an applied state BELOW the receipt, or at the receipt's sequence with
+///   another BOM, or a BOM copy that does not hash to the applied state, or
+///   no BOM copy at all: refused. The engine never writes those; a hand does.
+///
+/// A booted deployment that is the preseal's while the applied state names
+/// a newer train is refused: the engine's rollback exists only BEFORE the
+/// commit (`arm_rollback_once` from activating/activated/finalizing; a
+/// post-commit failure is `recovery_required`, never a rollback) and never
+/// rewrites the applied state, so that shape is an operator's
+/// `bootc rollback` beneath the committed baseline — the very thing the
+/// anti-rollback floor refuses.
+fn resolve_running_baseline(
+    state_dir: &Path,
     value: &crate::preseal::VerifiedPreseal,
-    running: &RunningSystem,
-) -> Option<String> {
-    if running.origin_ref != value.target_os_ref
-        || running.manifest != value.target_os_manifest_digest
+) -> Result<RunningBaseline, String> {
+    let Some(applied) = read_applied_state(state_dir)? else {
+        return Ok(RunningBaseline::preseal(value));
+    };
+    if !applied.is_media_independent() {
+        return Err(
+            "applied baseline was recorded by a media-era verifier (no media-independent format marker)"
+                .into(),
+        );
+    }
+    if !sha256(&applied.bom_sha256) {
+        return Err("applied state names a malformed BOM hash".into());
+    }
+    if applied.bundle_seq < value.bundle_seq {
+        return Err(format!(
+            "applied state sequence {} is below the sealed baseline floor {}",
+            applied.bundle_seq, value.bundle_seq
+        ));
+    }
+    if applied.bundle_seq == value.bundle_seq {
+        if applied.bom_sha256 != value.bom_sha256 {
+            return Err("applied state at the sealed sequence names another BOM".into());
+        }
+        return Ok(RunningBaseline::preseal(value));
+    }
+    let bom_path = state_dir.join("applied.bom.json");
+    let bytes = read_noatime_regular(&bom_path, 0o600, APPLIED_BOM_MAX_BYTES).map_err(|error| {
+        format!(
+            "committed applied state has no readable BOM beside it: {}",
+            error.0
+        )
+    })?;
+    if runner::sha256_bytes(&bytes).map_err(|error| error.0)? != applied.bom_sha256 {
+        return Err("applied BOM differs from the committed applied state".into());
+    }
+    applied_baseline_from_bom(&bytes, &applied)
+}
+
+/// The identity a committed BOM gives the running system. Every field is
+/// re-validated with the shapes `bootstrap` demands of a BOM it seeds from.
+fn applied_baseline_from_bom(
+    bytes: &[u8],
+    applied: &crate::state::AppliedState,
+) -> Result<RunningBaseline, String> {
+    let bom: crate::verify::BomCore = serde_json::from_slice(bytes)
+        .map_err(|error| format!("applied BOM is malformed: {error}"))?;
+    bom.require_media_independent()?;
+    if bom.bundle_seq != applied.bundle_seq {
+        return Err("applied BOM sequence differs from the applied state".into());
+    }
+    let hardware_target = crate::config::immutable_hardware_target().map_err(|error| error.0)?;
+    if bom.hardware_target != hardware_target {
+        return Err("applied BOM names another hardware target".into());
+    }
+    let os_base = bom
+        .appliance
+        .as_ref()
+        .and_then(|appliance| appliance.os_base.as_ref())
+        .ok_or("applied BOM lacks appliance.os_base")?;
+    let os_ref = format!("{}@{}", os_base.image, os_base.digest);
+    if !digest_pinned_os_ref(&os_ref) {
+        return Err("applied BOM OS reference is not digest-pinned".into());
+    }
+    let seed_ref = bom
+        .sources
+        .as_ref()
+        .and_then(|sources| sources.seed.as_ref())
+        .map(|seed| seed.reference.clone())
+        .ok_or("applied BOM lacks sources.seed.ref")?;
+    if !seed_revision(&seed_ref) {
+        return Err("applied BOM seed reference is malformed".into());
+    }
+    if !train_name(&bom.train) {
+        return Err("applied BOM train is malformed".into());
+    }
+    Ok(RunningBaseline {
+        source: BaselineSource::Applied,
+        bundle_seq: applied.bundle_seq,
+        os_ref,
+        manifest_digest: None,
+        seed_ref,
+    })
+}
+
+/// `None` when the running system IS the authenticated baseline; otherwise
+/// the refusal it earns on its own.
+fn baseline_divergence(baseline: &RunningBaseline, running: &RunningSystem) -> Option<String> {
+    if running.origin_ref != baseline.os_ref
+        || baseline
+            .manifest_digest
+            .as_deref()
+            .is_some_and(|expected| running.manifest != expected)
         || !running.manifest.strip_prefix("sha256:").is_some_and(sha256)
     {
-        return Some("booted deployment differs from authenticated preseal baseline".into());
+        return Some(format!(
+            "booted deployment differs from authenticated {} baseline",
+            baseline.source.name()
+        ));
     }
-    if running.payload != format!("{}\n", value.seed_ref).as_bytes() {
-        return Some("running PAYLOAD_ID differs from authenticated preseal baseline".into());
+    if running.payload != format!("{}\n", baseline.seed_ref).as_bytes() {
+        return Some(format!(
+            "running PAYLOAD_ID differs from authenticated {} baseline",
+            baseline.source.name()
+        ));
     }
     None
 }
@@ -2999,22 +3193,24 @@ fn verify_running_baseline(
     verify_running_baseline_at(state_dir, value, &running_system_paths())
 }
 
-/// Bind the running system to the authenticated applied baseline — or, when
-/// it is not that baseline, to the ONE durable OTA transaction whose health
-/// window explains the difference. `Ok(None)` is the applied baseline;
-/// `Ok(Some(_))` is the window; anything else is the refusal the divergence
-/// earned, with the reason the transaction did not explain it appended.
+/// Bind the running system to the authenticated baseline — the latest of
+/// the preseal receipt and the committed applied state — or, when it is not
+/// that baseline, to the ONE durable OTA transaction whose health window
+/// explains the difference. `Ok(None)` is the baseline; `Ok(Some(_))` is the
+/// window; anything else is the refusal the divergence earned, with the
+/// reason the transaction did not explain it appended.
 fn verify_running_baseline_at(
     state_dir: &Path,
     value: &crate::preseal::VerifiedPreseal,
     paths: &RunningSystemPaths,
 ) -> Result<Option<HeldTransaction>, String> {
+    let baseline = resolve_running_baseline(state_dir, value)?;
     let running = observe_running_system(paths)?;
-    let Some(divergence) = baseline_divergence(value, &running) else {
+    let Some(divergence) = baseline_divergence(&baseline, &running) else {
         reobserve_running_system(paths, &running)?;
         return Ok(None);
     };
-    let held = transaction_window(state_dir, value, &running, &paths.boot_id)
+    let held = transaction_window(state_dir, &baseline, &running, &paths.boot_id)
         .map_err(|why| format!("{divergence}; not a held OTA transaction window: {why}"))?;
     reobserve_running_system(paths, &running)?;
     Ok(Some(held))
@@ -3104,7 +3300,7 @@ const OTA_TRANSACTION_ARTIFACTS: [&str; 4] = [
 /// still required to be well-formed and unchanged across the read.
 fn transaction_window(
     state_dir: &Path,
-    value: &crate::preseal::VerifiedPreseal,
+    baseline: &RunningBaseline,
     running: &RunningSystem,
     boot_id_path: &Path,
 ) -> Result<HeldTransaction, String> {
@@ -3138,7 +3334,7 @@ fn transaction_window(
     let state = parse_transaction_state(&bytes)?;
     let hardware_target = crate::config::immutable_hardware_target().map_err(|error| error.0)?;
     let boot_id = current_boot_id(boot_id_path)?;
-    bind_transaction_window(&state, value, running, &hardware_target, &boot_id)
+    bind_transaction_window(&state, baseline, running, &hardware_target, &boot_id)
 }
 
 /// The engine's `secure_transaction` shapes, re-applied to the bytes on disk.
@@ -3191,7 +3387,7 @@ fn parse_transaction_state(bytes: &[u8]) -> Result<OtaTransactionState, String> 
 /// says which one an operator is looking at.
 fn bind_transaction_window(
     state: &OtaTransactionState,
-    value: &crate::preseal::VerifiedPreseal,
+    baseline: &RunningBaseline,
     running: &RunningSystem,
     hardware_target: &str,
     boot_id: &str,
@@ -3217,7 +3413,7 @@ fn bind_transaction_window(
     // The transaction must depart from THE authenticated applied baseline,
     // not from some baseline: a transaction prepared against another
     // previous identity has nothing to say about this appliance's state.
-    if state.previous_os_ref != value.target_os_ref || state.previous_seed_ref != value.seed_ref {
+    if state.previous_os_ref != baseline.os_ref || state.previous_seed_ref != baseline.seed_ref {
         return Err(
             "OTA transaction does not depart from the authenticated applied baseline".into(),
         );
@@ -6253,6 +6449,7 @@ mod tests {
             target_os_ref: image.clone(),
             target_os_manifest_digest: digest.into(),
             seed_ref: "fabric-seed-revision".into(),
+            bom_sha256: "e".repeat(64),
         };
         // No transaction under this state directory: a divergence has nothing
         // to explain it and refuses exactly as it did before the window existed.
@@ -6342,13 +6539,12 @@ mod tests {
         }
     }
 
-    fn applied_baseline(state: &serde_json::Value) -> crate::preseal::VerifiedPreseal {
-        crate::preseal::VerifiedPreseal {
+    fn applied_baseline(state: &serde_json::Value) -> RunningBaseline {
+        RunningBaseline {
+            source: BaselineSource::Preseal,
             bundle_seq: 13,
-            receipt_sha256: "c".repeat(64),
-            set_sha256: "d".repeat(64),
-            target_os_ref: state["previous_os_ref"].as_str().unwrap().to_owned(),
-            target_os_manifest_digest: format!("sha256:{}", "9".repeat(64)),
+            os_ref: state["previous_os_ref"].as_str().unwrap().to_owned(),
+            manifest_digest: Some(format!("sha256:{}", "9".repeat(64))),
             seed_ref: state["previous_seed_ref"].as_str().unwrap().to_owned(),
         }
     }
@@ -6476,7 +6672,7 @@ mod tests {
         let baseline = applied_baseline(&json);
         let running = running_target_system(&json);
         let bind = |state: &OtaTransactionState,
-                    baseline: &crate::preseal::VerifiedPreseal,
+                    baseline: &RunningBaseline,
                     running: &RunningSystem,
                     boot: &str| {
             bind_transaction_window(state, baseline, running, target, boot).unwrap_err()
@@ -6497,7 +6693,7 @@ mod tests {
             "OTA transaction names another hardware target"
         );
         let mut other_previous = baseline.clone();
-        other_previous.target_os_ref = format!(
+        other_previous.os_ref = format!(
             "registry.example.test/neural-ice/neural-ice-appliance@sha256:{}",
             "1".repeat(64)
         );
@@ -6512,7 +6708,7 @@ mod tests {
             "OTA transaction does not depart from the authenticated applied baseline"
         );
         let mut still_previous = running_target_system(&json);
-        still_previous.origin_ref = baseline.target_os_ref.clone();
+        still_previous.origin_ref = baseline.os_ref.clone();
         assert_eq!(
             bind(&state, &baseline, &still_previous, boot_id),
             "booted deployment is not the OTA transaction target"
