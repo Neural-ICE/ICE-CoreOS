@@ -211,6 +211,23 @@ struct AuthenticatedOtaStatus {
     schema: String,
 }
 
+/// What the authenticated reader answers, and what it answered FROM. The
+/// status is the only thing on stdout; the held transaction, when there is
+/// one, is named on stderr so the journal says why an uncommitted appliance
+/// was answered at all (the five silent gate failures of ICE-Fabric issue
+/// 665 are exactly the shape this line prevents).
+struct StatusOutcome {
+    status: AuthenticatedOtaStatus,
+    held_transaction: Option<HeldTransaction>,
+}
+
+/// The OTA transaction whose health window the status was answered in.
+#[derive(Debug, Eq, PartialEq)]
+struct HeldTransaction {
+    phase: String,
+    train: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TimeChallenge {
@@ -2521,7 +2538,10 @@ fn run_authenticated_ota_status_bounded(args: &[String]) -> Result<u8, InternalE
         );
     }
     crate::runner::check_operation_deadline("status result validation")?;
-    let status = match authenticated? {
+    let StatusOutcome {
+        status,
+        held_transaction,
+    } = match authenticated? {
         Ok(value) => value,
         Err(reason) => return status_refusal(reason),
     };
@@ -2532,6 +2552,12 @@ fn run_authenticated_ota_status_bounded(args: &[String]) -> Result<u8, InternalE
     })?;
     bytes.push(b'\n');
     crate::runner::check_operation_deadline("status success output")?;
+    if let Some(held) = held_transaction {
+        eprintln!(
+            "ni-ota-verify: authenticated OTA status HELD inside OTA transaction window: phase {} of train {}",
+            held.phase, held.train
+        );
+    }
     print!(
         "{}",
         String::from_utf8(bytes).expect("status JSON is UTF-8")
@@ -2548,7 +2574,7 @@ fn authenticate_status(
     state_dir: &Path,
     config_path: &Path,
     operation: &Path,
-) -> Result<Result<AuthenticatedOtaStatus, String>, InternalError> {
+) -> Result<Result<StatusOutcome, String>, InternalError> {
     let first_public = match read_state_public()? {
         Ok(value) => value,
         Err(reason) => return Ok(Err(reason)),
@@ -2600,12 +2626,15 @@ fn authenticate_status(
                 Ok(None) => return Ok(Err("historical OTA state is unprovisioned".into())),
                 Err(error) => return Ok(Err(error.0)),
             };
-            Ok(AuthenticatedOtaStatus {
-                committed_generation: Some(current.0.manifest.generation),
-                completion_version: 1,
-                enforce_ready_verified: current.1,
-                profile: "retained-platform-state-v1".into(),
-                schema: "neural-ice-authenticated-ota-status-v1".into(),
+            Ok(StatusOutcome {
+                status: AuthenticatedOtaStatus {
+                    committed_generation: Some(current.0.manifest.generation),
+                    completion_version: 1,
+                    enforce_ready_verified: current.1,
+                    profile: "retained-platform-state-v1".into(),
+                    schema: "neural-ice-authenticated-ota-status-v1".into(),
+                },
+                held_transaction: None,
             })
         }
         StateProfile::OwnerSealedV1 { written } => {
@@ -2670,15 +2699,23 @@ fn authenticate_status(
                 )
             } else if state_dir.join("state-v1").exists() {
                 Err("pristine owner anchor is mixed with generation state".into())
-            } else if let Err(reason) = verify_running_baseline(&verified) {
-                Err(reason)
             } else {
-                Ok(AuthenticatedOtaStatus {
-                    committed_generation: None,
-                    completion_version: 2,
-                    enforce_ready_verified: false,
-                    profile: OWNER_STATE_PROFILE.into(),
-                    schema: "neural-ice-authenticated-ota-status-v1".into(),
+                // Everything above authenticated the APPLIED baseline: the
+                // owner anchor, the completion, the signed preseal set and its
+                // receipt, the baseline floor. Only the running system is
+                // still to be bound to it — or, during one OTA transaction's
+                // health window, to the transaction that departs from it.
+                verify_running_baseline(state_dir, &verified).map(|held_transaction| {
+                    StatusOutcome {
+                        status: AuthenticatedOtaStatus {
+                            committed_generation: None,
+                            completion_version: 2,
+                            enforce_ready_verified: false,
+                            profile: OWNER_STATE_PROFILE.into(),
+                            schema: "neural-ice-authenticated-ota-status-v1".into(),
+                        },
+                        held_transaction,
+                    }
                 })
             }
         }
@@ -2837,7 +2874,19 @@ fn validate_owner_inspection(
     Ok(())
 }
 
-fn verify_running_baseline(value: &crate::preseal::VerifiedPreseal) -> Result<(), String> {
+/// Where the running system's identity is read from. One struct so the
+/// applied baseline and an OTA transaction window are compared against the
+/// SAME observation of the same sources.
+struct RunningSystemPaths {
+    ostree: PathBuf,
+    deployment_root: PathBuf,
+    payload: PathBuf,
+    boot_id: PathBuf,
+}
+
+const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
+
+fn running_system_paths() -> RunningSystemPaths {
     #[cfg(feature = "test-path-overrides")]
     let ostree = std::env::var_os("NI_OTA_AUTH_STATUS_OSTREE")
         .map_or_else(|| PathBuf::from("/usr/bin/ostree"), PathBuf::from);
@@ -2853,52 +2902,398 @@ fn verify_running_baseline(value: &crate::preseal::VerifiedPreseal) -> Result<()
         .map_or_else(|| PathBuf::from(PAYLOAD_ID_MARKER), PathBuf::from);
     #[cfg(not(feature = "test-path-overrides"))]
     let payload = PathBuf::from(PAYLOAD_ID_MARKER);
-    verify_running_baseline_at(value, &ostree, &deployment_root, &payload)
+    #[cfg(feature = "test-path-overrides")]
+    let boot_id = std::env::var_os("NI_OTA_AUTH_STATUS_BOOT_ID")
+        .map_or_else(|| PathBuf::from(BOOT_ID_FILE), PathBuf::from);
+    #[cfg(not(feature = "test-path-overrides"))]
+    let boot_id = PathBuf::from(BOOT_ID_FILE);
+    RunningSystemPaths {
+        ostree,
+        deployment_root,
+        payload,
+        boot_id,
+    }
 }
 
-fn verify_running_baseline_at(
-    value: &crate::preseal::VerifiedPreseal,
-    ostree: &Path,
-    deployment_root: &Path,
-    payload: &Path,
-) -> Result<(), String> {
-    let (initial_status, initial_bytes) = inspect_booted_deployment(ostree)?;
-    let origin_name = format!(
-        "{}.{}.origin",
-        initial_status.checksum, initial_status.serial
-    );
-    let initial_origin =
-        read_deployment_origin(deployment_root, &initial_status.stateroot, &origin_name)?;
-    let origin_ref = parse_deployment_origin(&initial_origin.bytes)?;
-    let initial_manifest = inspect_booted_manifest(ostree, &initial_status.checksum)?;
+/// One observation of the running system: the booted OSTree deployment, its
+/// origin, the manifest digest it imported and the payload marker of the
+/// booted image. Whatever it is compared against, the mutable parts are
+/// re-read afterwards (`reobserve_running_system`) so a deployment switched
+/// while the status was running is a refusal.
+struct RunningSystem {
+    deployment: OstreeDeployment,
+    deployment_bytes: Vec<u8>,
+    origin_name: String,
+    origin: StableRegular,
+    origin_ref: String,
+    manifest: String,
+    payload: Vec<u8>,
+}
 
-    if origin_ref != value.target_os_ref
-        || initial_manifest != value.target_os_manifest_digest
-        || !initial_manifest.strip_prefix("sha256:").is_some_and(sha256)
-    {
-        return Err("booted deployment differs from authenticated preseal baseline".into());
-    }
-    let bytes = read_noatime_regular(payload, 0o644, 256)
+fn observe_running_system(paths: &RunningSystemPaths) -> Result<RunningSystem, String> {
+    let (deployment, deployment_bytes) = inspect_booted_deployment(&paths.ostree)?;
+    let origin_name = format!("{}.{}.origin", deployment.checksum, deployment.serial);
+    let origin =
+        read_deployment_origin(&paths.deployment_root, &deployment.stateroot, &origin_name)?;
+    let origin_ref = parse_deployment_origin(&origin.bytes)?;
+    let manifest = inspect_booted_manifest(&paths.ostree, &deployment.checksum)?;
+    let payload = read_noatime_regular(&paths.payload, 0o644, 256)
         .map_err(|error| format!("cannot authenticate running PAYLOAD_ID: {}", error.0))?;
-    if bytes != format!("{}\n", value.seed_ref).as_bytes() {
-        return Err("running PAYLOAD_ID differs from authenticated preseal baseline".into());
-    }
+    Ok(RunningSystem {
+        deployment,
+        deployment_bytes,
+        origin_name,
+        origin,
+        origin_ref,
+        manifest,
+        payload,
+    })
+}
 
-    // Re-read every mutable observation after the baseline comparison. An
-    // update which stages or switches a deployment while status is running is
-    // a refusal, even if the new origin happens to name the same image.
-    let final_manifest = inspect_booted_manifest(ostree, &initial_status.checksum)?;
-    let final_origin =
-        read_deployment_origin(deployment_root, &initial_status.stateroot, &origin_name)?;
-    let (final_status, final_bytes) = inspect_booted_deployment(ostree)?;
-    if initial_manifest != final_manifest
-        || initial_origin != final_origin
-        || initial_status != final_status
-        || initial_bytes != final_bytes
+/// Re-read every mutable observation after a comparison. An update which
+/// stages or switches a deployment while status is running is a refusal,
+/// even if the new origin happens to name the same image.
+fn reobserve_running_system(
+    paths: &RunningSystemPaths,
+    initial: &RunningSystem,
+) -> Result<(), String> {
+    let final_manifest = inspect_booted_manifest(&paths.ostree, &initial.deployment.checksum)?;
+    let final_origin = read_deployment_origin(
+        &paths.deployment_root,
+        &initial.deployment.stateroot,
+        &initial.origin_name,
+    )?;
+    let (final_deployment, final_bytes) = inspect_booted_deployment(&paths.ostree)?;
+    if initial.manifest != final_manifest
+        || initial.origin != final_origin
+        || initial.deployment != final_deployment
+        || initial.deployment_bytes != final_bytes
     {
         return Err("booted deployment changed during authenticated inspection".into());
     }
     Ok(())
+}
+
+/// `None` when the running system IS the authenticated applied baseline;
+/// otherwise the refusal it earns on its own.
+fn baseline_divergence(
+    value: &crate::preseal::VerifiedPreseal,
+    running: &RunningSystem,
+) -> Option<String> {
+    if running.origin_ref != value.target_os_ref
+        || running.manifest != value.target_os_manifest_digest
+        || !running.manifest.strip_prefix("sha256:").is_some_and(sha256)
+    {
+        return Some("booted deployment differs from authenticated preseal baseline".into());
+    }
+    if running.payload != format!("{}\n", value.seed_ref).as_bytes() {
+        return Some("running PAYLOAD_ID differs from authenticated preseal baseline".into());
+    }
+    None
+}
+
+fn verify_running_baseline(
+    state_dir: &Path,
+    value: &crate::preseal::VerifiedPreseal,
+) -> Result<Option<HeldTransaction>, String> {
+    verify_running_baseline_at(state_dir, value, &running_system_paths())
+}
+
+/// Bind the running system to the authenticated applied baseline — or, when
+/// it is not that baseline, to the ONE durable OTA transaction whose health
+/// window explains the difference. `Ok(None)` is the applied baseline;
+/// `Ok(Some(_))` is the window; anything else is the refusal the divergence
+/// earned, with the reason the transaction did not explain it appended.
+fn verify_running_baseline_at(
+    state_dir: &Path,
+    value: &crate::preseal::VerifiedPreseal,
+    paths: &RunningSystemPaths,
+) -> Result<Option<HeldTransaction>, String> {
+    let running = observe_running_system(paths)?;
+    let Some(divergence) = baseline_divergence(value, &running) else {
+        reobserve_running_system(paths, &running)?;
+        return Ok(None);
+    };
+    let held = transaction_window(state_dir, value, &running, &paths.boot_id)
+        .map_err(|why| format!("{divergence}; not a held OTA transaction window: {why}"))?;
+    reobserve_running_system(paths, &running)?;
+    Ok(Some(held))
+}
+
+/// The durable OTA transaction exactly as ICE-Fabric
+/// `neural-ice-ota-transaction.sh` writes it (`schema_version` 3, one JSON
+/// object at `<state_dir>/transaction/state.json`). Every field the engine's
+/// `secure_transaction` contracts is modeled and re-validated with the same
+/// shapes; keys it appends in flight (`failure_reason`, `data_snapshot`) are
+/// not, so an engine that gains a key does not turn every OTA into a rollback.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct OtaTransactionState {
+    schema_version: u64,
+    phase: String,
+    train: String,
+    channel: String,
+    previous_ring: String,
+    ring_state_migration: bool,
+    hardware_target: String,
+    target_seed_ref: String,
+    target_os_ref: String,
+    previous_seed_ref: String,
+    previous_os_ref: String,
+    prepared_boot_id: String,
+    activated_boot_id: Option<String>,
+    activation_attempts: u64,
+    finalize_attempts: u64,
+    commit_attempts: u64,
+    rollback_attempts: u64,
+}
+
+/// The engine writes a state of a few hundred bytes; this bound is generous
+/// and still far inside the per-file bound of the persistent snapshot.
+const OTA_TRANSACTION_STATE_MAX_BYTES: usize = 64 * 1024;
+
+/// The artifacts `secure_transaction` requires beside `state.json`. Their
+/// presence is what distinguishes a transaction the engine assembled from a
+/// directory somebody named `transaction`.
+const OTA_TRANSACTION_ARTIFACTS: [&str; 4] = [
+    "aliases.tsv",
+    "entitlements.txt",
+    "bom.json",
+    "previous-bom.json",
+];
+
+/// WHY AN UNCOMMITTED APPLIANCE MAY BE ANSWERED AT ALL.
+///
+/// Measured on the lab appliance .67, 2026-09-17 02:07–02:13 CEST, OTA
+/// 0.61.0 → 0.61.2 (ICE-Fabric issue 665): after `bootc switch` and the
+/// reboot onto the staged target, the transaction engine swapped the aliases,
+/// entered `finalizing` and ran the target's health probes. The first
+/// required probe is `neural-ice-licensed.target`, opened by the licence gate,
+/// which runs THIS verb and fails closed on a non-zero exit. The verb refused
+/// — booted deployment ≠ applied baseline, which is true by construction
+/// until the commit — so the gate never opened, the probe timed out after
+/// 180 s, the engine armed the rollback and `bootc rollback --apply` ran. The
+/// commit was conditioned on the gate, the gate on the commit: no OTA could
+/// ever finalize on a freshly installed appliance.
+///
+/// Opening the licensed plane during the health window is what makes the
+/// health probe meaningful, and it is safe for three reasons, none of which
+/// this function has to trust on its own:
+///
+/// 1. The target was verified BEFORE it was staged: the engine's `prepare`
+///    took the signed BOM and the channel record through `ni-ota-verify`,
+///    and `target_os_ref` is the digest-pinned image the verified BOM names.
+/// 2. The engine verified the booted identity against the transaction at
+///    activation (`target_identity_ok`: PAYLOAD_ID, the payload stamp and
+///    `bootc status` booted ref, all equal to the transaction's target) and
+///    this function re-verifies the same identity from the same sources, in
+///    the same boot (`activated_boot_id`).
+/// 3. The rollback is armed if health fails: a target that does not pass its
+///    probes inside the window is rolled back by the engine, and the window
+///    closes with the transaction — `completed` commits the new baseline and
+///    this branch is never consulted again; `rollback_armed`, `rolled_back`,
+///    `recovery_required` and every other phase refuse exactly as before.
+///
+/// What is answered is the HELD status — `enforce_ready_verified` false,
+/// `committed_generation` null — the same bytes a pristine first boot earns.
+/// Nothing in this window ever reports the target as verified-ready.
+///
+/// What is NOT bound here, deliberately: the per-arch OSTree manifest digest.
+/// The applied baseline binds it through the signed installer authorization;
+/// the transaction carries only the index-digest reference the engine staged,
+/// and bootc resolved the manifest from that reference itself. The digest is
+/// still required to be well-formed and unchanged across the read.
+fn transaction_window(
+    state_dir: &Path,
+    value: &crate::preseal::VerifiedPreseal,
+    running: &RunningSystem,
+    boot_id_path: &Path,
+) -> Result<HeldTransaction, String> {
+    // `state_dir` is the persistent snapshot this reader works on. It was
+    // captured under `validate_status_metadata`: every entry reached without
+    // following a symlink, a regular file or directory, root-owned when the
+    // reader is root, mode 0600/0700 exactly — the modes the engine's
+    // `secure_transaction` sets — and the tree is re-captured after the
+    // verdict, so a transaction rewritten meanwhile refuses the whole status.
+    // A transaction the engine would refuse therefore never reaches this
+    // parse; what remains is its shape and its bindings.
+    let directory = state_dir.join("transaction");
+    let metadata = std::fs::symlink_metadata(&directory)
+        .map_err(|_| "no durable OTA transaction".to_owned())?;
+    if !metadata.file_type().is_dir() {
+        return Err("OTA transaction is not a directory".into());
+    }
+    for artifact in OTA_TRANSACTION_ARTIFACTS {
+        let present = std::fs::symlink_metadata(directory.join(artifact))
+            .is_ok_and(|metadata| metadata.file_type().is_file());
+        if !present {
+            return Err(format!("OTA transaction lacks its {artifact}"));
+        }
+    }
+    let bytes = read_noatime_regular(
+        &directory.join("state.json"),
+        0o600,
+        OTA_TRANSACTION_STATE_MAX_BYTES,
+    )
+    .map_err(|error| format!("OTA transaction state is unreadable: {}", error.0))?;
+    let state = parse_transaction_state(&bytes)?;
+    let hardware_target = crate::config::immutable_hardware_target().map_err(|error| error.0)?;
+    let boot_id = current_boot_id(boot_id_path)?;
+    bind_transaction_window(&state, value, running, &hardware_target, &boot_id)
+}
+
+/// The engine's `secure_transaction` shapes, re-applied to the bytes on disk.
+fn parse_transaction_state(bytes: &[u8]) -> Result<OtaTransactionState, String> {
+    let state: OtaTransactionState = serde_json::from_slice(bytes)
+        .map_err(|error| format!("OTA transaction state is malformed: {error}"))?;
+    let ring = |value: &str| matches!(value, "lab" | "beta" | "stable");
+    let attempts_bounded = [
+        state.activation_attempts,
+        state.finalize_attempts,
+        state.commit_attempts,
+        state.rollback_attempts,
+    ]
+    .iter()
+    .all(|attempts| *attempts <= 2);
+    if state.schema_version != 3
+        || !matches!(
+            state.phase.as_str(),
+            "prepared"
+                | "pending_reboot"
+                | "activating"
+                | "activated"
+                | "finalizing"
+                | "committing"
+                | "rollback_armed"
+                | "completed"
+                | "rolled_back"
+                | "recovery_required"
+                | "aborted"
+        )
+        || !train_name(&state.train)
+        || !ring(&state.channel)
+        || !ring(&state.previous_ring)
+        || !engine_hardware_target(&state.hardware_target)
+        || !seed_revision(&state.target_seed_ref)
+        || !seed_revision(&state.previous_seed_ref)
+        || !digest_pinned_os_ref(&state.target_os_ref)
+        || !digest_pinned_os_ref(&state.previous_os_ref)
+        || !boot_id_shape(&state.prepared_boot_id)
+        || !state.activated_boot_id.as_deref().is_none_or(boot_id_shape)
+        || !attempts_bounded
+    {
+        return Err("OTA transaction state is outside the engine's schema".into());
+    }
+    Ok(state)
+}
+
+/// The window itself: the phase, the boot, the baseline it departs from and
+/// the target it landed on. Each binding names its own refusal so the journal
+/// says which one an operator is looking at.
+fn bind_transaction_window(
+    state: &OtaTransactionState,
+    value: &crate::preseal::VerifiedPreseal,
+    running: &RunningSystem,
+    hardware_target: &str,
+    boot_id: &str,
+) -> Result<HeldTransaction, String> {
+    if !matches!(
+        state.phase.as_str(),
+        "activated" | "finalizing" | "committing"
+    ) {
+        return Err(format!(
+            "OTA transaction phase {} is not a health window",
+            state.phase
+        ));
+    }
+    // The window lives in the boot the engine activated the target in. A
+    // reboot inside it means health did not pass; the engine's next
+    // `finalize` arms the rollback, and until it does, nothing is answered.
+    if state.activated_boot_id.as_deref() != Some(boot_id) {
+        return Err("OTA transaction was not activated in this boot".into());
+    }
+    if state.hardware_target != hardware_target {
+        return Err("OTA transaction names another hardware target".into());
+    }
+    // The transaction must depart from THE authenticated applied baseline,
+    // not from some baseline: a transaction prepared against another
+    // previous identity has nothing to say about this appliance's state.
+    if state.previous_os_ref != value.target_os_ref || state.previous_seed_ref != value.seed_ref {
+        return Err(
+            "OTA transaction does not depart from the authenticated applied baseline".into(),
+        );
+    }
+    if running.origin_ref != state.target_os_ref {
+        return Err("booted deployment is not the OTA transaction target".into());
+    }
+    if running.payload != format!("{}\n", state.target_seed_ref).as_bytes() {
+        return Err("running PAYLOAD_ID is not the OTA transaction target seed".into());
+    }
+    Ok(HeldTransaction {
+        phase: state.phase.clone(),
+        train: state.train.clone(),
+    })
+}
+
+fn current_boot_id(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read the boot identity: {error}"))?;
+    let boot_id = text.trim();
+    if !boot_id_shape(boot_id) {
+        return Err("boot identity is malformed".into());
+    }
+    Ok(boot_id.to_owned())
+}
+
+/// `^[0-9a-f-]{36}$` — the engine's shape for a kernel boot id.
+fn boot_id_shape(value: &str) -> bool {
+    value.len() == 36
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b'-')
+}
+
+/// `^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$` — the engine's shape for a train.
+fn train_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// `^[a-z0-9][a-z0-9_-]{0,63}$` — the engine's shape for a hardware target.
+fn engine_hardware_target(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+/// `^[0-9a-f]{40}$` — the engine's shape for a seed revision.
+fn seed_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// `^[^@[:space:]]+@sha256:[0-9a-f]{64}$` — the engine's shape for an OS
+/// reference: bootc's booted/staged image string, digest-pinned.
+fn digest_pinned_os_ref(value: &str) -> bool {
+    value
+        .rsplit_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.is_empty()
+                && !repository
+                    .bytes()
+                    .any(|byte| byte == b'@' || byte.is_ascii_whitespace())
+                && sha256(digest)
+        })
 }
 
 fn inspect_booted_deployment(ostree: &Path) -> Result<(OstreeDeployment, Vec<u8>), String> {
@@ -5859,18 +6254,331 @@ mod tests {
             target_os_manifest_digest: digest.into(),
             seed_ref: "fabric-seed-revision".into(),
         };
-        let result = verify_running_baseline_at(&verified, &ostree, &deployment_root, &payload);
-        assert!(result.is_ok(), "{result:?}");
+        // No transaction under this state directory: a divergence has nothing
+        // to explain it and refuses exactly as it did before the window existed.
+        let state_dir = root.join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let boot_id = root.join("boot_id");
+        std::fs::write(&boot_id, b"11111111-2222-3333-4444-555555555555\n").unwrap();
+        let paths = RunningSystemPaths {
+            ostree,
+            deployment_root,
+            payload: payload.clone(),
+            boot_id,
+        };
+        let result = verify_running_baseline_at(&state_dir, &verified, &paths);
+        assert!(matches!(result, Ok(None)), "{result:?}");
         verified.target_os_manifest_digest = format!("sha256:{}", "e".repeat(64));
+        let refused = verify_running_baseline_at(&state_dir, &verified, &paths).unwrap_err();
         assert!(
-            verify_running_baseline_at(&verified, &ostree, &deployment_root, &payload).is_err()
+            refused.starts_with("booted deployment differs from authenticated preseal baseline; not a held OTA transaction window: no durable OTA transaction"),
+            "{refused}"
         );
         verified.target_os_manifest_digest = digest.into();
         std::fs::write(&payload, b"different-seed\n").unwrap();
+        let refused = verify_running_baseline_at(&state_dir, &verified, &paths).unwrap_err();
         assert!(
-            verify_running_baseline_at(&verified, &ostree, &deployment_root, &payload).is_err()
+            refused.starts_with("running PAYLOAD_ID differs from authenticated preseal baseline; not a held OTA transaction window: no durable OTA transaction"),
+            "{refused}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn engine_transaction_state(phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 3,
+            "phase": phase,
+            "train": "0.61.2",
+            "channel": "lab",
+            "previous_ring": "lab",
+            "ring_state_migration": false,
+            "hardware_target": "nvidia-gb10-arm64",
+            "target_seed_ref": "e".repeat(40),
+            "target_os_ref": format!("registry.example.test/neural-ice/neural-ice-appliance@sha256:{}", "f".repeat(64)),
+            "previous_seed_ref": "c".repeat(40),
+            "previous_os_ref": format!("registry.example.test/neural-ice/neural-ice-appliance@sha256:{}", "a".repeat(64)),
+            "prepared_boot_id": "11111111-2222-3333-4444-555555555555",
+            "activated_boot_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+            "rollback_boot_id": null,
+            "activation_attempts": 1,
+            "finalize_attempts": 1,
+            "commit_attempts": 0,
+            "rollback_attempts": 0
+        })
+    }
+
+    fn running_target_system(state: &serde_json::Value) -> RunningSystem {
+        RunningSystem {
+            deployment: OstreeDeployment {
+                booted: true,
+                checksum: "d".repeat(64),
+                serial: 0,
+                stateroot: "default".into(),
+            },
+            deployment_bytes: b"{}".to_vec(),
+            origin_name: format!("{}.0.origin", "d".repeat(64)),
+            origin: StableRegular {
+                bytes: Vec::new(),
+                identity: TreeEntry {
+                    bytes: None,
+                    dev: 0,
+                    ino: 0,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                    size: 0,
+                    atime: 0,
+                    atime_nsec: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    ctime: 0,
+                    ctime_nsec: 0,
+                },
+            },
+            origin_ref: state["target_os_ref"].as_str().unwrap().to_owned(),
+            manifest: format!("sha256:{}", "b".repeat(64)),
+            payload: format!("{}\n", state["target_seed_ref"].as_str().unwrap()).into_bytes(),
+        }
+    }
+
+    fn applied_baseline(state: &serde_json::Value) -> crate::preseal::VerifiedPreseal {
+        crate::preseal::VerifiedPreseal {
+            bundle_seq: 13,
+            receipt_sha256: "c".repeat(64),
+            set_sha256: "d".repeat(64),
+            target_os_ref: state["previous_os_ref"].as_str().unwrap().to_owned(),
+            target_os_manifest_digest: format!("sha256:{}", "9".repeat(64)),
+            seed_ref: state["previous_seed_ref"].as_str().unwrap().to_owned(),
+        }
+    }
+
+    #[test]
+    fn transaction_state_parse_applies_the_engine_schema_and_tolerates_in_flight_keys() {
+        let mut state = engine_transaction_state("finalizing");
+        let parsed = parse_transaction_state(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(parsed.phase, "finalizing");
+        assert_eq!(
+            parsed.activated_boot_id.as_deref(),
+            Some("66666666-7777-8888-9999-aaaaaaaaaaaa")
+        );
+
+        // The engine appends these while a transaction is in flight
+        // (`require_recovery`, `snapshot_data`); they are not a schema change.
+        state["failure_reason"] = "health_timeout".into();
+        state["data_snapshot"] = "taken".into();
+        assert!(parse_transaction_state(&serde_json::to_vec(&state).unwrap()).is_ok());
+        // A null activated boot is the engine's own `prepared` shape.
+        state["activated_boot_id"] = serde_json::Value::Null;
+        assert!(parse_transaction_state(&serde_json::to_vec(&state).unwrap()).is_ok());
+
+        let hostile: [(&str, serde_json::Value); 16] = [
+            ("schema_version", 2.into()),
+            ("phase", "health_window".into()),
+            ("train", "".into()),
+            ("train", "-0.61.2".into()),
+            ("channel", "prod".into()),
+            ("previous_ring", "".into()),
+            ("ring_state_migration", "false".into()),
+            ("hardware_target", "GB10".into()),
+            ("target_seed_ref", "e".repeat(39).into()),
+            ("previous_seed_ref", "C".repeat(40).into()),
+            (
+                "target_os_ref",
+                format!(
+                    "registry.example.test/neural-ice/neural-ice-appliance:0.61.2@sha256:{}",
+                    "f".repeat(64)
+                )
+                .replace("@sha256", " @sha256")
+                .into(),
+            ),
+            (
+                "previous_os_ref",
+                "registry.example.test/neural-ice/neural-ice-appliance:0.61.0".into(),
+            ),
+            (
+                "prepared_boot_id",
+                "11111111-2222-3333-4444-55555555555".into(),
+            ),
+            (
+                "activated_boot_id",
+                "66666666-7777-8888-9999-AAAAAAAAAAAA".into(),
+            ),
+            ("finalize_attempts", 3.into()),
+            ("commit_attempts", (-1).into()),
+        ];
+        for (key, value) in hostile {
+            let mut state = engine_transaction_state("finalizing");
+            state[key] = value.clone();
+            assert!(
+                parse_transaction_state(&serde_json::to_vec(&state).unwrap()).is_err(),
+                "{key} = {value} must be outside the engine's schema"
+            );
+        }
+        let mut missing = engine_transaction_state("finalizing");
+        missing.as_object_mut().unwrap().remove("previous_os_ref");
+        assert!(parse_transaction_state(&serde_json::to_vec(&missing).unwrap()).is_err());
+        assert!(parse_transaction_state(b"[]").is_err());
+        assert!(parse_transaction_state(b"").is_err());
+    }
+
+    #[test]
+    fn transaction_window_binds_phase_boot_baseline_and_booted_target() {
+        let boot_id = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+        let target = "nvidia-gb10-arm64";
+        for phase in ["activated", "finalizing", "committing"] {
+            let json = engine_transaction_state(phase);
+            let state = parse_transaction_state(&serde_json::to_vec(&json).unwrap()).unwrap();
+            let held = bind_transaction_window(
+                &state,
+                &applied_baseline(&json),
+                &running_target_system(&json),
+                target,
+                boot_id,
+            )
+            .unwrap();
+            assert_eq!(
+                held,
+                HeldTransaction {
+                    phase: phase.into(),
+                    train: "0.61.2".into()
+                }
+            );
+        }
+        for phase in [
+            "prepared",
+            "pending_reboot",
+            "activating",
+            "rollback_armed",
+            "completed",
+            "rolled_back",
+            "recovery_required",
+            "aborted",
+        ] {
+            let json = engine_transaction_state(phase);
+            let state = parse_transaction_state(&serde_json::to_vec(&json).unwrap()).unwrap();
+            let refused = bind_transaction_window(
+                &state,
+                &applied_baseline(&json),
+                &running_target_system(&json),
+                target,
+                boot_id,
+            )
+            .unwrap_err();
+            assert_eq!(
+                refused,
+                format!("OTA transaction phase {phase} is not a health window")
+            );
+        }
+
+        let json = engine_transaction_state("finalizing");
+        let state = parse_transaction_state(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let baseline = applied_baseline(&json);
+        let running = running_target_system(&json);
+        let bind = |state: &OtaTransactionState,
+                    baseline: &crate::preseal::VerifiedPreseal,
+                    running: &RunningSystem,
+                    boot: &str| {
+            bind_transaction_window(state, baseline, running, target, boot).unwrap_err()
+        };
+        assert_eq!(
+            bind(
+                &state,
+                &baseline,
+                &running,
+                "11111111-2222-3333-4444-555555555555"
+            ),
+            "OTA transaction was not activated in this boot"
+        );
+        let mut other_target = state.clone();
+        other_target.hardware_target = "nvidia-gb10-x86_64".into();
+        assert_eq!(
+            bind(&other_target, &baseline, &running, boot_id),
+            "OTA transaction names another hardware target"
+        );
+        let mut other_previous = baseline.clone();
+        other_previous.target_os_ref = format!(
+            "registry.example.test/neural-ice/neural-ice-appliance@sha256:{}",
+            "1".repeat(64)
+        );
+        assert_eq!(
+            bind(&state, &other_previous, &running, boot_id),
+            "OTA transaction does not depart from the authenticated applied baseline"
+        );
+        let mut other_seed = baseline.clone();
+        other_seed.seed_ref = "2".repeat(40);
+        assert_eq!(
+            bind(&state, &other_seed, &running, boot_id),
+            "OTA transaction does not depart from the authenticated applied baseline"
+        );
+        let mut still_previous = running_target_system(&json);
+        still_previous.origin_ref = baseline.target_os_ref.clone();
+        assert_eq!(
+            bind(&state, &baseline, &still_previous, boot_id),
+            "booted deployment is not the OTA transaction target"
+        );
+        let mut third_image = running_target_system(&json);
+        third_image.origin_ref = format!(
+            "registry.example.test/neural-ice/neural-ice-appliance@sha256:{}",
+            "3".repeat(64)
+        );
+        assert_eq!(
+            bind(&state, &baseline, &third_image, boot_id),
+            "booted deployment is not the OTA transaction target"
+        );
+        let mut previous_payload = running_target_system(&json);
+        previous_payload.payload = format!("{}\n", baseline.seed_ref).into_bytes();
+        assert_eq!(
+            bind(&state, &baseline, &previous_payload, boot_id),
+            "running PAYLOAD_ID is not the OTA transaction target seed"
+        );
+        let mut unframed_payload = running_target_system(&json);
+        unframed_payload.payload = state.target_seed_ref.clone().into_bytes();
+        assert_eq!(
+            bind(&state, &baseline, &unframed_payload, boot_id),
+            "running PAYLOAD_ID is not the OTA transaction target seed"
+        );
+    }
+
+    #[test]
+    fn engine_shapes_match_the_transaction_script() {
+        assert!(boot_id_shape("c8c2a17b-0000-4000-8000-000000000000"));
+        assert!(!boot_id_shape("c8c2a17b-0000-4000-8000-00000000000"));
+        assert!(!boot_id_shape("C8C2A17B-0000-4000-8000-000000000000"));
+        assert!(train_name("0.61.2"));
+        assert!(train_name("_x"));
+        assert!(!train_name(".x"));
+        assert!(!train_name(&"a".repeat(129)));
+        assert!(engine_hardware_target("nvidia-gb10-arm64"));
+        assert!(!engine_hardware_target("-gb10"));
+        assert!(!engine_hardware_target("gb10 "));
+        assert!(seed_revision(&"0".repeat(40)));
+        assert!(!seed_revision(&"0".repeat(64)));
+        assert!(digest_pinned_os_ref(&format!(
+            "r.example.test/neural-ice/neural-ice-appliance@sha256:{}",
+            "0".repeat(64)
+        )));
+        assert!(digest_pinned_os_ref(&format!(
+            "r.example.test:5056/x:tag@sha256:{}",
+            "0".repeat(64)
+        )));
+        assert!(!digest_pinned_os_ref("r.example.test/x:0.61.2"));
+        assert!(!digest_pinned_os_ref(&format!(
+            "@sha256:{}",
+            "0".repeat(64)
+        )));
+        assert!(!digest_pinned_os_ref(&format!(
+            "r@x@sha256:{}",
+            "0".repeat(64)
+        )));
+        assert!(!digest_pinned_os_ref(&format!(
+            "r x@sha256:{}",
+            "0".repeat(64)
+        )));
+        assert!(!digest_pinned_os_ref(&format!(
+            "r@sha256:{}",
+            "0".repeat(63)
+        )));
     }
 
     #[test]
