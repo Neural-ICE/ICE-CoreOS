@@ -148,6 +148,9 @@ pub(crate) struct VerifiedPreseal {
     pub(crate) target_os_ref: String,
     pub(crate) target_os_manifest_digest: String,
     pub(crate) seed_ref: String,
+    /// The BOM bytes the receipt authenticates: an applied state at the
+    /// receipt's sequence must name exactly this BOM.
+    pub(crate) bom_sha256: String,
 }
 
 pub(crate) struct RetainedPresealPaths<'a> {
@@ -647,6 +650,7 @@ fn verify_command(
         target_os_ref: receipt.target_os_ref.clone(),
         target_os_manifest_digest: installer.image_manifest_digest.clone(),
         seed_ref: receipt.seed_ref.clone(),
+        bom_sha256: receipt.bom_sha256.clone(),
     };
     let created = match &mode {
         VerificationMode::Initial { .. } => {

@@ -2116,3 +2116,264 @@ fn tampered_ota_transaction_refuses_the_whole_status() {
     let before = observe_tree(&owner.fixture.state);
     assert_held(&owner, &owner.run(), &before, "finalizing");
 }
+
+// ---------------------------------------------------------------------------
+// The committed applied state as the running baseline (ICE-Fabric PR 667
+// report, gap E1).
+//
+// Before this, the running system was compared to the PRESEAL baseline only.
+// An OTA that reached `completed` committed applied.json + applied.bom.json
+// and archived its transaction; the next reboot had no window, a booted
+// deployment that was the committed train and a preseal naming the installed
+// one — refused, licence gate closed, on every OTA'd appliance at its second
+// boot. These tests hold the baseline as the latest of the two.
+// ---------------------------------------------------------------------------
+
+const THIRD_INDEX: &str = "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+const THIRD_SEED: &str = "5555555555555555555555555555555555555555";
+
+/// The release BOM the engine copies beside the applied state at commit.
+fn committed_bom(train: &str, seq: u64, index: &str, seed: &str) -> Vec<u8> {
+    serde_json::to_vec_pretty(&json!({
+        "appliance":{"os_base":{"digest":index,"image":OWNER_REPOSITORY},"version":train},
+        "bundle_seq":seq,"compat_min":5,"compat_version":5,"hardware_target":"nvidia-gb10-arm64",
+        "sources":{"seed":{"ref":seed,"repo":"ICE-Fabric"}},"train":train
+    }))
+    .unwrap()
+}
+
+impl PristineOwner {
+    /// What `commit` and the engine's `persist_applied_bom` leave behind.
+    fn commit_applied(&self, bom: &[u8], seq: u64) {
+        write_mode(
+            &self.fixture.state.join("applied.json"),
+            &canonical(&json!({
+                "bundle_seq": seq, "bom_sha256": hash(bom),
+                "bom_format": "media-independent-v1", "active_ring": "lab"
+            })),
+            0o600,
+        );
+        write_mode(&self.fixture.state.join("applied.bom.json"), bom, 0o600);
+    }
+
+    fn boot_third(&self) {
+        self.boot_image(&format!("{OWNER_REPOSITORY}@{THIRD_INDEX}"));
+        fs::write(
+            &self.ostree.metadata,
+            format!("'sha256:{}'\n", "8".repeat(64)),
+        )
+        .unwrap();
+        write_mode(&self.payload, format!("{THIRD_SEED}\n").as_bytes(), 0o644);
+    }
+
+    fn boot_preseal(&self) {
+        self.boot_image(&format!("{OWNER_REPOSITORY}@{OWNER_INDEX}"));
+        fs::write(&self.ostree.metadata, format!("'{OWNER_CHILD}'\n")).unwrap();
+        write_mode(
+            &self.payload,
+            format!("{PREVIOUS_SEED}\n").as_bytes(),
+            0o644,
+        );
+    }
+}
+
+fn assert_answered_silently(owner: &PristineOwner, before: &[ObservedTreeEntry]) {
+    let output = owner.run();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, HELD_STATUS);
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(observe_tree(&owner.fixture.state), before);
+    assert_eq!(fs::read_dir(&owner.fixture.scratch).unwrap().count(), 0);
+}
+
+#[test]
+fn committed_applied_state_is_the_running_baseline_after_the_transaction_is_archived() {
+    let owner = install_pristine_owner("applied-baseline");
+    let bom = committed_bom("0.61.2", 6, TARGET_INDEX, TARGET_SEED);
+    owner.commit_applied(&bom, 6);
+    // The engine archives the completed transaction beside the state.
+    owner.install_transaction(&engine_state("completed"));
+    fs::rename(
+        owner.transaction_dir(),
+        owner.fixture.state.join("transaction.previous"),
+    )
+    .unwrap();
+
+    // Second boot after the OTA: booted on the committed train, no window.
+    owner.boot_target();
+    let before = observe_tree(&owner.fixture.state);
+    assert_answered_silently(&owner, &before);
+
+    // The committed BOM names its image by the index digest alone: another
+    // well-formed manifest digest is not a divergence, a malformed one is.
+    fs::write(
+        &owner.ostree.metadata,
+        format!("'sha256:{}'\n", "4".repeat(64)),
+    )
+    .unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    assert_answered_silently(&owner, &before);
+    fs::write(&owner.ostree.metadata, "'not-a-digest'\n").unwrap();
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "booted manifest metadata is malformed",
+    );
+    fs::write(&owner.ostree.metadata, format!("'{TARGET_CHILD}'\n")).unwrap();
+
+    // The NEXT OTA departs from the committed baseline, not from the
+    // preseal: its window is held on top of the applied state.
+    let mut next = engine_state("finalizing");
+    next["train"] = "0.61.3".into();
+    next["previous_os_ref"] = format!("{OWNER_REPOSITORY}@{TARGET_INDEX}").into();
+    next["previous_seed_ref"] = TARGET_SEED.into();
+    next["target_os_ref"] = format!("{OWNER_REPOSITORY}@{THIRD_INDEX}").into();
+    next["target_seed_ref"] = THIRD_SEED.into();
+    owner.install_transaction(&next);
+    owner.boot_third();
+    let before = observe_tree(&owner.fixture.state);
+    let output = owner.run();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, HELD_STATUS);
+    assert_eq!(
+        output.stderr,
+        b"ni-ota-verify: authenticated OTA status HELD inside OTA transaction window: phase finalizing of train 0.61.3\n"
+    );
+    assert_eq!(observe_tree(&owner.fixture.state), before);
+
+    // A transaction that still departs from the preseal is stale here.
+    let mut stale = next.clone();
+    stale["previous_os_ref"] = format!("{OWNER_REPOSITORY}@{OWNER_INDEX}").into();
+    stale["previous_seed_ref"] = PREVIOUS_SEED.into();
+    owner.write_state(&stale);
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "booted deployment differs from authenticated applied baseline; not a held OTA transaction window: OTA transaction does not depart from the authenticated applied baseline",
+    );
+}
+
+#[test]
+fn a_boot_beneath_the_committed_baseline_is_refused() {
+    let owner = install_pristine_owner("applied-beneath");
+    let bom = committed_bom("0.61.2", 6, TARGET_INDEX, TARGET_SEED);
+    owner.commit_applied(&bom, 6);
+
+    // An operator's `bootc rollback` after `completed`: the engine never
+    // rewrites the applied state (its rollback exists only before the
+    // commit), so the preseal deployment now sits beneath the committed
+    // baseline — the anti-rollback floor's own refusal.
+    owner.boot_preseal();
+    let before = observe_tree(&owner.fixture.state);
+    assert_window_refused(
+        &owner,
+        &owner.run(),
+        &before,
+        "booted deployment differs from authenticated applied baseline; not a held OTA transaction window: no durable OTA transaction",
+    );
+
+    // The rollback the engine DOES perform happens before the commit: the
+    // applied state is still the preseal's, the booted deployment is the
+    // preseal's, and the archived transaction says so.
+    fs::remove_file(owner.fixture.state.join("applied.json")).unwrap();
+    fs::remove_file(owner.fixture.state.join("applied.bom.json")).unwrap();
+    let mut rolled_back = engine_state("rolled_back");
+    rolled_back["failure_reason"] = "health_timeout".into();
+    owner.install_transaction(&rolled_back);
+    let before = observe_tree(&owner.fixture.state);
+    assert_answered_silently(&owner, &before);
+}
+
+#[test]
+fn a_tampered_or_incomplete_applied_state_refuses_the_status() {
+    let owner = install_pristine_owner("applied-tampered");
+    let bom = committed_bom("0.61.2", 6, TARGET_INDEX, TARGET_SEED);
+    owner.commit_applied(&bom, 6);
+    owner.boot_target();
+    let applied = owner.fixture.state.join("applied.json");
+    let applied_bom = owner.fixture.state.join("applied.bom.json");
+    let refused = |reason: &str| {
+        let before = observe_tree(&owner.fixture.state);
+        assert_window_refused(&owner, &owner.run(), &before, reason);
+    };
+
+    // The BOM copy no longer hashes to the applied state.
+    let mut altered = bom.clone();
+    altered.push(b'\n');
+    write_mode(&applied_bom, &altered, 0o600);
+    refused("applied BOM differs from the committed applied state");
+    // No BOM copy at all beside a committed state.
+    fs::remove_file(&applied_bom).unwrap();
+    refused("committed applied state has no readable BOM beside it");
+    // A BOM that hashes right but names another hardware target.
+    let foreign = serde_json::to_vec_pretty(&json!({
+        "appliance":{"os_base":{"digest":TARGET_INDEX,"image":OWNER_REPOSITORY},"version":"0.61.2"},
+        "bundle_seq":6,"compat_min":5,"compat_version":5,"hardware_target":"nvidia-gb10-x86_64",
+        "sources":{"seed":{"ref":TARGET_SEED,"repo":"ICE-Fabric"}},"train":"0.61.2"
+    }))
+    .unwrap();
+    owner.commit_applied(&foreign, 6);
+    refused("applied BOM names another hardware target");
+    // A BOM that hashes right but names another image than the booted one.
+    let other_image = committed_bom("0.61.2", 6, THIRD_INDEX, TARGET_SEED);
+    owner.commit_applied(&other_image, 6);
+    refused("booted deployment differs from authenticated applied baseline");
+    // A BOM copy wider than 0600 refuses the whole directory, as any entry.
+    owner.commit_applied(&bom, 6);
+    fs::set_permissions(&applied_bom, fs::Permissions::from_mode(0o644)).unwrap();
+    refused("persistent OTA state has unsafe mode/owner/type metadata; expected 0600");
+    fs::set_permissions(&applied_bom, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Applied states the engine never writes: beneath the sealed floor, at
+    // the sealed sequence with another BOM, without the format marker.
+    owner.commit_applied(&committed_bom("0.60.9", 4, TARGET_INDEX, TARGET_SEED), 4);
+    refused("applied state sequence 4 is below the sealed baseline floor 5");
+    owner.commit_applied(&committed_bom("0.61.0", 5, TARGET_INDEX, TARGET_SEED), 5);
+    refused("applied state at the sealed sequence names another BOM");
+    write_mode(
+        &applied,
+        &canonical(&json!({"bundle_seq": 6, "bom_sha256": hash(&bom), "active_ring": "lab"})),
+        0o600,
+    );
+    write_mode(&applied_bom, &bom, 0o600);
+    refused("applied baseline was recorded by a media-era verifier");
+
+    // The sealed BOM bootstrapped by hand at the sealed sequence (the .67
+    // shape after the night of 2026-09-17): the preseal stays the baseline,
+    // manifest digest included, and no BOM copy is consulted.
+    let sealed = fs::read(owner.fixture.state.join("preseal-input-v1/bom.json")).unwrap();
+    write_mode(
+        &applied,
+        &canonical(&json!({
+            "bundle_seq": 5, "bom_sha256": hash(&sealed),
+            "bom_format": "media-independent-v1", "active_ring": "lab"
+        })),
+        0o600,
+    );
+    fs::remove_file(&applied_bom).unwrap();
+    owner.boot_preseal();
+    let before = observe_tree(&owner.fixture.state);
+    assert_answered_silently(&owner, &before);
+    // …and the exact committed shape answers again on the target.
+    owner.commit_applied(&bom, 6);
+    owner.boot_target();
+    let before = observe_tree(&owner.fixture.state);
+    assert_answered_silently(&owner, &before);
+}
