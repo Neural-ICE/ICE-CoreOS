@@ -43,14 +43,23 @@ ANCHOR="$ANCHOR neuralice.relauth_schema=neural-ice-installer-release-authorizat
 ANCHOR="$ANCHOR neuralice.rootverity=$(printf '%064d' 3)"
 ANCHOR="$ANCHOR neuralice.trust_policy_id=neural-ice-secureboot-lab-v1"
 
-# The appliance's REAL NetworkManager profiles: the generator pins the resolve-
-# only avahi to the management port named by mgmt-*.nmconnection, so the fixture
-# is the overlay the image ships, not a stand-in.
-NM_CONN_FIXTURE="$ROOT/image/bootc-overlay/etc/NetworkManager/system-connections"
-MGMT_INTERFACE="$(sed -n 's/^interface-name=//p' "$NM_CONN_FIXTURE"/mgmt-*.nmconnection | head -1)"
-[[ -n "$MGMT_INTERFACE" ]] || fail "the appliance overlay names no management interface in mgmt-*.nmconnection"
+# The appliance's REAL management-port rule (image/mdns/neural-ice-mgmt-port.sh):
+# the generator makes the resolve-only avahi pin itself to that port when it
+# STARTS (ExecStartPre=), because a generator runs before udev has named a NIC.
+# The tool under test is the one the image ships, not a stand-in; it is later
+# EXECUTED on a fake /sys/class/net to prove the pin it makes.
+MGMT_PORT_TOOL="$ROOT/image/mdns/neural-ice-mgmt-port.sh"
+[[ -f "$MGMT_PORT_TOOL" && -x "$MGMT_PORT_TOOL" ]] || fail "the management-port tool is missing or not executable: $MGMT_PORT_TOOL"
+# A KVM bench guest: one virtio port, enp0s1, and the virtual interfaces podman
+# adds — the host ICE-CoreOS issue 215 measured with no network at first boot.
+SYSNET_FIXTURE="$TMP/sysnet-bench"
+mkdir -p "$SYSNET_FIXTURE/enp0s1" "$SYSNET_FIXTURE/devices/pci0000:00/0000:00:01.0/virtio1" \
+  "$SYSNET_FIXTURE/bus/drivers/virtio_net" "$SYSNET_FIXTURE/lo" "$SYSNET_FIXTURE/podman1"
+printf '52:54:00:12:34:56\n' > "$SYSNET_FIXTURE/enp0s1/address"
+ln -s ../devices/pci0000:00/0000:00:01.0/virtio1 "$SYSNET_FIXTURE/enp0s1/device"
+ln -s ../../../../bus/drivers/virtio_net "$SYSNET_FIXTURE/devices/pci0000:00/0000:00:01.0/virtio1/driver"
 
-run_generator() { # $1=cmdline $2=output-root [--check]   (RUN_GENERATOR_BINARY / RUN_GENERATOR_NM_CONN_DIR: sabotage and fixtures only)
+run_generator() { # $1=cmdline $2=output-root [--check]   (RUN_GENERATOR_BINARY / RUN_GENERATOR_MGMT_PORT_TOOL: sabotage and fixtures only)
   local cmdline=$1 output=$2 mode=${3:-generate}
   install -d -m 0755 "$output/normal" "$output/early" "$output/late"
   printf '%s\n' "$cmdline" > "$output/cmdline"
@@ -58,7 +67,7 @@ run_generator() { # $1=cmdline $2=output-root [--check]   (RUN_GENERATOR_BINARY 
   local -a command=(env NI_INSTALLER_GENERATOR_TESTING=1
     NI_INSTALLER_GENERATOR_TEST_CMDLINE="$output/cmdline"
     NI_INSTALLER_GENERATOR_TEST_GRAMMAR="$GRAMMAR"
-    NI_INSTALLER_GENERATOR_TEST_NM_CONN_DIR="${RUN_GENERATOR_NM_CONN_DIR:-$NM_CONN_FIXTURE}"
+    NI_INSTALLER_GENERATOR_TEST_MGMT_PORT_TOOL="${RUN_GENERATOR_MGMT_PORT_TOOL:-$MGMT_PORT_TOOL}"
     NI_INSTALLER_GENERATOR_TEST_MDNS_RUN_DIR="$output/mdns-run"
     "${RUN_GENERATOR_BINARY:-$GENERATOR}")
   if [[ "$mode" == --check ]]; then
@@ -383,12 +392,11 @@ MDNS_REQUEST_DROPIN=neural-ice-autoinstall.service.d/20-neural-ice-mirror-mdns-r
 # block appended by anyone would otherwise win silently -- and the daemon must
 # be started on that file rather than on the appliance's publishing one.
 assert_mdns_resolve_only() { # $1=output-root -> 0, or a reason on stdout and 1
-  local output=$1 conf="$1/mdns-run/avahi-daemon.conf" key value count observed
+  local output=$1 conf="$1/mdns-run/avahi-daemon.conf" key value count observed pinned
   local dropin="$1/early/$MDNS_RESOLVE_ONLY_DROPIN"
   [[ -f "$conf" ]] || { echo "no resolve-only avahi configuration was written"; return 1; }
   local -A expected=(
     [server/use-ipv4]=yes [server/use-ipv6]=no [server/enable-dbus]=no
-    [server/allow-interfaces]="$MGMT_INTERFACE"
     [wide-area/enable-wide-area]=no
     [publish/disable-publishing]=yes [publish/publish-addresses]=no
     [publish/publish-hinfo]=no [publish/publish-workstation]=no [publish/publish-domain]=no
@@ -409,6 +417,30 @@ assert_mdns_resolve_only() { # $1=output-root -> 0, or a reason on stdout and 1
   grep -qx "ExecStart=/usr/sbin/avahi-daemon --syslog --file=${conf}" "$dropin" \
     || { echo "avahi is not started on the resolve-only configuration"; return 1; }
   grep -qx 'Type=simple' "$dropin" || { echo "avahi keeps its D-Bus service type"; return 1; }
+  # The interface pin is made at START, by the appliance's own rule, never at
+  # generation time (no NIC has a name yet) and never as a bare "every
+  # interface": the generated file carries no allow-interfaces=, the drop-in
+  # runs the tool exactly once before ExecStart=, and the tool, EXECUTED on the
+  # bench fixture, inserts allow-interfaces=enp0s1 under [server] once, leaving
+  # every other byte as generated.
+  ! grep -q '^allow-interfaces=' "$conf" \
+    || { echo "allow-interfaces= is stated at generation time, before any NIC has a name"; return 1; }
+  [[ "$(grep -c '^ExecStartPre=' "$dropin")" == 1 ]] \
+    || { echo "the drop-in runs $(grep -c '^ExecStartPre=' "$dropin") pre-start commands, expected exactly the interface pin"; return 1; }
+  grep -qx "ExecStartPre=${MGMT_PORT_TOOL} --pin-avahi ${conf}" "$dropin" \
+    || { echo "the pre-start is not the management-port pin on the resolve-only configuration"; return 1; }
+  [[ "$(grep -n '^ExecStartPre=\|^ExecStart=/usr' "$dropin" | head -1)" == *ExecStartPre=* ]] \
+    || { echo "the interface pin is not ordered before avahi's start"; return 1; }
+  pinned="$output/mdns-run/avahi-daemon.conf.pinned"
+  cp "$conf" "$pinned"
+  env NEURAL_ICE_SYS_NET="$SYSNET_FIXTURE" "$MGMT_PORT_TOOL" --pin-avahi "$pinned" >/dev/null 2>&1 \
+    || { echo "the management-port tool could not pin the generated configuration on the bench fixture"; return 1; }
+  [[ "$(awk '/^\[/ {s=$0} s=="[server]" && /^allow-interfaces=/' "$pinned")" == "allow-interfaces=enp0s1" ]] \
+    || { echo "after the pre-start, [server] does not carry allow-interfaces=enp0s1 (got: $(grep '^allow-interfaces=' "$pinned" || echo none))"; return 1; }
+  [[ "$(grep -c '^allow-interfaces=' "$pinned")" == 1 ]] || { echo "the pin is stated more than once"; return 1; }
+  cmp -s <(grep -v '^allow-interfaces=' "$pinned") "$conf" \
+    || { echo "the pre-start changed more than the interface pin"; return 1; }
+  rm -f "$pinned"
   return 0
 }
 
@@ -426,9 +458,13 @@ grep -qx 'Wants=avahi-daemon.socket avahi-daemon.service' "$TMP/mdns/early/$MDNS
   || fail "the resolver request is not a Wants= (a resolver that fails must yield the installer's own named refusal, not a dependency failure)"
 grep -Eq '^Requires=' "$TMP/mdns/early/$MDNS_REQUEST_DROPIN" \
   && fail "the resolver request hard-requires avahi"
-# The production path is the one the generator names when it is not under test.
+# The production paths are the ones the generator names when it is not under test.
 grep -qx '  readonly MDNS_RUN_DIR=/run/neural-ice-installer-mdns' "$GENERATOR" \
   || fail "the generator's production resolve-only configuration is not under /run"
+grep -qx '  readonly MGMT_PORT_TOOL=/usr/local/bin/neural-ice-mgmt-port' "$GENERATOR" \
+  || fail "the generator's production management-port tool is not the one image/Containerfile.bootc installs"
+grep -Fq 'COPY image/mdns/neural-ice-mgmt-port.sh /usr/local/bin/neural-ice-mgmt-port' "$ROOT/image/Containerfile.bootc" \
+  || fail "the image does not install the management-port tool the generator's ExecStartPre= names"
 # ...and the graph: avahi is STARTABLE (its closure holds no masked unit), the
 # Install target still is, and the installer's effective Wants= names both
 # avahi units beside the network it already asked for.
@@ -467,24 +503,37 @@ for other in ip-mirror dns-mirror registry install live; do
   grep -q avahi <<<"$(python3 "$UNIT_GRAPH" --wants neural-ice-autoinstall.service "$TMP/$other/early:${mdns_search#*:}")" \
     && fail "$other's installer requests avahi"
 done
-# NO MANAGEMENT PROFILE, NO RESOLVER. A .local mirror on an image whose overlay
-# names no management port has nowhere to pin the daemon: the generator fails
-# loudly, avahi stays masked, nothing is written -- and the Install path it had
-# already taken back stays reachable, so the installer produces its own named
-# refusal instead of a boot that reaches nothing.
-mkdir -p "$TMP/no-mgmt-profiles"
-RUN_GENERATOR_NM_CONN_DIR="$TMP/no-mgmt-profiles" run_generator "$mdns_cmdline" "$TMP/mdns-no-mgmt" >/dev/null 2>&1 \
-  && fail "a .local mirror with no management profile to pin the resolver to was accepted silently"
-for unit in avahi-daemon.service avahi-daemon.socket; do
-  [[ -L "$TMP/mdns-no-mgmt/early/$unit" && "$(readlink "$TMP/mdns-no-mgmt/early/$unit")" == /dev/null ]] \
-    || fail "with no management profile the generator still unmasked $unit"
+# NO MANAGEMENT-PORT RULE ON THE MEDIUM, NO RESOLVER. A .local mirror on a
+# medium that does not carry the executable tool has nothing to pin the daemon
+# with: the generator fails loudly, avahi stays masked, nothing is written --
+# and the Install path it had already taken back stays reachable, so the
+# installer produces its own named refusal instead of a boot that reaches
+# nothing. A tool that is present but not executable is the same medium.
+: > "$TMP/not-executable-tool"; chmod 0644 "$TMP/not-executable-tool"
+for missing in "$TMP/absent-tool" "$TMP/not-executable-tool"; do
+  RUN_GENERATOR_MGMT_PORT_TOOL="$missing" run_generator "$mdns_cmdline" "$TMP/mdns-no-mgmt" >/dev/null 2>&1 \
+    && fail "a .local mirror with no management-port tool to pin the resolver with was accepted silently ($missing)"
+  for unit in avahi-daemon.service avahi-daemon.socket; do
+    [[ -L "$TMP/mdns-no-mgmt/early/$unit" && "$(readlink "$TMP/mdns-no-mgmt/early/$unit")" == /dev/null ]] \
+      || fail "with no management-port tool the generator still unmasked $unit"
+  done
+  [[ ! -e "$TMP/mdns-no-mgmt/mdns-run/avahi-daemon.conf" && ! -e "$TMP/mdns-no-mgmt/early/$MDNS_REQUEST_DROPIN" ]] \
+    || fail "with no management-port tool the generator still wrote resolver material"
+  for unit in neural-ice-installer.target neural-ice-autoinstall.service; do
+    [[ ! -e "$TMP/mdns-no-mgmt/early/$unit" ]] \
+      || fail "with no management-port tool the Install path was masked; the installer's named refusal would be unreachable"
+  done
+  rm -rf "$TMP/mdns-no-mgmt"
 done
-[[ ! -e "$TMP/mdns-no-mgmt/mdns-run/avahi-daemon.conf" && ! -e "$TMP/mdns-no-mgmt/early/$MDNS_REQUEST_DROPIN" ]] \
-  || fail "with no management profile the generator still wrote resolver material"
-for unit in neural-ice-installer.target neural-ice-autoinstall.service; do
-  [[ ! -e "$TMP/mdns-no-mgmt/early/$unit" ]] \
-    || fail "with no management profile the Install path was masked; the installer's named refusal would be unreachable"
-done
+# ...and a medium with the tool but NO built-in wired port (a USB dongle only)
+# fails the pre-start itself, so avahi never starts on an unpinned file.
+mkdir -p "$TMP/sysnet-dongle/enx6c6e0756c268" "$TMP/sysnet-dongle/devices/pci0000:00/0000:00:14.0/usb2/2-1/2-1:2.0" "$TMP/sysnet-dongle/lo"
+ln -s ../devices/pci0000:00/0000:00:14.0/usb2/2-1/2-1:2.0 "$TMP/sysnet-dongle/enx6c6e0756c268/device"
+cp "$TMP/mdns/mdns-run/avahi-daemon.conf" "$TMP/dongle-only.conf"
+env NEURAL_ICE_SYS_NET="$TMP/sysnet-dongle" "$MGMT_PORT_TOOL" --pin-avahi "$TMP/dongle-only.conf" >/dev/null 2>&1 \
+  && fail "the pre-start pinned the resolver to a USB dongle"
+cmp -s "$TMP/dongle-only.conf" "$TMP/mdns/mdns-run/avahi-daemon.conf" \
+  || fail "a refused pre-start altered the resolve-only configuration"
 
 # Directives only: the generator may name the publishing switches in prose, but
 # no directive it emits may turn one on, and no systemd-resolved switch exists.
@@ -517,7 +566,9 @@ sabotage_generator "publish an HINFO record" 's/^publish-hinfo=no$/publish-hinfo
 sabotage_generator "join IPv6 multicast" 's/^use-ipv6=no$/use-ipv6=yes/'
 sabotage_generator "expose avahi on D-Bus" 's/^enable-dbus=no$/enable-dbus=yes/'
 sabotage_generator "reflect between interfaces" 's/^enable-reflector=no$/enable-reflector=yes/'
-sabotage_generator "listen on every interface" 's/^allow-interfaces=\${interfaces}$/allow-interfaces=/'
+sabotage_generator "listen on every interface from generation time" 's/^enable-dbus=no$/enable-dbus=no\nallow-interfaces=/'
+sabotage_generator "skip the start-time interface pin" '/^ExecStartPre=\${MGMT_PORT_TOOL} --pin-avahi/d'
+sabotage_generator "pin with a tool other than the appliance's rule" 's#^ExecStartPre=\${MGMT_PORT_TOOL} #ExecStartPre=/usr/bin/true #'
 sabotage_generator "restate the publishing switch in a later block" \
   's/^rlimit-nproc=3$/rlimit-nproc=3\n\n[publish]\ndisable-publishing=no/'
 sabotage_generator "start avahi on the appliance's publishing configuration" \
@@ -801,4 +852,4 @@ bash "$GATE_TEST" >/dev/null
 bash "$GRAMMAR_TEST" >/dev/null
 bash "$LIVE_DIAG_TEST" >/dev/null
 
-echo "INSTALLER_SYSTEMD_LIFECYCLE_TEST_OK (${#consumer_units[@]} consumers suppressed; ${#masked_units[@]} transient masks; installed boot emits none; a registry install both requests NetworkManager and resolves its closure, a medium install requests neither; a .local mirror gets a resolve-only avahi, an image without a management profile gets none, and eleven sabotaged generators are refused)"
+echo "INSTALLER_SYSTEMD_LIFECYCLE_TEST_OK (${#consumer_units[@]} consumers suppressed; ${#masked_units[@]} transient masks; installed boot emits none; a registry install both requests NetworkManager and resolves its closure, a medium install requests neither; a .local mirror gets a resolve-only avahi pinned to the management port when it starts, a medium without the management-port tool gets none, and thirteen sabotaged generators are refused)"

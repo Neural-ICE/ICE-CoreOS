@@ -137,7 +137,7 @@ done
 allowed=(
   /usr/lib/os-release /usr/lib/neural-ice/version /usr/lib/neural-ice/status-screen
   /usr/lib/neural-ice/release-image /usr/lib/bootc/bound-images.d /usr/share/containers/systemd
-  /etc/containers/systemd /etc/NetworkManager/system-connections /etc/neural-ice/ota.conf
+  /etc/containers/systemd /etc/neural-ice/ota.conf /run/neural-ice/mgmt-interface
   /var/lib/neural-ice/data/release/CHANNEL /var/lib/neural-ice/data/seed-store/current/overlay-images/images.json
   /var/lib/containers/storage/overlay-images/images.json /usr/lib/bootc/storage/overlay-images/images.json
   /sys/class/net /sys/class/dmi/id
@@ -151,14 +151,12 @@ while IFS= read -r found; do
   (( ok )) || fail "status screen code names a path outside its allow-list: $found"
 done < <(grep -oE '(^|[^A-Za-z0-9_])/(usr|etc|var|sys|proc|dev|run|root|home|tmp|boot|opt|srv|sysroot|ostree|mnt|media)(/[A-Za-z0-9_.@-]+)*' "$CODE" \
            | sed -E 's/^[^\/]//' | sort -u)
-# The only NetworkManager profile read is the interface name of mgmt-*; a
-# profile can carry credentials and this code must never read anything else.
-nm_reads="$(grep -n 'nmconnection' "$CODE" || true)"
-[[ -n $nm_reads ]] || fail "management NIC resolution disappeared"
-while IFS= read -r l; do
-  [[ $l == *'mgmt-*.nmconnection'* ]] || fail "status screen reads a NetworkManager profile other than mgmt-*: $l"
-done <<<"$nm_reads"
-grep -Fq "sed -n 's/^interface-name=//p' \"\$conn\"" "$CODE" || fail "status screen must extract only interface-name= from the mgmt profile"
+# The management NIC is the one hostname-init selected and published (one rule,
+# neural-ice-mgmt-port); a NetworkManager profile can carry credentials and this
+# code must not read any profile at all.
+! grep -q 'nmconnection\|NetworkManager/system-connections' "$CODE" \
+  || fail "status screen reads a NetworkManager profile; the management port comes from /run/neural-ice/mgmt-interface"
+grep -Fq '/run/neural-ice/mgmt-interface' "$CODE" || fail "status screen does not read hostname-init's management-port contract"
 # The UART is the kernel's active console (then console=), never a guess, and
 # only the two nodes DeviceAllow= opens qualify.
 grep -Fq '/sys/class/tty/console/active' "$CODE" || fail "serial mirror does not read the kernel's active console list"
@@ -217,7 +215,7 @@ make_fixture() { # fresh fixture root with a first-boot scene
   rm -rf "$FX"
   mkdir -p "$FX/root/usr/lib/neural-ice/status-screen" "$FX/root/usr/lib/bootc/bound-images.d" \
     "$FX/root/usr/share/containers/systemd/neural-ice-bound-images" "$FX/root/etc/containers/systemd" \
-    "$FX/root/etc/NetworkManager/system-connections" "$FX/root/etc/neural-ice" \
+    "$FX/root/run/neural-ice" "$FX/root/etc/neural-ice" \
     "$FX/root/var/lib/neural-ice/data/release" "$FX/root/var/lib/containers/storage/overlay-images" \
     "$FX/root/sys/class/net/enP7s7/statistics" "$FX/root/sys/class/net/enP7s7/device" \
     "$FX/root/sys/class/net/lo/statistics" "$FX/root/sys/class/net/veth0/statistics" \
@@ -235,8 +233,7 @@ make_fixture() { # fresh fixture root with a first-boot scene
   printf 'DGX Spark\n' > "$FX/root/sys/class/dmi/id/product_name"
   printf 'SN-1234-5678\n' > "$FX/root/sys/class/dmi/id/product_serial"
   printf 'beta-debug\n' > "$FX/root/var/lib/neural-ice/data/release/CHANNEL"
-  printf '[connection]\nid=mgmt-enP7s7\ninterface-name=enP7s7\n[802-3-ethernet]\n' \
-    > "$FX/root/etc/NetworkManager/system-connections/mgmt-enP7s7.nmconnection"
+  printf 'enP7s7\n' > "$FX/root/run/neural-ice/mgmt-interface"   # published by hostname-init
   printf 'up\n' > "$FX/root/sys/class/net/enP7s7/operstate"
   printf '1000000\n' > "$FX/root/sys/class/net/enP7s7/statistics/rx_bytes"
   printf 'unknown\n' > "$FX/root/sys/class/net/lo/operstate"
@@ -309,6 +306,25 @@ reject "$serial" 'RX ' "serial mirror never carries the volatile rate"
 # 3b. serial lines are emitted on CHANGE only; the redraw never repeats them.
 out="$(run_screen 3 0)"
 [[ "$(grep -c 'neural-ice-status: ' "$FX/root/dev/ttyS0")" -eq 7 ]] || fail "unchanged phases were re-mirrored to serial"
+
+# 3b-bis. the management port is hostname-init's published contract, nothing
+# else: absent (hostname-init not yet run, or NI-E05) the phase waits and names
+# it; a published name with no such interface is treated the same, never trusted.
+make_fixture
+rm -f "$FX/root/run/neural-ice/mgmt-interface"
+out="$(run_screen 1 0)"
+expect "$out" '[    ]  Network         waiting for the management port (hostname-init)' "no contract: the network phase waits on hostname-init"
+reject "$out" 'enP7s7' "without the contract the screen must not guess a port"
+make_fixture
+printf 'enp0s9\n' > "$FX/root/run/neural-ice/mgmt-interface"
+out="$(run_screen 1 0)"
+expect "$out" 'waiting for the management port (hostname-init)' "a published port absent from /sys/class/net is not trusted"
+make_fixture
+mkdir -p "$FX/root/sys/class/net/enp0s1/statistics" "$FX/root/sys/class/net/enp0s1/device"
+printf 'up\n' > "$FX/root/sys/class/net/enp0s1/operstate"; printf '10\n' > "$FX/root/sys/class/net/enp0s1/statistics/rx_bytes"
+printf 'enp0s1\n' > "$FX/root/run/neural-ice/mgmt-interface"
+out="$(run_screen 1 0)"
+expect "$out" '[ OK ]  Network         enp0s1 up 192.168.1.20' "the KVM bench port (enp0s1) is shown when hostname-init published it"
 
 # 3c. receive rate from rx_bytes deltas, physical interfaces only.
 make_fixture

@@ -8,39 +8,61 @@
 #
 # Écart couvert : ICE-Fabric #447 — sans DHCP, l'appliance n'obtenait AUCUNE
 # adresse IPv4 et n'était joignable par aucun chemin.
+#
+# Et ICE-CoreOS issue 215 — le profil de gestion épinglait `interface-name=enP7s7`
+# (le port du GX10) : sur la VM KVM du banc (`enp0s1`) hostname-init échouait en
+# NI-E05, aucun profil ne s'activait, ni semis ni sshd. Le port est désormais
+# choisi par DEVICE (image/mdns/neural-ice-mgmt-port.sh), et ce test rejoue trois
+# hôtes : le GX10, la VM QEMU, et un dongle USB qui ne doit jamais prendre le rôle.
 set -euo pipefail
 
 SCRIPT=image/mdns/neural-ice-hostname-init.sh
+PORT_LIB=image/mdns/neural-ice-mgmt-port.sh
+PROFIL_LIVRE=image/bootc-overlay/etc/NetworkManager/system-connections/mgmt-onboard.nmconnection
 n=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok()   { n=$((n+1)); printf '  ok  %s\n' "$*"; }
 egal() { [ "$2" = "$3" ] || fail "$1 : attendu '$3', obtenu '$2'"; ok "$1"; }
 
 [ -f "$SCRIPT" ] || fail "script introuvable : $SCRIPT (lancer depuis la racine du dépôt)"
+[ -f "$PORT_LIB" ] || fail "règle du port de gestion introuvable : $PORT_LIB"
+[ -f "$PROFIL_LIVRE" ] || fail "profil de gestion livré introuvable : $PROFIL_LIVRE"
 
 # ---------------------------------------------------------------- bac à sable
 bac="$(mktemp -d)"; trap 'rm -rf "$bac"' EXIT
 IFACE=enP7s7
 MAC=30:c5:99:3f:93:b9
 
-monter_bac() { # $1 = mac de l interface de gestion
+# Un port dans le faux /sys/class/net, avec ce que la règle regarde : le lien
+# `device` (un port virtuel n'en a pas), le chemin de ce device (un dongle USB
+# passe par `/usbN/`), et le pilote lié. Le GX10 réel : enP7s7 = r8169 sur
+# pci0007, les deux ConnectX = mlx5_core ; un dongle réel mesuré le 17.09 sur la
+# machine de dev : enx6c6e0756c268 = cdc_ncm sous /usb2/2-1/.
+poser_port() { # $1 = nom  $2 = mac  $3 = pilote  $4 = chemin device relatif à devices/
+  local nom=$1 mac=$2 pilote=$3 chemin=$4
+  mkdir -p "$bac/sys/$nom" "$bac/sys/devices/$chemin" "$bac/sys/bus/drivers/$pilote"
+  printf '%s\n' "$mac" > "$bac/sys/$nom/address"
+  ln -s "../devices/$chemin" "$bac/sys/$nom/device"
+  ln -sfn "$(printf '../%.0s' $(seq 1 "$(awk -F/ '{print NF}' <<<"$chemin")"))../bus/drivers/$pilote" "$bac/sys/devices/$chemin/driver"
+}
+poser_port_virtuel() { # $1 = nom — aucun lien device
+  mkdir -p "$bac/sys/$1"; printf '00:00:00:00:00:00\n' > "$bac/sys/$1/address"
+}
+
+monter_bac() { # $1 = mac de l interface de gestion  [$2 = nom du port, défaut enP7s7]
+  local mac=$1 port=${2:-$IFACE}
   rm -rf "$bac"; mkdir -p "$bac"
-  mkdir -p "$bac/nm" "$bac/sys/$IFACE" "$bac/run" "$bac/etc"
-  printf '%s\n' "$1" > "$bac/sys/$IFACE/address"
-  cat > "$bac/nm/mgmt-${IFACE}.nmconnection" <<EOF
-[connection]
-id=mgmt-${IFACE}
-type=ethernet
-interface-name=${IFACE}
-autoconnect=true
-autoconnect-priority=100
-
-[ipv4]
-method=auto
-
-[ipv6]
-method=disabled
-EOF
+  mkdir -p "$bac/nm" "$bac/sys" "$bac/run" "$bac/etc"
+  case "$port" in
+    enP7s7) poser_port enP7s7 "$mac" r8169 'pci0007:00/0007:00:00.0/0007:01:00.0'
+            poser_port enp1s0f0np0 30:c5:99:3f:00:10 mlx5_core 'pci0000:00/0000:00:01.0/0000:01:00.0'
+            poser_port enp1s0f1np1 30:c5:99:3f:00:11 mlx5_core 'pci0000:00/0000:00:01.0/0000:01:00.1' ;;
+    enp0s1) poser_port enp0s1 "$mac" virtio_net 'pci0000:00/0000:00:01.0/virtio1' ;;
+    *)      poser_port "$port" "$mac" r8169 'pci0000:00/0000:00:05.0' ;;
+  esac
+  poser_port_virtuel lo; poser_port_virtuel podman1; poser_port_virtuel veth0
+  # Le VRAI profil livré, pas une doublure : c'est lui que NetworkManager lira.
+  cp "$PROFIL_LIVRE" "$bac/nm/mgmt-onboard.nmconnection"
   printf '[server]\nhost-name=x\n' > "$bac/etc/avahi.conf"
   printf 'inconnu\n'               > "$bac/etc/hostname"
   printf '127.0.0.1\tlocalhost\n'  > "$bac/etc/hosts"
@@ -73,6 +95,7 @@ EOF
 jouer() { # exécute le script entier dans le bac
   env NEURAL_ICE_NM_CONN_DIR="$bac/nm" \
       NEURAL_ICE_SYS_NET="$bac/sys" \
+      NEURAL_ICE_MGMT_PORT_LIB="$PORT_LIB" \
       NEURAL_ICE_RUN_DIR="$bac/run" \
       NEURAL_ICE_AVAHI_CONF="$bac/etc/avahi.conf" \
       NEURAL_ICE_ETC_HOSTNAME="$bac/etc/hostname" \
@@ -82,12 +105,96 @@ jouer() { # exécute le script entier dans le bac
       bash "$SCRIPT"
 }
 
+# ==================================== 0. le port de gestion est choisi par DEVICE
+# La règle est EXÉCUTÉE (le programme, puis le script complet), sur trois hôtes.
+echo "== 0. le port de gestion : premier port filaire intégré, jamais un dongle, jamais un ConnectX =="
+choisir() { env NEURAL_ICE_SYS_NET="$bac/sys" bash "$PORT_LIB"; }
+
+monter_bac "$MAC"                                    # GX10 : enP7s7 + 2 ConnectX + virtuels
+egal "GX10 : enP7s7, pas un port ConnectX (mlx5_core), pas un port virtuel" "$(choisir)" "enP7s7"
+monter_bac "52:54:00:12:34:56" enp0s1                # VM QEMU virt du banc
+egal "VM KVM : enp0s1 (virtio_net)" "$(choisir)" "enp0s1"
+monter_bac "$MAC"; poser_port enx6c6e0756c268 6c:6e:07:56:c2:68 cdc_ncm 'pci0000:00/0000:00:14.0/usb2/2-1/2-1:2.0'
+egal "un dongle USB ne vole pas le rôle au port intégré" "$(choisir)" "enP7s7"
+monter_bac "$MAC" eth0
+egal "un nom classique eth0 est admis" "$(choisir)" "eth0"
+monter_bac "52:54:00:12:34:56" enp0s1; poser_port enp0s2 52:54:00:12:34:57 virtio_net 'pci0000:00/0000:00:02.0/virtio2'
+egal "deux ports intégrés : le premier par ordre de nom (C) — règle documentée" "$(choisir)" "enp0s1"
+
+# Le dongle seul : refus explicite, pas un nom d'hôte qui suivrait la clé USB.
+rm -rf "$bac"; mkdir -p "$bac/nm" "$bac/sys" "$bac/run" "$bac/etc"
+poser_port enx6c6e0756c268 6c:6e:07:56:c2:68 cdc_ncm 'pci0000:00/0000:00:14.0/usb2/2-1/2-1:2.0'
+poser_port_virtuel lo
+if choisir >"$bac/log0" 2>&1; then fail "un dongle USB seul ne doit pas devenir le port de gestion : $(cat "$bac/log0")"; fi
+grep -q 'no built-in wired port' "$bac/log0" || fail "le refus doit nommer sa raison : $(cat "$bac/log0")"
+ok "dongle seul : refusé, avec la raison"
+cp "$PROFIL_LIVRE" "$bac/nm/mgmt-onboard.nmconnection"
+printf '[server]\nhost-name=x\n' > "$bac/etc/avahi.conf"; printf 'inconnu\n' > "$bac/etc/hostname"
+printf '127.0.0.1\tlocalhost\n' > "$bac/etc/hosts"; printf 'inconnu' > "$bac/etc/proc-hostname"
+if jouer >"$bac/log0b" 2>&1; then fail "hostname-init doit échouer (NI-E05) quand seul un dongle est présent"; fi
+grep -q 'ERROR: no management interface found' "$bac/log0b" || fail "l'échec doit être journalisé comme absence de port : $(tail -2 "$bac/log0b")"
+egal "dongle seul : aucun nom d'hôte dérivé" "$(cat "$bac/etc/hostname")" "inconnu"
+
+# PREUVE DE NON-VACUITÉ, dans une copie jamais dans l'arbre : sans l'exclusion
+# USB, le même bac donne le dongle. Si ce contrôle ne rougit pas, le précédent
+# ne mesure rien.
+sed '/\*\/usb\[0-9\]\*\/\*) continue/d' "$PORT_LIB" > "$bac/port-sabote.sh"
+grep -q 'usb\[0-9\]' "$bac/port-sabote.sh" && fail "le sabotage n'a pas retiré l'exclusion USB"
+egal "sabotage : sans l'exclusion USB le dongle est choisi (le contrôle sait rougir)" \
+  "$(env NEURAL_ICE_SYS_NET="$bac/sys" bash "$bac/port-sabote.sh")" "enx6c6e0756c268"
+
+# Le script complet, sur la VM du banc : nom d'hôte, secours et contrat /run
+# viennent tous du port choisi — c'est exactement ce que NI-E05 empêchait.
+monter_bac "52:54:00:12:34:56" enp0s1
+jouer >"$bac/log0c" 2>&1 || fail "hostname-init a échoué sur l'hôte VM : $(tail -3 "$bac/log0c")"
+egal "VM : nom d'hôte dérivé de enp0s1"        "$(cat "$bac/etc/hostname")" "ni-coreos-3456"
+egal "VM : contrat /run/neural-ice/mgmt-interface" "$(cat "$bac/run/mgmt-interface")" "enp0s1"
+[ -f "$bac/nm/fallback-enp0s1.nmconnection" ] || fail "VM : profil de secours non rendu sur enp0s1"
+grep -qxF 'interface-name=enp0s1' "$bac/nm/fallback-enp0s1.nmconnection" || fail "VM : le secours n'est pas épinglé sur enp0s1"
+egal "VM : avahi épinglé sur enp0s1" "$(grep -c '^allow-interfaces=enp0s1$' "$bac/etc/avahi.conf")" "1"
+
+# Le mode programme de l'installeur : `--pin-avahi` épingle la conf resolve-only
+# une fois, et rejouer ne double rien.
+monter_bac "$MAC"
+printf '[server]\nuse-ipv4=yes\n\n[publish]\ndisable-publishing=yes\n' > "$bac/etc/resolve-only.conf"
+env NEURAL_ICE_SYS_NET="$bac/sys" bash "$PORT_LIB" --pin-avahi "$bac/etc/resolve-only.conf" >/dev/null || fail "--pin-avahi a échoué"
+env NEURAL_ICE_SYS_NET="$bac/sys" bash "$PORT_LIB" --pin-avahi "$bac/etc/resolve-only.conf" >/dev/null || fail "--pin-avahi rejoué a échoué"
+egal "--pin-avahi : allow-interfaces une seule fois, sous [server]" \
+  "$(awk '/^\[/ {s=$0} s=="[server]" && /^allow-interfaces=/' "$bac/etc/resolve-only.conf")" "allow-interfaces=enP7s7"
+egal "--pin-avahi : jamais hors de [server]" "$(grep -c '^allow-interfaces=' "$bac/etc/resolve-only.conf")" "1"
+if env NEURAL_ICE_SYS_NET="$bac/sys" bash "$PORT_LIB" --pin-avahi "$bac/etc/absent.conf" >/dev/null 2>&1; then
+  fail "--pin-avahi sur un fichier absent doit échouer"; fi
+ok "--pin-avahi refuse un fichier absent"
+
+# Le profil LIVRÉ dit la même règle dans le vocabulaire de NetworkManager : pas
+# de nom épinglé, et exactement les trois clés [match] que la règle sysfs mime.
+echo "== 0bis. le profil livré porte la même règle =="
+grep -q '^interface-name=' <(sed -n '/^\[connection\]/,/^\[/p' "$PROFIL_LIVRE") \
+  && fail "le profil livré épingle encore un interface-name sous [connection] (issue 215)"
+egal "[match] interface-name" "$(sed -n '/^\[match\]/,/^\[/{s/^interface-name=//p}' "$PROFIL_LIVRE")" "en*;eth*"
+egal "[match] driver"         "$(sed -n '/^\[match\]/,/^\[/{s/^driver=//p}' "$PROFIL_LIVRE")" "!mlx5_core"
+egal "[match] path"           "$(sed -n '/^\[match\]/,/^\[/{s/^path=//p}' "$PROFIL_LIVRE")" "!*-usb-*"
+egal "id stable, lu par dhcp-retry" "$(sed -n 's/^id=//p' "$PROFIL_LIVRE")" "mgmt-onboard"
+egal "priorité 100 conservée" "$(sed -n 's/^autoconnect-priority=//p' "$PROFIL_LIVRE")" "100"
+# Le vrai analyseur keyfile de NetworkManager, hors ligne, quand il est là.
+if command -v nmcli >/dev/null 2>&1; then
+  normalise="$(nmcli --offline connection modify < "$PROFIL_LIVRE" 2>&1)" \
+    || fail "nmcli --offline rejette le profil livré : $normalise"
+  grep -qx 'driver=!mlx5_core;' <<<"$normalise" || fail "nmcli ne relit pas match.driver : $normalise"
+  grep -qx 'path=!\*-usb-\*;' <<<"$normalise" || fail "nmcli ne relit pas match.path : $normalise"
+  grep -qx 'interface-name=en\*;eth\*;' <<<"$normalise" || fail "nmcli ne relit pas match.interface-name : $normalise"
+  ok "nmcli --offline ($(nmcli --version | awk '{print $NF}')) relit les trois clés [match] du profil livré"
+else
+  echo "  --  nmcli absent : le profil n'est validé que statiquement ici (la CI native le relit)"
+fi
+
 # ============================================================ 1. la dérivation
 # Sourcer expose les fonctions sans lancer main() — la garde BASH_SOURCE.
 monter_bac "$MAC"
 derive() {
   env NEURAL_ICE_NM_CONN_DIR="$bac/nm" NEURAL_ICE_SYS_NET="$bac/sys" \
       NEURAL_ICE_RUN_DIR="$bac/run" NEURAL_ICE_AVAHI_CONF="$bac/etc/avahi.conf" \
+      NEURAL_ICE_MGMT_PORT_LIB="$PORT_LIB" \
       bash -c "source '$SCRIPT'; linklocal_address '$1'"
 }
 echo "== 1. l'adresse dérive des deux mêmes octets que le nom d'hôte =="
@@ -116,7 +223,7 @@ egal "hors bande repliée, aucune collision" "$collisions" "0"
 # ================================================ 2. le profil est bien rendu
 echo "== 2. le profil est rendu par une exécution COMPLÈTE du script =="
 monter_bac "$MAC"
-mgmt_avant="$(sha256sum "$bac/nm/mgmt-${IFACE}.nmconnection" | cut -d' ' -f1)"
+mgmt_avant="$(sha256sum "$bac/nm/mgmt-onboard.nmconnection" | cut -d' ' -f1)"
 jouer >"$bac/log1" 2>&1 || fail "le script a échoué : $(tail -3 "$bac/log1")"
 profil="$bac/nm/fallback-${IFACE}.nmconnection"
 [ -f "$profil" ] || fail "profil de secours non rendu (main ne l'appelle pas ?) — $(tail -3 "$bac/log1")"
@@ -135,7 +242,7 @@ for ligne in \
 done
 ok "toutes les clés attendues sont présentes"
 egal "priorité, une seule occurrence" "$(grep -c '^autoconnect-priority=' "$profil")" "1"
-egal "le profil de gestion est intact" "$(sha256sum "$bac/nm/mgmt-${IFACE}.nmconnection" | cut -d' ' -f1)" "$mgmt_avant"
+egal "le profil de gestion est intact" "$(sha256sum "$bac/nm/mgmt-onboard.nmconnection" | cut -d' ' -f1)" "$mgmt_avant"
 egal "aucun fichier temporaire laissé" "$(find "$bac/nm" -name '*.tmp.*' | wc -l)" "0"
 
 # ============================================================ 3. idempotence
@@ -271,7 +378,8 @@ ok "aucun retry DHCP périodique n'est livré ni activé"
 rejouer_retry() {
   env NEURAL_ICE_NM_CONN_DIR="$bac/nm" NEURAL_ICE_SYS_NET="$bac/sys" \
       NEURAL_ICE_RUN_DIR="$bac/run" NEURAL_ICE_AVAHI_CONF="$bac/etc/avahi.conf" \
-      NEURAL_ICE_HOSTNAME_INIT="$SCRIPT" PATH="$bac/bin:$PATH" \
+      NEURAL_ICE_HOSTNAME_INIT="$SCRIPT" NEURAL_ICE_MGMT_PORT_LIB="$PORT_LIB" \
+      PATH="$bac/bin:$PATH" \
       bash "$RETRY"
 }
 
@@ -280,22 +388,22 @@ printf 'fallback-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
 : > "$bac/appels"
 rejouer_retry >"$bac/log8a" 2>&1 || fail "le retour au DHCP ne doit pas échouer"
 egal "reconnexion demandée quand le secours tient" \
-  "$(grep -c "^nmcli connection up mgmt-${IFACE}$" "$bac/appels")" "1"
+  "$(grep -c '^nmcli connection up mgmt-onboard$' "$bac/appels")" "1"
 
-printf 'mgmt-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
+printf 'mgmt-onboard:%s\n' "$IFACE" > "$bac/actives"
 : > "$bac/appels"
 rejouer_retry >"$bac/log8b" 2>&1 || fail "run avec DHCP actif en échec"
 egal "aucune reconnexion quand le DHCP tient déjà" \
   "$(grep -c '^nmcli connection up' "$bac/appels")" "0"
 
 # Le nom du profil se lit DANS le fichier, il n est pas supposé « mgmt-<iface> ».
-sed -i "s/^id=mgmt-${IFACE}$/id=administration/" "$bac/nm/mgmt-${IFACE}.nmconnection"
+sed -i 's/^id=mgmt-onboard$/id=administration/' "$bac/nm/mgmt-onboard.nmconnection"
 printf 'fallback-%s:%s\n' "$IFACE" "$IFACE" > "$bac/actives"
 : > "$bac/appels"
 rejouer_retry >"$bac/log8c" 2>&1 || fail "run avec un id renommé en échec"
 egal "le profil est nommé d après son fichier" \
   "$(grep -c '^nmcli connection up administration$' "$bac/appels")" "1"
-sed -i "s/^id=administration$/id=mgmt-${IFACE}/" "$bac/nm/mgmt-${IFACE}.nmconnection"
+sed -i 's/^id=administration$/id=mgmt-onboard/' "$bac/nm/mgmt-onboard.nmconnection"
 
 # NetworkManager arrêté : rien du tout.
 poser_bouchons 3
