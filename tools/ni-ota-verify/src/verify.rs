@@ -569,23 +569,95 @@ fn human_summary(verdict: &Verdict) {
 /// Best-effort posture surface: the last verdict lands in state_dir so the
 /// sovereignty check 14 (Fabric P2) can report it without re-running a verify.
 /// Never fatal — observability must not block (or fake) a verdict.
+///
+/// MODE 0600, LIKE EVERY OTHER ENTRY OF state_dir. `authenticated-ota-status`
+/// snapshots the whole directory and refuses it as a unit when any entry is
+/// not a root-owned regular file in mode 0600 (`validate_status_metadata`).
+/// This file used to be written with `std::fs::write` under the process
+/// umask, i.e. 0644 — measured on .67, 2026-09-17 00:35 (ICE-CoreOS issue
+/// 208): after one `appliance-ota-mvp.sh --check-only`, the listing read
+/// `600 … applied.json` for everything except `644 root 1290
+/// last-verdict.json`, `authenticated-ota-status` answered "persistent OTA
+/// state has unsafe mode/owner/type metadata; expected 0600", the licence
+/// gate failed five times and the AI stack never started; `chmod 0600` and
+/// the gate opened. One OTA check therefore closed the licensed plane on the
+/// next boot of every appliance — the same class as issue 201, a value put
+/// where another reader refuses it.
+///
+/// No reader outside this binary needs the file world-readable: the status
+/// screen and the Fabric scripts do not open it (grepped 2026-09-17), and the
+/// posture report to come reads it as root. Written through an exclusive
+/// 0600 temp file beside it and renamed into place, so the directory never
+/// holds a half-written or wider-than-0600 verdict at any instant.
 fn record_last_verdict(cfg: &Config, json: &str) {
     let Some(dir) = &cfg.state_dir else { return };
-    let write = || -> Result<(), InternalError> {
-        ensure_secure_state_directory(dir)?;
-        std::fs::write(dir.join("last-verdict.json"), format!("{json}\n")).map_err(|error| {
-            InternalError(format!(
-                "cannot write {}: {error}",
-                dir.join("last-verdict.json").display()
-            ))
-        })
-    };
-    if let Err(InternalError(error)) = write() {
+    if let Err(InternalError(error)) = write_last_verdict(dir, json) {
         eprintln!(
             "ni-ota-verify: WARN: could not record last verdict in {}: {error}",
             dir.display()
         );
     }
+}
+
+const LAST_VERDICT_NAME: &str = "last-verdict.json";
+
+fn write_last_verdict(dir: &Path, json: &str) -> Result<(), InternalError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    ensure_secure_state_directory(dir)?;
+    let target = dir.join(LAST_VERDICT_NAME);
+    let (temp, mut file) = (0_u16..128)
+        .find_map(|attempt| {
+            let path = dir.join(format!(
+                ".{LAST_VERDICT_NAME}.{}.{attempt}.tmp",
+                std::process::id()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            match options.open(&path) {
+                Ok(file) => Some(Ok((path, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(InternalError(format!(
+                    "cannot create {}: {error}",
+                    path.display()
+                )))),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            InternalError(format!(
+                "cannot allocate a temp file beside {}",
+                target.display()
+            ))
+        })?;
+    let staged = (|| -> Result<(), InternalError> {
+        // create_new + mode already gave 0600 minus umask; umask can only
+        // narrow, and the target contract is exactly 0600, so restate it.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| InternalError(format!("cannot secure {}: {error}", temp.display())))?;
+        file.write_all(format!("{json}\n").as_bytes())
+            .map_err(|error| InternalError(format!("cannot write {}: {error}", temp.display())))?;
+        file.sync_all()
+            .map_err(|error| InternalError(format!("cannot sync {}: {error}", temp.display())))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    // rename replaces a symlink at the target name rather than following it:
+    // a planted `last-verdict.json -> elsewhere` is overwritten, not written
+    // through.
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(InternalError(format!(
+            "cannot move {} into place: {error}",
+            temp.display()
+        )));
+    }
+    crate::state::sync_directory(dir)
 }
 
 #[cfg(test)]

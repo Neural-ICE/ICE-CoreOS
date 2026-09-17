@@ -2943,3 +2943,145 @@ fn bootstrap_from_preseal_requires_a_pristine_anchor_and_the_sealed_channel() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// ICE-CoreOS issue 208, measured on .67 2026-09-17 00:35: after one OTA
+/// check the state directory read `600 …` for every entry except
+/// `644 root 1290 last-verdict.json`, the authenticated reader refused the
+/// directory as a unit and the licence gate stayed closed; `chmod 0600`
+/// reopened it. The verdict `verify` records must never close the reader
+/// that shares its directory — and a foreign 0644 entry must still.
+#[test]
+fn verify_verdict_keeps_the_authenticated_status_answerable() {
+    let fixture = Fixture::new("verdict-beside-status", "");
+    let access = install_access_profile(&fixture, "lab-managed");
+    let (receipt_sha, set_sha) = install_owner_preseal(&fixture);
+    install_completion_v2(&fixture, &access, &receipt_sha, &set_sha);
+    let public = owner_public(
+        "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "policywrite|authread|ownerread|no_da|nt=extend",
+    );
+    install_read_only_tpm(&fixture, &access, &public, None, 5);
+    let profile = fixture.root.join("ota-state-profile");
+    write_mode(&profile, b"owner-sealed-ota-state-v1\n", 0o444);
+    let payload = fixture.root.join("PAYLOAD_ID");
+    write_mode(
+        &payload,
+        b"cccccccccccccccccccccccccccccccccccccccc\n",
+        0o644,
+    );
+    let ostree = install_ostree_fixture(&fixture);
+    let held = b"{\"committed_generation\":null,\"completion_version\":2,\"enforce_ready_verified\":false,\"profile\":\"owner-sealed-ota-state-v1\",\"schema\":\"neural-ice-authenticated-ota-status-v1\"}\n";
+    let output = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, held);
+
+    // The OTA controller's `verify`, against the SAME state directory. The
+    // fixture's root key is real (install_owner_preseal generated it), so
+    // the BOM and the channel record carry real signatures the fixture's
+    // cosign checks with OpenSSL; the verdict itself is whatever an unseeded
+    // enforcing appliance earns — what matters here is the file it leaves.
+    let root_key = fixture.root.join("ota-root.key");
+    let bom = serde_json::to_vec_pretty(&json!({
+        "appliance":{"os_base":{"digest":OWNER_INDEX,"image":OWNER_REPOSITORY},"version":"0.50.9-lab.20260905"},
+        "bundle_seq":5,"compat_min":5,"compat_version":5,"hardware_target":"nvidia-gb10-arm64",
+        "sources":{"seed":{"ref":"cccccccccccccccccccccccccccccccccccccccc","repo":"ICE-Fabric"}},"train":"0.50.9-lab.20260905"
+    }))
+    .unwrap();
+    let record = canonical(&json!({
+        "assigned_at":"2026-09-05T00:00:00Z","bundle_digest":format!("sha256:{}", "d".repeat(64)),
+        "bundle_seq":5,"channel":"lab","hardware_target":"nvidia-gb10-arm64","key_version":1,
+        "schema_version":2,"train":"0.50.9-lab.20260905"
+    }));
+    let bom_path = fixture.root.join("verify-bom.json");
+    let record_path = fixture.root.join("verify-record.json");
+    fs::write(&bom_path, &bom).unwrap();
+    fs::write(&record_path, &record).unwrap();
+    let bom_sig = fixture.root.join("verify-bom.sig");
+    let record_sig = fixture.root.join("verify-record.sig");
+    fs::write(
+        &bom_sig,
+        base64(&sign(&root_key, b"", &bom, &fixture.root, "verify-bom")),
+    )
+    .unwrap();
+    fs::write(
+        &record_sig,
+        base64(&sign(
+            &root_key,
+            b"",
+            &record,
+            &fixture.root,
+            "verify-record",
+        )),
+    )
+    .unwrap();
+    let verify = Command::new(env!("CARGO_BIN_EXE_ni-ota-verify"))
+        .arg("verify")
+        .arg("--bom")
+        .arg(&bom_path)
+        .arg("--bom-sig")
+        .arg(&bom_sig)
+        .arg("--record")
+        .arg(&record_path)
+        .arg("--record-sig")
+        .arg(&record_sig)
+        .args(["--bundle-digest", &format!("sha256:{}", "d".repeat(64))])
+        .args(["--device-channel", "lab", "--device-compat", "5,5"])
+        .arg("--config")
+        .arg(&fixture.config)
+        .env("NI_OTA_COSIGN", fixture.root.join("cosign"))
+        .env(
+            "NI_OTA_HARDWARE_TARGET_FILE",
+            fixture.root.join("hardware-target"),
+        )
+        .output()
+        .unwrap();
+    assert_ne!(
+        verify.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let verdict = fixture.state.join("last-verdict.json");
+    let metadata = fs::symlink_metadata(&verdict).unwrap();
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    let recorded: Value = serde_json::from_slice(&fs::read(&verdict).unwrap()).unwrap();
+    assert!(recorded["checks"].is_array(), "{recorded}");
+
+    // The reader answers with the verdict beside it, and touches nothing.
+    let before = observe_tree(&fixture.state);
+    let output = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, held);
+    assert_eq!(observe_tree(&fixture.state), before);
+
+    // The .67 shape, reproduced: the same verdict widened to 0644 closes it.
+    fs::set_permissions(&verdict, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = observe_tree(&fixture.state);
+    let output = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_owner_status_refused(&fixture, &output, &before);
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("persistent OTA state has unsafe mode/owner/type metadata; expected 0600"));
+    fs::set_permissions(&verdict, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A foreign 0644 entry is refused exactly the same way: the mode contract
+    // of the directory did not move, only the verifier's own writer did.
+    write_mode(&fixture.state.join("posture.json"), b"{}\n", 0o644);
+    let before = observe_tree(&fixture.state);
+    let output = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_owner_status_refused(&fixture, &output, &before);
+    fs::remove_file(fixture.state.join("posture.json")).unwrap();
+    let output = run_owner_status(&fixture, &profile, &payload, &ostree);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, held);
+}
