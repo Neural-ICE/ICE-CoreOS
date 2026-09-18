@@ -787,6 +787,69 @@ cache_kept="$(find "$CACHE/store/sealed-store" -mindepth 1 -maxdepth 1 -type d |
 
 echo "  incremental build: the sealed store cache is opt-in, keyed by document, bounded, and re-proved on every reuse"
 
+# --------------------------------------------------------------------------- #
+# ADR-0058 Volet C: the sealed store identity is sourced from the SIGNED
+# reference, not from podman's local .Digest.
+#
+# resolve_sealed_store_identity is LIFTED from the producer (as the cache
+# functions above are) and driven directly: it needs bash and nothing else, so
+# it too lives ABOVE the veritysetup fixture that `exit 0`s on this host. It owns
+# the manifest-digest PROVENANCE -- the value the whole store-equality chain is
+# compared against -- so a regression here is exactly the "phantom digest" class
+# ADR-0058 closes.
+# --------------------------------------------------------------------------- #
+IDENTITY="$TMP/identity-lift"; mkdir -p "$IDENTITY"
+python3 - "$BUILDER" "$IDENTITY/identity.sh" resolve_sealed_store_identity <<'PYEOF' \
+  || fail "cannot lift the store-identity resolver"
+import re, sys
+source = open(sys.argv[1], encoding="utf-8").read().splitlines()
+extracted = []
+for name in sys.argv[3:]:
+    opening = f"{name}() {{"
+    starts = [i for i, line in enumerate(source) if line.startswith(opening)]
+    if len(starts) != 1:
+        raise SystemExit(f"the producer defines {name} {len(starts)} times")
+    for index in range(starts[0], len(source)):
+        extracted.append(source[index])
+        if index > starts[0] and source[index] == "}":
+            break
+    else:
+        raise SystemExit(f"{name} has no closing brace")
+    extracted.append("")
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(extracted) + "\n")
+PYEOF
+grep -q '^resolve_sealed_store_identity()' "$IDENTITY/identity.sh" \
+  || fail "the producer no longer defines resolve_sealed_store_identity; the store identity would be untested"
+bash -n "$IDENTITY/identity.sh" || fail "the lifted store-identity resolver does not parse"
+# shellcheck source=/dev/null
+. "$IDENTITY/identity.sh"
+
+SIGNED_INDEX="sha256:$(printf 'a%.0s' {1..64})"
+OTHER_DIGEST="sha256:$(printf 'b%.0s' {1..64})"
+SIGNED_REF="registry.example.test/neural-ice/appliance@${SIGNED_INDEX}"
+# (i) A signed reference whose locally observed manifest matches yields exactly
+# the SIGNED digest -- the value the readback of the staged store is compared
+# against, so an accepted build reads the same digest back.
+resolved="$(resolve_sealed_store_identity "$SIGNED_REF" "$SIGNED_INDEX")" \
+  || fail "the store identity was refused for a base whose observed manifest matches its signed reference"
+[ "$resolved" = "$SIGNED_INDEX" ] \
+  || fail "the store identity resolved to '$resolved', not the signed reference digest $SIGNED_INDEX"
+# (iv) A locally observed manifest that DIFFERS from the signed reference (a
+# re-encoded or substituted manifest -- different content behind the same ref) is
+# refused; the digest is never taken from podman's local view alone.
+if resolve_sealed_store_identity "$SIGNED_REF" "$OTHER_DIGEST" >/dev/null 2>&1; then
+  fail "a manifest digest differing from the signed reference was accepted"
+fi
+# A reference that is not digest-pinned carries no signed identity at all.
+if resolve_sealed_store_identity "registry.example.test/neural-ice/appliance:latest" "$SIGNED_INDEX" >/dev/null 2>&1; then
+  fail "a tag-only (unpinned) reference was accepted as a signed store identity"
+fi
+# A malformed observed digest is refused rather than trusted.
+if resolve_sealed_store_identity "$SIGNED_REF" "not-a-digest" >/dev/null 2>&1; then
+  fail "a malformed observed manifest digest was accepted"
+fi
+echo "  store identity: sourced from the signed reference digest, podman's .Digest demoted to a fail-closed cross-check (ADR-0058 Volet C)"
+
 
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"

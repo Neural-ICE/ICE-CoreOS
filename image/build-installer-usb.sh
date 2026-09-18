@@ -192,6 +192,28 @@ sha256_of() { # $1=path -> lowercase hex
   sha256sum -- "$1" | awk '{print tolower($1)}'
 }
 
+# ADR-0058 Volet C. The digest the sealed store is proven against comes from the
+# SIGNED, sovereign reference -- `${ref##*@}`, the cosign-signed index/repository
+# digest the release inputs pinned -- NOT from a digest podman recomputed off a
+# locally re-encoded copy. The chain ships single-manifest linux/arm64 images
+# (ADR-0008), for which the repository/index digest and the platform manifest
+# digest name the same object, so podman's locally observed `.Digest` is a
+# fail-closed CROSS-CHECK, never the source: a divergence means a re-encoded or
+# genuinely multi-arch base, which this single-manifest install path does not
+# support, and it is refused rather than trusted. Content identity (config id,
+# and the diff-ids the config id hashes over) is proven separately downstream by
+# EXPECTED_STORE_IMAGE_ID; this function owns only the manifest-digest provenance.
+resolve_sealed_store_identity() { # $1=digest-pinned reference  $2=locally observed platform manifest digest
+  local ref=$1 observed=$2 signed=${1##*@}
+  [[ "$signed" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { echo "ERROR: the base reference is not pinned to a sha256 digest: $ref" >&2; return 1; }
+  [[ "$observed" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { echo "ERROR: the locally observed platform manifest digest is malformed: '${observed}'" >&2; return 1; }
+  [[ "$observed" == "$signed" ]] \
+    || { echo "ERROR: the locally observed manifest digest ${observed} differs from the signed reference digest ${signed}; this single-manifest install path (ADR-0008) refuses a re-encoded or multi-arch base image" >&2; return 1; }
+  printf '%s' "$signed"
+}
+
 # --------------------------------------------------------------------------- #
 # 🔴 THE MEASUREMENT LIVES IN THE ARTEFACT (FAB-0057 P1.7).
 #
@@ -1054,10 +1076,15 @@ BASE_IMAGE_ID="${_base_image_id_raw#sha256:}"
 [[ "$BASE_IMAGE_ID" =~ ^[0-9a-f]{64}$ ]] \
   || { echo "ERROR: BASE_IMAGE has no immutable config identity" >&2; exit 1; }
 BASE_IMAGE_REF="sha256:${BASE_IMAGE_ID}"
-BASE_MANIFEST_DIGEST="$(sudo podman image inspect "$BASE_IMAGE" --format '{{.Digest}}' 2>/dev/null | tr -d '[:space:]')" \
+# The platform manifest digest podman observes on the locally loaded copy is a
+# CROSS-CHECK; resolve_sealed_store_identity takes the trusted value from the
+# signed, digest-pinned $BASE_IMAGE and refuses if the two diverge (ADR-0058
+# Volet C). The .RepoDigests match below independently proves the local object
+# carries exactly that signed reference.
+_base_observed_manifest_digest="$(sudo podman image inspect "$BASE_IMAGE" --format '{{.Digest}}' 2>/dev/null | tr -d '[:space:]')" \
   || { echo "ERROR: cannot resolve the BASE_IMAGE platform manifest digest" >&2; exit 1; }
-[[ "$BASE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-  || { echo "ERROR: BASE_IMAGE reports no immutable platform manifest digest" >&2; exit 1; }
+BASE_MANIFEST_DIGEST="$(resolve_sealed_store_identity "$BASE_IMAGE" "$_base_observed_manifest_digest")" \
+  || exit 1
 BASE_REPODIGEST_MATCHES="$(sudo podman image inspect "$BASE_IMAGE" \
   --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
   | awk -v exact="$BASE_IMAGE" '$0 == exact {n++} END {print n+0}')"
