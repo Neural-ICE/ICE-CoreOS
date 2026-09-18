@@ -14,9 +14,11 @@ use crate::{parse_flags, runner, InternalError, DEFAULT_CONFIG, EXIT_PASS, EXIT_
 
 pub(crate) mod beta;
 pub(crate) mod contract;
+pub(crate) mod lab;
 
 pub(crate) use beta::run as run_beta;
 pub(crate) use beta::run_usb;
+pub(crate) use lab::run as run_lab;
 
 use contract::{
     canonical_hash, encode_base64, parse_canonical, safe_uint, sha256, validate_chain,
