@@ -417,6 +417,19 @@ assert_mdns_resolve_only() { # $1=output-root -> 0, or a reason on stdout and 1
   grep -qx "ExecStart=/usr/sbin/avahi-daemon --syslog --file=${conf}" "$dropin" \
     || { echo "avahi is not started on the resolve-only configuration"; return 1; }
   grep -qx 'Type=simple' "$dropin" || { echo "avahi keeps its D-Bus service type"; return 1; }
+  # 🔴 ORDERED AFTER network-online.target. The vendor unit orders only on
+  # avahi-daemon.socket, so without this the daemon starts at network.target,
+  # before NetworkManager has given the management port a routable address; the
+  # ExecStartPre pin below then binds an address-less interface and avahi emits
+  # no query at all (measured on .67: a pcap showed zero mDNS packets). Wants=,
+  # not Requires=: a link that never comes up must still reach the installer's
+  # own bounded refusal, not a systemd dependency failure.
+  grep -qx 'After=network-online.target' "$dropin" \
+    || { echo "the resolve-only drop-in is not ordered after network-online.target; avahi may start before the management interface has a routable address and emit nothing"; return 1; }
+  grep -qx 'Wants=network-online.target' "$dropin" \
+    || { echo "the resolve-only drop-in does not pull in network-online.target; the ordering edge would be inert if nothing else pulled the target"; return 1; }
+  grep -Eq '^Requires=network-online.target' "$dropin" \
+    && { echo "the resolve-only drop-in hard-requires network-online.target; a link that never comes up must yield the installer's own refusal, not a dependency failure"; return 1; }
   # The interface pin is made at START, by the appliance's own rule, never at
   # generation time (no NIC has a name yet) and never as a bare "every
   # interface": the generated file carries no allow-interfaces=, the drop-in
@@ -568,6 +581,8 @@ sabotage_generator "expose avahi on D-Bus" 's/^enable-dbus=no$/enable-dbus=yes/'
 sabotage_generator "reflect between interfaces" 's/^enable-reflector=no$/enable-reflector=yes/'
 sabotage_generator "listen on every interface from generation time" 's/^enable-dbus=no$/enable-dbus=no\nallow-interfaces=/'
 sabotage_generator "skip the start-time interface pin" '/^ExecStartPre=\${MGMT_PORT_TOOL} --pin-avahi/d'
+sabotage_generator "start avahi before the management interface has an address" '/^After=network-online.target$/d'
+sabotage_generator "leave the network-online ordering edge inert" '/^Wants=network-online.target$/d'
 sabotage_generator "pin with a tool other than the appliance's rule" 's#^ExecStartPre=\${MGMT_PORT_TOOL} #ExecStartPre=/usr/bin/true #'
 sabotage_generator "restate the publishing switch in a later block" \
   's/^rlimit-nproc=3$/rlimit-nproc=3\n\n[publish]\ndisable-publishing=no/'
@@ -852,4 +867,4 @@ bash "$GATE_TEST" >/dev/null
 bash "$GRAMMAR_TEST" >/dev/null
 bash "$LIVE_DIAG_TEST" >/dev/null
 
-echo "INSTALLER_SYSTEMD_LIFECYCLE_TEST_OK (${#consumer_units[@]} consumers suppressed; ${#masked_units[@]} transient masks; installed boot emits none; a registry install both requests NetworkManager and resolves its closure, a medium install requests neither; a .local mirror gets a resolve-only avahi pinned to the management port when it starts, a medium without the management-port tool gets none, and thirteen sabotaged generators are refused)"
+echo "INSTALLER_SYSTEMD_LIFECYCLE_TEST_OK (${#consumer_units[@]} consumers suppressed; ${#masked_units[@]} transient masks; installed boot emits none; a registry install both requests NetworkManager and resolves its closure, a medium install requests neither; a .local mirror gets a resolve-only avahi pinned to the management port when it starts, a medium without the management-port tool gets none, and fifteen sabotaged generators are refused)"
