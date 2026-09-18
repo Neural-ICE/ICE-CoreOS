@@ -212,18 +212,28 @@ done
 # run-as-root/helper structure, the closed installer intent, the persistent
 # device root and SRK (Secure Boot chain), the LUKS2 TPM contract (TPM point
 # #2) and the persistent object Names.  In the relaxed posture the sealed
-# OTA-state / preseal attestation (TPM point #4) is NOT the trust anchor, so
-# log and let the boot proceed instead of entering the preseal
-# verify/seed/validate block below.  On 2026-09-17 appliance .67 `die`d in that
-# block on a preseal refusal, tripping the unit's OnFailure=emergency.target and
-# dropping the appliance into emergency mode (root locked).  Exit 0 keeps this
-# oneshot `active (success)` so its Requires=/After= consumers (sshd, network,
-# licensed) proceed -- the whole point of the lever.  `strict` runs the
-# historical block below unchanged.
-if [[ "$SEALED_OTA_STATE" == relaxed ]]; then
-  printf 'neural-ice-firstboot-tpm-ceremony: sealed OTA-state verification RELAXED (ADR-0050 lab-trust); skipping preseal attestation\n' >&2
-  exit 0
-fi
+# OTA-state / preseal attestation (TPM point #4) is NOT the trust anchor, so a
+# refusal from it is logged and the boot proceeds.  On 2026-09-17 appliance .67
+# `die`d on such a refusal, tripping the unit's OnFailure=emergency.target and
+# dropping the appliance into emergency mode (root locked).
+#
+# The lever neutralises ONE anchor, not the unit.  It used to `exit 0` here,
+# which ended the whole script: the owner ceremony, `ceremony-prepare`, the
+# access-profile anchor enrolment and the completion record never happened, on
+# every appliance built with the MVP default posture.  The unit still reported
+# `active (success)` after three seconds with ownerAuth unset, and nothing
+# downstream could tell that apart from a ceremony that had run.  The cost was
+# not theoretical: with no anchor and no completion record `ni-ota-verify
+# device-policy` refuses, so `neural-ice-model-fetch` refuses, so the appliance
+# serves no model at all -- and reinstalling replays the same empty ceremony
+# (.67, 2026-09-18).
+#
+# So the posture is scoped to the two calls it actually names, below.  `strict`
+# dies on a preseal refusal exactly as before.
+preseal_refusal() { # <message>
+  [[ "$SEALED_OTA_STATE" == relaxed ]] || die "$*"
+  printf 'neural-ice-firstboot-tpm-ceremony: preseal attestation RELAXED (ADR-0050 lab-trust), continuing: %s\n' "$*" >&2
+}
 
 build_evidence() { # $1=TPM state snapshot
   python3 - "$1" "$INSTALL_IDENTITY" "$WORK/system-luks-evidence.json" \
@@ -366,7 +376,10 @@ PY
     --current-os-ref "$os_ref" --current-os-manifest-digest "$manifest" \
     --current-seed-ref "$seed" --candidate-root "$CANDIDATE_ROOT" \
     --receipt-out "$PRESEAL_RECEIPT" --config "$OTA_CONFIG" >/dev/null \
-    || die "installed candidate does not match the authenticated preseal baseline"
+    || preseal_refusal "installed candidate does not match the authenticated preseal baseline"
+  # The three values below come from the sealed metadata read above, not from
+  # the attestation, so they are still exact when the relaxed posture continues
+  # past a refusal.
   printf '%s %s %s\n' "$receipt_hash" "$set_hash" "$floor"
 }
 
@@ -399,7 +412,7 @@ seed_applied_baseline() { # expected receipt hash, set hash
     --installer-authorization-sig "$PRESEAL_INPUT/installer-release-authorization-v2.sig" \
     --expected-set-sha256 "$2" --expected-receipt-sha256 "$1" \
     --receipt "$PRESEAL_RECEIPT" --scratch-dir "$WORK" --config "$OTA_CONFIG" >/dev/null \
-    || die "cannot seed the applied OTA baseline from the authenticated preseal receipt"
+    || preseal_refusal "cannot seed the applied OTA baseline from the authenticated preseal receipt"
 }
 
 verify_preseal_retained() { # expected receipt hash, set hash
@@ -416,7 +429,7 @@ verify_preseal_retained() { # expected receipt hash, set hash
     --expected-set-sha256 "$2" --expected-receipt-sha256 "$1" \
     --receipt "$PRESEAL_RECEIPT" --scratch-dir "$WORK" \
     --config "$OTA_CONFIG" >/dev/null \
-    || die "retained preseal baseline does not match authenticated completion evidence"
+    || preseal_refusal "retained preseal baseline does not match authenticated completion evidence"
 }
 
 build_evidence_v2() { # snapshot, receipt hash, set hash, floor, completion ota_state JSON
