@@ -296,6 +296,12 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
     neuralice.mirror_generation|neuralice.pcr_policy_seq)
       [[ "$value" =~ ^[1-9][0-9]{0,18}$ ]]
       ;;
+    neuralice.pcr_policy_posture)
+      # ADR-0058 Volet D. The lab posture the initramfs reads to relax the
+      # media-installer sequence ratchet. Two values only; the combination rule
+      # in section 4 keeps `relaxed` off a customer-locked medium.
+      [[ "$value" == relaxed || "$value" == strict ]]
+      ;;
     neuralice.target)
       # This value selects the disk that is about to be destroyed.
       [[ "$value" =~ ^/dev/[a-zA-Z0-9]+[a-zA-Z0-9_-]*$ ]]
@@ -324,6 +330,7 @@ _ni_sealed_install_optional_keys=(
   neuralice.seed_closure neuralice.seed_manifest neuralice.seed_trusted_now
   neuralice.seed_source
   neuralice.pcr_policy neuralice.pcr_policy_key neuralice.pcr_policy_signature neuralice.pcr_policy_seq
+  neuralice.pcr_policy_posture
 )
 
 _ni_sealed_contains() { # $1=needle $2..=haystack
@@ -508,6 +515,20 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
       [[ -n "${optional_seen[$policy_key]:-}" ]] \
         || { _ni_sealed_refuse "missing-install-pcr-policy:$policy_key"; return 1; }
     done
+  fi
+
+  # 🔴 ADR-0058 Volet D. THE LAB PCR-POLICY POSTURE IS A LAB-ANCHOR PROPERTY. The
+  # initramfs reads `neuralice.pcr_policy_posture=relaxed` to drop the LOWER bound
+  # of the media-installer sequence ratchet (so a controlled bench/loan device can
+  # be reflashed with an earlier generation); it honours it ONLY under the lab
+  # Secure Boot anchor. A customer-locked (prod) medium must never seal `relaxed`
+  # -- it is the build half of "a prod UKI never carries the relaxation". The
+  # value is otherwise free (`strict` is the absent default), and lab-managed and
+  # developer-diagnostic media (both lab-anchored) may carry it.
+  if [[ -n "${optional_seen[neuralice.pcr_policy_posture]:-}" ]] \
+    && [[ "$(ni_sealed_argument_value neuralice.pcr_policy_posture "${words[@]}")" == relaxed ]]; then
+    [[ "$(ni_sealed_argument_value neuralice.access_profile "${words[@]}")" != customer-locked ]] \
+      || { _ni_sealed_refuse posture-relaxed-not-permitted-on-customer-locked; return 1; }
   fi
 
   # ------------------------------------------------------------------------- #

@@ -280,6 +280,12 @@ write_install_cmdline() {
   printf 'quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_profile=lab-managed neuralice.hardware_target=nvidia-gb10-arm64 neuralice.payload=%s neuralice.relauth_keyid=%s neuralice.relauth_schema=neural-ice-installer-release-authorization-v2 neuralice.rootverity=%s neuralice.trust_policy_id=neural-ice-secureboot-lab-v1 neuralice.pcr_policy=%s neuralice.pcr_policy_key=%s neuralice.pcr_policy_seq=%s neuralice.pcr_policy_signature=%s %s\n' \
     "$HASH" "$HASH" "$HASH" "$HASH" "$HASH" "$1" "$HASH" "${2:-}" >"$cmdline"
 }
+# Same install line, but with a caller-chosen Secure Boot anchor and optional
+# extra kargs -- so a prod-anchored UKI carrying the lab posture can be exercised.
+write_install_cmdline_anchor() { # $1=seq $2=trust_policy_id $3=extra kargs
+  printf 'quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_profile=lab-managed neuralice.hardware_target=nvidia-gb10-arm64 neuralice.payload=%s neuralice.relauth_keyid=%s neuralice.relauth_schema=neural-ice-installer-release-authorization-v2 neuralice.rootverity=%s neuralice.trust_policy_id=%s neuralice.pcr_policy=%s neuralice.pcr_policy_key=%s neuralice.pcr_policy_seq=%s neuralice.pcr_policy_signature=%s %s\n' \
+    "$HASH" "$HASH" "$HASH" "$2" "$HASH" "$HASH" "$1" "$HASH" "${3:-}" >"$cmdline"
+}
 cases=0
 must_refuse() {
   local label=$1
@@ -460,6 +466,69 @@ done
 write_install_cmdline 5 'neuralice.live=1'
 must_refuse preceremony_live_selector run_hook \
   NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+
+# --------------------------------------------------------------------------- #
+# ADR-0058 Volet D: the lab PCR-policy posture, carried by the signed UKI.
+#
+# In `relaxed` posture ON A LAB-ANCHORED installer UKI, the media-installer
+# ratchet's LOWER bound is dropped, so a controlled bench/loan device that
+# already activated a generation can be reflashed with a medium whose generation
+# is <= that one (the refusal that blocked five media on 2026-09-09). Everything
+# else is unchanged: the upper bound, the floor, the pre-ceremony state, the lab
+# anchor requirement, and -- proven separately below -- the installed-boot unlock
+# equality (I2). The marker is set valid at the top of the block and restored at
+# the end so the installed-OS section that follows is unaffected.
+# --------------------------------------------------------------------------- #
+printf 'neural-ice-signed-installer-initramfs-v1\n' >"$test_root/etc/neural-ice/installer-media"
+# The exact 2026-09-09 shape: generation 4 activated, a medium sealing 3.
+write_install_cmdline 3
+must_refuse posture_absent_defaults_to_strict run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 3 'neuralice.pcr_policy_posture=strict'
+must_refuse posture_strict_refuses_lower_generation run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 3 'neuralice.pcr_policy_posture=relaxed'
+must_accept posture_relaxed_accepts_lower_generation run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+# A relaxed medium may go well below the activated generation.
+write_install_cmdline 1 'neuralice.pcr_policy_posture=relaxed'
+must_accept posture_relaxed_accepts_far_below_generation run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+# The UPPER bound is retained even when relaxed: a generation more than the
+# activation gap ahead of the activated one is still refused.
+write_install_cmdline 4101 'neuralice.pcr_policy_posture=relaxed'
+must_refuse posture_relaxed_still_bounded_above run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+# The relaxation is a property of the SIGNED LAB UKI. A prod-anchored UKI (a
+# different Secure Boot trust policy) carrying `relaxed` is NOT honoured; it
+# falls back to the strict lower bound. This is the runtime half of "a prod UKI
+# never activates relaxed"; the build half is asserted in the producer's suite.
+write_install_cmdline_anchor 3 neural-ice-secureboot-prod-v1 'neuralice.pcr_policy_posture=relaxed'
+must_refuse posture_relaxed_ignored_on_non_lab_anchor run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+# Fail-closed on a malformed or shadowed posture.
+write_install_cmdline 4 'neuralice.pcr_policy_posture=bogus'
+must_refuse posture_value_malformed run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+write_install_cmdline 4 'neuralice.pcr_policy_posture=relaxed neuralice.pcr_policy_posture=strict'
+must_refuse posture_duplicated_is_shadowing run_hook \
+  NI_TEST_COUNTER_SEQ=4 NI_TEST_NV_HANDLES='- 0x1500007\n'
+
+# 🔴 I2 REGRESSION GUARD. The installed-boot unlock equality releases the LUKS
+# key ONLY when the requested generation equals the activated one, and the lab
+# posture must NEVER relax it. Without the installer-media marker every boot is
+# equality-only; a `neuralice.pcr_policy_posture=relaxed` on an installed boot
+# with a mismatched generation is still refused, in relaxed as in strict.
+rm -f "$test_root/etc/neural-ice/installer-media"
+printf 'quiet neuralice.pcr_policy_seq=6 neuralice.pcr_policy_posture=relaxed neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
+must_refuse i2_relaxed_does_not_unlock_below_generation run_hook NI_TEST_COUNTER_SEQ=7
+printf 'quiet neuralice.pcr_policy_seq=8 neuralice.pcr_policy_posture=relaxed neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
+must_refuse i2_relaxed_does_not_unlock_above_generation run_hook NI_TEST_COUNTER_SEQ=7
+# And the equality path still ACCEPTS the exact generation with the posture karg
+# present, proving the karg is inert on an installed boot rather than breaking it.
+printf 'quiet neuralice.pcr_policy_seq=7 neuralice.pcr_policy_posture=relaxed neuralice.pcr_policy_signature=%s\n' "$HASH" >"$cmdline"
+must_accept i2_installed_unlock_equality_ignores_posture run_hook NI_TEST_COUNTER_SEQ=7
+printf 'neural-ice-signed-installer-initramfs-v1\n' >"$test_root/etc/neural-ice/installer-media"
 
 # Command-line words cannot turn an installed OS into signed installer media.
 # Without the initramfs marker, every installed boot remains equality-only.

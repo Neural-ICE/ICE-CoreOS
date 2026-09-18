@@ -756,6 +756,7 @@ SEALED_INSTALL_OPTIONAL_KEYS = (
     "neuralice.pcr_policy_key",
     "neuralice.pcr_policy_signature",
     "neuralice.pcr_policy_seq",
+    "neuralice.pcr_policy_posture",
 )
 # 🔴 ONE CANONICAL ORIGIN, SEALED RATHER THAN COMPILED IN (independent review
 # 2026-09-02, P0 #3). Every OS/source reference a medium may seal carries the
@@ -920,6 +921,11 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
         return bool(re.fullmatch(r"[0-9]{1,5}", value)) and 16 <= int(value) <= 65536
     if key in ("neuralice.mirror_generation", "neuralice.pcr_policy_seq"):
         return bool(re.fullmatch(r"[1-9][0-9]{0,18}", value))
+    if key == "neuralice.pcr_policy_posture":
+        # ADR-0058 Volet D. The lab posture the initramfs reads to relax the
+        # media-installer sequence ratchet; the combination rule below keeps
+        # `relaxed` off a customer-locked medium.
+        return value in ("relaxed", "strict")
     if key == "neuralice.seed_trusted_now":
         return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value))
     if key == "neuralice.seed_source":
@@ -1051,6 +1057,15 @@ def classify_sealed_cmdline(cmdline: str) -> str:
                 raise SelectorRefusal(
                     f"missing-install-pcr-policy:{policy_key}"
                 )
+
+    # 🔴 ADR-0058 Volet D. The lab PCR-policy posture is a lab-anchor property.
+    # The initramfs reads `neuralice.pcr_policy_posture=relaxed` to drop the lower
+    # bound of the media-installer sequence ratchet and honours it only under the
+    # lab Secure Boot anchor; a customer-locked (prod) medium must never seal it.
+    # This is the build half of "a prod UKI never carries the relaxation".
+    if optional.get("neuralice.pcr_policy_posture") == "relaxed":
+        if sealed_fields(cmdline)["neuralice.access_profile"] == "customer-locked":
+            raise SelectorRefusal("posture-relaxed-not-permitted-on-customer-locked")
 
     # ----------------------------------------------------------------------- #
     # THE REGISTRY-INSTALL CONTRACT, stated once so the producer, the generator

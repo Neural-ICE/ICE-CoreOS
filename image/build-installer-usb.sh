@@ -186,10 +186,41 @@ if [[ -n "$PCR_POLICY_SEQ_COUNTER_FILE" ]]; then
   PCR_POLICY_SEQ="$(pcr_policy_seq_from_counter "$PCR_POLICY_SEQ_COUNTER_FILE")" || exit 1
   echo "    PCR policy sequence ${PCR_POLICY_SEQ} taken from the bench counter ${PCR_POLICY_SEQ_COUNTER_FILE} (previous cut sealed $((PCR_POLICY_SEQ - 1)))"
 fi
+# ADR-0058 Volet D. The lab PCR-policy posture sealed into the install UKI. The
+# initramfs reads it to relax the media-installer sequence ratchet's lower bound
+# (a controlled bench/loan reflash below the activated generation) and honours it
+# ONLY under the lab Secure Boot anchor. `strict` (the default) seals nothing --
+# the initramfs defaults to strict on absence, keeping the cmdline byte budget
+# untouched on every medium that does not opt in. `relaxed` is refused on a
+# customer-locked (prod) medium at seal time (below), which is the build half of
+# "a prod UKI never carries the relaxation".
+PCR_POLICY_POSTURE="${PCR_POLICY_POSTURE:-strict}"
+[[ "$PCR_POLICY_POSTURE" == relaxed || "$PCR_POLICY_POSTURE" == strict ]] \
+  || { echo "ERROR: PCR_POLICY_POSTURE must be relaxed or strict" >&2; exit 1; }
 RELEASE_AUTHORIZATION_STAGE_ROOT=""
 
 sha256_of() { # $1=path -> lowercase hex
   sha256sum -- "$1" | awk '{print tolower($1)}'
+}
+
+# ADR-0058 Volet D. The PCR-policy posture karg to seal into an Install UKI,
+# given the requested posture and the medium's sealed access profile. `relaxed`
+# is refused on a customer-locked (prod) medium -- the build half of "a prod UKI
+# never carries the relaxation" (the initramfs additionally refuses to honour it
+# unless the UKI is lab-anchored). `strict` seals NOTHING: the initramfs defaults
+# to strict on absence, so a strict medium spends no cmdline byte budget on it.
+# Pure/injectable so the build-variant rule is unit-tested without a container.
+pcr_policy_posture_karg() { # $1=posture  $2=sealed access profile -> prints the karg (or nothing)
+  local posture=$1 profile=$2
+  case "$posture" in
+    strict) return 0 ;;
+    relaxed)
+      [[ "$profile" != customer-locked ]] \
+        || { echo "ERROR: PCR_POLICY_POSTURE=relaxed is a LAB medium input; a ${profile} medium may not seal the relaxed PCR-policy posture" >&2; return 1; }
+      printf 'neuralice.pcr_policy_posture=relaxed'
+      ;;
+    *) echo "ERROR: PCR_POLICY_POSTURE must be relaxed or strict" >&2; return 1 ;;
+  esac
 }
 
 # --------------------------------------------------------------------------- #
@@ -1583,6 +1614,11 @@ case "$MEDIA_MODE" in
       "neuralice.pcr_policy_key=${PCR_POLICY_PUBLIC_KEY_SHA256}" \
       "neuralice.pcr_policy_signature=${PCR_POLICY_SIGNATURE_SHA256}" \
       "neuralice.pcr_policy_seq=${PCR_POLICY_SEQ}")
+    # ADR-0058 Volet D. Seal the lab posture (or nothing, for strict) per the
+    # build variant's sealed access profile; the helper refuses relaxed on a
+    # customer-locked (prod) medium.
+    _posture_karg="$(pcr_policy_posture_karg "$PCR_POLICY_POSTURE" "$SEALED_ACCESS_PROFILE")" || exit 1
+    [[ -n "$_posture_karg" ]] && UKI_KARGS+=("$_posture_karg")
     case "$INSTALL_SOURCE" in
       medium)
         [[ -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
