@@ -505,45 +505,46 @@ mod tests {
     use super::*;
     use crate::delegated::signing_bytes;
 
+    /// The normative ICE-Fabric delegated-lab trio (from ICE-Fabric PR #688):
+    /// a delegation snapshot carrying the `release-lab` authority, the lab
+    /// release-authorization that authority signs, and the publication receipt
+    /// bound to the exact bytes of that release. These bytes are authoritative
+    /// — the lab verify path must canonicalize and sign over them exactly as the
+    /// Fabric SIGN half shipped them, so the whole `run_lab` chain has a real
+    /// end-to-end vector rather than a self-constructed one.
     const SNAPSHOT: &[u8] =
         include_bytes!("../../tests/fixtures/delegated-v1/lab-delegation-snapshot.json");
     const RELEASE: &[u8] =
         include_bytes!("../../tests/fixtures/delegated-v1/lab-release-authorization.json");
     const RECEIPT: &[u8] =
-        include_bytes!("../../tests/fixtures/delegated-v1/lab-publication-receipt-bound.json");
-    /// The normative ICE-Fabric lab receipt (PR #687). It is NOT bound to the
-    /// constructed release above — the #687 fixture set does not yet ship a lab
-    /// delegation snapshot with a `release-lab` key nor a lab
-    /// release-authorization — so it exists here to pin the exact bytes the
-    /// lab verify path must canonicalize and sign over, byte-for-byte.
-    const FABRIC_RECEIPT: &[u8] =
         include_bytes!("../../tests/fixtures/delegated-v1/lab-publication-receipt.json");
 
-    const NOW: &str = "2026-07-21T04:00:00Z";
+    const NOW: &str = "2026-07-22T04:00:00Z";
     const TARGET: &str = "nvidia-gb10-arm64";
 
     #[test]
     fn fabric_lab_receipt_bytes_are_pinned() {
-        // Byte-coherence with the ICE-Fabric contract fixture (#687). The
-        // canonical hash and the signing digest below are the two numbers a
-        // producer or a refactor cannot move without saying so — the first is
-        // the receipt's own canonical hash, the second is the exact message the
-        // delegated signature is made over (`neural-ice:<purpose>` + NUL +
-        // canonical bytes without their transport LF).
-        let receipt: LabReceipt = parse_canonical(FABRIC_RECEIPT, "fabric lab receipt").unwrap();
+        // Byte-coherence with the normative ICE-Fabric contract fixture (PR
+        // #688, which re-linked the lab receipt onto the exact release-auth
+        // bytes). The canonical hash and the signing digest below are the two
+        // numbers a producer or a refactor cannot move without saying so — the
+        // first is the receipt's own canonical hash, the second is the exact
+        // message the delegated signature is made over (`neural-ice:<purpose>`
+        // + NUL + canonical bytes without their transport LF).
+        let receipt: LabReceipt = parse_canonical(RECEIPT, "fabric lab receipt").unwrap();
         assert_eq!(receipt.schema, "neural-ice-ota-lab-publication-receipt-v1");
         assert_eq!(receipt.signing_role, "release-lab");
         assert_eq!(receipt.ring, "lab");
         assert_eq!(
-            canonical_hash(FABRIC_RECEIPT).unwrap(),
-            "994c8e3bb3f1ca315fd9c05b7d2b3f983c4ad5c7c029daf04e47f9c0208316e1"
+            canonical_hash(RECEIPT).unwrap(),
+            "b9c8c3056c1844abaa5dc5319dbc32cd4a9aa2d48a91a217bb6100ad17b5bea0"
         );
         let domain = crate::namespace::domain(RECEIPT_DOMAIN_PURPOSE_LAB);
-        let message = signing_bytes(&domain, FABRIC_RECEIPT).unwrap();
+        let message = signing_bytes(&domain, RECEIPT).unwrap();
         let digest = crate::runner::sha256_bytes(&message).unwrap();
         assert_eq!(
             digest,
-            "f1dcc07fcefa60c081361466655e5dd13078338c1405667d3f90458a91370dc1"
+            "93dfeeb5b54b75544f98047c8d8a3bed2f772bff81a9ecb2e4b1bba69d9670e1"
         );
     }
 
@@ -593,7 +594,7 @@ mod tests {
         )
         .is_err());
         receipt.access_policy_sha256 =
-            "03dea16718ff5f7f05d848cb7f0095dfe35ce6a4e1d8f1b346aa327ae1aadf7a".into();
+            "fe924b4b7650765bdd1f0f7b4f67ac411e2c9a66005eb18c591ba3a9e6601991".into();
 
         // Receipt drift: compat window no longer equal to the release's.
         receipt.compat_max += 1;
