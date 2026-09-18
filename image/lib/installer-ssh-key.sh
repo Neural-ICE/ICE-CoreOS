@@ -130,8 +130,30 @@ installer_ssh_key_require_matching_target() {
   local base_image=$2
   local target_image=$3
 
-  [[ -z "$key_file" || "$target_image" == "$base_image" ]] || {
-    echo "an installer SSH key requires TARGET_IMGREF to equal the staged BASE_IMAGE" >&2
+  # No key, nothing to bind: every non-key medium is unaffected.
+  [[ -n "$key_file" ]] || return 0
+
+  # The security invariant is "the image this medium installs IS the image its
+  # first boot will hand back for OTA" -- ONE image, identified by its content
+  # DIGEST. A ref's host is only where the manifest is served, never the image's
+  # identity: a lab source-mirror medium must stage BASE_IMAGE at the mirror host
+  # (the only host serving the canonical manifest podman persists) while
+  # TARGET_IMGREF must stay sovereign for the release-authority check. Same
+  # digest, different host => the same image. So compare DIGESTS, not whole refs.
+  #
+  # `${ref##*@}` yields the whole ref when there is no '@', so an unpinned ref
+  # would be "compared" as its own text and a mutable tag-only ref (no proven
+  # identity) could slip through. Take the STRICTEST form that unblocks the
+  # mirror/sovereign case: both refs MUST be pinned by an sha256 digest, else
+  # refuse. This relaxes ref->digest ONLY; nothing else is loosened.
+  local base_digest="${base_image##*@}"
+  local target_digest="${target_image##*@}"
+  [[ "$base_digest" =~ ^sha256:[0-9a-f]{64}$ && "$target_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "an installer SSH key requires BASE_IMAGE and TARGET_IMGREF to be pinned by sha256 digest" >&2
+    return 1
+  }
+  [[ "$target_digest" == "$base_digest" ]] || {
+    echo "an installer SSH key requires TARGET_IMGREF to name the same image digest as the staged BASE_IMAGE" >&2
     return 1
   }
 }

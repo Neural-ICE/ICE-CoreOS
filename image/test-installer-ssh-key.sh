@@ -84,6 +84,41 @@ fi
 bash "$HELPER" require-matching-target '' "$base_image" \
   "registry.example/prod@sha256:$(printf '%064d' 2)"
 
+# A lab source-mirror medium: BASE_IMAGE is staged at the mirror host (the only
+# host that serves the canonical manifest podman persists) and TARGET_IMGREF
+# stays sovereign, SAME digest, different host. The image identity is the
+# digest, not the host, so this must be ACCEPTED -- it is the case the medium
+# could not build before. (Placeholder hosts only: the open-core boundary gate
+# forbids the real sovereign endpoint bytes in any Git-visible file.)
+same_digest="sha256:$(printf '%064d' 3)"
+bash "$HELPER" require-matching-target "$key" \
+  "registry.mirror.example:5055/ice-coreos@${same_digest}" \
+  "registry.sovereign.example/ice-coreos@${same_digest}"
+# Same hosts, DIFFERENT digest is still a different image and must be refused.
+if bash "$HELPER" require-matching-target "$key" \
+  "registry.mirror.example:5055/ice-coreos@sha256:$(printf '%064d' 4)" \
+  "registry.sovereign.example/ice-coreos@sha256:$(printf '%064d' 5)" >/dev/null 2>&1; then
+  echo "installer SSH key was accepted across differing image digests" >&2
+  exit 1
+fi
+# A tag-only (unpinned) ref has no proven identity: strictest form refuses it,
+# on either side, even when the tags happen to read identically.
+if bash "$HELPER" require-matching-target "$key" \
+  "registry.example/lab:0.61.6" "registry.example/lab:0.61.6" >/dev/null 2>&1; then
+  echo "installer SSH key was accepted for tag-only (unpinned) refs" >&2
+  exit 1
+fi
+if bash "$HELPER" require-matching-target "$key" \
+  "registry.example/lab:0.61.6" "registry.example/lab@${same_digest}" >/dev/null 2>&1; then
+  echo "installer SSH key was accepted with an unpinned BASE_IMAGE" >&2
+  exit 1
+fi
+if bash "$HELPER" require-matching-target "$key" \
+  "registry.example/lab@${same_digest}" "registry.example/lab:0.61.6" >/dev/null 2>&1; then
+  echo "installer SSH key was accepted with an unpinned TARGET_IMGREF" >&2
+  exit 1
+fi
+
 mkdir "$work/esp"
 bash "$HELPER" install "$key" "$digest" "$work/esp"
 cmp "$key" "$work/esp/ice-coreos/authorized_keys"
