@@ -481,7 +481,7 @@ echo "  composed medium: producer and installer both reconcile the seed with the
 #
 # Four media were cut on the bench on 2026-09-09, each for one edit of
 # ota/neural-ice-autoinstall.sh, and each rebuilt the sealed store: a `skopeo
-# copy` of ~8 GiB plus a single-threaded zstd-19 `mksquashfs` over the result,
+# copy` of ~8 GiB plus a `mksquashfs` over the result (the copy dominates),
 # for a change the store cannot depend on. The producer may now hand that extent
 # back -- and the whole question is whether it can do so without weakening a
 # proof.

@@ -100,7 +100,7 @@ MANIFEST_OUT="${MANIFEST_OUT:-${ROOT_IMAGE_OUT}.manifest}"
 # each named by its digest. Two media cut for two edits of the installer root
 # therefore carry byte-identical stores, and producing it twice costs a
 # `skopeo copy` of ~8 GiB for the host plus ~22 GiB of bound images, then a
-# single-threaded zstd-19 `mksquashfs` over the result.
+# `mksquashfs` over the result (the copy is the dominant cost).
 #
 # The caller (image/build-installer-usb.sh) may hand that extent back instead,
 # with the facts a previous build recorded about it. It is a SEVEN-VALUE TUPLE
@@ -254,12 +254,23 @@ RESOLVED_STORE_IMAGE_ID="$(podman_run image inspect --format '{{.Id}}' "sha256:$
 
 # The exact mksquashfs invocation both images are built with. Every source of
 # build-host state is pinned: timestamps to the epoch, ownership to root, and no
-# fragment-order dependence on the CPU count.
+# fragment-order dependence on the CPU count -- which is precisely why the
+# compressor may run on every core: the archive is a deterministic function of
+# the tree, not of `-processors`, so parallelism costs no reproducibility.
+# The compression level is deliberately low: both trees are dominated by content
+# that is ALREADY compressed (the image store is ~30 GiB of OCI blobs, each layer
+# already zstd/gzip; the root carries compressed firmware and modules), so
+# `-Xcompression-level 19` spent minutes of single-threaded CPU to shave a
+# fraction of a percent off bytes that will not compress again. Level 1 over all
+# cores produces an archive of practically the same size in a fraction of the
+# time. What is pinned for reproducibility is the tree and the timestamps above,
+# never the packing effort, so neither the level nor the processor count is
+# asserted downstream.
 squash() { # $1=source tree  $2=output image
   rm -f -- "$2"
   "$(tool mksquashfs)" "$1" "$2" \
     -noappend -no-progress -no-recovery -all-root -mkfs-time 0 -all-time 0 \
-    -no-exports -xattrs -comp zstd -Xcompression-level 19 -processors 1 \
+    -no-exports -xattrs -comp zstd -Xcompression-level 1 -processors "$(nproc)" \
     || die "mksquashfs failed for $2"
   [[ -s "$2" ]] || die "mksquashfs produced no image at $2"
 }

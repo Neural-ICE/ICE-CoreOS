@@ -248,9 +248,9 @@ ni_step_summary() { # the table a bench run can be read off
 # byte-identical: it is a containers-storage holding exactly $BASE_IMAGE and the
 # images $BASE_IMAGE binds to itself, every one of them a digest. Producing it
 # costs a `skopeo copy` of ~8 GiB for the host plus ~22 GiB of bound images
-# (2026-09-17), then a single-threaded `mksquashfs -comp zstd -Xcompression-
-# level 19` over the result, and that work is repeated in full for a change it
-# cannot possibly depend on.
+# (2026-09-17) -- the dominant cost -- then a parallel `mksquashfs -comp zstd`
+# over the result, and that work is repeated in full for a change it cannot
+# possibly depend on.
 #
 # The cache is OFF unless MEDIUM_BUILD_CACHE_DIR names a directory: with it
 # unset this file behaves byte-for-byte as before, which is the only way a cache

@@ -148,6 +148,14 @@ args="$(cat "$TMP/a/mksquashfs.args")"
 for pinned in -all-root '-mkfs-time 0' '-all-time 0' -noappend -xattrs; do
   grep -Fq -- "$pinned" <<<"$args" || fail "mksquashfs is not invoked with $pinned"
 done
+# ...but the PACKING EFFORT is not a source of build-host state, so it is not
+# pinned -- and it must not regress to the single-threaded maximum-level squash
+# that spent minutes of CPU re-compressing content (the ~30 GiB image store) that
+# is already compressed. A revert to either would read here.
+grep -Fq -- '-processors 1' <<<"$args" \
+  && fail "mksquashfs is pinned to a single processor; it must pack on every core"
+grep -Fq -- '-Xcompression-level 19' <<<"$args" \
+  && fail "mksquashfs uses the maximum zstd level over already-compressed content"
 
 # --------------------------------------------------------------------------- #
 # 2) THE HASH FOLLOWS THE TREE. A build that produced a stale image would seal a
@@ -1074,7 +1082,7 @@ grep -Fq "digest-pinned registry reference" <<<"$out" || fail "the non-registry 
 #    installer root carry byte-identical stores, because the store is a
 #    containers-storage holding exactly one digest-named image. The caller may
 #    therefore hand the extent back instead of paying `skopeo copy` plus a
-#    single-threaded zstd-19 mksquashfs over ~8 GiB again.
+#    mksquashfs over ~8 GiB again (the copy is the dominant cost).
 #
 #    Every assertion below is about the REFUSALS, because a reuse path that
 #    accepts is a reuse path that has replaced a proof with a filename.
