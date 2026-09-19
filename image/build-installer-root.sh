@@ -599,6 +599,14 @@ print(str(hosts[0].get("id", "")).lower())
   || die "the staged image store records '$STORE_IMAGE_ID', which is not an immutable image ID"
 [[ "$STORE_IMAGE_ID" == "$EXPECTED_STORE_IMAGE_ID" ]] \
   || die "the staged image store holds image $STORE_IMAGE_ID but the build selected $EXPECTED_STORE_IMAGE_ID"
+# EXPECTED_STORE_IMAGE_ID (the config id) is the format-stable content identity:
+# it is the digest of the image config, which itself commits to the uncompressed
+# layer diff-ids, so equal config ids mean equal content regardless of manifest
+# format. STORE_MANIFEST_DIGEST, since ADR-0058 Volet C, is the digest of the
+# SIGNED sovereign reference the caller resolved (not a digest podman recomputed
+# off a re-encoded copy); the readback below proves the staged store's preserved
+# platform manifest is that same object, which for the single-manifest images
+# this chain ships (ADR-0008) is the signed reference itself.
 STORE_IMAGE_MANIFEST_DIGEST="$(podman_run --root "$STORE_TREE" --runroot "$WORK/runroot" \
   --storage-driver overlay image inspect --format '{{.Digest}}' "$STORE_IMAGE_NAME" 2>/dev/null \
   | tr -d '[:space:]')" \
