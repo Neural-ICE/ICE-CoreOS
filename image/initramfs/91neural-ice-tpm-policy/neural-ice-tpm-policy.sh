@@ -69,6 +69,12 @@ ni_written=536870912          # 0x20000000
 ni_expected_policy=e8c02d3c5e701670cbaa327db1a2e9f3f41b2c22793e5c669a6e7f44b912f6c0
 ni_max=9007199254740991
 ni_max_activation_gap=4096
+# ADR-0058 Volet D. The Secure Boot trust-policy anchor a LAB installer UKI
+# carries (self-signed lab CA, ADR-0050 lab posture). It is the only anchor under
+# which the media-installer sequence ratchet may be relaxed; a prod UKI carries a
+# different, shim-signed anchor and can therefore neither carry nor activate the
+# relaxed posture, so relaxing the ratchet stays under I1.
+ni_lab_secureboot_anchor=neural-ice-secureboot-lab-v1
 
 ni_cmdline_text=$(cat "$ni_cmdline") || ni_die "kernel command line is unreadable"
 ni_requested_count=0
@@ -89,6 +95,8 @@ ni_payload_count=0
 ni_payload=
 ni_relauth_keyid_count=0
 ni_relauth_keyid=
+ni_posture_count=0
+ni_posture=
 ni_relauth_schema_count=0
 ni_relauth_schema=
 ni_rootverity_count=0
@@ -105,6 +113,10 @@ for ni_word in $ni_cmdline_text; do
     neuralice.pcr_policy_signature=*)
       ni_signature_count=$((ni_signature_count + 1))
       ni_signature=${ni_word#*=}
+      ;;
+    neuralice.pcr_policy_posture=*)
+      ni_posture_count=$((ni_posture_count + 1))
+      ni_posture=${ni_word#*=}
       ;;
     systemd.unit=*)
       ni_unit_count=$((ni_unit_count + 1))
@@ -158,6 +170,20 @@ case "$ni_requested" in
 esac
 [ "$ni_requested" -le "$ni_max" ] 2>/dev/null \
   || ni_die "neuralice.pcr_policy_seq exceeds the safe integer ceiling"
+
+# ADR-0058 Volet D. The lab posture is carried by the signed UKI cmdline (I1),
+# never a runtime env, and defaults to strict when absent. A second occurrence is
+# how an external cmdline would try to shadow it with Secure Boot off, so it is
+# refused rather than resolved -- the same closed-world rule the sealed sequence
+# and signature below apply.
+case "$ni_posture_count" in
+  0) ni_posture=strict ;;
+  1) case "$ni_posture" in
+       relaxed|strict) ;;
+       *) ni_die "neuralice.pcr_policy_posture must be relaxed or strict" ;;
+     esac ;;
+  *) ni_die "neuralice.pcr_policy_posture must occur at most once" ;;
+esac
 
 # The public area is read through the one parser the OTA helper also uses
 # (image/lib/tpm2-nv-public.sh, staged by module-setup.sh); it refuses anything
@@ -343,11 +369,34 @@ if ni_public=$("$ni_tools/tpm2_nvreadpublic" "$ni_index" 2>/dev/null); then
   if [ "$ni_installer_media" -eq 1 ]; then
     ni_require_exact_install_boot
     ni_require_preceremony_state 1
+    # ADR-0058 Volet D. In the lab posture the media-installer ratchet's LOWER
+    # bound is relaxed, so a controlled bench/loan device that already activated a
+    # generation can be reflashed with a medium whose generation is <= that one,
+    # without spinning a TPM counter up to a signed number. This is honoured only
+    # when BOTH the posture the signed UKI carries is `relaxed` AND that UKI is
+    # anchored to the lab Secure Boot trust policy: a prod UKI is shim-signed and
+    # carries a different anchor, so it can neither carry (the producer refuses)
+    # nor activate the relaxation, and the posture stays under I1. It relaxes ONLY
+    # this pre-LUKS (re)install ratchet; the installed-boot unlock equality in the
+    # `else` branch below is untouched, so I2 -- the LUKS key is released solely on
+    # an exact generation match -- is unchanged in either posture.
+    ni_media_ratchet_relaxed=0
+    if [ "$ni_posture" = relaxed ] && [ "$ni_trust_policy" = "$ni_lab_secureboot_anchor" ]; then
+      ni_media_ratchet_relaxed=1
+    fi
     if ni_read_generation_base; then
-      [ "$ni_requested" -ge "$ni_generation" ] \
-        || ni_die "signed Install PCR policy generation is below the generation an interrupted install already activated on this device"
-      [ $((ni_requested - ni_generation)) -le "$ni_max_activation_gap" ] \
-        || ni_die "signed Install PCR policy generation is more than $ni_max_activation_gap ahead of the activated generation"
+      if [ "$ni_media_ratchet_relaxed" -eq 1 ]; then
+        # Lower bound dropped (a lab reflash may go backwards). The upper bound is
+        # retained so even a relaxed medium cannot request a generation far beyond
+        # the one already activated.
+        [ $((ni_requested - ni_generation)) -le "$ni_max_activation_gap" ] \
+          || ni_die "signed Install PCR policy generation is more than $ni_max_activation_gap ahead of the activated generation"
+      else
+        [ "$ni_requested" -ge "$ni_generation" ] \
+          || ni_die "signed Install PCR policy generation is below the generation an interrupted install already activated on this device"
+        [ $((ni_requested - ni_generation)) -le "$ni_max_activation_gap" ] \
+          || ni_die "signed Install PCR policy generation is more than $ni_max_activation_gap ahead of the activated generation"
+      fi
     else
       if ! { [ "$ni_requested" -ge 1 ] && [ "$ni_requested" -le "$ni_max_activation_gap" ]; }; then
         ni_die "initial signed PCR policy generation is outside the activation window"

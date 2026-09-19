@@ -787,6 +787,61 @@ cache_kept="$(find "$CACHE/store/sealed-store" -mindepth 1 -maxdepth 1 -type d |
 
 echo "  incremental build: the sealed store cache is opt-in, keyed by document, bounded, and re-proved on every reuse"
 
+# --------------------------------------------------------------------------- #
+# ADR-0058 Volet D: the build variant decides the PCR-policy posture, and a prod
+# medium NEVER carries the relaxation.
+#
+# pcr_policy_posture_karg is LIFTED from the producer (as the cache functions
+# are) and driven directly -- it needs bash only, so it lives ABOVE the
+# veritysetup fixture that `exit 0`s on this host. This is the build half of
+# ADR-0058 test (iv): a customer-locked (prod) medium may not seal `relaxed`.
+# --------------------------------------------------------------------------- #
+POSTURE_LIFT="$TMP/posture-lift"; mkdir -p "$POSTURE_LIFT"
+python3 - "$BUILDER" "$POSTURE_LIFT/posture.sh" pcr_policy_posture_karg <<'PYEOF' \
+  || fail "cannot lift the PCR-policy posture resolver"
+import sys
+source = open(sys.argv[1], encoding="utf-8").read().splitlines()
+extracted = []
+for name in sys.argv[3:]:
+    opening = f"{name}() {{"
+    starts = [i for i, line in enumerate(source) if line.startswith(opening)]
+    if len(starts) != 1:
+        raise SystemExit(f"the producer defines {name} {len(starts)} times")
+    for index in range(starts[0], len(source)):
+        extracted.append(source[index])
+        if index > starts[0] and source[index] == "}":
+            break
+    else:
+        raise SystemExit(f"{name} has no closing brace")
+    extracted.append("")
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(extracted) + "\n")
+PYEOF
+grep -q '^pcr_policy_posture_karg()' "$POSTURE_LIFT/posture.sh" \
+  || fail "the producer no longer defines pcr_policy_posture_karg; the build-variant posture rule would be untested"
+bash -n "$POSTURE_LIFT/posture.sh" || fail "the lifted posture resolver does not parse"
+# shellcheck source=/dev/null
+. "$POSTURE_LIFT/posture.sh"
+
+# strict seals nothing, on any profile (the initramfs defaults to strict).
+[ -z "$(pcr_policy_posture_karg strict lab-managed)" ] \
+  || fail "strict sealed a posture karg on a lab-managed medium"
+[ -z "$(pcr_policy_posture_karg strict customer-locked)" ] \
+  || fail "strict sealed a posture karg on a customer-locked medium"
+# relaxed is sealed on the lab-anchored profiles.
+[ "$(pcr_policy_posture_karg relaxed lab-managed)" = "neuralice.pcr_policy_posture=relaxed" ] \
+  || fail "relaxed did not seal the posture karg on a lab-managed medium"
+[ "$(pcr_policy_posture_karg relaxed developer-diagnostic)" = "neuralice.pcr_policy_posture=relaxed" ] \
+  || fail "relaxed did not seal the posture karg on a developer-diagnostic medium"
+# 🔴 test (iv) build half: relaxed is REFUSED on a customer-locked (prod) medium.
+if pcr_policy_posture_karg relaxed customer-locked >/dev/null 2>&1; then
+  fail "a customer-locked (prod) medium was allowed to seal the relaxed PCR-policy posture"
+fi
+# a malformed posture value is refused rather than silently sealed.
+if pcr_policy_posture_karg bogus lab-managed >/dev/null 2>&1; then
+  fail "a malformed PCR-policy posture value was accepted"
+fi
+echo "  pcr posture: strict seals nothing, relaxed only on lab-anchored profiles, refused on customer-locked (ADR-0058 Volet D)"
+
 
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
