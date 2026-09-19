@@ -2099,6 +2099,26 @@ readonly NEURALICE_SEED_VERIFIER
 # --------------------------------------------------------------------------- #
 readonly SEED_PACK_DIR="$INSTALLER_STATE_DIR/seed-pack"
 
+# The interface the kernel routes the mirror through, or nothing. `ip route get`
+# takes an address, not a name: handed the mDNS mirror name it exits non-zero,
+# and under `set -e` a failing assignment substitution ends the installer with
+# no message at all (measured 2026-09-19 on the GX10: 0.3 s after "MIRROR:
+# materialising", at the first name-sealed medium). The name was pinned in the
+# live hosts file by assert_mirror_name_resolves, so NSS is the lookup that is
+# allowed to answer here; every failure path yields "" and the callers log that
+# the fetch runs unpinned.
+mirror_route_iface() { # $1=host (name or address) -> interface name or ""
+  local host="$1" address=""
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    address="$host"
+  else
+    address="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NF >= 1 { print $1; exit }' || true)"
+  fi
+  [[ -n "$address" ]] || return 0
+  ip -o -4 route get "$address" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1 || true
+  return 0
+}
+
 # The bounded fetcher. One reviewable component: it derives the object plan from
 # the closure, drives `curl` with the pinned transport, hashes in flight, and
 # publishes each object by atomic rename only when the bytes hash to the name.
@@ -2131,7 +2151,7 @@ isolate_mirror_nic_irq() {
   local host iface online last cpuset q eff pinned=0 driver
   NI_FETCH_CPUSET=""
   host="${INSTALL_MIRROR%%:*}"
-  iface="$(ip -o -4 route get "$host" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+  iface="$(mirror_route_iface "$host")"
   [[ -n "$iface" && -d "/sys/class/net/$iface" ]] || { log "IRQ: no resolvable route to the mirror host ${host}; fetch runs unpinned"; return 0; }
   online="$(cat /sys/devices/system/cpu/online 2>/dev/null || echo 0)"
   last="${online##*-}"; last="${last##*,}"
@@ -2162,7 +2182,7 @@ declare -A _net_health_before=()
 network_health_snapshot() { # $1=label (before|after)
   local label="$1" host iface driver irqs q eff top missed dropped bytes soft gov irqb line=""
   host="${INSTALL_MIRROR%%:*}"
-  iface="$(ip -o -4 route get "$host" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+  iface="$(mirror_route_iface "$host")"
   if [[ -z "$iface" || ! -d "/sys/class/net/$iface" ]]; then
     log "NET ${label}: no resolvable route to the mirror host ${host}; no readout"
     return 0

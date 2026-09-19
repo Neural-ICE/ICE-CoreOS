@@ -80,6 +80,7 @@ on:
       - "ota/neural-ice-autoinstall.service"
       - "ota/test-autoinstall-kargs.sh"
       - "ota/test-installer-device-root-guard.sh"
+      - "ota/test-installer-mirror-iface-guard.sh"
       - "ota/test-firstboot-ceremony-failopen.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
