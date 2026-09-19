@@ -454,6 +454,27 @@ CONF
   cat > "$EARLY_DIR/avahi-daemon.service.d/$AVAHI_RESOLVE_ONLY_DROPIN" <<DROPIN
 # Neural ICE installer medium, generated into /run only.
 #
+# 🔴 ORDERED AFTER network-online.target (measured on .67, September 2026). The
+# vendor avahi unit orders only on avahi-daemon.socket, so it starts at
+# network.target — before NetworkManager has finished bringing the management
+# port up. avahi then opened its interface set while enP7s7 had carrier but no
+# routable IPv4 address, so allow-interfaces=<mgmt> (pinned by the ExecStartPre
+# below) matched an address-less interface: avahi registered no relevant
+# interface and emitted NOTHING on the wire — a pcap on the management LAN showed
+# ZERO mDNS packets from the box — so every resolve attempt failed into the
+# installer's named refusal even though the LAN mirror was announcing the name.
+# Wants=/After=network-online.target holds this daemon until
+# NetworkManager-wait-online reports the management link configured with a
+# routable address (systemd network-online.target: "a configured, routable IP
+# address"), so the pin below binds a live interface and the query goes out.
+# Wants=, not Requires=: a link that never comes up must still yield the
+# installer's own bounded refusal (mirror-name-unresolvable) with the target disk
+# untouched, not a systemd dependency failure — the same rule the network request
+# drop-in for neural-ice-autoinstall.service already follows.
+[Unit]
+Wants=network-online.target
+After=network-online.target
+#
 # The vendor unit starts avahi on /etc/avahi/avahi-daemon.conf, which publishes
 # this host's address record: that is the appliance's job, never a medium's.
 # ExecStart= is reset and pointed at the resolve-only configuration this
