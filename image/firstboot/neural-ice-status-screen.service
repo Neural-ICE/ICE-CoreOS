@@ -44,7 +44,14 @@ StandardInput=null
 StandardOutput=tty
 StandardError=journal
 TTYPath=/dev/tty1
-TTYReset=yes
+# NO reset: systemd resets a unit's TTY when the unit goes dead as well as
+# before it starts (systemd 257: service_enter_dead -> exec_context_revert_tty
+# -> terminal_reset_defensive). This screen exits only once the tty1 owner is
+# active, so an exit reset lands on the running console: tty1 went back to
+# canonical mode with echo, and the console's single-key [P] waited for an
+# Enter that never came (GX10 .67, 2026-09-24). At start tty1 is still the
+# kernel's; the script only writes to it and draws with explicit sequences.
+TTYReset=no
 TTYVHangup=no
 TTYVTDisallocate=no
 # The screen is informational: a crash must never hold the boot or be retried

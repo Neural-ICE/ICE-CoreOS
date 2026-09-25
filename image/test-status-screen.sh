@@ -47,6 +47,16 @@ grep -qx 'Restart=no' "$UNIT" || fail "a restarting observer would loop on top o
 grep -qx 'TTYPath=/dev/tty1' "$UNIT" || fail "status screen does not target tty1"
 grep -qx 'StandardOutput=tty' "$UNIT" || fail "status screen stdout is not the tty"
 grep -qx 'StandardInput=null' "$UNIT" || fail "status screen must not read the console"
+# The screen hands tty1 over to its owner (the product console, or getty) and
+# exits once that owner is active. systemd resets a unit's TTY when the unit
+# goes dead (service_enter_dead -> exec_context_revert_tty), so TTYReset=yes
+# put tty1 back into canonical mode with echo under the running console. A
+# single key such as the console's [P] then waited for an Enter that never
+# came (GX10 .67, 2026-09-24).
+grep -qx 'TTYReset=no' "$UNIT" \
+  || fail "status screen resets tty1 when it exits, under the console that now owns it (TTYReset= must be no)"
+grep -qx 'TTYVHangup=no' "$UNIT" || fail "status screen would hang up tty1 under its owner"
+grep -qx 'TTYVTDisallocate=no' "$UNIT" || fail "status screen would disallocate tty1 under its owner"
 grep -qx 'ExecStart=/usr/local/bin/neural-ice-status-screen.sh' "$UNIT" || fail "unexpected ExecStart"
 ! grep -E '^Exec(Start|StartPre|StartPost|Stop|StopPost)=.*(agetty|login|sulogin|/bin/sh|/bin/bash)' "$UNIT" \
   || fail "status screen must never spawn a shell or a login"
