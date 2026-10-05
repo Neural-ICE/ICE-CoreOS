@@ -601,6 +601,22 @@ grep -Fq 'neuralice.target must name a plain block device under /dev' "$AUTOINST
   || fail "the wipe target is not constrained to a plain /dev node"
 grep -Fq 'neuralice.systemsize must be a whole number of GiB' "$AUTOINSTALL" \
   || fail "the system size interpolated into sfdisk is not constrained"
+# The size check is exercised, not just grepped: the installer's own condition is
+# lifted and run. `0150` is octal 104 and `08` is an arithmetic error in bash, so
+# a leading zero is refused outright, like anything outside 16..65536.
+_size_cond="$(sed -n 's/^  if \(! \[\[ "\$SYSTEM_GIB" =~ .*\)); then$/\1)/p' "$AUTOINSTALL")"
+[ -n "$_size_cond" ] || fail "cannot lift the neuralice.systemsize condition from the installer"
+size_refused() { # $1=value -> 0 when the installer's condition refuses it
+  # shellcheck disable=SC2034 # read by the eval-ed installer condition
+  local SYSTEM_GIB=$1
+  eval "if $_size_cond; then return 0; else return 1; fi" 2>/dev/null
+}
+for good in 16 100 150 65536; do
+  size_refused "$good" && fail "the installer refuses a valid neuralice.systemsize=$good"
+done
+for bad in 0150 08 016 15 65537 0 abc 1.5 ''; do
+  size_refused "$bad" || fail "the installer accepts neuralice.systemsize='$bad'"
+done
 # 🔴 ONE CANONICAL ORIGIN, NO DEFAULT (independent review 2026-09-02, P0 #3).
 # The compiled-in fallback was `ghcr.io/neural-ice/neural-ice-coreos:stable` -- a
 # MUTABLE TAG on a registry that is not the release authority -- and an appliance

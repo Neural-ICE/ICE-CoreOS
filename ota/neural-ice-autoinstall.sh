@@ -745,8 +745,8 @@ if [[ -n "$_systemsize_karg" ]]; then
   # A size is interpolated into the sfdisk script that repartitions the target.
   # Anything that is not a plain, plausible number of GiB is refused rather than
   # rounded: sfdisk would otherwise silently reinterpret it.
-  if ! [[ "$SYSTEM_GIB" =~ ^[0-9]{1,5}$ ]] || (( SYSTEM_GIB < 16 || SYSTEM_GIB > 65536 )); then
-    die "neuralice.systemsize must be a whole number of GiB between 16 and 65536, got: $SYSTEM_GIB"
+  if ! [[ "$SYSTEM_GIB" =~ ^[1-9][0-9]{0,4}$ ]] || (( SYSTEM_GIB < 16 || SYSTEM_GIB > 65536 )); then
+    die "neuralice.systemsize must be a whole number of GiB between 16 and 65536 without a leading zero, got: $SYSTEM_GIB"
   fi
 fi
 

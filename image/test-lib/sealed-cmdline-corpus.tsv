@@ -147,6 +147,10 @@ refuse:unrepresentable-word	yes	a word outside the renderer's character class	qu
 refuse:unrepresentable-word	yes	a word that is only an equals sign	quiet systemd.unit=neural-ice-live.target neuralice.live=1 =value
 refuse:invalid-argument:neuralice.target	yes	a wipe target that escapes /dev	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.target=/dev/../etc/x
 refuse:invalid-argument:neuralice.systemsize	yes	a system size below the floor	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=8
+refuse:invalid-argument:neuralice.systemsize	yes	a system size with a leading zero, octal to bash arithmetic	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=0150
+refuse:invalid-argument:neuralice.systemsize	yes	a system size with a leading zero that bash arithmetic rejects	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=08
+refuse:invalid-argument:neuralice.systemsize	yes	a system size above the ceiling	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=65537
+refuse:invalid-argument:neuralice.systemsize	yes	a zero-padded size at the floor	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=016
 refuse:word-not-permitted-in-mode	yes	an Install-only argument on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.target=/dev/nvme0n1
 refuse:word-not-permitted-in-mode	yes	an operator SSH key on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.sshkey=QUFB
 refuse:word-not-permitted-in-mode	yes	an OTA origin on a Live medium	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.imgref=release.example.test/neural-ice/x@sha256:1111111111111111111111111111111111111111111111111111111111111111

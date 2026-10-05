@@ -290,7 +290,7 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
       [[ "$value" =~ ^[0-9a-f]{64}$ ]]
       ;;
     neuralice.systemsize)
-      [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+      [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
       (( value >= 16 && value <= 65536 ))
       ;;
     neuralice.mirror_generation|neuralice.pcr_policy_seq)

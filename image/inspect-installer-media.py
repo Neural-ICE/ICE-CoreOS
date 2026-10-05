@@ -917,7 +917,7 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
     ):
         return bool(re.fullmatch(r"[0-9a-f]{64}", value))
     if key == "neuralice.systemsize":
-        return bool(re.fullmatch(r"[0-9]{1,5}", value)) and 16 <= int(value) <= 65536
+        return bool(re.fullmatch(r"[1-9][0-9]{0,4}", value)) and 16 <= int(value) <= 65536
     if key in ("neuralice.mirror_generation", "neuralice.pcr_policy_seq"):
         return bool(re.fullmatch(r"[1-9][0-9]{0,18}", value))
     if key == "neuralice.seed_trusted_now":
