@@ -650,10 +650,13 @@ guard_line="$(grep -nE '^_fit_msg="\$\(target_fits_layout ' "$AUTOINSTALL" | hea
 announce_line="$(grep -nE '^log "Internal target disk = ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 [ -n "$guard_line" ] && [ -n "$announce_line" ] && [ -n "$wipe_line" ] \
   || fail "cannot locate the size guard, the wipe announcement or the wipe"
-[ "$guard_line" -lt "$announce_line" ] && [ "$announce_line" -lt "$wipe_line" ] \
-  || fail "the target size guard does not run before the wipe"
+if ! { [ "$guard_line" -lt "$announce_line" ] && [ "$announce_line" -lt "$wipe_line" ]; }; then
+  fail "the target size guard does not run before the wipe"
+fi
 sfdisk_line="$(grep -nE '^[[:space:]]*sfdisk .*"\$target"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
-[ -n "$sfdisk_line" ] && [ "$guard_line" -lt "$sfdisk_line" ] || fail "the size guard does not precede sfdisk"
+if ! { [ -n "$sfdisk_line" ] && [ "$guard_line" -lt "$sfdisk_line" ]; }; then
+  fail "the size guard does not precede sfdisk"
+fi
 # 🔴 ONE CANONICAL ORIGIN, NO DEFAULT (independent review 2026-09-02, P0 #3).
 # The compiled-in fallback was `ghcr.io/neural-ice/neural-ice-coreos:stable` -- a
 # MUTABLE TAG on a registry that is not the release authority -- and an appliance
