@@ -617,6 +617,43 @@ done
 for bad in 0150 08 016 15 65537 0 abc 1.5 ''; do
   size_refused "$bad" || fail "the installer accepts neuralice.systemsize='$bad'"
 done
+# THE PRE-WIPE SIZE GUARD. A system size the disk cannot hold used to fail inside
+# sfdisk, after wipefs had already destroyed the disk. The guard is lifted from
+# the installer and run; its call must precede every write to the target.
+{ sed -n '/^readonly ESP_BOOT_GIB=/p' "$AUTOINSTALL"
+  sed -n '/^target_fits_layout() {/,/^}$/p' "$AUTOINSTALL"; } > "${TMPDIR:-/tmp}/fits.$$"
+# shellcheck source=/dev/null
+. "${TMPDIR:-/tmp}/fits.$$"; rm -f "${TMPDIR:-/tmp}/fits.$$"
+declare -F target_fits_layout >/dev/null || fail "cannot lift target_fits_layout from the installer"
+GIB=$((1024 * 1024 * 1024))
+# exactly the minimum (2 + system + 64) is accepted; one byte less is refused
+target_fits_layout $(( (2 + 150 + 64) * GIB )) 150 2>/dev/null \
+  || fail "a disk of exactly the minimum for a 150 GiB system volume was refused"
+target_fits_layout $(( (2 + 150 + 64) * GIB - 1 )) 150 2>/dev/null \
+  && fail "a disk one byte below the minimum for a 150 GiB system volume was accepted"
+# a 256 GiB disk cannot hold a 200 GiB system volume plus the data minimum
+target_fits_layout $(( 256 * GIB )) 200 2>/dev/null \
+  && fail "a 256 GiB disk was accepted for a 200 GiB system volume"
+# the default (100, no karg) keeps working on the disks it always worked on
+target_fits_layout $(( 512 * GIB )) 100 2>/dev/null || fail "the default 100 GiB layout was refused on a 512 GiB disk"
+target_fits_layout $(( (2 + 100 + 64) * GIB )) 100 2>/dev/null || fail "the default 100 GiB layout was refused at its exact minimum"
+# an unreadable size is a refusal, never a pass
+for bad in '' 0 abc -5 1.5; do
+  target_fits_layout "$bad" 100 2>/dev/null && fail "target size '$bad' was accepted"
+done
+# the refusal states the numbers so the operator can act on it
+refusal_text="$(target_fits_layout $(( 100 * GIB )) 150 2>&1 || true)"
+[[ "$refusal_text" == *'needs 216 GiB'* ]] \
+  || fail "the size refusal does not state the required capacity"
+# ORDER: the guard is called before the wipe announcement and before wipefs/sfdisk
+guard_line="$(grep -nE '^_fit_msg="\$\(target_fits_layout ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+announce_line="$(grep -nE '^log "Internal target disk = ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[ -n "$guard_line" ] && [ -n "$announce_line" ] && [ -n "$wipe_line" ] \
+  || fail "cannot locate the size guard, the wipe announcement or the wipe"
+[ "$guard_line" -lt "$announce_line" ] && [ "$announce_line" -lt "$wipe_line" ] \
+  || fail "the target size guard does not run before the wipe"
+sfdisk_line="$(grep -nE '^[[:space:]]*sfdisk .*"\$target"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+[ -n "$sfdisk_line" ] && [ "$guard_line" -lt "$sfdisk_line" ] || fail "the size guard does not precede sfdisk"
 # 🔴 ONE CANONICAL ORIGIN, NO DEFAULT (independent review 2026-09-02, P0 #3).
 # The compiled-in fallback was `ghcr.io/neural-ice/neural-ice-coreos:stable` -- a
 # MUTABLE TAG on a registry that is not the release authority -- and an appliance

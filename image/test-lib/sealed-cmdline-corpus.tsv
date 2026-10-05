@@ -151,6 +151,9 @@ refuse:invalid-argument:neuralice.systemsize	yes	a system size with a leading ze
 refuse:invalid-argument:neuralice.systemsize	yes	a system size with a leading zero that bash arithmetic rejects	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=08
 refuse:invalid-argument:neuralice.systemsize	yes	a system size above the ceiling	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=65537
 refuse:invalid-argument:neuralice.systemsize	yes	a zero-padded size at the floor	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=016
+refuse:invalid-argument:neuralice.systemsize	yes	an empty system size	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=
+refuse:invalid-argument:neuralice.systemsize	yes	a non-digit system size	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=abc
+refuse:invalid-argument:neuralice.systemsize	yes	a system size with a unit suffix	quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.systemsize=150G
 refuse:word-not-permitted-in-mode	yes	an Install-only argument on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.target=/dev/nvme0n1
 refuse:word-not-permitted-in-mode	yes	an operator SSH key on a Live medium	quiet systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.sshkey=QUFB
 refuse:word-not-permitted-in-mode	yes	an OTA origin on a Live medium	quiet neuralice.release_authority=release.example.test systemd.unit=neural-ice-live.target neuralice.live=1 neuralice.imgref=release.example.test/neural-ice/x@sha256:1111111111111111111111111111111111111111111111111111111111111111

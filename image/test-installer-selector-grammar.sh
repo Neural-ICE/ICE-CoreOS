@@ -280,8 +280,9 @@ has_media_hint() { # $1=cmdline
 # production-length values, and it must classify as `install` AND fit under an
 # explicit margin. The anchor used for the measurement is the production-shaped
 # one: the longest trust policy id this tree names, not the fixture's.
-# 1900 -> 1920 when the producer began sealing neuralice.systemsize=150 (+25 bytes,
-# line 1909); still 37 bytes below the kernel bound.
+# 1900 -> 1920 when the producer began sealing neuralice.systemsize=150 (+25 bytes:
+# the full line measures 1909). The line itself keeps 48 bytes of headroom under
+# the 1957-byte kernel bound; the 1920 budget keeps a 37-byte margin below it.
 BUDGET_MAX_BYTES=1920
 KERNEL_CMDLINE_BYTES="$(sed -n 's/^NI_SEALED_CMDLINE_MAX_BYTES=\([0-9]*\)$/\1/p' "$GRAMMAR")"
 [[ "$KERNEL_CMDLINE_BYTES" =~ ^[0-9]+$ && "$BUDGET_MAX_BYTES" -lt "$KERNEL_CMDLINE_BYTES" ]] \

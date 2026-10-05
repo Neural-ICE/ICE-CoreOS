@@ -750,6 +750,24 @@ if [[ -n "$_systemsize_karg" ]]; then
   fi
 fi
 
+# The disk must hold ESP + /boot + the system volume + a usable data volume. The
+# data volume takes "the rest", so a larger neuralice.systemsize on a small disk
+# would otherwise only fail inside sfdisk, AFTER wipefs has destroyed the disk.
+# This guard runs before any write. No data minimum existed in the repo, so 64 GiB
+# is named here (models and client documents live on the data volume).
+readonly ESP_BOOT_GIB=2 DATA_MIN_GIB=64
+# $1=target size in bytes  $2=system GiB. Returns 1 (message on stderr) when too small.
+target_fits_layout() {
+  local bytes=$1 system_gib=$2 need_gib
+  [[ "$bytes" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "target disk size is not a positive byte count: '$bytes'" >&2; return 1; }
+  need_gib=$(( ESP_BOOT_GIB + system_gib + DATA_MIN_GIB ))
+  if (( bytes < need_gib * 1024 * 1024 * 1024 )); then
+    echo "target disk is $(( bytes / 1024 / 1024 / 1024 )) GiB; ESP+/boot ${ESP_BOOT_GIB} + system ${system_gib} + data minimum ${DATA_MIN_GIB} needs ${need_gib} GiB" >&2
+    return 1
+  fi
+}
+
 readonly DATA_MOUNT="/var/lib/neural-ice/data"
 
 # The TPM-backed monotonic state this machine keeps across a full-disk wipe: the
@@ -4036,6 +4054,11 @@ log_previous_firstboot_journal() {
   return 0
 }
 
+# Refuse BEFORE anything is written: nothing below this line has touched the disk.
+_target_bytes="$(blockdev --getsize64 "$target" 2>/dev/null)" \
+  || die "cannot read the size of $target; refusing to partition it"
+_fit_msg="$(target_fits_layout "$_target_bytes" "$SYSTEM_GIB" 2>&1)" \
+  || die "$_fit_msg -- disk left untouched"
 log_previous_failure_evidence
 log_previous_firstboot_journal
 log "Internal target disk = $target (serial $target_serial) — WIPING + ENCRYPTING in 5s…"
