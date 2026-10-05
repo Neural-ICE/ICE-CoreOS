@@ -648,8 +648,9 @@ refusal_text="$(target_fits_layout $(( 100 * GIB )) 150 2>&1 || true)"
 # ORDER: the guard is called before the wipe announcement and before wipefs/sfdisk
 guard_line="$(grep -nE '^_fit_msg="\$\(target_fits_layout ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
 announce_line="$(grep -nE '^log "Internal target disk = ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
-[ -n "$guard_line" ] && [ -n "$announce_line" ] && [ -n "$wipe_line" ] \
-  || fail "cannot locate the size guard, the wipe announcement or the wipe"
+if ! { [ -n "$guard_line" ] && [ -n "$announce_line" ] && [ -n "$wipe_line" ]; }; then
+  fail "cannot locate the size guard, the wipe announcement or the wipe"
+fi
 if ! { [ "$guard_line" -lt "$announce_line" ] && [ "$announce_line" -lt "$wipe_line" ]; }; then
   fail "the target size guard does not run before the wipe"
 fi
