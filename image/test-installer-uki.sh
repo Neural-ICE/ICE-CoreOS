@@ -268,4 +268,55 @@ for missing in KERNEL INITRD STUB OSREL ROOT_VERITY_HASH PAYLOAD_DIGEST VARIANT 
     && fail "the builder accepted an empty $missing"
 done
 
+# --------------------------------------------------------------------------- #
+# 7) THE SEALED SYSTEM PARTITION SIZE. image/build-installer-usb.sh seals an
+#    optional `neuralice.systemsize=<GiB>`; the function that decides it is
+#    LIFTED from the producer, handed to the real renderer through EXTRA_KARGS,
+#    and the rendered line is classified by the real closed grammar -- so the
+#    producer, the renderer and the reader are proved to agree on one line.
+# --------------------------------------------------------------------------- #
+USB_PRODUCER="$ROOT/image/build-installer-usb.sh"
+sed -n '/^system_size_karg() {/,/^}$/p' "$USB_PRODUCER" > "$TMP/system-size.sh"
+grep -q '^system_size_karg() {' "$TMP/system-size.sh" \
+  || fail "cannot lift system_size_karg from the producer"
+# shellcheck source=/dev/null
+. "$TMP/system-size.sh"
+# shellcheck source=/dev/null
+. "$ROOT/image/installer/neural-ice-sealed-cmdline-grammar.sh"
+grep -Fq 'system_size_karg "${SYSTEM_SIZE_GIB:-}"' "$USB_PRODUCER" \
+  || fail "the producer does not seal SYSTEM_SIZE_GIB through system_size_karg"
+
+[ -z "$(system_size_karg '')" ] || fail "an unset SYSTEM_SIZE_GIB sealed something"
+# An Install line shaped the way the producer shapes one (placeholder hosts and
+# digests only).
+INSTALL_WORDS="quiet rd.systemd.gpt_auto=0 luks=0 systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 neuralice.device_channel=lab neuralice.release_authority=release.example.test neuralice.imgref=release.example.test/neural-ice/appliance@sha256:$(printf '%064d' 1) neuralice.preseal=$(printf '%064d' 2) neuralice.pcr_policy=$(printf '%064d' 4) neuralice.pcr_policy_key=$(printf '%064d' 5) neuralice.pcr_policy_signature=$(printf '%064d' 6) neuralice.pcr_policy_seq=7 neuralice.source=medium"
+for size in 16 150 65536; do
+  karg="$(system_size_karg "$size")" || fail "SYSTEM_SIZE_GIB=$size was refused"
+  [ "$karg" = "neuralice.systemsize=$size" ] || fail "SYSTEM_SIZE_GIB=$size sealed '$karg'"
+  build "$TMP/size-$size" VARIANT=sealed-lab EXTRA_KARGS="$INSTALL_WORDS $karg" >"$TMP/size-$size.out" \
+    || fail "the UKI build refused a sealed system size of $size"
+  line="$(sed -n 's/^==> sealed cmdline: //p' "$TMP/size-$size.out")"
+  case " $line " in *" $karg "*) ;; *) fail "the rendered cmdline lost $karg" ;; esac
+  # The sealed fields come first and the producer's words follow verbatim.
+  case "${line%% *}" in neuralice.trust=*) ;; *) false ;; esac \
+    || fail "the rendered cmdline does not open with the sealed anchor"
+  [ "${line##* }" = "$karg" ] || fail "the system size is not sealed after the producer's words"
+  [ "$(ni_sealed_cmdline_classify "$line")" = install ] \
+    || fail "the closed grammar refused a sealed system size of $size: $NI_SEALED_CMDLINE_REASON"
+done
+
+# Refusals: nothing outside 16..65536 whole GiB, in plain decimal, is sealed.
+for bad in 0 15 65537 99999 100000 -150 +150 1.5 150G ' 150' 150' ' 0150 016 08 abc 0x96; do
+  system_size_karg "$bad" >/dev/null 2>&1 \
+    && fail "SYSTEM_SIZE_GIB='$bad' was sealed"
+done
+# The reader refuses the same lines even if a producer were to emit them.
+for bad in 15 65537 abc; do
+  ni_sealed_cmdline_classify "$(sed -n 's/^==> sealed cmdline: //p' "$TMP/size-150.out" | sed "s/neuralice.systemsize=150/neuralice.systemsize=$bad/")" >/dev/null 2>&1 \
+    && fail "the closed grammar accepted neuralice.systemsize=$bad"
+done
+# One occurrence only: a second size is the ambiguity the grammar exists to refuse.
+ni_sealed_cmdline_classify "$(sed -n 's/^==> sealed cmdline: //p' "$TMP/size-150.out") neuralice.systemsize=100" >/dev/null 2>&1 \
+  && fail "the closed grammar accepted two system sizes"
+
 echo "INSTALLER_UKI_TEST_OK"

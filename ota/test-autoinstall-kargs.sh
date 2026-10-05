@@ -601,6 +601,63 @@ grep -Fq 'neuralice.target must name a plain block device under /dev' "$AUTOINST
   || fail "the wipe target is not constrained to a plain /dev node"
 grep -Fq 'neuralice.systemsize must be a whole number of GiB' "$AUTOINSTALL" \
   || fail "the system size interpolated into sfdisk is not constrained"
+# The size check is exercised, not just grepped: the installer's own condition is
+# lifted and run. `0150` is octal 104 and `08` is an arithmetic error in bash, so
+# a leading zero is refused outright, like anything outside 16..65536.
+_size_cond="$(sed -n 's/^  if \(! \[\[ "\$SYSTEM_GIB" =~ .*\)); then$/\1)/p' "$AUTOINSTALL")"
+[ -n "$_size_cond" ] || fail "cannot lift the neuralice.systemsize condition from the installer"
+size_refused() { # $1=value -> 0 when the installer's condition refuses it
+  # shellcheck disable=SC2034 # read by the eval-ed installer condition
+  local SYSTEM_GIB=$1
+  eval "if $_size_cond; then return 0; else return 1; fi" 2>/dev/null
+}
+for good in 16 100 150 65536; do
+  size_refused "$good" && fail "the installer refuses a valid neuralice.systemsize=$good"
+done
+for bad in 0150 08 016 15 65537 0 abc 1.5 ''; do
+  size_refused "$bad" || fail "the installer accepts neuralice.systemsize='$bad'"
+done
+# THE PRE-WIPE SIZE GUARD. A system size the disk cannot hold used to fail inside
+# sfdisk, after wipefs had already destroyed the disk. The guard is lifted from
+# the installer and run; its call must precede every write to the target.
+{ sed -n '/^readonly ESP_BOOT_GIB=/p' "$AUTOINSTALL"
+  sed -n '/^target_fits_layout() {/,/^}$/p' "$AUTOINSTALL"; } > "${TMPDIR:-/tmp}/fits.$$"
+# shellcheck source=/dev/null
+. "${TMPDIR:-/tmp}/fits.$$"; rm -f "${TMPDIR:-/tmp}/fits.$$"
+declare -F target_fits_layout >/dev/null || fail "cannot lift target_fits_layout from the installer"
+GIB=$((1024 * 1024 * 1024))
+# exactly the minimum (2 + system + 64) is accepted; one byte less is refused
+target_fits_layout $(( (2 + 150 + 64) * GIB )) 150 2>/dev/null \
+  || fail "a disk of exactly the minimum for a 150 GiB system volume was refused"
+target_fits_layout $(( (2 + 150 + 64) * GIB - 1 )) 150 2>/dev/null \
+  && fail "a disk one byte below the minimum for a 150 GiB system volume was accepted"
+# a 256 GiB disk cannot hold a 200 GiB system volume plus the data minimum
+target_fits_layout $(( 256 * GIB )) 200 2>/dev/null \
+  && fail "a 256 GiB disk was accepted for a 200 GiB system volume"
+# the default (100, no karg) keeps working on the disks it always worked on
+target_fits_layout $(( 512 * GIB )) 100 2>/dev/null || fail "the default 100 GiB layout was refused on a 512 GiB disk"
+target_fits_layout $(( (2 + 100 + 64) * GIB )) 100 2>/dev/null || fail "the default 100 GiB layout was refused at its exact minimum"
+# an unreadable size is a refusal, never a pass
+for bad in '' 0 abc -5 1.5; do
+  target_fits_layout "$bad" 100 2>/dev/null && fail "target size '$bad' was accepted"
+done
+# the refusal states the numbers so the operator can act on it
+refusal_text="$(target_fits_layout $(( 100 * GIB )) 150 2>&1 || true)"
+[[ "$refusal_text" == *'needs 216 GiB'* ]] \
+  || fail "the size refusal does not state the required capacity"
+# ORDER: the guard is called before the wipe announcement and before wipefs/sfdisk
+guard_line="$(grep -nE '^_fit_msg="\$\(target_fits_layout ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+announce_line="$(grep -nE '^log "Internal target disk = ' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+if ! { [ -n "$guard_line" ] && [ -n "$announce_line" ] && [ -n "$wipe_line" ]; }; then
+  fail "cannot locate the size guard, the wipe announcement or the wipe"
+fi
+if ! { [ "$guard_line" -lt "$announce_line" ] && [ "$announce_line" -lt "$wipe_line" ]; }; then
+  fail "the target size guard does not run before the wipe"
+fi
+sfdisk_line="$(grep -nE '^[[:space:]]*sfdisk .*"\$target"' "$AUTOINSTALL" | head -1 | cut -d: -f1)"
+if ! { [ -n "$sfdisk_line" ] && [ "$guard_line" -lt "$sfdisk_line" ]; }; then
+  fail "the size guard does not precede sfdisk"
+fi
 # 🔴 ONE CANONICAL ORIGIN, NO DEFAULT (independent review 2026-09-02, P0 #3).
 # The compiled-in fallback was `ghcr.io/neural-ice/neural-ice-coreos:stable` -- a
 # MUTABLE TAG on a registry that is not the release authority -- and an appliance
