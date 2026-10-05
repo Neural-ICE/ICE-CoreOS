@@ -280,7 +280,9 @@ has_media_hint() { # $1=cmdline
 # production-length values, and it must classify as `install` AND fit under an
 # explicit margin. The anchor used for the measurement is the production-shaped
 # one: the longest trust policy id this tree names, not the fixture's.
-BUDGET_MAX_BYTES=1900
+# 1900 -> 1920 when the producer began sealing neuralice.systemsize=150 (+25 bytes,
+# line 1909); still 37 bytes below the kernel bound.
+BUDGET_MAX_BYTES=1920
 KERNEL_CMDLINE_BYTES="$(sed -n 's/^NI_SEALED_CMDLINE_MAX_BYTES=\([0-9]*\)$/\1/p' "$GRAMMAR")"
 [[ "$KERNEL_CMDLINE_BYTES" =~ ^[0-9]+$ && "$BUDGET_MAX_BYTES" -lt "$KERNEL_CMDLINE_BYTES" ]] \
   || fail "the grammar no longer states NI_SEALED_CMDLINE_MAX_BYTES as a literal, or the budget is not below it"
@@ -305,7 +307,7 @@ while IFS=$'\t' read -r expected anchor label words; do
       || fail "[$label] the full production line measures ${budget_bytes} bytes, above the ${BUDGET_MAX_BYTES}-byte budget (kernel bound 1957)"
     # Every term the producer seals on that medium must be on the line, or the
     # measurement is of a shorter medium than the one that ships.
-    for must in neuralice.imgref= neuralice.sshkey= neuralice.source=registry neuralice.osimage= \
+    for must in neuralice.imgref= neuralice.systemsize= neuralice.sshkey= neuralice.source=registry neuralice.osimage= \
       neuralice.preseal= neuralice.mirror= neuralice.mirror_ca_sha256= neuralice.mirror_generation= \
       neuralice.seed_closure= neuralice.seed_trusted_now= neuralice.seed_source=mirror \
       neuralice.device_channel= neuralice.release_authority= rd.systemd.gpt_auto=0 luks=0 enforcing=0; do

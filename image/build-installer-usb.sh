@@ -591,6 +591,24 @@ PY
 }
 
 # --------------------------------------------------------------------------- #
+# The optional system partition size, sealed as `neuralice.systemsize=<GiB>`.
+# Unset keeps the installer's own default. The producer holds the value to the
+# grammar's rule (whole GiB, 16..65536) and ALSO refuses a leading zero: both
+# the installer and the grammar evaluate the number with bash arithmetic, where
+# `0150` is octal and `08` is an error, so the only unambiguous spelling is the
+# plain decimal one. Prints the karg on success; prints nothing when unset.
+# --------------------------------------------------------------------------- #
+system_size_karg() { # $1=SYSTEM_SIZE_GIB (possibly empty)
+  local size=${1:-}
+  [[ -n "$size" ]] || return 0
+  if ! [[ "$size" =~ ^[1-9][0-9]{0,4}$ ]] || (( size < 16 || size > 65536 )); then
+    echo "ERROR: SYSTEM_SIZE_GIB must be a whole number of GiB between 16 and 65536 without leading zeros, got: $size" >&2
+    return 1
+  fi
+  printf 'neuralice.systemsize=%s' "$size"
+}
+
+# --------------------------------------------------------------------------- #
 # 🔴 THE OFFLINE SEED, SEALED FOR *BOTH* INSTALL SOURCES.
 #
 # The three seed arguments used to be sealed only inside the `medium` arm,
@@ -1558,6 +1576,10 @@ case "$MEDIA_MODE" in
       "neuralice.device_channel=${DEVICE_CHANNEL}" \
       "neuralice.release_authority=${RELEASE_AUTHORITY}" \
       "neuralice.imgref=${TARGET_IMGREF}")
+    # Optional sealed system partition size (Owner decision: v2 appliances
+    # get 150 GiB). Sealed in the signed UKI so the mutable ESP cannot choose it.
+    _system_size_karg="$(system_size_karg "${SYSTEM_SIZE_GIB:-}")" || exit 1
+    [[ -z "$_system_size_karg" ]] || UKI_KARGS+=("$_system_size_karg")
     if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
       # THE ONE TRANSPORT OF THE OPERATOR KEY. The already validated public key
       # is sealed into the signed UKI so replacing mutable vfat bytes cannot
