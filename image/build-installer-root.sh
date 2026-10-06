@@ -500,11 +500,46 @@ if [[ -n "$STORE_SOURCE_REF" ]]; then
     || die "cannot read the store source manifest from $STORE_SOURCE_REF"
   [[ "sha256:$(sha256_of "$SOURCE_MANIFEST_RAW")" == "$STORE_MANIFEST_DIGEST" ]] \
     || die "the store source at $STORE_SOURCE_REF serves a manifest that does not hash to $STORE_MANIFEST_DIGEST"
+  STORE_COPY_SOURCE="$STORE_SOURCE_REF"
+  # A digest-pinned BASE_IMAGE may be an image INDEX (buildx publishes the platform image beside its provenance and
+  # SBOM attestation manifests). podman then reports the index digest, so STORE_MANIFEST_DIGEST is the index: the
+  # store is staged from exactly ONE listed child whose bytes hash to its listed digest and whose config is the
+  # immutable store image. Any other shape (no such child, several, a nested index) is refused.
+  if python3 -c 'import json,sys; sys.exit(0 if "manifests" in json.load(open(sys.argv[1])) else 1)' "$SOURCE_MANIFEST_RAW" 2>/dev/null; then
+    mapfile -t STORE_INDEX_CHILDREN < <(python3 -c '
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+for m in d.get("manifests") or []:
+    dg = m.get("digest", "") if isinstance(m, dict) else ""
+    mt = m.get("mediaType", "") if isinstance(m, dict) else ""
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", dg) and mt in ("application/vnd.oci.image.manifest.v1+json",
+                                                         "application/vnd.docker.distribution.manifest.v2+json"):
+        print(dg)' "$SOURCE_MANIFEST_RAW") || die "the store source index cannot be read"
+    STORE_CHILD_MATCH=""
+    for child in "${STORE_INDEX_CHILDREN[@]}"; do
+      child_raw="$WORK/store-source-child.json"
+      "$(tool skopeo)" inspect --raw --no-creds "${STORE_COPY_SOURCE_ARGS[@]/--src-cert-dir/--cert-dir}" "${STORE_SOURCE_REF%@*}@${child}" \
+        | head -c 4194304 > "$child_raw" || die "cannot read the store source index child ${child}"
+      [[ "sha256:$(sha256_of "$child_raw")" == "$child" ]] \
+        || die "the store source serves bytes that do not hash to the listed child ${child}"
+      child_config="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("config",{}).get("digest",""))' "$child_raw")" \
+        || die "the store source index child ${child} is not a JSON image manifest"
+      if [[ "$child_config" == "sha256:${EXPECTED_STORE_IMAGE_ID}" ]]; then
+        [[ -z "$STORE_CHILD_MATCH" ]] || die "the store source index lists several children of the immutable store image"
+        STORE_CHILD_MATCH="$child"
+        cp "$child_raw" "$WORK/store-source-selected.json"
+      fi
+    done
+    [[ -n "$STORE_CHILD_MATCH" ]] \
+      || die "the store source index ${STORE_MANIFEST_DIGEST} lists no image manifest of the immutable store image ${EXPECTED_STORE_IMAGE_ID}"
+    SOURCE_MANIFEST_RAW="$WORK/store-source-selected.json"
+    STORE_COPY_SOURCE="${STORE_SOURCE_REF%@*}@${STORE_CHILD_MATCH}"
+    echo "    store source index ${STORE_MANIFEST_DIGEST}: staging its child ${STORE_CHILD_MATCH}"
+  fi
   SOURCE_CONFIG_DIGEST="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("config",{}).get("digest",""))' "$SOURCE_MANIFEST_RAW")" \
     || die "the store source manifest is not a JSON image manifest"
   [[ "$SOURCE_CONFIG_DIGEST" == "sha256:${EXPECTED_STORE_IMAGE_ID}" ]] \
     || die "the store source manifest names config '${SOURCE_CONFIG_DIGEST:-nothing}', not the immutable store image ${EXPECTED_STORE_IMAGE_ID}"
-  STORE_COPY_SOURCE="$STORE_SOURCE_REF"
   STORE_COPY_SOURCE_ARGS+=(--src-no-creds)
   echo "    store source: ${STORE_SOURCE_REF} (manifest and config identities verified)"
 fi
