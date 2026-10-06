@@ -71,6 +71,13 @@ PCR 7 is *"the digest of the UEFI Secure Boot state (PK, KEK, `db`, `dbx`, and
 the certificates that validated what was loaded)"* (`docs/TPM-SIGNED-POLICY-RUNBOOK.md`).
 So the varstore is not a detail — it **is** the input that decides PCR 7.
 
+> 🔴 **Corrected for GB10 (OS-0045, finding of PR #245).** The two sentences above hold for
+> firmware that measures the variable *contents* (AAVMF/EDK2: not verified here). On the GB10
+> firmwares measured (`.63`, `.67`) only the *names* of `PK`, `KEK`, `db` and `dbx` are measured:
+> PCR 7 does not move on a `dbx`, `KEK` or `PK` update and is driven by the `db` authority that
+> validates shim, the `SbatLevel`, the vendor certificate and the boot path. Normative text:
+> [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md).
+
 `virt-fw-vars` option semantics, from its own `--help` (virt-firmware, read
 2026-09-09):
 
@@ -185,8 +192,9 @@ explicitly. So the phase banners, the completion line, the PCR 7 values and the
 the `dbx` `--secure-boot` created) and of the certificate that authenticated the
 UKI that was loaded. It is **stable across rehearsals** as long as the
 certificate file, the owner GUID and the AAVMF build do not change, and it is
-**necessarily different from the GB10's**, whose PK/KEK/`dbx` are the platform
-vendor's rather than these three lines.
+**different from the GB10's** because the authorities and the boot path differ (the GB10
+firmwares measured do not bind the contents of PK/KEK/`dbx`, so those are not the reason; see §3
+and [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md)).
 
 **It must be measured, not predicted.** `ota/neural-ice-tpm-policy.py predict`
 replays the firmware's own TCG event log and refuses unless the replay

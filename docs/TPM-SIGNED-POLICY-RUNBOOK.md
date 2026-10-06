@@ -15,25 +15,32 @@
 ## Why this exists
 
 Before this mechanism, both LUKS volumes were sealed to the **literal value** of PCR 7, the digest
-of the UEFI Secure Boot state (PK, KEK, `db`, `dbx`, and the certificates that
-validated what was loaded).
+of the UEFI Secure Boot measurements. 🔴 On the GB10 firmwares measured (PNY `.63`, ASUS `.67`) the
+firmware measures the *names* of `SecureBoot`, `PK`, `KEK`, `db` and `dbx` with a zero-length data,
+not their contents: PCR 7 there is driven by the `db` certificate that validates shim, the
+`SbatLevel`, the vendor certificate and the boot path (finding of PR #245, see
+[OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md)). The table and wording below
+were written before that finding and are corrected where it matters.
 
 ```
 seal then  :  "release the key only if PCR 7 == A"
 ```
 
 The TPM compares and refuses. It has no notion of a *legitimate* change. So every
-one of these bricks automatic unlock, fleet-wide, at the same instant:
+one of these that moves PCR 7 bricks automatic unlock, fleet-wide, at the same instant:
 
 | event | frequency |
 | --- | --- |
-| enrolling or removing a Secure Boot key (PK/KEK/db) | at the lab → prod anchor switch |
-| **a `dbx` revocation update** | **published by Microsoft periodically** |
-| a firmware capsule touching the Secure Boot variables | whenever a firmware path exists |
+| enrolling or removing the `db` certificate that validates shim | at the lab → prod anchor switch |
+| a change of the `SbatLevel` or of the boot path (`shim-grub` / `uki-direct`) | with a shim or boot-chain update |
+| a firmware capsule that changes the `db` authority, the `SbatLevel` or the boot path | whenever a firmware path exists |
 | switching the signing certificate (lab key → Microsoft-signed shim) | once, for MVP 1.0 |
 
-🔴 The `dbx` row is the one that does not wait for our schedule. Under the literal
-seal, applying one revocation locks every appliance that applies it.
+🔴 On the measured GB10 firmwares, **a `dbx`, `KEK` or `PK` update does not move PCR 7**: the
+contents of those variables are not measured, so it does not brick the unlock under the literal
+seal, and PCR 7 does not revoke `dbx` either (an old `dbx` still unlocks). The "`dbx` revocation
+locks every appliance" claim, and the "enrol a key (PK/KEK/db) → PCR 7 moves" claim, are **not
+true on GB10**; they may hold for firmware that measures the data (AAVMF/EDK2: not verified).
 
 This is also why there is **no firmware update path at all** today: opening one
 without this policy guarantees the first capsule stops the fleet.
@@ -286,8 +293,9 @@ demonstration recorded here, **before** any wave is deployed.
 
 ```
 1. take a machine already installed and unlocking automatically
-2. break the policy deliberately — enrol a Secure Boot key so PCR 7 moves
-   without a signature covering the new state
+2. break the policy deliberately — move PCR 7 without a signature covering the new state:
+   enrol a `db` certificate that validates shim, or change the `SbatLevel` (enrolling a `PK`,
+   `KEK` or `dbx` entry may not move PCR 7 on GB10, so it may not make the unlock fail)
 3. reboot. Automatic unlock MUST fail.  ← this is the point: it must fail
 4. unlock with the recovery key, on the console
 5. re-enrol against the correct policy

@@ -41,6 +41,11 @@ grep -qE '\*\*4 ADR\*\*' docs/adr/README.md || bad "docs/adr/README.md ADR count
 # The new ADR may not claim the unmerged work as existing: it must keep the "Not proven" section.
 grep -q '^## Not proven' "$adr" || bad "$adr lost its 'Not proven' section"
 
+# The PR #245 finding (GB10 measures variable names only) and its consequence for the rules engine
+# must stay stated, not silently removed.
+grep -q '^### Finding of PR #245' "$adr" || bad "$adr lost its 'Finding of PR #245' section"
+grep -q '^## Limitation for the rules engine' "$adr" || bad "$adr lost its 'Limitation for the rules engine' section"
+
 # ADR-0004 must no longer carry the literal-seal decision.
 ! grep -q '^### TPM sealing = PCR 7 only' docs/ADR-0004-disk-encryption-tpm-luks.md \
   || bad "ADR-0004 still has the 'TPM sealing = PCR 7 only' decision"
