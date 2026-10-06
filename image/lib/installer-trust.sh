@@ -193,26 +193,34 @@ installer_trust_render_cmdline() {
 
 # --------------------------------------------------------------------------- #
 # The v2 release pair among the extra kargs (mission B, T3a;
-# docs/ota/V2-RELEASE-ATTESTATION.md). `neuralice.v2rel_sha256` and
+# docs/ota/V2-RELEASE-ATTESTATION.md section 11). `neuralice.v2rel_sha256` and
 # `neuralice.v2rel_sig_sha256` pin the v2 release manifest and its detached
 # signature. The renderer appends extras verbatim, so the ORDER is the producer's
 # -- and it is a contract, because the sealed line is a signed artefact a reviewer
-# diffs and the Fabric-v2 template states the same tokens in the same order:
-# manifest first, then signature. Anything that is not exactly that is refused at
-# build time, where refusing is free:
-#   - a hash alone pins nothing; the signature before the manifest is a second
-#     spelling of one line; either one twice is the shadowing the readers refuse;
+# diffs byte for byte and the Fabric-v2 template states the same tokens in the
+# same order. The grammar readers count occurrences and do not see positions
+# (the contract says so); this renderer is where the position is enforced. The
+# pair sits IMMEDIATELY after `neuralice.source=medium` -- the slot the preseal
+# set and the authorization pair occupy today -- manifest hash first, signature
+# hash second, and before any `neuralice.seed_*` token. Anything else is refused
+# at build time, where refusing is free:
+#   - a hash alone pins nothing; the signature before the manifest, a token
+#     between the two, or the pair elsewhere on the line is a second spelling of
+#     one line; either one twice is the shadowing the readers refuse;
 #   - one hash pinning two different objects pins neither;
 #   - beside `neuralice.preseal` or the authorization pair it is a second
-#     authentication route for one TPM floor.
+#     authentication route for one TPM floor;
+#   - without `neuralice.source=medium` it is a pair no reader accepts.
 # A line with no v2 pair is untouched. The sealed grammar
 # (image/installer/neural-ice-sealed-cmdline-grammar.sh) stays the authority on
-# the whole line; this is the renderer refusing early what that grammar refuses.
+# the whole line; this is the renderer refusing early what that grammar refuses,
+# plus the one thing that grammar cannot see: the position.
 #   $@ the extra kargs, in order
 # --------------------------------------------------------------------------- #
 installer_trust_v2rel_extras_are_wellformed() {
   local karg key manifest='' sig='' manifest_n=0 sig_n=0 position=0
-  local manifest_pos=0 sig_pos=0 other=0
+  local manifest_pos=0 sig_pos=0 other=0 source_n=0 source_pos=0 source_value=''
+  local seed_pos=0
   for karg in "$@"; do
     position=$(( position + 1 ))
     key=${karg%%=*}
@@ -221,6 +229,10 @@ installer_trust_v2rel_extras_are_wellformed() {
         manifest_n=$(( manifest_n + 1 )); manifest_pos=$position; manifest=${karg#*=} ;;
       neuralice.v2rel_sig_sha256)
         sig_n=$(( sig_n + 1 )); sig_pos=$position; sig=${karg#*=} ;;
+      neuralice.source)
+        source_n=$(( source_n + 1 )); source_pos=$position; source_value=${karg#*=} ;;
+      neuralice.seed_*)
+        (( seed_pos != 0 )) || seed_pos=$position ;;
       neuralice.preseal | neuralice.relauth_sha256 | neuralice.relauth_sig_sha256)
         other=1 ;;
     esac
@@ -230,8 +242,16 @@ installer_trust_v2rel_extras_are_wellformed() {
     echo "the v2 release pair must be sealed exactly once each, together (manifest: $manifest_n, signature: $sig_n)" >&2
     return 1
   fi
-  if (( manifest_pos > sig_pos )); then
-    echo "the v2 release manifest hash must be sealed before its signature hash" >&2
+  if (( source_n != 1 )) || [[ "$source_value" != medium ]]; then
+    echo "the v2 release pair requires exactly one neuralice.source=medium before it" >&2
+    return 1
+  fi
+  if (( manifest_pos != source_pos + 1 || sig_pos != manifest_pos + 1 )); then
+    echo "the v2 release pair must be sealed immediately after neuralice.source=medium, manifest hash first and signature hash second, with nothing between" >&2
+    return 1
+  fi
+  if (( seed_pos != 0 && seed_pos < manifest_pos )); then
+    echo "the v2 release pair must be sealed before any neuralice.seed_* token" >&2
     return 1
   fi
   [[ "$manifest" =~ ^[0-9a-f]{64}$ && "$sig" =~ ^[0-9a-f]{64}$ ]] || {

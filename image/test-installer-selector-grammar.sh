@@ -453,7 +453,8 @@ done < "$CORPUS"
   || fail "the corpus must carry exactly one budget-v2: vector (found $budget_v2_vectors); the v2 line's byte budget is otherwise unmeasured"
 # The v2 pair's closed rules must each be refused BY NAME somewhere in the corpus.
 for named in v2rel-sig-without-manifest v2rel-manifest-without-sig v2rel-hashes-identical \
-  v2rel-requires-medium-source v2rel-with-preseal v2rel-with-release-authorization; do
+  v2rel-requires-medium-source v2rel-with-preseal v2rel-with-release-authorization \
+  v2rel-not-permitted-outside-lab-managed; do
   grep -q "^refuse:${named}	" "$CORPUS" \
     || fail "the corpus no longer carries a vector refused as ${named}"
 done
@@ -695,6 +696,33 @@ v2_transport "$pinned_line" "" "" 1 \
   || fail "a medium with no v2 pair was refused when none was expected"
 v2_transport "$v2_pinned_line" "" "" 0 \
   || fail "a sealed v2 pair was refused when the producer stated no expectation"
+
+# THE POSITION OF THE PAIR (contract section 11). Both grammars count occurrences
+# and accept the pair anywhere; the finished medium's line is compared with the
+# produced order HERE, whether or not the producer stated an expectation: the
+# pair immediately after neuralice.source=medium, manifest hash then signature
+# hash, before any neuralice.seed_* token.
+v2_pair="neuralice.v2rel_sha256=$v2_manifest_sha neuralice.v2rel_sig_sha256=$v2_sig_sha"
+v2_head="$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1"
+seed_token="neuralice.seed_closure=$(esp_digest seed)"
+v2_transport "$v2_head neuralice.source=medium $v2_pair $seed_token" "" "" 0 \
+  || fail "the produced order (source, pair, seed tokens) was refused"
+v2_transport "$v2_head $v2_pair neuralice.source=medium" "" "" 0 \
+  && fail "a v2 pair sealed BEFORE neuralice.source=medium was accepted"
+v2_transport "$v2_head neuralice.source=medium $seed_token $v2_pair" "" "" 0 \
+  && fail "a v2 pair sealed AFTER an offline seed token was accepted"
+v2_transport "$v2_head neuralice.source=medium neuralice.v2rel_sig_sha256=$v2_sig_sha neuralice.v2rel_sha256=$v2_manifest_sha" "" "" 0 \
+  && fail "a v2 pair with the signature hash before the manifest hash was accepted"
+v2_transport "$v2_head neuralice.source=medium neuralice.v2rel_sha256=$v2_manifest_sha quiet neuralice.v2rel_sig_sha256=$v2_sig_sha" "" "" 0 \
+  && fail "a token interposed between the two v2 hashes was accepted"
+v2_transport "$v2_head neuralice.source=medium quiet $v2_pair" "" "" 0 \
+  && fail "a token interposed between the medium source and the v2 pair was accepted"
+v2_transport "$v2_head $v2_pair" "" "" 0 \
+  && fail "a v2 pair on a line with no neuralice.source=medium was accepted"
+v2_transport "$v2_head neuralice.source=medium $v2_pair" "$v2_manifest_sha" "$v2_sig_sha" 0 \
+  || fail "the approved v2 pair in its produced position was refused"
+v2_transport "$v2_head $v2_pair neuralice.source=medium" "$v2_manifest_sha" "$v2_sig_sha" 0 \
+  && fail "the approved v2 pair in the wrong position was accepted"
 
 # A medium that pins nothing and carries nothing is the ordinary medium install.
 esp_bound "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1" \

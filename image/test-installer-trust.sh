@@ -97,33 +97,61 @@ v2_expected="neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_prof
 bash "$LIB" field neuralice.relauth_keyid "$V2_LINE" >/dev/null \
   || fail "the sealed key id can no longer be read from a line carrying the v2 pair"
 
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" >/dev/null 2>&1 \
-  && fail "a v2 manifest hash without its signature hash was sealed"
-render_v2 "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" >/dev/null 2>&1 \
-  && fail "a v2 signature hash without its manifest hash was sealed"
-render_v2 "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" >/dev/null 2>&1 \
-  && fail "a v2 pair with the signature before the manifest was sealed"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
-  "neuralice.v2rel_sha256=$OTHER_HASH" >/dev/null 2>&1 \
-  && fail "a second v2 manifest hash was sealed"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
-  "neuralice.v2rel_sig_sha256=$OTHER_HASH" >/dev/null 2>&1 \
-  && fail "a second v2 signature hash was sealed"
-render_v2 "neuralice.v2rel_sha256=deadbeef" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" >/dev/null 2>&1 \
-  && fail "a truncated v2 manifest hash was sealed"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=${V2_SIG_SHA^^}" >/dev/null 2>&1 \
-  && fail "an uppercase v2 signature hash was sealed"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_MANIFEST_SHA" >/dev/null 2>&1 \
-  && fail "one hash pinning both the v2 manifest and its signature was sealed"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
-  "neuralice.preseal=$OTHER_HASH" >/dev/null 2>&1 \
-  && fail "the v2 pair was sealed beside the v1 preseal set"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
-  "neuralice.relauth_sha256=$OTHER_HASH" "neuralice.relauth_sig_sha256=$OTHER_HASH" >/dev/null 2>&1 \
-  && fail "the v2 pair was sealed beside the authorization pair"
-render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
-  "neuralice.relauth_sha256=$OTHER_HASH" >/dev/null 2>&1 \
-  && fail "the v2 pair was sealed beside the authorization document hash"
+# Each negative states its ONE difference from the good line (source, then the
+# pair, then optional seed tokens) and names the refusal it must come from: a
+# refusal for another reason would let the rule it means to pin go untested.
+V2_M="neuralice.v2rel_sha256=$V2_MANIFEST_SHA"
+V2_S="neuralice.v2rel_sig_sha256=$V2_SIG_SHA"
+v2_refused() { # $1=label $2=text the refusal must carry, rest = the extra kargs
+  local label=$1 reason=$2 out rc=0; shift 2
+  out="$(render_v2 "$@" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail "$label was sealed: $out"
+  grep -q -- "$reason" <<<"$out" || fail "$label was refused, but not for '$reason': $out"
+}
+v2_refused "a v2 manifest hash without its signature hash" "exactly once each, together" \
+  quiet neuralice.source=medium "$V2_M"
+v2_refused "a v2 signature hash without its manifest hash" "exactly once each, together" \
+  quiet neuralice.source=medium "$V2_S"
+v2_refused "a v2 pair with the signature before the manifest" "immediately after neuralice.source=medium" \
+  quiet neuralice.source=medium "$V2_S" "$V2_M"
+v2_refused "a second v2 manifest hash" "exactly once each, together" \
+  quiet neuralice.source=medium "$V2_M" "$V2_S" "neuralice.v2rel_sha256=$OTHER_HASH"
+v2_refused "a second v2 signature hash" "exactly once each, together" \
+  quiet neuralice.source=medium "$V2_M" "$V2_S" "neuralice.v2rel_sig_sha256=$OTHER_HASH"
+v2_refused "a truncated v2 manifest hash" "two lowercase SHA-256" \
+  quiet neuralice.source=medium neuralice.v2rel_sha256=deadbeef "$V2_S"
+v2_refused "an uppercase v2 signature hash" "two lowercase SHA-256" \
+  quiet neuralice.source=medium "$V2_M" "neuralice.v2rel_sig_sha256=${V2_SIG_SHA^^}"
+v2_refused "one hash pinning both the v2 manifest and its signature" "one hash cannot pin both" \
+  quiet neuralice.source=medium "$V2_M" "neuralice.v2rel_sig_sha256=$V2_MANIFEST_SHA"
+v2_refused "the v2 pair beside the v1 preseal set" "may not be sealed beside" \
+  quiet neuralice.source=medium "$V2_M" "$V2_S" "neuralice.preseal=$OTHER_HASH"
+v2_refused "the v2 pair beside the authorization pair" "may not be sealed beside" \
+  quiet neuralice.source=medium "$V2_M" "$V2_S" "neuralice.relauth_sha256=$OTHER_HASH" "neuralice.relauth_sig_sha256=$OTHER_HASH"
+v2_refused "the v2 pair beside the authorization document hash" "may not be sealed beside" \
+  quiet neuralice.source=medium "$V2_M" "$V2_S" "neuralice.relauth_sha256=$OTHER_HASH"
+# THE POSITION IS ENFORCED HERE (contract section 11): the readers count
+# occurrences and cannot see it, so a pair anywhere else than right after the
+# medium source is a second spelling of one signed line and must not be sealed.
+v2_refused "the v2 pair before neuralice.source=medium" "immediately after neuralice.source=medium" \
+  quiet "$V2_M" "$V2_S" neuralice.source=medium
+v2_refused "the v2 pair after an offline seed closure" "immediately after neuralice.source=medium" \
+  quiet neuralice.source=medium "neuralice.seed_closure=$OTHER_HASH" "$V2_M" "$V2_S"
+v2_refused "a token between the manifest hash and the signature hash" "immediately after neuralice.source=medium" \
+  quiet neuralice.source=medium "$V2_M" quiet "$V2_S"
+v2_refused "a token between the medium source and the pair" "immediately after neuralice.source=medium" \
+  quiet neuralice.source=medium enforcing=0 "$V2_M" "$V2_S"
+v2_refused "the pair after a seed token that precedes the source" "before any neuralice.seed_" \
+  quiet "neuralice.seed_closure=$OTHER_HASH" neuralice.source=medium "$V2_M" "$V2_S"
+v2_refused "the pair with no source at all" "requires exactly one neuralice.source=medium" \
+  quiet "$V2_M" "$V2_S"
+v2_refused "the pair with a registry source" "requires exactly one neuralice.source=medium" \
+  quiet neuralice.source=registry "$V2_M" "$V2_S"
+# The pair followed by the seed tokens the producer appends after it is the
+# produced order and is accepted.
+render_v2 quiet neuralice.source=medium "$V2_M" "$V2_S" "neuralice.seed_closure=$OTHER_HASH" \
+  "neuralice.seed_trusted_now=2026-10-06T10:00:00Z" >/dev/null \
+  || fail "the produced order (source, pair, seed tokens) was refused"
 # A line with no v2 pair is untouched: the existing preseal / authorization
 # renderings keep working byte for byte.
 render_v2 quiet neuralice.source=medium "neuralice.preseal=$OTHER_HASH" >/dev/null \

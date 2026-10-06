@@ -597,6 +597,14 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
     [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" \
        && -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
       || { _ni_sealed_refuse v2rel-with-release-authorization; return 1; }
+    # LAB-ONLY, like the preseal set it replaces (contract section 3.1: the v2
+    # lane is sealed-lab until a contract version admits `prod`). The producer
+    # already refuses it outside sealed-lab and the verifier refuses it at rule 13;
+    # this is the reader of the medium refusing it too, so a customer-locked line
+    # carrying the pair is not classified `install` by the one reader that sees
+    # the signed line at boot.
+    [[ "$(ni_sealed_argument_value neuralice.access_profile "${words[@]}")" == lab-managed ]] \
+      || { _ni_sealed_refuse v2rel-not-permitted-outside-lab-managed; return 1; }
   fi
 
   local preseal_seen="${optional_seen[neuralice.preseal]:-}"

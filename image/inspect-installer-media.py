@@ -1105,6 +1105,10 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             raise SelectorRefusal("v2rel-with-preseal")
         if {"neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"}.intersection(optional):
             raise SelectorRefusal("v2rel-with-release-authorization")
+        # Lab-only, like the preseal set it replaces (contract section 3.1); the
+        # shell grammar refuses it by the same token.
+        if sealed_fields(cmdline)["neuralice.access_profile"] != "lab-managed":
+            raise SelectorRefusal("v2rel-not-permitted-outside-lab-managed")
     # THE RELEASE-AUTHORIZATION PAIR IS SEALED ONCE (FAB-0057 P1.1b, rule B).
     # A preseal set binds `installer_authorization_sha256` and its signature
     # hash and is itself hashed against `neuralice.preseal`, so a line sealing
@@ -1487,6 +1491,42 @@ V2_RELEASE_MANIFEST_KARG = "neuralice.v2rel_sha256"
 V2_RELEASE_SIG_KARG = "neuralice.v2rel_sig_sha256"
 
 
+def check_v2_release_position(cmdline: str) -> None:
+    """The v2 pair sits where the contract fixes it, or the line is not the one sealed.
+
+    docs/ota/V2-RELEASE-ATTESTATION.md section 11: IMMEDIATELY after
+    ``neuralice.source=medium``, manifest hash then signature hash, and before any
+    ``neuralice.seed_*`` token. The grammar counts occurrences and does not see
+    positions, so this is where a finished medium's line is compared with the
+    produced order: the sealed line is a signed artefact diffed byte for byte,
+    and the Fabric-v2 template states the same tokens in the same order. A line
+    with no pair is not this function's business.
+    """
+    tokens = cmdline.split()
+    positions = [
+        index
+        for index, token in enumerate(tokens)
+        if token.split("=", 1)[0] in (V2_RELEASE_MANIFEST_KARG, V2_RELEASE_SIG_KARG)
+    ]
+    if not positions:
+        return
+    if "neuralice.source=medium" not in tokens:
+        raise InspectionError(
+            "the sealed command line carries a v2 release pair without neuralice.source=medium"
+        )
+    source_index = tokens.index("neuralice.source=medium")
+    expected_keys = [V2_RELEASE_MANIFEST_KARG, V2_RELEASE_SIG_KARG]
+    if positions != [source_index + 1, source_index + 2] or [
+        tokens[index].split("=", 1)[0] for index in positions
+    ] != expected_keys:
+        raise InspectionError(
+            "the v2 release pair is not sealed immediately after neuralice.source=medium, "
+            "manifest hash first and signature hash second"
+        )
+    if any(token.startswith("neuralice.seed_") for token in tokens[:source_index]):
+        raise InspectionError("the v2 release pair is sealed after a neuralice.seed_* token")
+
+
 def check_v2_release_transport(
     cmdline: str,
     expected_manifest_sha256: str | None = None,
@@ -1519,6 +1559,7 @@ def check_v2_release_transport(
                 "the sealed command line carries a v2 release manifest pin nobody approved for this medium"
             )
         return
+    check_v2_release_position(cmdline)
     if expected_manifest_sha256 is None:
         return
     for key, expected in (
