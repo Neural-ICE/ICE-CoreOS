@@ -1,0 +1,44 @@
+{
+  "schema": "ni-pcr-rules/1",
+  "sequence": 7,
+  "unbound_variables": "allow",
+  "note": "GB10 reference (GX10DGX.0104): floor = first 8 dbx hashes of that capture",
+  "approved_certs": [
+    "x509:d52695a681fddd54384a53471cc5d10dcf79e1e5a2e7c844b4bcb0f643b9e2b1",
+    "x509:48e99b991f57fc52f76149599bff0a58c47154229b9f8d603ac40d3500248507",
+    "x509:e8e95f0733a55e8bad7be0a1413ee23c51fcea64b3c8fa6a786935fddcc71961",
+    "x509:076f1fea90ac29155ebf77c17682f75f1fdd1be196da302dc8461e350a9ae330",
+    "x509:f6124e34125bee3fe6d79a574eaa7b91c0e7bd9d929c1a321178efd611dad901",
+    "x509:52229dd77e31ab47aa373c3a574177884d17b617ea86ce242bd6938b954970ac"
+  ],
+  "dbx_floor": [
+    "sha256:80b4d96931bf0d02fd91a61e19d14f1da452e66db2408ca8604d411f92659f0a",
+    "sha256:f52f83a3fa9cfbd6920f722824dbe4034534d25b8507246b3b957dac6e1bce7a",
+    "sha256:c5d9d8a186e2c82d09afaa2a6f7f2e73870d3e64f72c4e08ef67796a840f0fbd",
+    "sha256:1aec84b84b6c65a51220a9be7181965230210d62d6d33c48999c6b295a2b0a06",
+    "sha256:c3a99a460da464a057c3586d83cef5f4ae08b7103979ed8932742df0ed530c66",
+    "sha256:58fb941aef95a25943b3fb5f2510a0df3fe44c58c95e0ab80487297568ab9771",
+    "sha256:5391c3a2fb112102a6aa1edc25ae77e19f5d6f09cd09eeb2509922bfcd5992ea",
+    "sha256:d626157e1d6a718bc124ab8da27cbb65072ca03a7b6b257dbdcbbd60f65ef3d1"
+  ],
+  "authorities": [
+    {
+      "name": "db",
+      "ids": [
+        "x509:52229dd77e31ab47aa373c3a574177884d17b617ea86ce242bd6938b954970ac"
+      ]
+    },
+    {
+      "name": "SbatLevel",
+      "ids": [
+        "text-sha256:8abd52c674d91f83b9665bc741c84752910ee2abffbf1b6a70f3acad17dde53d"
+      ]
+    },
+    {
+      "name": "MokListRT",
+      "ids": [
+        "x509:44d0de0c42d1b38032f3a27fab290ea98bce9031bf10087ce548920f1b767803"
+      ]
+    }
+  ]
+}
