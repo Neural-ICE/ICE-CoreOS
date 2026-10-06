@@ -515,8 +515,9 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
 
   # THE SIGNED PCR7 RULES PAIR (ADR-0045, T5). Optional, Install only (the mode
   # check above already refused it on a Live line), and a pair: the digest pins
-  # ice-coreos/pcr-rules/rules.json and the sequence is the anti-rollback floor
-  # the installer holds the rules to. One without the other is a rules file
+  # ice-coreos/pcr-rules/rules.json and the sequence is the floor
+  # the installer holds the rules to (self-consistency of the sealed value and the signed
+  # document; real rollback protection is the NV counter, T9, not built). One without the other is a rules file
   # nothing protects against replay, or a floor protecting nothing.
   local pcr_rules_seen="${optional_seen[neuralice.pcr_rules]:-}"
   local pcr_rules_seq_seen="${optional_seen[neuralice.pcr_rules_seq]:-}"

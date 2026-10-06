@@ -166,7 +166,10 @@ SEED_SOURCE="${SEED_SOURCE:-}"
 # document the installer's PCR7 engine evaluates and `rules.json.sig` its
 # detached, domain-separated Owner signature. The producer reads each ONCE
 # (no link followed, at most 1 MiB, never empty) into a private copy, seals the
-# SHA-256 of rules.json and the rules' OWN `sequence` -- the anti-rollback floor,
+# SHA-256 of rules.json and the rules' OWN `sequence` -- a sequence floor -- a self-consistency check between the sealed value and the
+# signed document, NOT rollback protection: a signed medium cut earlier, without the
+# pair, installs under NI-P7-COVERAGE alone (logged, state=absent on the installed
+# ESP), and the cross-media guard is the NV generation counter (T9, not built),
 # read from the JSON and never asked for as a second input that could disagree
 # with it -- as neuralice.pcr_rules / neuralice.pcr_rules_seq, and stages both
 # files on the ESP at ice-coreos/pcr-rules/. The signature file's hash is NOT
@@ -581,7 +584,7 @@ assert_pcr_rules_inputs() {
   # The rules are read the way the engine reads them: a JSON object, no key
   # duplicated at any depth (the engine's parser and this one would otherwise
   # disagree about which `sequence` is the document's), no NaN/Infinity, and a
-  # `sequence` that is an integer in 1..2^53-1 -- 0 would switch anti-rollback
+  # `sequence` that is an integer in 1..2^53-1 -- 0 would switch the floor
   # off, and the floor is sealed and compared as a safe integer everywhere.
   PCR_RULES_SEQ="$(python3 -I - "$PCR_RULES_PRIVATE_DIR/rules.json" <<'PYEOF'
 import json

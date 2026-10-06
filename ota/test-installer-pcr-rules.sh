@@ -236,6 +236,111 @@ PY
 expect_refusal dropped-checks verdict-malformed "PCR_RULES_TOOL=$TMP/fake-engine-dropped.py"
 expect_refusal missing-engine verdict-malformed "PCR_RULES_TOOL=$TMP/no-such-engine.py"
 
+# A real engine whose verdict is edited on the way out: the installer's own reading of
+# the verdict must not depend on the engine being right (review of PR #252).
+cat > "$TMP/mutating-engine.py" <<'PY'
+import json, os, subprocess, sys
+real = subprocess.run([sys.executable, "-I", os.environ["REAL_ENGINE"], *sys.argv[1:]],
+                      capture_output=True, text=True)
+verdict = json.loads(real.stdout)
+mode = os.environ["MUTATE"]
+if mode == "setup-mode-attested":
+    for check in verdict["checks"]:
+        if check["name"] == "setup-mode":
+            check["binding"] = "attested"
+    verdict["observed"] = [c["name"] for c in verdict["checks"] if c["binding"] == "observed"]
+elif mode == "unknown-check":
+    verdict["checks"].append({"name": "surprise", "ok": True, "binding": "attested", "detail": ""})
+elif mode == "huge-sequence":
+    verdict["sequence"] = 10 ** 25
+elif mode == "escape-on-stderr":
+    sys.stderr.write("refused: \x1b[2J\x1b]0;pwned\x07 authority name from the firmware log\n")
+sys.stdout.write(json.dumps(verdict))
+sys.exit(real.returncode)
+PY
+for mutation in setup-mode-attested unknown-check huge-sequence; do
+  expect_refusal "mutated-$mutation" verdict-malformed "PCR_RULES_TOOL=$TMP/mutating-engine.py" \
+    "REAL_ENGINE=$ENGINE" "MUTATE=$mutation" "export REAL_ENGINE MUTATE"
+done
+# An accepted run with hostile bytes on the engine's stderr: they must not reach the console.
+rc="$(run_gate escape "PCR_RULES_TOOL=$TMP/mutating-engine.py" "REAL_ENGINE=$ENGINE" \
+  "MUTATE=escape-on-stderr" "export REAL_ENGINE MUTATE")"
+[[ "$rc" == 99 ]] || fail "the escape-on-stderr run was refused (rc=$rc)"
+if LC_ALL=C grep -q $'\x1b' "$TMP/err-escape"; then
+  fail "a control character from the engine's diagnostics reached the console log"
+fi
+grep -Fq 'authority name from the firmware log' "$TMP/err-escape" \
+  || fail "the engine's printable diagnostics were dropped from the log"
+
+# payload-unavailable carries a FIXED message: the digest it would otherwise quote varies.
+mkdir -p "$TMP/esp/ice-coreos/pcr-rules"
+cp "$TMP/rules.json" "$TMP/esp/ice-coreos/pcr-rules/rules.json"
+cp "$TMP/rules.json.sig" "$TMP/esp/ice-coreos/pcr-rules/rules.json.sig"
+{
+  awk '/^write_failure_evidence\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^die\(\)  \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_die\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_snapshot_file\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_staged_file\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_staged_file_unsealed\(\) \{/,/^}$/' "$AUTOINSTALL"
+} > "$TMP/esp-functions.sh"
+run_esp() { # $1=label $2=sealed digest $3=file name -> prints rc; die text in $TMP/err-$1
+  (
+    set -uo pipefail
+    log() { printf 'LOG: %s\n' "$*" >&2; }
+    FAILURE_EVIDENCE_SCHEMA=x FAILURE_EVIDENCE="$TMP/evidence-$1" EFI_FAILURE_EVIDENCE="$TMP/no-efi-$1"
+    PHASE_CODE=install-failed-preflight-and-trust-gate PHASE_ID=1 PHASE_TOTAL=8 PHASE_SLUG=s PHASE_LABEL=l
+    media_vfat_partition() { echo fake; }
+    mounted_at() { echo "$TMP/esp"; }
+    # shellcheck source=/dev/null
+    . "$TMP/esp-functions.sh"
+    esp_staged_file "$3" "$2" "$TMP/staged-$1" "NI-P7-RULES: payload-unavailable"
+  ) >/dev/null 2>"$TMP/err-$1" </dev/null
+  echo $?
+}
+[[ "$(run_esp esp-ok "$RULES_SHA" pcr-rules/rules.json)" == 0 ]] || fail "a matching ESP file was refused"
+[[ "$(run_esp esp-hash "$(printf '%064d' 3)" pcr-rules/rules.json)" == 1 ]] || fail "a hash mismatch was accepted"
+grep -Fq '[install-failed-preflight-and-trust-gate]: NI-P7-RULES: payload-unavailable' "$TMP/err-esp-hash" \
+  || fail "a hash mismatch was not classified payload-unavailable"
+if grep -E 'FAILED in phase' "$TMP/err-esp-hash" | grep -Eq 'payload-unavailable[: ]'; then
+  fail "payload-unavailable quotes more than its slug (the digest would make its detail vary)"
+fi
+grep -Fq 'hashes to' "$TMP/err-esp-hash" || fail "the hash-mismatch detail is not in the journal"
+[[ "$(run_esp esp-missing "$RULES_SHA" pcr-rules/absent.json)" == 1 ]] || fail "a missing ESP file was accepted"
+grep -Fq 'NI-P7-RULES: payload-unavailable' "$TMP/err-esp-missing" || fail "a missing ESP file was not payload-unavailable"
+
+# The call block: absent means ABSENT (no karg at all); an empty value is not that.
+{
+  awk '/^write_failure_evidence\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^die\(\)  \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^ni_path\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^karg_count\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^karg_once\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^PCR_RULES_DIGEST=/,/^readonly PCR_RULES_STATE$/' "$AUTOINSTALL"
+} > "$TMP/block-functions.sh"
+run_block() { # $1=label $2=cmdline -> rc
+  printf '%s\n' "$2" > "$TMP/cmdline-$1"
+  (
+    set -uo pipefail
+    log() { printf 'LOG: %s\n' "$*" >&2; }
+    NI_INSTALLER_TEST_SEAM=""
+    NEURALICE_CMDLINE_FILE="$TMP/cmdline-$1"
+    FAILURE_EVIDENCE_SCHEMA=x FAILURE_EVIDENCE="$TMP/evidence-$1" EFI_FAILURE_EVIDENCE="$TMP/no-efi-$1"
+    PHASE_CODE=install-failed-preflight-and-trust-gate PHASE_ID=1 PHASE_TOTAL=8 PHASE_SLUG=s PHASE_LABEL=l
+    # shellcheck source=/dev/null
+    . "$TMP/block-functions.sh"
+    echo "state=$PCR_RULES_STATE"
+  ) >"$TMP/out-$1" 2>"$TMP/err-$1" </dev/null
+  echo $?
+}
+[[ "$(run_block absent 'quiet neuralice.autoinstall=1')" == 0 ]] || fail "a medium with no rules karg was refused"
+grep -Fq 'state=absent' "$TMP/out-absent" || fail "no rules karg did not leave state=absent"
+grep -Fq 'seals no PCR rules' "$TMP/err-absent" || fail "the absent state is silent"
+[[ "$(run_block empty 'quiet neuralice.pcr_rules= neuralice.pcr_rules_seq=')" == 1 ]] \
+  || fail "empty rules kargs were taken for absent rules"
+grep -Fq 'NI-P7-RULES: payload-unavailable' "$TMP/err-empty" || fail "empty rules kargs were not payload-unavailable"
+[[ "$(run_block half "quiet neuralice.pcr_rules_seq=7")" == 1 ]] || fail "a sequence without a digest was taken for absent rules"
+
 # The classification is closed: the die messages above are the ONLY vocabulary.
 python3 -I - "$AUTOINSTALL" <<'PY'
 import pathlib, re, sys

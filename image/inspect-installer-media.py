@@ -1079,7 +1079,8 @@ def classify_sealed_cmdline(cmdline: str) -> str:
 
     # THE SIGNED PCR7 RULES PAIR (ADR-0045, T5): optional, Install only (refused
     # on a Live line above), and a pair. The digest pins rules.json; the sequence
-    # is the anti-rollback floor the installer holds the rules to.
+    # is the floor the installer holds the rules to (self-consistency of the sealed value
+    # and the signed document; real rollback protection is the NV counter, T9).
     if "neuralice.pcr_rules" in optional and "neuralice.pcr_rules_seq" not in optional:
         raise SelectorRefusal("pcr-rules-without-sequence")
     if "neuralice.pcr_rules_seq" in optional and "neuralice.pcr_rules" not in optional:
