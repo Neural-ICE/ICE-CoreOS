@@ -23,7 +23,7 @@ extract the workers build on.
 | `profile` in `authenticated-ota-status` | what the licence gate and model-fetch compare | `owner-sealed-ota-state-v1` — **unchanged** (§8) |
 
 The marker is 26 bytes (`owner-sealed-ota-state-v2\n`), `0444 root`. Compatibility,
-enforced by the installer (T3b) and the reader (T1): marker v2 **requires** the v2
+enforced by the installer (T3b) and the reader (T1; the cmdline keys are §11): marker v2 **requires** the v2
 seal and **forbids** `neuralice.preseal`; marker v1 **forbids** the v2 seal;
 `legacy-unmarked` + the v2 seal is refused (no silent downgrade). Completion version
 stays **2**; the digest `sha256("neural-ice:tpm:owner-ceremony-completion:v2\0" ‖ evidence)`
@@ -36,7 +36,13 @@ Object: `release-manifest.json` + `release-manifest.json.sig`, schema
 ASN.1-DER ECDSA-P256-SHA256 signature over the exact bytes of the manifest** — no
 envelope, no domain prefix, no canonicalisation (as `v2-manifest-sign.py` without
 `--domain`). A trailing LF is part of the bytes. The signature file carries no
-trailing LF.
+trailing LF (see "Signature file bytes" below for what enforces that).
+
+**High-S is accepted.** The verifier applies no low-S and no minimal-DER pre-filter:
+a KMS produces either form of an ECDSA-P256 signature, the golden signature is
+high-S, and `cosign verify-blob` accepts both. Rejecting high-S would refuse
+genuine KMS output. (The ceremony-bound signature of the access-profile anchor is a
+different object that does canonicalise to low-S; this rule is not about it.)
 
 Verification mechanism: the pinned `cosign verify-blob --key … --insecure-ignore-tlog=true`
 through `runner::verify_blob`, exactly as `delegated::verify_signature` and
@@ -46,6 +52,31 @@ crate is pulled with `default-features = false, features = ["arithmetic"]`, the
 (this corrects DESIGN-B §0.3 "aucune nouvelle dépendance"). `sha2` is already a
 dependency and is used in-process for every digest of this verb.
 
+**Single read of every input.** `--release-key`, `--manifest` and `--manifest-sig` are
+each opened once, without following a symlink, and must be a regular file of at most
+their bound (key 4 KiB, manifest 1 MiB, signature 1 KiB; none empty). Each is copied
+into a private file (`0600`, in a private directory created for the call) **at the
+moment it is first needed** and only that copy is used afterwards: it is hashed
+(rules 3-4), verified by `cosign` by path (rule 5) and parsed (rules 6-8). The
+source path is never read a second time, so a file rewritten between the in-process
+hash and cosign's own read cannot be substituted. The size bound is enforced at
+acquisition, **before** cosign ever runs, and is not a parsing rule. A file that is
+absent, not regular, a symlink, over its bound, or not stable during the copy
+refuses with the class of the digest rule that covers it: `key-digest` (key),
+`manifest-digest` (manifest), `sig-digest` (signature), in either seal mode. The
+candidate root (rules 13-15) is read the same way: each file once, bounded,
+no-follow, never executed. A shell caller (T3b) already works this way
+(`esp_staged_file`: copy, then hash the copy) and must hand the verifier the private
+copies, never the ESP path.
+
+**Malformed flag values refuse, they are not usage errors.** Exit 2 is for the shape
+of the command line (unknown, repeated, valueless or missing flag) and for tooling
+failures. A flag that is present but whose value is malformed (a sealed digest that
+is not 64 lowercase hex, a `--sealed-min-bundle-seq` that is not a canonical decimal
+in `1..=2^53-1`, a digest reference that is not `sha256:<64 lowercase hex>`, a token
+outside `[A-Za-z0-9._-]{1,63}`, an authority that is not `[A-Za-z0-9.:-]{1,255}`)
+refuses (exit 1) with the class of the rule that consumes it, as listed below.
+
 Rules, a **closed set**, evaluated in this order; the first failure is the refusal
 and names its class (§3.1):
 
@@ -53,25 +84,40 @@ and names its class (§3.1):
 |---|---|---|
 | 1 | `mode` | exactly one of the two seal modes (§3.1), else refuse |
 | 2 | `freshness-unsupported` | `--freshness`/`--freshness-sig` are **reserved**: refused in this contract version (the object's schema is T7/OS-0044 work) |
-| 3 | `key-digest` | `sha256(file --release-key) == --sealed-key-sha256` |
-| 4 | `manifest-digest` / `sig-digest` | mode manifest-digest only: `sha256(manifest)` and `sha256(sig)` equal the sealed values |
+| 3 | `key-digest` | `sha256(file --release-key) == --sealed-key-sha256` (a malformed `--sealed-key-sha256` refuses here) |
+| 4 | `manifest-digest` / `sig-digest` | mode manifest-digest only: `sha256(manifest)` and `sha256(sig)` equal the sealed values (a malformed sealed value refuses here) |
 | 5 | `signature` | the signature verifies under `--release-key` over the exact manifest bytes |
-| 6 | `duplicate-key` | the manifest is JSON with no duplicated key at any depth, ≤ 1 MiB |
-| 7 | `schema` | `schema == neural-ice-release-manifest-v1`; `release_id` matches `[A-Za-z0-9._-]+`; no other field is interpreted by this verb |
-| 8 | `bundle-seq` | `bundle_seq` is an integer (not a float, not a string) in `1..=2^53-1` (the bound of `ota-tpm-state.sh`) |
-| 9 | `min-bundle-seq` | mode floor only: `bundle_seq >= --sealed-min-bundle-seq` |
-| 10 | `hardware-target` | `manifest.hardware_target == --hardware-target` |
-| 11 | `authority` | the authority of `host.repository` (text before the first `/`) `== --release-authority` |
-| 12 | `host-digest` | `host.digest == --host-index-digest` |
-| 13 | `candidate-marker` | in `--candidate-root`, read **without executing it** and each at most 64 bytes: `usr/lib/neural-ice/hardware-target`, `appliance-variant`, `signed-boot-trust-policy-id`, `access-policy`, `ota-state-profile` equal `--hardware-target`, `--variant`, `--trust-policy-id`, `--access-profile` and `owner-sealed-ota-state-v2` (regular files, not symlinks) |
+| 6 | `duplicate-key` | the manifest, which is valid UTF-8 JSON, has no duplicated object key at any depth (the 1 MiB bound is acquisition, above) |
+| 7 | `schema` | the manifest is a JSON object; `schema == neural-ice-release-manifest-v1`; `release_id` is present, a string, and matches `[A-Za-z0-9._-]{1,128}`. This rule validates only what the verb **depends on for its own integrity**; the fields rules 8-12 compare are judged by their own rule, and every other field is ignored by this verb |
+| 8 | `bundle-seq` | `bundle_seq` is present and an integer (not a float, not a string) in `1..=2^53-1` (the bound of `ota-tpm-state.sh`) |
+| 9 | `min-bundle-seq` | mode floor only: `--sealed-min-bundle-seq` is a canonical decimal in `1..=2^53-1` **and** `bundle_seq >= --sealed-min-bundle-seq` |
+| 10 | `hardware-target` | `manifest.hardware_target` is present, a string, and equal to `--hardware-target` (itself a token) |
+| 11 | `authority` | `manifest.host` is an object, `host.repository` is a present string of printable ASCII, ≤ 255, whose authority (text before the first `/`) is `[A-Za-z0-9.:-]{1,255}` and `== --release-authority` |
+| 12 | `host-digest` | `host.digest` is a present string `sha256:<64 lowercase hex>` and `== --host-index-digest`; `--host-manifest-digest` must also be `sha256:<64 lowercase hex>` (refused here: it is compared with nothing, only recorded) |
+| 13 | `candidate-marker` | in `--candidate-root`, read **without executing it**: `usr/lib/neural-ice/hardware-target`, `appliance-variant`, `signed-boot-trust-policy-id`, `access-policy`, `ota-state-profile`. Each is a regular, non-symlink file of at most 64 bytes whose bytes are **exactly `<value>\n`**: one value, one final LF, no CR, no other whitespace, no leading or trailing blank, nothing stripped or trimmed. The values are `--hardware-target`, `--variant`, `--trust-policy-id`, `--access-profile` and `owner-sealed-ota-state-v2`; each sealed value is a token `[A-Za-z0-9._-]{1,63}`, and `--variant` is in the closed set. A marker that is absent, not a regular file, or not exactly that form refuses |
 | 14 | `candidate-key` | `sha256(candidate usr/lib/neural-ice/keys/release-authorization.pub) == --sealed-key-sha256` (key continuity installer → host) |
 | 15 | `candidate-anchor` | the candidate carries **no** `etc/neural-ice/keys/ota-root.pub` and **no** `usr/lib/neural-ice/ota-bootstrap` (defence in depth: the v2 host forbids the v1 anchors) |
 | 16 | `receipt-conflict` | publishing the receipt (§3.1) |
 
 No clock is read anywhere. `--host-manifest-digest` is **not** compared with the
 manifest (it is the platform child of the index, which the caller resolved); it is
-validated as `sha256:<64 lowercase hex>` and recorded in the receipt, where the
-reader binds the booted deployment to it (DESIGN-B P4).
+validated as `sha256:<64 lowercase hex>` (rule 12) and recorded in the receipt, where
+the reader binds the booted deployment to it (DESIGN-B P4).
+
+**Why rule 13 is stricter than the installer's current marker reader.**
+`_img_read` in `ota/neural-ice-autoinstall.sh` deletes **every** whitespace character
+(`tr -d '[:space:]'`) and tolerates up to 128 bytes, so `owner-sealed-ota-state-v2`
+with a trailing blank, an embedded newline run or a CR would pass there and fail the
+verifier (or the reverse for a value the verifier would reject). The verifier is the
+only judge of rule 13: T3b must call it, or enforce this exact form byte for byte; it
+must not reuse `_img_read` as the decision.
+
+**Signature file bytes.** "No trailing LF" is a property of how the golden and the KMS
+write the file, not something cosign or `openssl base64 -d` enforces: both accept one
+final LF. It is enforced in mode `manifest-digest` only, by the sealed hash of the
+exact bytes; in mode `floor` a signature with a final LF verifies. This is harmless
+(no forgery follows: the signed bytes are the manifest's) and is recorded so no test
+expects more.
 
 ## 3. CLI contract
 
@@ -90,7 +136,11 @@ ni-ota-verify verify-v2-release
 
 * Every flag is required except `--freshness`/`--freshness-sig` (rule 2). An unknown,
   repeated, valueless or missing flag is a **usage error**: exit 2, as `parse_flags`.
-* `--variant` is the closed set `{sealed-lab}` in this contract version.
+* `--variant` is the closed set `{sealed-lab}` in this contract version. The image
+  build also accepts `debug` and `prod` (`image/Containerfile.bootc`); this lane is
+  **lab-only** and refuses them (rule 13). Opening the lane to `prod` is a contract
+  change (and, per the workspace rule on "lab only" options, a tracked release-blocking
+  item with a production exit criterion: §12), not a local decision of a consumer.
 * `--receipt OUT`: create-if-absent by hard link of a private staged file, then sync
   the directory; if `OUT` already exists it must be **byte-equal** to the receipt
   that would be written, else refuse `receipt-conflict` (same rules as
@@ -165,38 +215,151 @@ freshness object does not exist yet); a reader rejects it as an unknown key unti
 /var/lib/neural-ice/ota/v2-release/receipt.json
 ```
 
+The three files are the **complete** v2-lane footprint of the directory. The lanes are
+disjoint on disk too: with lane2 evidence the reader refuses a state directory that also
+holds `preseal-input-v1/`, `preseal/` or `state-v1/` (T1 `owner_v2_release_status`), and
+with preseal evidence it refuses `v2-release-input-v1/` or `v2-release/`. A completed
+instance is `tests/fixtures/v2-release/completed/<mode>/` (§6.5).
+
 Replay is create-if-absent, byte-equal otherwise, refuse on difference. T3b chooses
 between extending `neural-ice-preseal-handoff.py` with `--kind v2-release` and a
 sibling script; the layout above is the contract.
 
-## 6. Completion evidence `neural-ice-owner-ceremony-evidence-v2-lane2` (T2 / T1 reader)
+## 6. Completion evidence `neural-ice-owner-ceremony-evidence-v2-lane2` (T2 writes, T1 reads)
 
-Built like `build_evidence_v2` with `ota_preseal` **replaced** by `v2_release`
-(`ota_preseal` XOR `v2_release`: the schemas are disjoint, no cross-lane reading):
+The reference parser is T1's `authenticated_completion` in
+`tools/ni-ota-verify/src/access_profile_anchor.rs` (PR #238, head `9a7d220`); this
+section states what it accepts, byte for byte, and `tests/fixtures/v2-release/completed/`
+is a complete instance. A divergence between this text, that parser and the T2
+producer is a defect of one side to be fixed in the same change, never a local choice.
+
+### 6.1 File, selection and digest chain
+
+* File: `/var/lib/neural-ice/ota/owner-ceremony-evidence-v2.json`, the **same name** as
+  evidence v2: the TPM completion record (`completion_version` 2) selects the file, the
+  `schema` member selects the lane. `0600 root`, ≤ **16384 bytes**.
+* Completion record: `neural-ice-tpm-state completion-inspect` prints, and the
+  reader requires byte for byte,
+  `{"completion_version":2,"evidence_digest_sha256":"<64hex>","schema":"neural-ice-owner-ceremony-completion-inspection-v1"}` + LF.
+* `evidence_digest_sha256 = sha256("neural-ice:tpm:owner-ceremony-completion:v2\0" ‖ file bytes)`
+  — `COMPLETION_MAGIC_V2` / `ceremony-finalize-v2`, **unchanged**. The reader recomputes
+  it over the file it read and refuses on a difference.
+
+### 6.2 Canonical form (what "canonical JSON plus LF" means)
+
+The file is **one line**: a JSON object, then exactly one LF, nothing else.
+
+* Object keys sorted in bytewise (code-point) order **at every depth**; separators `,`
+  and `:` only, **no whitespace anywhere**.
+* ASCII only. No non-ASCII and no control character in any string, no `\u` or other
+  escape other than the ones a producer needs for `"` and `\` (the contract's values
+  need none). Integers are plain decimal (no sign, no leading zero, no exponent, no
+  fraction: `3`, never `3.0`). `true`/`false` lower case. No `null` in this lane's
+  evidence.
+* No duplicated key. No key not listed below.
+* Producer (shell/python): `json.dumps(obj, sort_keys=True, separators=(",", ":"))`
+  then a newline, i.e. the form of `build_evidence_v2`. Reader (Rust): parses the bytes
+  to a generic value, **re-serialises** it (sorted, compact) + LF and requires equality
+  with the bytes read: any deviation (order, a space, an escape, a float) refuses with
+  "not canonical JSON plus LF" before any field is looked at.
+
+### 6.3 Members (closed; each object has exactly these keys)
 
 ```json
-{"access_profile_anchor":{…unchanged…},"data_luks":{…},"device_root_name":"<hex>",
+{"access_profile_anchor":{"json_sha256":"<64hex>","signature_sha256":"<64hex>","spki_sha256":"<64hex>"},
+ "data_luks":{LUKS},"device_root_name":"<68hex>",
  "install_identity":{"install_source":"medium","installed_at":"1970-01-01T00:00:00Z",
    "installer_sealed_identity_sha256":"<64hex>","release_identity_sha256":"<manifest_sha256>",
    "schema":"neural-ice-owner-ceremony-install-identity-v1"},
- "ota_state":{…identical to evidence-v2: anchor_*, baseline_floor, clear_protected_at_completion,
-   floor_*, profile:"owner-sealed-ota-state-v1"…},
- "schema":"neural-ice-owner-ceremony-evidence-v2-lane2","srk_name":"<hex>","system_luks":{…},"tpm_state":{…},
+ "ota_state":{OTA},
+ "schema":"neural-ice-owner-ceremony-evidence-v2-lane2","srk_name":"<68hex>","system_luks":{LUKS},
+ "tpm_state":{TPM},
  "v2_release":{"bundle_seq":3,"manifest_sha256":"<64hex>","manifest_sig_sha256":"<64hex>",
    "receipt_schema":"neural-ice-v2-release-receipt-v1","receipt_sha256":"<64hex>",
-   "release_id":"…","release_key_sha256":"<64hex>"}}
+   "release_id":"v2-test-train-3","release_key_sha256":"<64hex>"}}
 ```
 
-Invariants checked by the ceremony at completion and by the reader at every boot:
-`ota_state.baseline_floor == v2_release.bundle_seq == receipt.bundle_seq`;
-`v2_release.receipt_sha256` is the digest `verify-retained-v2-release` is given;
-`install_identity.release_identity_sha256 == v2_release.manifest_sha256`;
-`install_identity.install_source == "medium"` and
-`install_identity.installed_at == "1970-01-01T00:00:00Z"` (T2 pins both, and judges the
-whole identity before the one-time TPM mutation). Rust:
-`OwnerCeremonyEvidenceV2Lane2` with `deny_unknown_fields`; `VerifiedOwnerCompletion`
-carries an attestation enum `{Preseal{…}, V2Release{…}}`. (The shape of the
-`tpm_state`/`luks` sub-objects is that of evidence v2 and is not restated here.)
+* Top level: exactly the ten keys above (`ota_preseal` is **forbidden**: evidence v2 and
+  lane2 are disjoint, a reader of one never accepts the other).
+* `access_profile_anchor`: the sha256 of `access-profile-v1.json`, `access-profile-v1.sig`
+  and `access-profile-v1.spki` (unchanged from evidence v2).
+* `device_root_name`, `srk_name`: 68 lowercase hex (`000b` ‖ a 32-byte Name).
+* `LUKS` (`data_luks`, `system_luks`): exactly `keyslot`, `pcr_bank`, `pcrs`, `policy_hash`,
+  `policy_public_key_sha256`, `schema` = `neural-ice-luks-token-evidence-v1`,
+  `sealed_object_sha256`, `srk_sha256`, `token_sha256` (unchanged from evidence v2).
+* `TPM` (`tpm_state`): exactly `freshness_counter`, `freshness_public_sha256`,
+  `install_counter`, `install_public_sha256`, `profile_binding`, `schema` =
+  `neural-ice-tpm-state-snapshot-v1` (unchanged).
+* `OTA` (`ota_state`): exactly the sixteen keys of evidence v2, with the **same
+  constants**: `profile` `owner-sealed-ota-state-v1`; floor `floor_index` `0x01500001`,
+  `floor_attributes` `0x62008`, `floor_size` 8, `floor_policy_sha256` and `floor_name`
+  (constants of `access_profile_anchor.rs`); anchor `anchor_index` `0x01500002`,
+  `anchor_attributes` `0x2060048`, `anchor_size` 32, `anchor_policy_sha256`,
+  `anchor_pristine_name`, `anchor_written_name` (constants);
+  `anchor_state_at_completion` `pristine`, `anchor_name_at_completion` =
+  `anchor_pristine_name`, `clear_protected_at_completion` `true`, `baseline_floor` an
+  integer in `1..=2^53-1`. The golden file shows every constant; none is restated here.
+* `install_identity` is the parsed content of the installer's canonical file
+  `owner-ceremony-install-identity-v1.json` (itself `json.dumps(sort_keys, compact)` +
+  LF, `autoinstall.sh`, "install-identity"), embedded verbatim:
+  * `install_source` = `medium` (the v2 seal requires `neuralice.source=medium`, §11);
+  * `installed_at` = **`1970-01-01T00:00:00Z`**, a fixed value: the installer has no
+    trusted clock, and the ceremony only checks the shape
+    `YYYY-MM-DDThh:mm:ssZ` and passes it as the access-profile anchor's `enrolled_at`;
+  * `installer_sealed_identity_sha256` = sha256 of the sealed trust-anchor text exactly as
+    `printf '%s' "$SEALED_ANCHOR" | sha256sum` computes it today (unchanged);
+  * `release_identity_sha256` = **`v2_release.manifest_sha256`** in this lane (the
+    medium-without-preseal value `sha256(ANCHOR ‖ 0x00 ‖ PAYLOAD_DIGEST)` does not apply).
+* `v2_release`: exactly seven keys. `bundle_seq` integer; `manifest_sha256`,
+  `manifest_sig_sha256`, `receipt_sha256`, `release_key_sha256` 64 lowercase hex;
+  `receipt_schema` = `neural-ice-v2-release-receipt-v1`; `release_id`
+  `[A-Za-z0-9._-]{1,128}`. `receipt_sha256` is the sha256 of the bytes of
+  `receipt.json` (§4), the value `verify-retained-v2-release` is given.
+
+### 6.4 Invariants and who enforces them
+
+| Invariant | Enforced by |
+|---|---|
+| canonical form, closed key sets, constants of `ota_state`, hex shapes, `release_id` shape, `receipt_schema` | T1 parser (`authenticated_completion`) and T2 at build |
+| `ota_state.baseline_floor == v2_release.bundle_seq` | T1 parser; T2 at completion |
+| `install_identity.release_identity_sha256 == v2_release.manifest_sha256` | T1 parser; T2 at completion |
+| `install_identity`: key set and `schema` only | T1 parser. **It does not compare `install_source`, `installed_at` or `installer_sealed_identity_sha256`**: T2's ceremony (regexes) and the golden carry those |
+| `TPM inspect-v2.baseline_floor == baseline_floor == receipt.bundle_seq` | T1 reader (`owner_v2_release_status`) at every status |
+| `receipt` re-derived from the persisted pair equals `receipt_sha256`; the booted deployment is the receipt's host | T1 reader (`verify_retained`, `verify_running_v2_release`) |
+| `preseal-input-v1`, `preseal` and `state-v1` absent from the state directory; anchor pristine | T1 reader |
+
+Rust: `OwnerCeremonyEvidenceV2Lane2` (`deny_unknown_fields`); `VerifiedOwnerCompletion`
+carries the attestation enum `{None, Preseal{…}, V2Release{…}}`. The shape of the
+`LUKS`/`TPM` sub-objects is that of evidence v2.
+
+### 6.5 Completed-appliance vector (`tests/fixtures/v2-release/completed/<mode>/`)
+
+One tree per seal mode (`manifest-digest`, `floor`), generated by
+`generate-golden.py --completed-only` from the committed pair without touching a
+signature or an existing digest:
+
+```
+completed/<mode>/completion-inspection.json                       # §6.1, what completion-inspect prints
+completed/<mode>/var/lib/neural-ice/ota/owner-ceremony-evidence-v2.json
+completed/<mode>/var/lib/neural-ice/ota/owner-ceremony-install-identity-v1.json
+completed/<mode>/var/lib/neural-ice/ota/v2-release-input-v1/release-manifest.json      # = top-level pair
+completed/<mode>/var/lib/neural-ice/ota/v2-release-input-v1/release-manifest.json.sig
+completed/<mode>/var/lib/neural-ice/ota/v2-release/receipt.json                        # = expected-receipt-<mode>.json
+```
+
+Only the v2-lane entries are pinned; the other files of that directory (device-root,
+SRK, intent, access-profile triple, …) are unchanged by this lane and absent here.
+`golden.json` `expected.completed.<mode>` gives `evidence_sha256`,
+`completion_digest_sha256` and `receipt_sha256`.
+
+**Synthetic parts, stated so no test expects more:** `access_profile_anchor` carries
+three fixed placeholder digests, and the `LUKS`/`TPM` members, `device_root_name`,
+`srk_name` and `installer_sealed_identity_sha256` are fixed placeholders of the right
+shape. A test that runs the **reader** (anchor signature, TPM stubs) must install its
+own anchor files, rewrite the three anchor digests, re-canonicalise and recompute the
+completion digest, exactly as T1's `v2_evidence` helper does; a test that runs only the
+**completion parser** (`owner-completion-test`, `verified_owner_completion`) can use the
+tree as is. `ota_state` carries the real constants.
 
 ## 7. Shell library `ota/neural-ice-v2-owner-seal.sh`
 
@@ -264,7 +427,8 @@ asserts the drop-in does not remove the variable and is T4's to update.
 | `expected-receipt-manifest-digest.json`, `expected-receipt-floor.json` | the receipt bytes for each seal mode (floor mode seals minimum 2 for a manifest at 3) |
 | `expected-authenticated-ota-status.json` | §8 |
 | `golden.json` | every input of §3.1 (`inputs`) and every expected value (`expected`: `bundle_seq`, `release_id`, `host_repository`, `receipt_sha256` per mode, `verify_stdout` per mode with `idempotent:false`, `status_sha256`) |
-| `generate-golden.py` | the regeneration procedure (python3 + openssl; ECDSA is randomised, so a regeneration changes every digest: read `golden.json`, never hard-code one) |
+| `completed/{manifest-digest,floor}/…` | a completed-appliance instance (§6.5): lane2 evidence, completion record, install identity, persisted pair and receipt |
+| `generate-golden.py` | the regeneration procedure (python3 + openssl): **regenerable, not reproducible** — ECDSA is randomised, so a full regeneration changes the key, the signature and every digest derived from them: read `golden.json`, never hard-code one. `--completed-only` rebuilds `completed/` and the `expected.completed` block from the committed files and changes no existing digest. Not run by CI: only the Rust test keeps the committed bytes coherent |
 
 `tests/v2_release_golden.rs` pins these files to this contract without any verifier
 (signature under `openssl`, digests, canonical receipt bytes, markers, status
@@ -273,17 +437,100 @@ literal, sensitivity to a flipped byte and to an extra LF).
 Replay obligations: **T1** — `verify-v2-release` over `inputs` prints
 `expected.verify_stdout[mode]` and writes the golden receipt bytes in both modes; a
 second call prints `idempotent:true`; `authenticated-ota-status` on a completed
-fixture prints the status bytes; the refusals of §2 each name their class (≥ 14
+fixture prints the status bytes (the `completed/` tree of §6.5, with the anchor
+digests rewritten as §6.5 says); the refusals of §2 each name their class (≥ 14
 negatives, derived from these files by mutation). **T2** — the evidence of §6 built
-from the receipt digest; a forced `relaxed` still refuses. **T3b** — `v2seal_*`
+from the receipt digest equals `completed/<mode>/…/owner-ceremony-evidence-v2.json`
+byte for byte once the synthetic members are supplied; a forced `relaxed` still
+refuses. **T3a/T5** — the cmdline and ESP of §11. **T3b** — `v2seal_*`
 call the verifier with `inputs` and obtain the same receipt. **T6** — the status
 bytes for the consumer contract tests.
 
-## 11. Not verified, open
+## 11. Sealed cmdline and ESP carrier (T3a grammar and media, T3b installer, T5 builder)
 
-* Nothing here ran against `ni-ota-verify` (the verbs do not exist yet), a TPM, QEMU
-  or hardware.
+Source: DESIGN-B §2 (mode manifest-digest, adapter A1) and §4 T3a/T3b/T5. Mode floor
+(adapter A2, the generic installer) carries no manifest on this medium and uses none of
+this section.
+
+**Keys, exactly** (the ones DESIGN-B names; no other spelling is valid):
+
+| Cmdline key | Value | ESP file (relative to the ESP root) | Hashed value |
+|---|---|---|---|
+| `neuralice.v2rel_sha256` | 64 lowercase hex | `ice-coreos/v2-release-manifest.json` | `sha256` of the exact bytes of the manifest |
+| `neuralice.v2rel_sig_sha256` | 64 lowercase hex | `ice-coreos/v2-release-manifest.json.sig` | `sha256` of the exact bytes of the detached signature |
+
+The installer reads them with `esp_staged_file` **unchanged** (it prepends
+`ice-coreos/`, copies to a private file, hashes the **copy** against the sealed value).
+The verifier is then called with `--sealed-manifest-sha256` / `--sealed-manifest-sig-sha256`
+set to those cmdline values and with the private copies as `--manifest` / `--manifest-sig`.
+The key itself is **not** a new token: it is the already-sealed `neuralice.relauth_keyid`
+(sha256 of the v2 release key file), passed as `--sealed-key-sha256`.
+
+**Grammar and exclusivity** (T3a, enforced by the shell grammar
+`image/installer/neural-ice-sealed-cmdline-grammar.sh` **and** its Python twin
+`image/inspect-installer-media.py`, which must agree on one shared corpus):
+
+1. Each key appears **at most once**, and the two appear **together or not at all**.
+2. They are **mutually exclusive with `neuralice.preseal`**, and with the registry
+   authorisation pair **`neuralice.relauth_sha256` / `neuralice.relauth_sig_sha256`**:
+   a v2 line carries neither (the v2 manifest is the authorisation).
+3. They require **`neuralice.source=medium`** (a registry source, or no source, refuses).
+4. The two values differ (derived from the relauth pair rule "one hash twice pins
+   nothing"; DESIGN-B is silent, and an honest medium never trips it).
+5. Lane coupling at the installer (T3b, DESIGN-B §3.1, §1 above): image marker
+   `owner-sealed-ota-state-v2` **requires** the v2 seal and **forbids** `preseal`;
+   marker `owner-sealed-ota-state-v1` **forbids** the v2 seal; `legacy-unmarked` + the
+   v2 seal is refused.
+6. The inspector's ESP allow-list gains exactly those two file names, and refuses a
+   medium whose ESP hash differs from the cmdline value, or that carries one file
+   without the other.
+
+**Token order** (T3a renders, T5's `trust/v2-lab/installer-cmdline.template` copies, the
+inspector compares). DESIGN-B fixes the keys but leaves the position to the CoreOS
+render ("l'ordre exact du rendu CoreOS"); this contract therefore **derives** it from
+`image/build-installer-usb.sh` (`UKI_KARGS`, around `seal_install_authorization`) and
+fixes it here so T3a and T5 cannot diverge: the pair sits **immediately after
+`neuralice.source=medium`**, in the slot where `neuralice.preseal` or the
+`neuralice.relauth_*` pair sit today, **`v2rel_sha256` first, then `v2rel_sig_sha256`**,
+and before any `neuralice.seed_*` token. In the Fabric-v2 template, whose last token is
+`neuralice.source=medium`, that is:
+
+```
+… neuralice.source=medium neuralice.v2rel_sha256=@V2REL_SHA@ neuralice.v2rel_sig_sha256=@V2REL_SIG_SHA@
+```
+
+(`@V2REL_SHA@`, `@V2REL_SIG_SHA@`: the placeholder names of DESIGN-B T5.) The shell
+grammar itself is order-insensitive for optional keys (it counts occurrences), so the
+order is enforced where the line is compared byte for byte: the renderer, the
+template match in `v2-uki-claims.py`, and the inspector's expected cmdline.
+
+**Budget (estimate, not measured on a real medium).** The grammar caps a line at
+`NI_SEALED_CMDLINE_MAX_BYTES=1957` bytes and `NI_SEALED_CMDLINE_MAX_WORDS=64`. The
+Fabric-v2 template with plausibly sized placeholders is ≈ 1319 bytes / 24 words; the
+two tokens add ≈ 180 bytes / 2 words. T3a must re-measure on the real render.
+
+## 12. Not verified, open
+
+* Nothing here ran against `ni-ota-verify` from this PR (the verbs live in T1, PR #238),
+  a TPM, QEMU or hardware. §6 was written from T1's parser at `9a7d220` by reading it;
+  the completed-appliance vector (§6.5) was additionally fed to that parser's
+  completion reader (`test-inspect-owner-completion`, scratch build of `9a7d220` with
+  `test-path-overrides`): both trees are accepted, and a spaced re-serialisation, an
+  added `ota_preseal` and a `bundle_seq` ≠ `baseline_floor` are refused. The reader
+  (anchor signature, TPM stubs, booted deployment) was not run on the vector.
 * `host_manifest_digest` provenance (who resolves the platform child, and from which
   source in each installer) is the caller's; only its format is checked.
 * The freshness object (mode floor) and the successor rule for an updated host (T9)
   are out of this contract version.
+* **`--variant` is `{sealed-lab}`** while the image build accepts `debug|sealed-lab|prod`.
+  Owner of the extension: the coordinator with Thomas; production exit criterion: a
+  contract version that admits `prod` (and its marker/receipt values) before the first
+  customer delivery. Until then a `prod` image is refused by rule 13.
+* **Generic installer (T7) and cosign.** The contract imposes `cosign` for both verbs
+  (rule 5). DESIGN-B's T7 line (`mkosi.conf`: `ni-ota-verify`, `ota-tpm-state`, the
+  library) does not list it. **Suspected, not verified**: the generic-installer tree
+  (`image/generic-installer`, PR #234) is not in this worktree and was not read. T7
+  must ship a pinned `cosign` in the initrd/installer root or the verb cannot run there.
+* CI runs the golden test through the `openssl` CLI. The pinned
+  `rust:1.93-bookworm` image should carry it; the PR's own `pull-request` job passing
+  is the only evidence, and no more than that.
