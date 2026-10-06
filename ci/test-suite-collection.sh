@@ -68,6 +68,7 @@ NOT_EXECUTED_HERE = {
     "ci/test-fabric-coreos-differential.sh":
         "run as the explicit release differential with NEURAL_ICE_FABRIC_ROOT; a CoreOS-only checkout has no Fabric vector tree",
     "ci/test-open-core-workflow.sh": "run by .github/workflows/open-core-boundary.yml",
+    "ci/test-docs-tpm-scale-runbooks.py": "run by .github/workflows/open-core-boundary.yml",
     "ota/test-neural-ice-lab-baseline-handoff.sh": "run by .github/workflows/test-installer-handoff.yml",
     "ota/test-neural-ice-device-root-tpm.sh": "run by .github/workflows/test-installer-handoff.yml",
     "ota/test-tpm-signed-policy.sh": "run by .github/workflows/test-installer-handoff.yml",

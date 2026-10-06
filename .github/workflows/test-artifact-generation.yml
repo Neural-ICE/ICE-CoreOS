@@ -87,6 +87,7 @@ on:
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-docs-tpm-policy-adr.sh"
+      - "ci/test-docs-tpm-scale-runbooks.py"
       - "ci/test-oci-signature-policy.sh"
       - "ci/test-seed-import-policy.sh"
       - "ci/test-no-shim-chained-updater.sh"
@@ -187,6 +188,7 @@ on:
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-docs-tpm-policy-adr.sh"
+      - "ci/test-docs-tpm-scale-runbooks.py"
       - "ci/test-oci-signature-policy.sh"
       - "ci/test-seed-import-policy.sh"
       - "ci/test-no-shim-chained-updater.sh"
@@ -318,6 +320,7 @@ jobs:
               "ota/neural-ice-preseal-handoff.py",
               "ota/neural-ice-tpm-policy.py",
               "ota/test-neural-ice-luks-token-evidence.py",
+              "ci/test-docs-tpm-scale-runbooks.py",
               "ota/test-neural-ice-preseal-handoff.py",
           ]
           missing = [f for f in files if not pathlib.Path(f).is_file()]
