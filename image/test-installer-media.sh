@@ -1207,7 +1207,7 @@ pr_refused "symlinked rules" "non-empty regular files" PCR_RULES_FILE="$PRP/link
 pr_refused "symlinked signature" "non-empty regular files" PCR_RULES_SIGNATURE_FILE="$PRP/link"
 pr_refused "a directory as rules" "non-empty regular files" PCR_RULES_FILE="$PRP"
 pr_refused "rules over 1 MiB" "larger than the 1048576-byte bound" PCR_RULES_FILE="$PRP/huge"
-pr_refused "signature over 1 MiB" "larger than the 1048576-byte bound" PCR_RULES_SIGNATURE_FILE="$PRP/huge"
+pr_refused "signature over 4096 bytes (the installer's bound)" "larger than the 4096-byte bound" PCR_RULES_SIGNATURE_FILE="$PRP/huge"
 # The rules the engine will read: a JSON object whose `sequence` is an integer in 1..2^53-1.
 pr_bad_rules() { # $1=label $2=body $3=text the refusal must carry
   pr_write_rules "$PRP/bad" "$2"

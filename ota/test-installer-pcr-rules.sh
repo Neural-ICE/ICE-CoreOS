@@ -129,7 +129,7 @@ expect_refusal() { # $1=label $2=class $3...=overrides
     || { cat "$TMP/err-$label" >&2; fail "[$label] did not reach die()"; }
   grep -Fq "[install-failed-preflight-and-trust-gate]: NI-P7-RULES: $class" "$TMP/err-$label" \
     || { cat "$TMP/err-$label" >&2; fail "[$label] was not refused as NI-P7-RULES: $class"; }
-  if grep -E 'NI-P7-RULES: ' "$TMP/err-$label" | grep -Eq "NI-P7-RULES: $class[^[:space:]]"; then
+  if grep -E 'NI-P7-RULES: ' "$TMP/err-$label" | grep -Eq "NI-P7-RULES: ${class}[^[:space:]]"; then
     fail "[$label] the refusal carries more than its closed-vocabulary slug"
   fi
   [[ ! -s "$TMP/mutations-$label" ]] \

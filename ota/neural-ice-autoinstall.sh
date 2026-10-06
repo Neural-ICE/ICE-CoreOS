@@ -1789,8 +1789,9 @@ esp_staged_file_unsealed() { # $1=basename $2=destination $3=die prefix (optiona
   local name=$1 destination=$2 prefix=${3:-} size
   esp_snapshot_file "$name" "$destination" "${3:-}"
   size="$(stat -c %s -- "$destination")"
-  [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size <= 4096 )) \
-    || esp_die "$prefix" "the ESP's ${name} is empty or larger than 4096 bytes"
+  if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size == 0 || size > 4096 )); then
+    esp_die "$prefix" "the ESP's ${name} is empty or larger than 4096 bytes"
+  fi
   return 0
 }
 

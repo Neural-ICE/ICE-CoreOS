@@ -1835,6 +1835,10 @@ PCR_RULES_SEQ_KARG = "neuralice.pcr_rules_seq"
 # One bound for both files: the producer refuses anything larger and the
 # installer reads nothing larger (ADR-0045, T5).
 PCR_RULES_MAX_BYTES = 1 << 20
+# The detached signature: base64 of at most 1024 bytes is below 1400 characters; the
+# installer (esp_staged_file_unsealed) refuses above 4096 and so does the producer.
+PCR_RULES_SIGNATURE_MAX_BYTES = 4096
+PCR_RULES_SAFE_INTEGER = 2**53 - 1
 
 
 def check_pcr_rules_material(paths: set[str], read_file, cmdline: str) -> None:
@@ -1875,19 +1879,38 @@ def check_pcr_rules_material(paths: set[str], read_file, cmdline: str) -> None:
             )
     rules = read_file(PCR_RULES_JSON_PATH)
     signature = read_file(PCR_RULES_SIG_PATH)
-    for path, data in ((PCR_RULES_JSON_PATH, rules), (PCR_RULES_SIG_PATH, signature)):
+    for path, data, bound in ((PCR_RULES_JSON_PATH, rules, PCR_RULES_MAX_BYTES),
+                              (PCR_RULES_SIG_PATH, signature, PCR_RULES_SIGNATURE_MAX_BYTES)):
         if not data:
             raise InspectionError(f"{path} is empty")
-        if len(data) > PCR_RULES_MAX_BYTES:
-            raise InspectionError(f"{path} exceeds its {PCR_RULES_MAX_BYTES}-byte bound")
+        if len(data) > bound:
+            raise InspectionError(f"{path} exceeds its {bound}-byte bound")
+
+    def no_duplicates(pairs):
+        seen = {}
+        for key, value in pairs:
+            if key in seen:
+                raise InspectionError(f"{PCR_RULES_JSON_PATH} carries a duplicated JSON key: {key!r}")
+            seen[key] = value
+        return seen
+
+    def no_constant(name):
+        raise InspectionError(f"{PCR_RULES_JSON_PATH} carries a non-finite number: {name}")
+
+    # The reading the producer and the engine apply: no duplicated key at any depth, no
+    # NaN/Infinity, so every reader agrees which `sequence` is the document's.
     try:
-        document = json.loads(rules.decode("utf-8"))
+        document = json.loads(
+            rules.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constant
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InspectionError(f"{PCR_RULES_JSON_PATH} is not valid JSON: {error}") from error
     sequence = document.get("sequence") if isinstance(document, dict) else None
-    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+    if (isinstance(sequence, bool) or not isinstance(sequence, int)
+            or not 1 <= sequence <= PCR_RULES_SAFE_INTEGER):
         raise InspectionError(
-            f"{PCR_RULES_JSON_PATH} carries no integer sequence >= 1; the installer would refuse it"
+            f"{PCR_RULES_JSON_PATH} carries no integer sequence in 1..{PCR_RULES_SAFE_INTEGER}; "
+            "the installer would refuse it"
         )
     if sequence < int(floor):
         raise InspectionError(

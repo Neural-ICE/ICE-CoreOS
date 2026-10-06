@@ -24,8 +24,8 @@ are removed on exit unless `--keep`.
 * The rules and the Owner key are read from a FAT "medium" through the installer's
   own `esp_staged_file`, against hashes given on the kernel command line.
 * Scenarios: A conforming (gate accepts, the real `systemd-cryptenroll` enrols a
-  scratch disk, a `PolicyAuthorize` token bound to the Owner key exists, the installed
-  ESP record is written); B a second, unapproved certificate in `db`; C rules that
+  scratch disk, a `PolicyAuthorize` token whose public key is the Owner key staged by
+  the gate exists, the installed ESP record is written); B a second, unapproved certificate in `db`; C rules that
   approve no `db` certificate; D no PK (setup mode, Secure Boot off); E rules on the
   medium that are not the sealed ones. B-E must refuse with a closed-vocabulary class and leave the
   scratch disk **byte-identical**.
@@ -35,7 +35,14 @@ are removed on exit unless `--keep`.
 * Not the whole installer: no bootc deployment, seed or mirror.
 * Not the signed command line: the sealed arguments travel on the QEMU `-append`.
 * Not a GB10: this firmware measures the **contents** of the Secure Boot variables
-  (`binding=contents`), a GB10 only their names (`names-only`, covered by the unit test on
-  the real `.67` fixtures, `ota/test-installer-pcr-rules.sh`).
+  (`binding=contents`), a GB10 only their names (`names-only`). That path is exercised by
+  the unit test `ota/test-installer-pcr-rules.sh` on the real `.67` event log and variables,
+  **except `SetupMode`/`AuditMode`, which the `.67` capture lacks and the test supplies
+  synthetically**. The engine refuses a machine without `SetupMode`: until a physical GB10
+  capture shows the firmware exposes it, a rules-carrying install on a GB10 may be refused
+  as `secure-boot-state`. That is unproven, not known to work.
+* Not run by CI: it needs an aarch64 KVM host. `ota/test-installer-pcr-rules.sh` (CI) checks
+  the gate's order against the destructive steps textually, not dynamically; this bench is
+  the dynamic proof.
 * Not the NV shard: enrolment here is the `PolicyAuthorize` shard only.
 * The host's systemd is 255; the appliance ships 257.

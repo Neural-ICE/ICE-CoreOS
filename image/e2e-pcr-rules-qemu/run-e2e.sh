@@ -146,7 +146,7 @@ ex() { awk "/^$1\\(\\) \\{/,/^}\$/" "$AUTOINSTALL"; }
 {
   echo 'NI_INSTALLER_TEST_SEAM=""'
   ex ni_path; ex write_failure_evidence; ex karg_count; ex karg_once
-  ex esp_snapshot_file; ex esp_staged_file; ex esp_staged_file_unsealed
+  ex esp_die; ex esp_snapshot_file; ex esp_staged_file; ex esp_staged_file_unsealed
   awk '/^die\(\)  \{/,/^}$/' "$AUTOINSTALL"
 } > "$I/gate.sh"
 awk '/^PCR_RULES_DIGEST=/,/^readonly PCR_RULES_STATE$/' "$AUTOINSTALL" > "$I/gate-block.sh"
@@ -248,7 +248,7 @@ run_vm conforming "$WORK/vars.conform.fd" "$WORK/medium.good.img" "$(common_cmdl
 check "A: gate accepted" log_has conforming "E2E: gate state=accepted"
 check "A: binding is contents (the guest firmware measures contents)" log_has conforming "binding=contents"
 check "A: the installer enrolled the scratch disk" log_has conforming "E2E: ENROLLED"
-check "A: a PolicyAuthorize (pubkey-bound) TPM2 token exists" log_has conforming "pubkey-bound 1"
+check "A: a PolicyAuthorize TPM2 token bound to THE Owner key (the staged PEM, byte for byte) exists" log_has conforming "owner-key 1"
 check "A: the target changed (the install really wrote)" test "$(target_sha conforming)" != "$TARGET_ORIG"
 check "A: the installed ESP record says state=accepted, sequence 7, binding=contents" \
   bash -c 'tr -d "\r" < "'"$WORK/conforming.log"'" | grep -F "E2E: record " | grep -F "state=accepted" | grep -F "sequence=7" | grep -F "binding=contents"'

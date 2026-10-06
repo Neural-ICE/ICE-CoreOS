@@ -101,12 +101,17 @@ for _ in 1 2 3 4 5; do [[ -b ${TARGET}1 ]] && break; sleep 1; done
 . /enroll.sh
 SYS_RECOVERY="$(enroll_luks "${TARGET}1" system)" || { echo "E2E-FAIL: enroll_luks"; exit 94; }
 cryptsetup luksDump --dump-json-metadata "${TARGET}1" > /tmp/luks.json
-python3 -I - /tmp/luks.json <<'PY'
-import json, sys
+python3 -I - /tmp/luks.json "$PCR_POLICY_KEY_RUNTIME" <<'PY'
+import base64, json, sys
 meta = json.load(open(sys.argv[1]))
+owner_pem = open(sys.argv[2], "rb").read()
 tokens = [t for t in meta["tokens"].values() if t.get("type") == "systemd-tpm2"]
+# systemd stores the PEM it was given, base64-encoded, in tpm2_pubkey: compare it with the
+# Owner key the gate staged against its sealed hash.
 print("E2E: tpm2 tokens", len(tokens),
       "pubkey-bound", sum(1 for t in tokens if t.get("tpm2_pubkey")),
+      "owner-key", sum(1 for t in tokens if t.get("tpm2_pubkey")
+                       and base64.b64decode(t["tpm2_pubkey"]).strip() == owner_pem.strip()),
       "pubkey-pcrs", [t.get("tpm2_pubkey_pcrs") for t in tokens],
       "pcrs", [t.get("tpm2-pcrs") for t in tokens])
 sys.exit(0 if tokens else 1)

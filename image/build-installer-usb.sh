@@ -530,7 +530,7 @@ pcr_rules_acquire() {
     || { echo "ERROR: cannot create the private directory for the PCR rules pair" >&2; exit 1; }
   chmod 0700 -- "$PCR_RULES_PRIVATE_DIR"
   python3 -I - "$PCR_RULES_FILE" "$PCR_RULES_PRIVATE_DIR/rules.json" \
-    "$PCR_RULES_SIGNATURE_FILE" "$PCR_RULES_PRIVATE_DIR/rules.json.sig" 1048576 <<'PYEOF' \
+    "$PCR_RULES_SIGNATURE_FILE" "$PCR_RULES_PRIVATE_DIR/rules.json.sig" 1048576 4096 <<'PYEOF' \
     || exit 1
 import os
 import stat
@@ -542,9 +542,10 @@ def refuse(reason):
     raise SystemExit(1)
 
 
-source_rules, copy_rules, source_signature, copy_signature, bound = sys.argv[1:]
-bound = int(bound)
-for source, destination in ((source_rules, copy_rules), (source_signature, copy_signature)):
+source_rules, copy_rules, source_signature, copy_signature, rules_bound, signature_bound = sys.argv[1:]
+# The signature is bounded at what the installer reads (4096); the rules at 1 MiB.
+for source, destination, bound in ((source_rules, copy_rules, int(rules_bound)),
+                                   (source_signature, copy_signature, int(signature_bound))):
     try:
         # O_NOFOLLOW: a link is refused by the open itself, not by a test an
         # attacker can race. O_NONBLOCK: a FIFO is refused below, not waited on.
