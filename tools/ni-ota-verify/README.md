@@ -615,6 +615,46 @@ the older BOM; recovery is a forward repair with a higher signed sequence (or
 the existing equal-sequence, byte-identical BOM repair carve-out). Thus neither
 bootstrap nor concurrent commits can regress the anti-rollback state.
 
+### v2 release attestation (`verify-v2-release`, `verify-retained-v2-release`)
+
+An owner-sealed **v2** host cannot carry the v1 preseal set (it needs the v1 OTA
+authority a v2 host forbids). The TPM floor of that lane is authenticated by the
+**v2 release manifest and its detached signature** instead. The contract —
+flags, the closed set of refusal classes, the receipt `neural-ice-v2-release-receipt-v1`,
+the persisted layout — is `docs/ota/V2-RELEASE-ATTESTATION.md`; this section only
+says where it lives in the verifier.
+
+```
+ni-ota-verify verify-v2-release --manifest F --manifest-sig F --release-key F --sealed-key-sha256 HEX
+    ( --sealed-manifest-sha256 HEX --sealed-manifest-sig-sha256 HEX | --sealed-min-bundle-seq N )
+    --hardware-target T --access-profile P --trust-policy-id ID --variant sealed-lab
+    --release-authority HOST --candidate-root DIR
+    --host-index-digest sha256:HEX --host-manifest-digest sha256:HEX --receipt OUT
+ni-ota-verify verify-retained-v2-release --manifest F --manifest-sig F --release-key F
+    --expected-receipt-sha256 HEX --receipt F --scratch-dir /run/...
+```
+
+* Exit **0** pass, **1** refusal (`ni-ota-verify: v2 release REFUSED: <class>: <detail>`),
+  **2** usage or tooling failure. No clock is read.
+* The signature is the pinned `cosign verify-blob` over the exact manifest bytes
+  (no envelope, no domain prefix, no canonicalisation, **no low-S pre-filter**: a
+  KMS signature need not be low-S, and the golden one is not). Digests are in-process.
+* `authenticated-ota-status` on a v2-lane appliance (image marker
+  `owner-sealed-ota-state-v2`, evidence `neural-ice-owner-ceremony-evidence-v2-lane2`)
+  prints **exactly** the v1 lane's status bytes, so the licence gate and model-fetch
+  change nothing. It re-runs `verify-retained-v2-release` against the live `/`, binds
+  the receipt digest, the manifest and the TPM floor to the evidence, and the booted
+  deployment (`repository@index digest`, platform manifest) to the receipt's host.
+  There is no `relaxed` branch and no OTA transaction window on this lane: an updated
+  host is refused until the successor rule (T9) lands.
+* Test seams, `test-path-overrides` only (absent from the shipped binary, checked by
+  `tests/v2_release_shipped.rs`): `--root DIR` on the retained verb and
+  `NI_OTA_AUTH_STATUS_V2_ROOT` for the status reader replace `/`.
+* Tests: `tests/v2_release_cli.rs` replays `tests/fixtures/v2-release/golden.json`
+  and derives the refusals by mutation; the status lane is in
+  `tests/owner_state_reader.rs` (`v2_lane_*`) and the evidence shape in
+  `tests/owner_completion_cli.rs`.
+
 ## Release-manifest v1 planner (`release-plan`)
 
 A **pure reader**: two already-authenticated manifests in, one plan out. It

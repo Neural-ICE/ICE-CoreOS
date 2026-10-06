@@ -218,12 +218,67 @@ struct OwnerCeremonyEvidenceV2 {
     tpm_state: serde_json::Value,
 }
 
+/// Evidence of the v2 attestation lane (`docs/ota/V2-RELEASE-ATTESTATION.md` §6).
+/// Its schema is disjoint from evidence v2: `ota_preseal` XOR `v2_release`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerCeremonyEvidenceV2Lane2 {
+    access_profile_anchor: CeremonyAnchorEvidence,
+    data_luks: serde_json::Value,
+    device_root_name: String,
+    install_identity: serde_json::Value,
+    ota_state: OwnerOtaStateEvidence,
+    schema: String,
+    srk_name: String,
+    system_luks: serde_json::Value,
+    tpm_state: serde_json::Value,
+    v2_release: V2ReleaseEvidence,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2ReleaseEvidence {
+    bundle_seq: u64,
+    manifest_sha256: String,
+    manifest_sig_sha256: String,
+    receipt_schema: String,
+    receipt_sha256: String,
+    release_id: String,
+    release_key_sha256: String,
+}
+
+/// What a completion record attests the baseline floor with. The two lanes are
+/// disjoint: a reader of one never accepts the other's evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Attestation {
+    /// Evidence v1: no OTA baseline is recorded.
+    None,
+    /// Evidence v2: the signed preseal set and its receipt.
+    Preseal {
+        receipt_sha256: String,
+        set_sha256: String,
+    },
+    /// Evidence v2-lane2: the v2 release manifest, its signature and the receipt.
+    V2Release(V2ReleaseAttestation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct V2ReleaseAttestation {
+    pub(crate) bundle_seq: u64,
+    pub(crate) manifest_sha256: String,
+    pub(crate) manifest_sig_sha256: String,
+    pub(crate) receipt_sha256: String,
+    pub(crate) release_id: String,
+    pub(crate) release_key_sha256: String,
+    /// `install_identity.release_identity_sha256`: the manifest digest.
+    pub(crate) release_identity_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VerifiedOwnerCompletion {
     pub(crate) completion_version: u64,
     pub(crate) evidence_digest_sha256: String,
-    pub(crate) preseal_receipt_sha256: Option<String>,
-    pub(crate) preseal_set_sha256: Option<String>,
+    pub(crate) attestation: Attestation,
     pub(crate) baseline_floor: Option<u64>,
 }
 
@@ -643,8 +698,7 @@ fn authenticated_completion(
             verified: VerifiedOwnerCompletion {
                 completion_version: 1,
                 evidence_digest_sha256: inspection.evidence_digest_sha256,
-                preseal_receipt_sha256: None,
-                preseal_set_sha256: None,
+                attestation: Attestation::None,
                 baseline_floor: None,
             },
             anchor: evidence.access_profile_anchor,
@@ -668,6 +722,74 @@ fn authenticated_completion(
             "the authenticated owner-ceremony evidence is not canonical JSON plus LF",
         )));
     }
+    let violation = || {
+        Ok(Err(reinstall_required(
+            "the authenticated owner-profile completion evidence violates its closed contract",
+        )))
+    };
+    if generic.get("schema").and_then(serde_json::Value::as_str)
+        == Some("neural-ice-owner-ceremony-evidence-v2-lane2")
+    {
+        let evidence: OwnerCeremonyEvidenceV2Lane2 = match serde_json::from_slice(&evidence_bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Err(reinstall_required(&format!(
+                    "the authenticated owner-ceremony evidence is malformed ({error})"
+                ))))
+            }
+        };
+        let release = &evidence.v2_release;
+        let release_identity = evidence
+            .install_identity
+            .get("release_identity_sha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if evidence.schema != "neural-ice-owner-ceremony-evidence-v2-lane2"
+            || !owner_evidence_closed(
+                &evidence.install_identity,
+                &evidence.tpm_state,
+                &evidence.system_luks,
+                &evidence.data_luks,
+                &evidence.ota_state,
+                &evidence.device_root_name,
+                &evidence.srk_name,
+            )
+            || release.receipt_schema != "neural-ice-v2-release-receipt-v1"
+            || !is_lower_hex(&release.receipt_sha256, 64)
+            || !is_lower_hex(&release.manifest_sha256, 64)
+            || !is_lower_hex(&release.manifest_sig_sha256, 64)
+            || !is_lower_hex(&release.release_key_sha256, 64)
+            || release.release_id.is_empty()
+            || release.release_id.len() > 128
+            || !release
+                .release_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            // The floor the TPM holds is the manifest's bundle_seq, and the
+            // install identity is the manifest digest (contract §6).
+            || release.bundle_seq != evidence.ota_state.baseline_floor
+            || release_identity != release.manifest_sha256
+        {
+            return violation();
+        }
+        return Ok(Ok(AuthenticatedCompletion {
+            verified: VerifiedOwnerCompletion {
+                completion_version: 2,
+                evidence_digest_sha256: inspection.evidence_digest_sha256,
+                attestation: Attestation::V2Release(V2ReleaseAttestation {
+                    bundle_seq: release.bundle_seq,
+                    manifest_sha256: release.manifest_sha256.clone(),
+                    manifest_sig_sha256: release.manifest_sig_sha256.clone(),
+                    receipt_sha256: release.receipt_sha256.clone(),
+                    release_id: release.release_id.clone(),
+                    release_key_sha256: release.release_key_sha256.clone(),
+                    release_identity_sha256: release_identity.to_owned(),
+                }),
+                baseline_floor: Some(evidence.ota_state.baseline_floor),
+            },
+            anchor: evidence.access_profile_anchor,
+        }));
+    }
     let evidence: OwnerCeremonyEvidenceV2 = match serde_json::from_slice(&evidence_bytes) {
         Ok(value) => value,
         Err(error) => {
@@ -676,87 +798,103 @@ fn authenticated_completion(
             ))))
         }
     };
-    let ota = &evidence.ota_state;
     if evidence.schema != "neural-ice-owner-ceremony-evidence-v2"
-        || !closed_object(
+        || !owner_evidence_closed(
             &evidence.install_identity,
-            &[
-                "install_source",
-                "installed_at",
-                "installer_sealed_identity_sha256",
-                "release_identity_sha256",
-                "schema",
-            ],
-            "neural-ice-owner-ceremony-install-identity-v1",
-        )
-        || !closed_object(
             &evidence.tpm_state,
-            &[
-                "freshness_counter",
-                "freshness_public_sha256",
-                "install_counter",
-                "install_public_sha256",
-                "profile_binding",
-                "schema",
-            ],
-            "neural-ice-tpm-state-snapshot-v1",
+            &evidence.system_luks,
+            &evidence.data_luks,
+            &evidence.ota_state,
+            &evidence.device_root_name,
+            &evidence.srk_name,
         )
-        || ![&evidence.system_luks, &evidence.data_luks]
-            .into_iter()
-            .all(|value| {
-                closed_object(
-                    value,
-                    &[
-                        "keyslot",
-                        "pcr_bank",
-                        "pcrs",
-                        "policy_hash",
-                        "policy_public_key_sha256",
-                        "schema",
-                        "sealed_object_sha256",
-                        "srk_sha256",
-                        "token_sha256",
-                    ],
-                    "neural-ice-luks-token-evidence-v1",
-                )
-            })
         || evidence.ota_preseal.receipt_schema != "neural-ice-ota-preseal-receipt-v1"
         || !is_lower_hex(&evidence.ota_preseal.receipt_sha256, 64)
         || !is_lower_hex(&evidence.ota_preseal.set_sha256, 64)
-        || ota.profile != OWNER_STATE_PROFILE
-        || ota.floor_index != "0x01500001"
-        || ota.floor_attributes != "0x62008"
-        || ota.floor_policy_sha256 != OWNER_FLOOR_POLICY
-        || ota.floor_size != 8
-        || ota.floor_name != OWNER_FLOOR_NAME
-        || ota.anchor_index != "0x01500002"
-        || ota.anchor_attributes != "0x2060048"
-        || ota.anchor_policy_sha256 != OWNER_ANCHOR_POLICY
-        || ota.anchor_size != 32
-        || ota.anchor_pristine_name != OWNER_ANCHOR_PRISTINE_NAME
-        || ota.anchor_written_name != OWNER_ANCHOR_WRITTEN_NAME
-        || ota.anchor_state_at_completion != "pristine"
-        || ota.anchor_name_at_completion != OWNER_ANCHOR_PRISTINE_NAME
-        || !ota.clear_protected_at_completion
-        || ota.baseline_floor == 0
-        || ota.baseline_floor > 9_007_199_254_740_991
-        || !is_lower_hex(&evidence.device_root_name, 68)
-        || !is_lower_hex(&evidence.srk_name, 68)
     {
-        return Ok(Err(reinstall_required(
-            "the authenticated owner-profile completion evidence violates its closed contract",
-        )));
+        return violation();
     }
     Ok(Ok(AuthenticatedCompletion {
         verified: VerifiedOwnerCompletion {
             completion_version: 2,
             evidence_digest_sha256: inspection.evidence_digest_sha256,
-            preseal_receipt_sha256: Some(evidence.ota_preseal.receipt_sha256),
-            preseal_set_sha256: Some(evidence.ota_preseal.set_sha256),
-            baseline_floor: Some(ota.baseline_floor),
+            attestation: Attestation::Preseal {
+                receipt_sha256: evidence.ota_preseal.receipt_sha256,
+                set_sha256: evidence.ota_preseal.set_sha256,
+            },
+            baseline_floor: Some(evidence.ota_state.baseline_floor),
         },
         anchor: evidence.access_profile_anchor,
     }))
+}
+
+/// The parts of the owner evidence the two lanes share: only the attestation
+/// object (`ota_preseal` / `v2_release`) differs between them.
+fn owner_evidence_closed(
+    install_identity: &serde_json::Value,
+    tpm_state: &serde_json::Value,
+    system_luks: &serde_json::Value,
+    data_luks: &serde_json::Value,
+    ota: &OwnerOtaStateEvidence,
+    device_root_name: &str,
+    srk_name: &str,
+) -> bool {
+    closed_object(
+        install_identity,
+        &[
+            "install_source",
+            "installed_at",
+            "installer_sealed_identity_sha256",
+            "release_identity_sha256",
+            "schema",
+        ],
+        "neural-ice-owner-ceremony-install-identity-v1",
+    ) && closed_object(
+        tpm_state,
+        &[
+            "freshness_counter",
+            "freshness_public_sha256",
+            "install_counter",
+            "install_public_sha256",
+            "profile_binding",
+            "schema",
+        ],
+        "neural-ice-tpm-state-snapshot-v1",
+    ) && [system_luks, data_luks].into_iter().all(|value| {
+        closed_object(
+            value,
+            &[
+                "keyslot",
+                "pcr_bank",
+                "pcrs",
+                "policy_hash",
+                "policy_public_key_sha256",
+                "schema",
+                "sealed_object_sha256",
+                "srk_sha256",
+                "token_sha256",
+            ],
+            "neural-ice-luks-token-evidence-v1",
+        )
+    }) && ota.profile == OWNER_STATE_PROFILE
+        && ota.floor_index == "0x01500001"
+        && ota.floor_attributes == "0x62008"
+        && ota.floor_policy_sha256 == OWNER_FLOOR_POLICY
+        && ota.floor_size == 8
+        && ota.floor_name == OWNER_FLOOR_NAME
+        && ota.anchor_index == "0x01500002"
+        && ota.anchor_attributes == "0x2060048"
+        && ota.anchor_policy_sha256 == OWNER_ANCHOR_POLICY
+        && ota.anchor_size == 32
+        && ota.anchor_pristine_name == OWNER_ANCHOR_PRISTINE_NAME
+        && ota.anchor_written_name == OWNER_ANCHOR_WRITTEN_NAME
+        && ota.anchor_state_at_completion == "pristine"
+        && ota.anchor_name_at_completion == OWNER_ANCHOR_PRISTINE_NAME
+        && ota.clear_protected_at_completion
+        && ota.baseline_floor != 0
+        && ota.baseline_floor <= 9_007_199_254_740_991
+        && is_lower_hex(device_root_name, 68)
+        && is_lower_hex(srk_name, 68)
 }
 
 #[allow(dead_code)] // Frozen Slice-C API consumed by the subsequent R1 reader.
@@ -774,13 +912,28 @@ pub(crate) fn run_owner_completion_test(args: &[String]) -> Result<u8, InternalE
     })?;
     match verified_owner_completion(Path::new(state_dir))? {
         Ok(value) => {
+            let quoted = |value: &str| format!("\"{value}\"");
+            let (receipt, set, v2_release) = match &value.attestation {
+                Attestation::None => ("null".into(), "null".into(), None),
+                Attestation::Preseal {
+                    receipt_sha256,
+                    set_sha256,
+                } => (quoted(receipt_sha256), quoted(set_sha256), None),
+                Attestation::V2Release(attested) => (
+                    "null".into(),
+                    "null".into(),
+                    Some(attested.receipt_sha256.clone()),
+                ),
+            };
+            // The v1 lanes keep their exact output; only the v2 lane adds a key.
+            let v2_release = v2_release.map_or(String::new(), |digest| {
+                format!(",\"v2_release_receipt_sha256\":\"{digest}\"")
+            });
             println!(
-                "{{\"baseline_floor\":{},\"completion_version\":{},\"evidence_digest_sha256\":\"{}\",\"preseal_receipt_sha256\":{},\"preseal_set_sha256\":{}}}",
+                "{{\"baseline_floor\":{},\"completion_version\":{},\"evidence_digest_sha256\":\"{}\",\"preseal_receipt_sha256\":{receipt},\"preseal_set_sha256\":{set}{v2_release}}}",
                 value.baseline_floor.map_or("null".into(), |v| v.to_string()),
                 value.completion_version,
                 value.evidence_digest_sha256,
-                value.preseal_receipt_sha256.map_or("null".into(), |v| format!("\"{v}\"")),
-                value.preseal_set_sha256.map_or("null".into(), |v| format!("\"{v}\"")),
             );
             Ok(crate::EXIT_PASS)
         }

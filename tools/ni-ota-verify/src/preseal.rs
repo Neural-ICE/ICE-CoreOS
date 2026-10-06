@@ -980,7 +980,7 @@ fn read_marker(root: &Path, relative: &str) -> Result<String, String> {
     Ok(value[..value.len() - 1].to_owned())
 }
 
-fn snapshot(
+pub(crate) fn snapshot(
     store: &FileStateStore,
     source: &Path,
     label: &str,

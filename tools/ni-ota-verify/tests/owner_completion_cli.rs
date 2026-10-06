@@ -187,6 +187,110 @@ fn wrong_domain_noncanonical_or_foreign_owner_contract_is_refused() {
     assert_eq!(foreign.run().status.code(), Some(1));
 }
 
+/// Turn the evidence-v2 fixture into the v2 attestation lane's evidence
+/// (`ota_preseal` replaced by `v2_release`) and re-bind the completion record.
+fn lane2(edit: impl FnOnce(&mut Value)) -> Output {
+    let fixture = Fixture::new(2);
+    let path = fixture.root.join("owner-ceremony-evidence-v2.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("ota_preseal");
+    value["schema"] = json!("neural-ice-owner-ceremony-evidence-v2-lane2");
+    value["install_identity"]["release_identity_sha256"] = json!("ab".repeat(32));
+    value["v2_release"] = json!({
+        "bundle_seq":5,"manifest_sha256":"ab".repeat(32),"manifest_sig_sha256":"cd".repeat(32),
+        "receipt_schema":"neural-ice-v2-release-receipt-v1","receipt_sha256":"ef".repeat(32),
+        "release_id":"v2-test-train-5","release_key_sha256":"12".repeat(32)
+    });
+    edit(&mut value);
+    let bytes = canonical(&value);
+    fs::write(&path, &bytes).unwrap();
+    let mut message = DOMAIN.to_vec();
+    message.extend_from_slice(&bytes);
+    write_inspection(&fixture.root, 2, &hash(&message));
+    fixture.run()
+}
+
+#[test]
+fn v2_lane_evidence_is_accepted_and_names_its_receipt_not_a_preseal() {
+    let output = lane2(|_| {});
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["completion_version"], 2);
+    assert_eq!(value["baseline_floor"], 5);
+    assert!(value["preseal_receipt_sha256"].is_null());
+    assert!(value["preseal_set_sha256"].is_null());
+    assert_eq!(value["v2_release_receipt_sha256"], "ef".repeat(32));
+}
+
+#[test]
+fn v2_lane_evidence_outside_its_closed_contract_is_refused() {
+    type Edit = Box<dyn FnOnce(&mut Value)>;
+    let refusals: Vec<(&str, Edit)> = vec![
+        (
+            "preseal and release together",
+            Box::new(|v| {
+                v["ota_preseal"] = json!({"receipt_schema":"neural-ice-ota-preseal-receipt-v1","receipt_sha256":"88".repeat(32),"set_sha256":"99".repeat(32)});
+            }),
+        ),
+        (
+            "neither attestation",
+            Box::new(|v| {
+                v.as_object_mut().unwrap().remove("v2_release");
+            }),
+        ),
+        (
+            "bundle_seq is not the floor",
+            Box::new(|v| v["v2_release"]["bundle_seq"] = json!(6)),
+        ),
+        (
+            "identity is not the manifest digest",
+            Box::new(|v| {
+                v["install_identity"]["release_identity_sha256"] = json!("77".repeat(32));
+            }),
+        ),
+        (
+            "receipt schema",
+            Box::new(|v| {
+                v["v2_release"]["receipt_schema"] = json!("neural-ice-v2-release-receipt-v2")
+            }),
+        ),
+        (
+            "uppercase digest",
+            Box::new(|v| v["v2_release"]["manifest_sha256"] = json!("AB".repeat(32))),
+        ),
+        (
+            "short digest",
+            Box::new(|v| v["v2_release"]["receipt_sha256"] = json!("ef")),
+        ),
+        (
+            "release id",
+            Box::new(|v| v["v2_release"]["release_id"] = json!("has space")),
+        ),
+        (
+            "unknown key",
+            Box::new(|v| v["v2_release"]["freshness_sha256"] = json!("00".repeat(32))),
+        ),
+        (
+            "float bundle_seq",
+            Box::new(|v| v["v2_release"]["bundle_seq"] = json!(5.5)),
+        ),
+    ];
+    for (label, edit) in refusals {
+        let output = lane2(edit);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn anchor() -> Value {
     json!({"json_sha256":"11".repeat(32),"signature_sha256":"22".repeat(32),"spki_sha256":"33".repeat(32)})
 }
