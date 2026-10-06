@@ -121,7 +121,7 @@ sanitize() { # printable ASCII only, one line, bounded length
 #   - lines: blank, `# comment`, or `key=value` (no space around `=`, no key
 #     twice, no key outside the list below);
 #   - version=1 is required; images_* keys come all together (images_release_key
-#     optional) in ONE file; core_units= may be spread over files.
+#     optional) in ONE file; core_units= and tty1_owners= may be spread over files.
 # A file that breaks any rule contributes NOTHING and is reported (NI-E06): the
 # screen never half-applies a declaration and never guesses what was meant.
 # Values name units, a path and manifest keys; the screen reads the one manifest
@@ -137,7 +137,7 @@ DECL_UNIT_RE='^[A-Za-z0-9@._:\\-]{1,200}\.(service|target|mount|socket)$'
 DECL_IMG_UNIT_RE='^[A-Za-z0-9@._:-]{1,200}\.service$'
 DECL_JSON_KEY_RE='^[a-z][a-z0-9_]{0,31}$'
 DECL_ALIAS_RE='^[a-z0-9._/:-]*\{id\}[a-z0-9._/:-]*$'
-declare -a DECL_FAULTS=() DECL_CORE=() DECL_IMG_UNITS=()
+declare -a DECL_FAULTS=() DECL_CORE=() DECL_TTY1=() DECL_IMG_UNITS=()
 DECL_IMG_FILE=""; DECL_MANIFEST=""; DECL_COMP_KEY=""; DECL_DIGEST_KEY=""; DECL_ALIAS=""; DECL_RELEASE_KEY=""
 
 decl_fault() { DECL_FAULTS+=("$(sanitize "$1" 40)|$(sanitize "$2" 40)"); }   # <file> <why>
@@ -166,9 +166,9 @@ decl_path_ok() { # <path>: absolute, bounded, plain components, under an allowed
 }
 decl_parse() { # <file> <name>: parse one declaration; its facts are committed only when all of it is valid
   local f=$1 name=$2 line key value lineno=0 k u
-  local -a core_items
+  local -a core_items tty1_items
   local -A seen=()
-  local d_version="" d_units="" d_manifest="" d_comp="" d_digest="" d_alias="" d_release="" d_core=""
+  local d_version="" d_units="" d_manifest="" d_comp="" d_digest="" d_alias="" d_release="" d_core="" d_tty1=""
   while IFS= read -r line || [[ -n $line ]]; do
     lineno=$((lineno + 1))
     [[ -n $line && $line != '#'* ]] || continue
@@ -199,6 +199,9 @@ decl_parse() { # <file> <name>: parse one declaration; its facts are committed o
       core_units)
         decl_unit_list "$value" 16 "$DECL_UNIT_RE" || { decl_fault "$name" "bad core_units"; return 0; }
         d_core=$value ;;
+      tty1_owners)
+        decl_unit_list "$value" 4 "$DECL_IMG_UNIT_RE" || { decl_fault "$name" "bad tty1_owners"; return 0; }
+        d_tty1=$value ;;
       *) decl_fault "$name" "unknown key $key"; return 0 ;;
     esac
   done < "$f"
@@ -211,7 +214,7 @@ decl_parse() { # <file> <name>: parse one declaration; its facts are committed o
       [[ -n ${seen[$k]:-} ]] || { decl_fault "$name" "missing key $k"; return 0; }
     done
     [[ -z $DECL_IMG_FILE ]] || { decl_fault "$name" "images declared by another file"; return 0; }
-  elif [[ -z $d_core ]]; then
+  elif [[ -z $d_core && -z $d_tty1 ]]; then
     decl_fault "$name" "declares nothing"; return 0
   fi
   if [[ -n ${seen[images]:-} ]]; then
@@ -222,6 +225,10 @@ decl_parse() { # <file> <name>: parse one declaration; its facts are committed o
   if [[ -n $d_core ]]; then
     IFS=' ' read -ra core_items <<<"$d_core"
     for u in "${core_items[@]}"; do DECL_CORE+=("$u"); done
+  fi
+  if [[ -n $d_tty1 ]]; then
+    IFS=' ' read -ra tty1_items <<<"$d_tty1"
+    for u in "${tty1_items[@]}"; do DECL_TTY1+=("$u"); done
   fi
 }
 decl_load() {
@@ -261,8 +268,13 @@ if [[ -n $DECL_IMG_FILE ]]; then IMG_UNITS=("${DECL_IMG_UNITS[@]}")
 else IMG_UNITS=("$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD"); fi
 # tty1 owners: the login getty (debug variant) or the product console dashboard
 # (branded appliance, ICE-Fabric neural-ice-tui.service). Either one active
-# means the screen is no longer ours.
+# means the screen is no longer ours. A declaration adds the units its image
+# starts on tty1 instead (tty1_owners=, e.g. a kiosk compositor): the OS does not
+# name them.
 TTY1_OWNERS=('getty@tty1.service' 'neural-ice-tui.service')
+for u in "${DECL_TTY1[@]}"; do
+  [[ " ${TTY1_OWNERS[*]} " == *" $u "* ]] || TTY1_OWNERS+=("$u")
+done
 # Core services shipped by this OS. The branded derivation adds its product
 # units through its declaration (core_units=) or the older
 # /usr/lib/neural-ice/status-screen/core-services (one unit per line, `#`

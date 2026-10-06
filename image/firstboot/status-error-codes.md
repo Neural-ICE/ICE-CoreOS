@@ -75,8 +75,8 @@ Grammar (closed; the parser is `decl_parse` in the script):
   non-empty value. A list is single-space separated.
 - `version=1` is required. The `images_*` keys come **together** in one file
   (`images_release_key` optional) and only one file may declare them;
-  `core_units` may be given by several files. A file declaring none of them is
-  refused.
+  `core_units` and `tty1_owners` may be given by several files. A file declaring
+  none of them is refused.
 
 | Key                      | Value                                                                                       |
 |--------------------------|---------------------------------------------------------------------------------------------|
@@ -88,6 +88,7 @@ Grammar (closed; the parser is `decl_parse` in the script):
 | `images_alias=`          | alias of a component in containers-storage, `[a-z0-9._/:-]` with exactly one `{id}` replaced by the component id |
 | `images_release_key=`    | optional JSON key whose string value (`[A-Za-z0-9._-]`, else `unset`) is shown as `release <value>` in the header instead of the v1 channel |
 | `core_units=`            | 1–16 `*.service`/`*.target`/`*.mount`/`*.socket` names appended to the core services         |
+| `tty1_owners=`           | 1–4 `*.service` names that take tty1 over from this screen (a kiosk compositor, for example). Added to the OS's own owners (`getty@tty1.service`, `neural-ice-tui.service`); an owner that is `active` ends the screen, one that is only `activating`, `failed` or absent owns nothing. Without this key the screen is the v1 screen, byte for byte |
 
 With `images_*` declared:
 
@@ -166,8 +167,8 @@ session; on sealed variants nothing else writes there.
 
 The script exits on its own once READY has been shown for
 `NI_STATUS_READY_LINGER` seconds (default 10), or as soon as a tty1 owner —
-`getty@tty1.service` (debug variant) or `neural-ice-tui.service` (branded
-appliance) — is active. Ownership is re-asked from the manager immediately
+`getty@tty1.service` (debug variant), `neural-ice-tui.service` (branded
+appliance) or a unit the image declares with `tty1_owners=` — is active. Ownership is re-asked from the manager immediately
 before every write to tty1 (and in the exit handler): a frame prepared while
 the owner was starting is dropped, never drawn. The unit is never restarted
 within a boot and is stopped on shutdown (`Conflicts=`/`Before=shutdown.target`,

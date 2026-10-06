@@ -532,6 +532,7 @@ images_digest_key=digest
 images_alias=localhost/neural-ice-applied/{id}:v1
 images_release_key=release_id
 core_units=neural-ice-product-payload-apply.service icecore-api.service
+tty1_owners=neural-ice-console-compositor.service
 EOF
 V2_REL=v2-lab-train-3-20261006-b
 v2_digest() { printf 'sha256:%064d' "$1"; }
@@ -841,10 +842,62 @@ expect "$out" 'channel beta-debug' "a refused images declaration is not half-app
 expect "$out" 'Images          1/2 present' "a refused images declaration is not half-applied (v1 inventory)"
 expect "$out" 'NI-E06' "and it is reported"
 [[ ! -e pwned && ! -e $FX/pwned ]] || fail "declaration content reached a shell"
+# 4j. tty1_owners: the units that take tty1 over from the status screen are declared by
+# the product, not named by the OS. A declared owner that is active ends the screen
+# exactly as getty@tty1 does; one that is only starting, or failed, owns nothing.
+CMP=neural-ice-console-compositor.service
+make_v2_fixture; v2_ready_scene
+out="$(run_screen 1 0)"
+expect "$out" 'READY' "4j baseline: the v2 fixture draws while the compositor is not running"
+set_state "$CMP" loaded active running
+out="$(run_screen 5 0)"
+[[ -z $out ]] || fail "a declared tty1 owner (the console compositor) is active: the screen must leave tty1 alone: $out"
+for st in 'activating start' 'failed failed' 'inactive dead'; do
+  set -- $st
+  set_state "$CMP" loaded "$1" "$2"
+  out="$(run_screen 1 0)"
+  expect "$out" 'READY' "a declared owner that is $1 does not own tty1"
+done
+# the OS's own owners still count on a declared host
+v2_ready_scene; set_state 'getty@tty1.service' loaded active running
+out="$(run_screen 5 0)"
+[[ -z $out ]] || fail "getty@tty1 still owns tty1 on a declared host: $out"
+# no declaration, no new owner: the compositor means nothing to the v1 screen
+make_fixture
+set_state "$CMP" loaded active running
+out="$(run_screen 1 0)"
+expect "$out" 'NEURAL ICE   Neural ICE CoreOS' "without a declaration the screen never reads tty1_owners: v1 screen unchanged"
+# ownership taken between the loop's snapshot and the write drops the frame (second query of the owner)
+make_v2_fixture; v2_ready_scene
+out="$(run_screen 3 0 NI_TEST_FLIP_UNIT=$CMP NI_TEST_FLIP_AFTER=2)"
+[[ -z $out ]] || fail "a declared owner that appeared between snapshot and write must suppress the frame: $out"
+out="$(run_screen 3 0 NI_TEST_FLIP_UNIT=$CMP NI_TEST_FLIP_AFTER=3)"
+[[ "$(grep -c 'NEURAL ICE   Neural ICE CoreOS' <<<"$out")" -eq 1 ]] \
+  || fail "after the declared owner took tty1 mid-run no further frame may be drawn: $out"
+# tty1_owners alone is a declaration, and several files add up
+make_fixture
+write_decl own1.conf $'version=1\ntty1_owners=product-a.service'
+write_decl own2.conf $'version=1\ntty1_owners=product-b.service product-c.service'
+out="$(run_screen 1 0)"
+reject "$out" 'NI-E06' "tty1_owners alone is a valid declaration"
+for u in product-a.service product-b.service product-c.service; do
+  set_state "$u" loaded active running
+  out="$(run_screen 3 0)"
+  [[ -z $out ]] || fail "owner $u declared across files must own tty1: $out"
+  set_state "$u" loaded inactive dead
+done
+# malformed tty1_owners: refused and reported, never half-applied
+refuse "tty1 owner that is not a service" "$BAD_NAME" $'version=1\ntty1_owners=x.socket' "bad tty1_owners"
+refuse "tty1 owner with a path" "$BAD_NAME" $'version=1\ntty1_owners=../x.service' "bad tty1_owners"
+refuse "tty1 owner given twice in a list" "$BAD_NAME" $'version=1\ntty1_owners=a.service a.service' "bad tty1_owners"
+refuse "too many tty1 owners" "$BAD_NAME" $'version=1\ntty1_owners=a.service b.service c.service d.service e.service' "bad tty1_owners"
+refuse "tty1_owners key twice" "$BAD_NAME" $'version=1\ntty1_owners=a.service\ntty1_owners=b.service' "key tty1_owners given twice"
+refuse "tty1 owner with shell metacharacters" "$BAD_NAME" $'version=1\ntty1_owners=x$(touch pwned).service' "bad tty1_owners"
+[[ ! -e pwned && ! -e $FX/pwned ]] || fail "tty1_owners content reached a shell"
 # the grammar paragraph of the doc names every key the parser accepts, and only those
-for k in version images_units images_manifest images_component_key images_digest_key images_release_key images_alias core_units; do
+for k in version images_units images_manifest images_component_key images_digest_key images_release_key images_alias core_units tty1_owners; do
   grep -qE "^\| \`$k=\` " "$CODES" || fail "declaration key $k is not documented in status-error-codes.md"
   grep -qE "^      $k\)" "$SCRIPT" || fail "declaration key $k is not parsed"
 done
 
-echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, open-core boundary, 13 v1 behaviour scenes, declared-product scenes, malformed-declaration refusals)"
+echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, open-core boundary, 13 v1 behaviour scenes, declared-product scenes, tty1 owners, malformed-declaration refusals)"
