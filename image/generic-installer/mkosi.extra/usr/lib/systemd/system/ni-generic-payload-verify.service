@@ -1,0 +1,11 @@
+[Unit]
+Description=Neural ICE generic installer: verify the signed payload
+DefaultDependencies=no
+After=systemd-udev-trigger.service systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/neural-ice-generic/verify-payload.sh
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes

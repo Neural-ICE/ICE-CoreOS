@@ -1,0 +1,6 @@
+[Unit]
+Description=Neural ICE generic installer
+Requires=sysinit.target ni-generic-payload-verify.service
+Wants=systemd-udevd.service systemd-udev-trigger.service
+After=sysinit.target ni-generic-payload-verify.service
+AllowIsolate=yes
