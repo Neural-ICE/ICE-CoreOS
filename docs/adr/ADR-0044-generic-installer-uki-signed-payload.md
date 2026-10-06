@@ -32,7 +32,7 @@ The Owner wants a production installer that is built and signed once, versioned,
 ### The installer: one UKI
 
 - Built with **mkosi** (`Format=uki`) from **CentOS Stream 10 minimal**. That is the host's el10 lineage: same systemd, cryptsetup, tpm2-tools, podman and bootc.
-- It uses the **same `nvidia-gb10` 4k kernel RPMs and GSP firmware as the host** (D5). The kernel RPMs are the staged generation `image/rpms/` that `image/Containerfile.bootc` step 1 installs, checked by the same `ci/verify-build-context.sh`; the firmware is the staged `image/nvidia-userspace` tree (ADR-0041). The installer therefore changes with every kernel bump of the host. `build-in-container.sh` proves after the build that the UKI's kernel has the staged generation's `vmlinuz_unsigned_sha256`, and `host-kernel.env` in the initrd records the kernel NEVRA and the generation id.
+- It uses the **same `nvidia-gb10` 4k kernel RPMs and GSP firmware as the host** (D5). The kernel RPMs are the staged generation `image/rpms/` that `image/Containerfile.bootc` step 1 installs, checked by the same `ci/verify-build-context.sh`; the firmware is the staged `image/nvidia-userspace` tree (ADR-0041). The installer therefore changes with every kernel bump of the host. `build-in-container.sh` proves after the build that the kernel mkosi emitted next to the UKI has the staged generation's `vmlinuz_unsigned_sha256` (extracting the `.linux` section of the UKI itself is a follow-up), and `host-kernel.env` in the initrd records the kernel NEVRA and the generation id.
 - The whole system is the initrd. There is no root filesystem, no embedded host and no verity root to seal.
 - It is signed once per installer version: the UEFI signature (lab key now, the MS-signed shim path later) covers the kernel, the initrd and the cmdline.
 
@@ -72,9 +72,9 @@ The payload partition (GPT label `ni-payload`, read-only) carries:
    - `mirror`: the signed mirror configuration, then a pull by digest;
    - `registry`: a pull by digest.
 6. Before any disk write, the **existing closed policy reader** (`image/installer/neural-ice-registry-authorisation.py`) checks the installer's and the host's `policy.json`: default reject, the expected key, the exact repository scope, and no weak `signedIdentity` mode. After deployment, the installed policy is validated again (review 234, P2).
-   **Prototype exception, declared (review 234, P3):** in payload mode the installer lends a policy of its own: default reject, `insecureAcceptAnything` only for the exact RAM layout `/run/ni-verified/host-oci` and for the `containers-storage` transport, whose store is a fresh tmpfs holding only the verified image. The identity of the bytes is proven by the signed manifest digest, the RAM copy of the index and manifests, and the digest check skopeo makes on every blob it reads, and the installer checks that the unpacked image has the verified manifest's digest. The same file is mounted into the `bootc` container. This is the pattern of the legacy medium path and replaces nothing in the option-B policy: registry modes get no such exception.
+   **Prototype exception, declared (review 234, P3):** in payload mode the installer lends a policy of its own: default reject, `insecureAcceptAnything` only for the exact RAM layout `/run/ni-verified/host-oci` and for the `containers-storage` transport, whose store is a fresh tmpfs holding only the verified image. The identity of the bytes is proven by the signed manifest digest, the RAM copy of the index and manifests, and the digest check skopeo makes on every blob it reads, and the installer checks that the unpacked image has the verified manifest's digest. The same file is mounted into the `bootc` container. This is the pattern of the legacy medium path. It is a different file from the option-B policy of step 7: the registry and mirror modes will ship their own policy file and get no such exception.
 7. **Every pull** is checked by the host-side policy of Owner option B: `sigstoreSigned` with `keyPath` set to the v2 image-signing key (Scaleway KMS `ni-v2-image-signing`), with `signedIdentity` restricted to the v2 namespace. The installer's own `/etc/containers/policy.json` is the same policy.
-8. It runs the existing LUKS and TPM enrolment, policy activation, strict-policy restore and seed handoff, then reboots.
+8. It runs the existing LUKS and TPM enrolment, policy activation, strict-policy restore and seed handoff, then **powers off** (never reboots: a medium left in the machine must not start the installer again; the operator removes it and powers on).
 
 ### Making a medium
 
@@ -152,7 +152,7 @@ Build host DGX Spark .77 (arm64, KVM), work directory `/var/tmp/ni-geninst-20261
 | Firmware | `nvidia/580.159.03/gsp_ga10x.bin` and `gsp_tu10x.bin` (101 MiB tree), plus `nvidia.ko` of the same kernel, all in the initrd |
 | **UKI size, full package set** | **311,242,240 bytes = 296.8 MiB** (initrd 296 MB zstd, 640 MB unpacked; kernel 14.9 MB). Under the 450 MiB budget (D6) |
 | Package set | systemd, udev, podman, crun, skopeo, python3, openssl, jq, cryptsetup, tpm2-tools, dosfstools, e2fsprogs |
-| Kernel provenance | after the build, the canonical `vmlinuz` of the UKI hashes to the generation's `vmlinuz_unsigned_sha256` `1b2aaddf…` (checked by `build-in-container.sh`) |
+| Kernel provenance | after the build, the canonical `vmlinuz` emitted with the UKI hashes to the generation's `vmlinuz_unsigned_sha256` `1b2aaddf…` (checked by `build-in-container.sh`) |
 | Build, warm package cache | 41 s (UKI build only; the container tool install adds about 1 to 2 min). mkosi 25.3, systemd-ukify 257.13 (versions in the evidence file) |
 | Medium assembly | 6.6 s for 2.0 GiB (host image 1.6 GiB included) |
 | Gate, from kernel start | payload verified 3.9 s after kernel start |
@@ -162,11 +162,12 @@ Build host DGX Spark .77 (arm64, KVM), work directory `/var/tmp/ni-geninst-20261
 
 Proofs (`qemu-install-proof.sh`, `qemu-proof.sh`):
 
-- **Install**: release `v2-lab-train-3-20261005`, host `host-appliance@sha256:c3414495…`, the real signed train-3 manifest and the OCI layout cut from the LAN mirror store. `ni-generic: NI-GENERIC-PAYLOAD-OK` then `ni-generic-install: NI-GENERIC-INSTALL-OK`, then reboot.
+- **Install**: release `v2-lab-train-3-20261005`, host `host-appliance@sha256:c3414495…`, the real signed train-3 manifest and the OCI layout cut from the LAN mirror store. `ni-generic: NI-GENERIC-PAYLOAD-OK` then `ni-generic-install: NI-GENERIC-INSTALL-OK`, then power off.
 - **Refusals, each scripted (`tamper-payload.sh`, `EXPECT_REFUSAL` in `qemu-install-proof.sh`), target disk asserted untouched (0 bytes allocated, all zeros)**:
   - manifest with `bundle_seq` changed: `REFUSED: the release manifest does not verify under the sealed release key`;
   - good payload, UKI sealing `min_bundle_seq=2`: `REFUSED: bundle_seq 1 below the sealed floor 2`;
-  - UKI sealed `install_stage=production`: `REFUSED: this installer has no install gates yet`.
+  - UKI sealed `install_stage=production`: `REFUSED: this installer has no install gates yet`;
+  - one flipped byte in one layer (`tamper-payload.sh layer`): `REFUSED: cannot unpack the host image from the payload`.
 - Review 234 (Sonnet 5.5, high) of this step found one P2 (TOCTOU between verification and `skopeo copy`): fixed, the identity-bearing objects are now read once into RAM and used from there, and the unpacked image digest is checked. Evidence: `raw_mission_report_to_ingest/EVIDENCE-generic-installer-step2-20261006/`.
 - **First boot of the installed disk**: GRUB entry `Neural ICE CoreOS (ostree:0)`, initrd, `ostree-prepare-root`, switch root, `Welcome to Neural ICE CoreOS!`. Then the host's own first-boot gate `neural-ice-firstboot-tpm-ceremony.service` fails (`NI-E02`) and the system stops in emergency mode. **This is expected and is not a multi-user boot**: the installer does not yet provision the TPM ceremony, the PCR policy kargs or the LUKS data volume. The host refuses to run without them. It is the first release-blocking item.
 
@@ -181,9 +182,9 @@ Findings that shaped the installer (all reproduced in QEMU):
 
 ## Relation to ADR-0015
 
-ADR-0015 stays in force for everything this installer keeps: the access-profile anchor, the closed-world cmdline rule, the TPM device-root and policy-generation amendments (K, M, N, O), the PCR 7 coverage gate and amendment E (freshness is a sequence, not the RTC), which D2 extends with a signed freshness object.
+ADR-0015 stays in force for everything this installer keeps: the access-profile anchor, the closed-world cmdline rule, the TPM device-root amendment (D), the owner ceremony (K) and the policy-generation amendments (M, N, O), the PCR 7 coverage gate and amendment E (freshness is a sequence, not the RTC), which D2 extends with a signed freshness object.
 
-The other amendments of ADR-0015 carry over by intent, and are re-proved for the generic installer rather than assumed: C (single-purpose medium, one EFI authority: `assemble-media.sh` writes exactly ESP and payload), G (the medium identifies its own disk: by its `ni-payload` partition), H (one immutable image identity, resolved once: the RAM copy of the index and manifests, then the digest check after unpacking), I and K (TPM write-lock and owner ceremony) and L (the sealed core is inspected after the last write: to be redone for payload mode, see below).
+The other amendments of ADR-0015 carry over by intent, and are re-proved for the generic installer rather than assumed: C (single-purpose medium, one EFI authority: `assemble-media.sh` writes exactly ESP and payload), G (the medium identifies its own disk: by its `ni-payload` partition), H (one immutable image identity, resolved once: the RAM copy of the index and manifests, then the digest check after unpacking), I (TPM write-lock) and L (the sealed core is inspected after the last write: to be redone for payload mode, see below). Of these, only C and G hold by construction today and none has its own test yet; H is implemented for the identity of the image (the image is then referred to by the tag `localhost/ni-host:install` in the throw-away RAM store, the only writer being the installer).
 
 It describes, and this ADR replaces, the host-derived chain: §1 (dm-verity installer root and the sealed `neuralice.rootverity` and `neuralice.payload` fields), amendment A (verity squashfs runtime) and amendment B (the install payload as one object with a sealed header). Those sections still describe the code of `build-installer-{root,payload,uki,usb}.sh`, which builds the media of the current lane until the generic installer replaces it. **They are removed from ADR-0015 in the same change that removes that chain**; deleting them earlier would leave shipping code without its decision record. That removal is a release-blocking item.
 

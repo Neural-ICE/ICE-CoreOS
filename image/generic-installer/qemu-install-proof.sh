@@ -6,6 +6,7 @@
 # Usage: qemu-install-proof.sh OUTDIR MEDIUM.img [TARGET_GIB] [INSTALL_BUDGET_S] [BOOT_BUDGET_S]
 # Refusal proof: EXPECT_REFUSAL='<regex of the refusal text>' makes phase 1 succeed only when the installer prints
 # exactly that refusal, no install verdict, and leaves the target disk untouched (nothing allocated, all zeros).
+# EXPECT_RELEASE and EXPECT_HOST_DIGEST pin the release the install verdict must name (set them in CI).
 # Exit codes: 0 proven, 1 not proven, 2 installed and booted, but the host's own trust gate refused (NI-E02).
 set -euo pipefail
 OUT="${1:?outdir}"; MEDIUM="${2:?medium image}"; GIB="${3:-64}"; IB="${4:-2400}"; BB="${5:-420}"
@@ -40,7 +41,7 @@ if [ -n "${EXPECT_REFUSAL:-}" ]; then
   [ "$(grep -c 'REFUSED' "$OUT/phase1.verdicts")" = 1 ] && grep -qE "REFUSED: .*(${EXPECT_REFUSAL})" "$OUT/phase1.verdicts" && ! grep -q 'INSTALL-OK' "$OUT/phase1.verdicts" \
     || { echo "REFUSAL NOT PROVEN"; exit 1; }
   [ "$(du -s --block-size=1 "$TARGET" | cut -f1)" = 0 ] || { echo "TARGET DISK WAS WRITTEN"; exit 1; }
-  case "$(cmp "$TARGET" /dev/zero 2>&1 || true)" in *"EOF on"*) ;; *) echo "TARGET DISK WAS WRITTEN"; exit 1 ;; esac
+  LC_ALL=C cmp -s -n "$(stat -c %s "$TARGET")" "$TARGET" /dev/zero || { echo "TARGET DISK WAS WRITTEN"; exit 1; }
   echo "REFUSAL PROVEN, target disk untouched"; exit 0
 fi
 [ "$(grep -c 'NI-GENERIC-PAYLOAD-OK' "$OUT/phase1.verdicts")" = 1 ] && [ "$(grep -c 'NI-GENERIC-INSTALL-OK' "$OUT/phase1.verdicts")" = 1 ] && ! grep -q 'REFUSED' "$OUT/phase1.verdicts" \

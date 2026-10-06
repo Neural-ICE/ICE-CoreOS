@@ -48,12 +48,13 @@ cfg="$(jq -r '.config.digest // empty' "$(vblob "$child")")"; [[ "$cfg" =~ ^sha2
 take "$cfg" 4194304
 mapfile -t layers < <(jq -r '.layers[] | .digest + " " + (.size | tostring)' "$(vblob "$child")")
 [ "${#layers[@]}" -ge 1 ] || die "the manifest has no layers"
-packed=0
+packed=0; declare -A seen=()
 for l in "${layers[@]}"; do
   d="${l%% *}"; sz="${l##* }"
   [[ "$d" =~ ^sha256:[0-9a-f]{64}$ && "$sz" =~ ^[0-9]+$ ]] || die "malformed layer descriptor"
   [ -f "$(sblob "$d")" ] && [ ! -L "$(sblob "$d")" ] && [ "$(stat -c %s "$(sblob "$d")")" = "$sz" ] || die "layer $d is missing or has the wrong size"
-  ln -s "$(sblob "$d")" "$(vblob "$d")"; packed=$(( packed + sz ))
+  [ -z "${seen[$d]:-}" ] || continue     # a layer repeated in the manifest is stored, and counted, once
+  seen[$d]=1; ln -s "$(sblob "$d")" "$(vblob "$d")"; packed=$(( packed + sz ))
 done
 # Resource bound: the image is unpacked into RAM. Refuse before touching anything when it cannot fit.
 need=$(( packed * 3 + 2 * 1024 * 1024 * 1024 ))
@@ -66,8 +67,13 @@ pdev="$(findmnt -no SOURCE /run/ni-payload)"; medium="$(lsblk -no PKNAME "$pdev"
 list() { lsblk -dnbJ -o NAME,TYPE,RO,RM,TRAN,SIZE | jq -r --arg m "$medium" '.blockdevices[]
   | select(.type == "disk" and .name != $m and (.ro | tostring | . == "false" or . == "0") and (.rm | tostring | . == "false" or . == "0")
            and (.tran // "") != "usb" and (.size | tonumber) >= 34359738368) | .name' | sort; }
-prev=""; for _ in 1 2 3 4 5 6 7 8 9 10; do udevadm settle --timeout=30 || true; cur="$(list)"; [ "$cur" = "$prev" ] && break; prev="$cur"; sleep 2; done
-[ "$cur" = "$prev" ] || die "the disk list does not settle"
+prev="$(list)" || die "cannot list the disks"; settled=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  udevadm settle --timeout=30 || true; sleep 2; cur="$(list)" || die "cannot list the disks"
+  if [ "$cur" = "$prev" ]; then settled=1; break; fi
+  prev="$cur"
+done
+[ "$settled" = 1 ] || die "the disk list does not settle"
 mapfile -t cands <<< "$cur"; [ -n "$cur" ] || cands=()
 [ "${#cands[@]}" = 1 ] || die "need exactly one internal writable target disk of at least 32 GiB besides the medium, found ${#cands[@]}"
 disk="/dev/${cands[0]}"
@@ -86,6 +92,7 @@ say "unpacked in $(( SECONDS - t0 )) s, free memory $(( $(awk '/^MemAvailable:/ 
 # Cross-check the sealed values against the markers the host image carries (read only, no code of the image runs).
 pm() { podman --cgroup-manager=cgroupfs --events-backend=file "$@"; }
 mnt="$(pm image mount localhost/ni-host:install 2>/dev/null)" || die "cannot inspect the host image"
+for c in usr usr/lib usr/lib/neural-ice; do [ -d "$mnt/$c" ] && [ ! -L "$mnt/$c" ] || die "the host image has no plain /$c"; done
 marker() { [ -f "$mnt/usr/lib/neural-ice/$1" ] && [ ! -L "$mnt/usr/lib/neural-ice/$1" ] && [ "$(stat -c %s "$mnt/usr/lib/neural-ice/$1")" -le 256 ] \
   && tr -d '\n' < "$mnt/usr/lib/neural-ice/$1" || echo MISSING; }
 m_profile="$(marker access-policy)"; m_policy="$(marker signed-boot-trust-policy-id)"; m_target="$(marker hardware-target)"

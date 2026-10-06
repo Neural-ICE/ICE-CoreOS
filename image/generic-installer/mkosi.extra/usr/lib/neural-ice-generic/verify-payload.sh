@@ -2,7 +2,7 @@
 # The generic installer's first gate (ADR-0044). Nothing on the payload partition is used before
 # the release manifest it carries verifies under the release key whose file sha256 the UKI cmdline seals.
 # On success it writes /run/ni-verified/release.env, the only input the install step trusts.
-# Closed-world: sealed kargs exactly once and well-formed (an external cmdline appended by systemd-stub when
+# Closed-world: sealed kargs exactly once and well-formed (an external cmdline that systemd-stub appends, or substitutes, when
 # Secure Boot is off must not shadow them); exactly one payload partition; one bounded copy of each object,
 # verified and parsed from that copy; the manifest must be canonical JSON (no duplicate keys).
 set -euo pipefail
