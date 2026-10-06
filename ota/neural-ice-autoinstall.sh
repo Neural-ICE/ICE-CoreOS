@@ -1736,31 +1736,41 @@ assert_mirror_name_resolves() { # $1=host[:port] -> logs the address, or dies by
   die "${MIRROR_NAME_UNRESOLVABLE}: the LAN mirror ${host} did not resolve by mDNS (avahi-resolve via the resolve-only avahi-daemon on the management port) in ${MIRROR_MDNS_RESOLVE_ATTEMPTS} attempts of ${MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS}s; the bench must announce this name on the management LAN (lan-mirror-mdns.service) or the medium must seal an address; nothing has been written to the target disk"
 }
 
+# With a class prefix the refusal is EXACTLY that slug (its failure-evidence detail is then
+# deterministic); the diagnostic, which may quote a digest, goes to the log.
+esp_die() { # $1=class prefix (may be empty) $2=diagnostic
+  if [[ -n "$1" ]]; then
+    log "$1: $2"
+    die "$1"
+  fi
+  die "$2"
+}
+
 esp_snapshot_file() { # $1=basename $2=destination $3=die prefix (optional) -> copies it or fails
-  local name=$1 destination=$2 prefix=${3:+$3: } esp mountpoint mounted=0
+  local name=$1 destination=$2 prefix=${3:-} esp mountpoint mounted=0
   esp="$(media_vfat_partition || true)"
-  [[ -n "${esp:-}" ]] || die "${prefix}this medium carries no ESP to read ${name} from"
+  [[ -n "${esp:-}" ]] || esp_die "$prefix" "this medium carries no ESP to read ${name} from"
   mountpoint="$(mounted_at "/dev/$esp" || true)"
   if [[ -z "$mountpoint" ]]; then
     mountpoint=/run/neural-ice-installer/esp
     install -d -m 0700 "$mountpoint"
     mount -o ro,nodev,nosuid,noexec "/dev/$esp" "$mountpoint" \
-      || die "${prefix}cannot mount the installer ESP read-only to read ${name}"
+      || esp_die "$prefix" "cannot mount the installer ESP read-only to read ${name}"
     mounted=1
   fi
   if [[ -f "$mountpoint/ice-coreos/$name" && ! -L "$mountpoint/ice-coreos/$name" ]]; then
     install -m 0600 "$mountpoint/ice-coreos/$name" "$destination" \
-      || die "${prefix}cannot snapshot ${name} from the installer ESP"
+      || esp_die "$prefix" "cannot snapshot ${name} from the installer ESP"
   else
     (( mounted == 1 )) && umount "$mountpoint"
-    die "${prefix}the installer ESP carries no ${name}; this medium's signature says it must"
+    esp_die "$prefix" "the installer ESP carries no ${name}; this medium's signature says it must"
   fi
-  (( mounted == 1 )) && { umount "$mountpoint" || die "${prefix}cannot unmount the installer ESP after reading ${name}"; }
+  (( mounted == 1 )) && { umount "$mountpoint" || esp_die "$prefix" "cannot unmount the installer ESP after reading ${name}"; }
   return 0
 }
 
 esp_staged_file() { # $1=basename $2=expected sha256 $3=destination $4=die prefix (optional) -> stages it or fails
-  local name=$1 expected=$2 destination=$3 prefix=${4:+$4: } observed
+  local name=$1 expected=$2 destination=$3 prefix=${4:-} observed
   esp_snapshot_file "$name" "$destination" "${4:-}"
   # 🔴 THE HASH IS THE POINT. The ESP is a mutable vfat partition an attacker
   # holding the medium can rewrite; the value it is compared against is inside
@@ -1768,7 +1778,7 @@ esp_staged_file() { # $1=basename $2=expected sha256 $3=destination $4=die prefi
   # actually be used, so the file cannot change between the check and the use.
   observed="$(sha256sum -- "$destination" | awk '{print tolower($1)}')"
   [[ "$observed" == "$expected" ]] \
-    || die "${prefix}the ESP's ${name} hashes to ${observed}, not the ${expected} this medium's signature seals"
+    || esp_die "$prefix" "the ESP's ${name} hashes to ${observed}, not the ${expected} this medium's signature seals"
   return 0
 }
 
@@ -1776,11 +1786,11 @@ esp_staged_file() { # $1=basename $2=expected sha256 $3=destination $4=die prefi
 # over these very bytes. Bounded, so a hostile medium cannot hand the verifier an
 # unbounded document.
 esp_staged_file_unsealed() { # $1=basename $2=destination $3=die prefix (optional)
-  local name=$1 destination=$2 prefix=${3:+$3: } size
+  local name=$1 destination=$2 prefix=${3:-} size
   esp_snapshot_file "$name" "$destination" "${3:-}"
   size="$(stat -c %s -- "$destination")"
   [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size <= 4096 )) \
-    || die "${prefix}the ESP's ${name} is empty or larger than 4096 bytes"
+    || esp_die "$prefix" "the ESP's ${name} is empty or larger than 4096 bytes"
   return 0
 }
 
@@ -2110,9 +2120,14 @@ verify_pcr_rules() {
     --efivars "$PCR_RULES_EFIVARS" \
     --live \
     >"$PCR_RULES_VERDICT_RUNTIME" 2>"$engine_err" </dev/null || rc=$?
-  # The engine's diagnostics name digests and certificates: journal only, never
-  # the failure code and never the die() message.
-  while IFS= read -r _line; do log "NI-P7-RULES engine: ${_line:0:300}"; done < <(head -n 20 "$engine_err")
+  # The engine's diagnostics name digests, certificates and authority names read from
+  # the firmware's event log. They go to the log (journal AND console, like every
+  # other line here), reduced to printable ASCII and bounded, and never into the
+  # failure code or the die() message.
+  while IFS= read -r _line; do
+    _line="$(printf '%s' "$_line" | LC_ALL=C tr -cd '\040-\176')"
+    log "NI-P7-RULES engine: ${_line:0:300}"
+  done < <(head -n 20 "$engine_err")
   rm -f -- "$engine_err"
   # The decision is the installer's, taken on a CLOSED reading of the verdict:
   # exit status and `accepted` must agree, every rule check must have reported
@@ -2194,11 +2209,13 @@ if not accepted:
 try:
     assert set(verdict) == {"accepted", "binding", "observed", "rules_sha256", "sequence", "checks"}
     names = [check["name"] for check in checks]
-    assert len(names) == len(set(names)) and REQUIRED <= set(names)
+    # Exactly the checks this reader knows: an unknown one is an engine this reader
+    # was not written for, and "ok" from it means nothing here.
+    assert len(names) == len(set(names)) and REQUIRED <= set(names) and set(names) <= set(SLUGS)
     assert all(check["ok"] for check in checks)
     assert verdict["rules_sha256"] == sealed_digest
     assert isinstance(verdict["sequence"], int) and not isinstance(verdict["sequence"], bool)
-    assert verdict["sequence"] >= int(floor)
+    assert int(floor) <= verdict["sequence"] <= 2**53 - 1
     assert verdict["binding"] in ("contents", "names-only")
     observed = verdict["observed"]
     assert isinstance(observed, list) and observed == [c["name"] for c in checks if c["binding"] == "observed"]
@@ -2206,6 +2223,12 @@ try:
     # `observed` and the binding must tell the same story: names-only means the
     # log carried a variable by name only, contents means no variable was.
     assert (verdict["binding"] == "names-only") == ("unbound-variables" in observed)
+    # SetupMode is read from efivarfs, never measured: it is always observed. And a
+    # names-only log leaves at least one of the variable-derived checks observed.
+    assert "setup-mode" in observed
+    if verdict["binding"] == "names-only":
+        assert observed and set(observed) & {"secure-boot", "pk-present", "pk-approved", "kek-approved",
+                                             "db-subset-of-approved", "dbx-superset-of-floor"}
 except (AssertionError, KeyError, TypeError, ValueError):
     refuse("verdict-malformed")
 print("accept {} {} {} {}".format(
@@ -2235,7 +2258,7 @@ PCR_RULES_VERDICT_PY
   log "NI-P7-RULES: accepted (rules sha256 ${PCR_RULES_RULES_SHA256:0:16}…, sequence $PCR_RULES_SEQUENCE, binding $PCR_RULES_BINDING, observed-not-attested: $PCR_RULES_OBSERVED)"
 }
 
-if [[ -z "$PCR_RULES_DIGEST" && -z "$PCR_RULES_SEQ" ]]; then
+if (( $(karg_count neuralice.pcr_rules) == 0 && $(karg_count neuralice.pcr_rules_seq) == 0 )); then
   log "NI-P7-RULES: this medium seals no PCR rules; NI-P7-COVERAGE is its only PCR7 gate"
 else
   [[ "$PCR_RULES_DIGEST" =~ ^[0-9a-f]{64}$ && "$PCR_RULES_SEQ" =~ ^[1-9][0-9]{0,18}$ ]] \

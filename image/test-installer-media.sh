@@ -1853,6 +1853,35 @@ make_esp "$SEALED/installer-rules-floor-above.efi" "$SEALED/installer-rules-floo
 assemble "$ESP" "$SEALED/payload.img"
 inspect >/dev/null 2>&1 \
   && fail "a medium whose sealed sequence floor exceeds the rules' own sequence was accepted"
+# One bound on the signature for every reader (4096 bytes: the installer's), and one
+# strict reading of the rules for every reader (the builder's): a medium the installer
+# or the engine would refuse after the wipe is refused here, at the cut.
+rules_case() { # $1=name $2=rules doc $3=signature file -> builds and inspects the medium
+  local name=$1 doc=$2 sig=$3 sha
+  sha="$(sha256sum "$doc" | awk '{print $1}')"
+  build_uki "installer-rules-$name" "$pcr_rules_head neuralice.pcr_rules=${sha} neuralice.pcr_rules_seq=7" >/dev/null \
+    || fail "the PCR rules '$name' UKI failed to build"
+  make_esp "$SEALED/installer-rules-$name.efi" "$SEALED/installer-rules-$name.efi.manifest" \
+    installer-install.efi.manifest "::/ice-coreos/pcr-rules/rules.json=$doc" "::/ice-coreos/pcr-rules/rules.json.sig=$sig"
+  assemble "$ESP" "$SEALED/payload.img"
+  inspect
+}
+rules_ok="$TMP/pcr-rules-ok.json"
+printf '%s' '{"schema":"ni-pcr-rules/1","sequence":7,"unbound_variables":"allow"}' > "$rules_ok"
+rules_case strict-ok "$rules_ok" "$TMP/pcr-rules.json.sig" >/dev/null 2>&1 \
+  || fail "the strict-reading control medium was refused"
+head -c 5000 /dev/zero | tr '\0' 'A' > "$TMP/pcr-rules-bigsig.sig"
+rules_case bigsig "$rules_ok" "$TMP/pcr-rules-bigsig.sig" >/dev/null 2>&1 \
+  && fail "a 5000-byte rules signature (the installer refuses above 4096) was accepted"
+printf '%s' '{"schema":"ni-pcr-rules/1","sequence":7,"sequence":8,"unbound_variables":"allow"}' > "$TMP/pcr-rules-dupkey.json"
+rules_case dupkey "$TMP/pcr-rules-dupkey.json" "$TMP/pcr-rules.json.sig" >/dev/null 2>&1 \
+  && fail "rules carrying a duplicated JSON key were accepted"
+printf '%s' '{"schema":"ni-pcr-rules/1","sequence":1152921504606846976,"unbound_variables":"allow"}' > "$TMP/pcr-rules-hugeseq.json"
+rules_case hugeseq "$TMP/pcr-rules-hugeseq.json" "$TMP/pcr-rules.json.sig" >/dev/null 2>&1 \
+  && fail "rules whose sequence is above 2^53-1 were accepted"
+printf '%s' '{"schema":"ni-pcr-rules/1","sequence":NaN,"unbound_variables":"allow"}' > "$TMP/pcr-rules-nan.json"
+rules_case nan "$TMP/pcr-rules-nan.json" "$TMP/pcr-rules.json.sig" >/dev/null 2>&1 \
+  && fail "rules carrying a non-finite number were accepted"
 # Restore the good registry medium for the assertions that follow.
 make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
   installer-install.efi.manifest "${registry_esp_files[@]}"
