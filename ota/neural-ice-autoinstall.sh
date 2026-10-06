@@ -319,17 +319,23 @@ heartbeat_start() { # $1=label — proof-of-life tick on the console every 20 s
 # that a non-installing Live/rescue boot cannot create a persistent TPM object
 # (ota/neural-ice-device-root-installer-only.conf). It must NOT survive in the
 # installed appliance: kept, it would suppress the first-boot ceremony and every
-# later attestation for ever. WHERE the guard can come from decides what is
-# measured on the staged deployment, and that is the install source:
-#   medium   — bootc deploys the sealed store's image and the deployment /etc
-#              replicates the installer's, so the guard IS there and is removed;
-#              its absence means this is not the deployment the installer staged.
+# later attestation for ever. The desired end state is therefore ABSENCE, for
+# every install source; what differs is only what a present drop-in means:
+#   medium   — bootc deploys the sealed store's image, which is exactly
+#              BASE_IMAGE (the appliance), never the installer image: the guard
+#              lives only in image/Containerfile.installer, so the deployment
+#              normally carries none and that is the final state. A drop-in that
+#              is nevertheless there (a store built from an installer-derived
+#              image) is installer-only state and is removed here.
 #   registry — bootc deploys the pulled appliance image's own /etc; the guard
 #              never existed there. Its presence would be foreign content that
 #              the pinned appliance ships, and a medium must not silently repair
 #              the appliance it deploys.
-# Measured 2026-09-07 (QEMU, LIGHT 0.60.0 f25a, neuralice.source=registry): the
-# medium-only expectation killed phase 6 in front of a correct deployment.
+# In both sources a symlink (or any non-regular entry) is refused before any
+# removal. Measured 2026-09-07 (registry) and 2026-10-06 (medium, mission B
+# candidate): demanding the drop-in killed phase 6 in front of a correct
+# deployment; the old "deployment /etc replicates the installer's" premise
+# ended when the installer started installing the store's BASE_IMAGE.
 remove_installer_device_root_guard() { # $1=deployment root  $2=install source
   local dep="$1" source="$2" dropin
   dropin="$dep/etc/systemd/system/neural-ice-device-root.service.d/10-installer-only.conf"
@@ -337,8 +343,12 @@ remove_installer_device_root_guard() { # $1=deployment root  $2=install source
     || die "installer device-root Live guard is a symlink in the target deployment"
   case "$source" in
     medium)
+      if [[ ! -e "$dropin" ]]; then
+        log "Medium-sourced deployment carries no installer-only device-root guard (the sealed store holds the appliance image); nothing to remove."
+        return 0
+      fi
       [[ -f "$dropin" ]] \
-        || die "installer device-root Live guard is missing from the target deployment"
+        || die "installer device-root Live guard is not a regular file in the target deployment"
       ;;
     registry)
       [[ ! -e "$dropin" ]] \
@@ -4746,8 +4756,8 @@ stateroot="$(dirname "$(dirname "$dep")")"   # …/ostree/deploy/<name>
 mount -o remount,rw "$TGT" \
   || die "cannot remount the target read-write after bootc finalize"
 # The installer-only Live guard is intentionally not part of the installed
-# deployment (see remove_installer_device_root_guard): what the deployment
-# must carry depends on which /etc bootc deployed, i.e. on the install source.
+# deployment (see remove_installer_device_root_guard): its absence is the
+# desired end state; a leftover drop-in is removed, never kept.
 remove_installer_device_root_guard "$dep" "$INSTALL_SOURCE"
 
 # The first-boot ceremony unit is the pinned appliance's own
