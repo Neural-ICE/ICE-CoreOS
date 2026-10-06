@@ -650,8 +650,10 @@ ni-ota-verify verify-retained-v2-release --manifest F --manifest-sig F --release
   change nothing. It re-runs `verify-retained-v2-release` against the live `/`, binds
   the receipt digest, the manifest and the TPM floor to the evidence, and the booted
   deployment (`repository@index digest`, platform manifest) to the receipt's host.
-  There is no `relaxed` branch and no OTA transaction window on this lane: an updated
-  host is refused until the successor rule (T9) lands.
+  There is no `relaxed` branch and no OTA transaction window on this lane. An updated
+  host is accepted by the succession rule (T9, contract §8.1) when it is the host of the
+  signed current release `/var/lib/neural-ice-v2/current-release/`; any other host is
+  refused.
 * Test seams, `test-path-overrides` only (absent from the shipped binary, checked by
   `tests/v2_release_shipped.rs`): `--root DIR` on the retained verb and
   `NI_OTA_AUTH_STATUS_V2_ROOT` for the status reader replace `/`.

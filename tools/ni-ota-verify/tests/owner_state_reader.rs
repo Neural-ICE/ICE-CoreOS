@@ -3656,3 +3656,467 @@ fn preseal_lane_refuses_v2_release_state_beside_it() {
     assert_owner_status_refused(&owner.fixture, &output, &before);
     assert!(String::from_utf8_lossy(&output.stderr).contains("mixed with v2-release evidence"));
 }
+
+// ---------------------------------------------------------------------------
+// T9, the succession rule: a booted host that is not the one the install
+// receipt names is accepted when it is the host of the CURRENT RELEASE — the
+// manifest `/var/lib/neural-ice-v2/current-release/` that the engine hands over
+// — signed under the receipt's own release key, at a `bundle_seq` no lower than
+// the TPM floor, for the receipt's hardware target and release authority.
+// The golden key is not kept, so these appliances are re-keyed with a key the
+// test holds: the receipt, its digest and the completion evidence follow it.
+// ---------------------------------------------------------------------------
+
+const SUCCESSOR_INDEX: &str =
+    "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+const SUCCESSOR_CHILD: &str =
+    "sha256:d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+
+struct V2Keyed {
+    owner: V2Owner,
+    private_key: PathBuf,
+}
+
+fn sign_v2_manifest(private_key: &Path, work: &Path, name: &str, manifest: &[u8]) -> Vec<u8> {
+    let payload = work.join(format!("{name}.manifest"));
+    let der = work.join(format!("{name}.der"));
+    fs::write(&payload, manifest).unwrap();
+    openssl(&[
+        "dgst",
+        "-sha256",
+        "-sign",
+        private_key.to_str().unwrap(),
+        "-out",
+        der.to_str().unwrap(),
+        payload.to_str().unwrap(),
+    ]);
+    base64(&fs::read(&der).unwrap()).into_bytes()
+}
+
+/// A completed v2 appliance whose receipt key is `private_key`: the golden
+/// manifest is re-signed, the receipt and the evidence re-bound to it.
+fn install_v2_keyed_owner(name: &str) -> V2Keyed {
+    let mut owner = install_v2_owner(name, "manifest-digest");
+    let work = owner.fixture.root.join("keyed");
+    fs::create_dir(&work).unwrap();
+    let private_key = work.join("release.key");
+    let public_key = work.join("release.pub");
+    openssl(&[
+        "ecparam",
+        "-name",
+        "prime256v1",
+        "-genkey",
+        "-noout",
+        "-out",
+        private_key.to_str().unwrap(),
+    ]);
+    openssl(&[
+        "ec",
+        "-in",
+        private_key.to_str().unwrap(),
+        "-pubout",
+        "-out",
+        public_key.to_str().unwrap(),
+    ]);
+    let public = fs::read(&public_key).unwrap();
+    let key_sha = hash(&public);
+    fs::write(
+        owner
+            .live_root
+            .join("usr/lib/neural-ice/keys/release-authorization.pub"),
+        &public,
+    )
+    .unwrap();
+    let manifest = fs::read(owner.state("v2-release-input-v1/release-manifest.json")).unwrap();
+    let signature = sign_v2_manifest(&private_key, &work, "install", &manifest);
+    write_mode(
+        &owner.state("v2-release-input-v1/release-manifest.json.sig"),
+        &signature,
+        0o600,
+    );
+    let mut receipt: Value =
+        serde_json::from_slice(&fs::read(owner.state("v2-release/receipt.json")).unwrap()).unwrap();
+    receipt["release_key_sha256"] = json!(key_sha);
+    receipt["manifest_sig_sha256"] = json!(hash(&signature));
+    let receipt_bytes = canonical(&receipt);
+    write_mode(
+        &owner.state("v2-release/receipt.json"),
+        &receipt_bytes,
+        0o600,
+    );
+    owner.golden["inputs"]["sealed_key_sha256"] = json!(key_sha);
+    owner.golden["inputs"]["sealed_manifest_sig_sha256"] = json!(hash(&signature));
+    owner.golden["expected"]["receipt_sha256"]["manifest-digest"] = json!(hash(&receipt_bytes));
+    let evidence = v2_evidence(&owner, V2_FLOOR);
+    install_v2_completion(&owner, &evidence, V2_FLOOR);
+    V2Keyed { owner, private_key }
+}
+
+impl V2Keyed {
+    fn current_release(&self, relative: &str) -> PathBuf {
+        self.owner
+            .live_root
+            .join("var/lib/neural-ice-v2/current-release")
+            .join(relative)
+    }
+
+    /// The golden manifest with `edit` applied, signed by `key`, handed over
+    /// as the current release.
+    fn hand_over(&self, key: &Path, edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let mut manifest: Value = serde_json::from_slice(
+            &fs::read(
+                self.owner
+                    .state("v2-release-input-v1/release-manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        edit(&mut manifest);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let signature = sign_v2_manifest(
+            key,
+            &self.owner.fixture.root.join("keyed"),
+            "current",
+            &bytes,
+        );
+        fs::create_dir_all(self.current_release("")).unwrap();
+        write_mode(
+            &self.current_release("release-manifest.json"),
+            &bytes,
+            0o644,
+        );
+        write_mode(
+            &self.current_release("release-manifest.json.sig"),
+            &signature,
+            0o644,
+        );
+        bytes
+    }
+
+    /// The signed successor host: bundle 4, a new index digest.
+    fn hand_over_successor(&self) {
+        self.hand_over(&self.private_key, |manifest| {
+            manifest["bundle_seq"] = json!(V2_FLOOR + 1);
+            manifest["release_id"] = json!("v2-test-train-4");
+            manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+        });
+    }
+
+    fn repository(&self) -> String {
+        self.owner.golden["expected"]["host_repository"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn boot(&self, index_digest: &str, child: &str) {
+        self.boot_ref(&format!("{}@{index_digest}", self.repository()), child);
+    }
+
+    fn boot_ref(&self, host: &str, child: &str) {
+        fs::remove_file(&self.owner.ostree.origin).unwrap();
+        write_mode(
+            &self.owner.ostree.origin,
+            format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{host}\n")
+                .as_bytes(),
+            0o644,
+        );
+        fs::write(&self.owner.ostree.metadata, format!("'{child}'\n")).unwrap();
+    }
+
+    fn boot_successor(&self) {
+        self.boot(SUCCESSOR_INDEX, SUCCESSOR_CHILD);
+    }
+}
+
+const NOT_THE_CURRENT_HOST: &str =
+    "booted deployment differs from authenticated v2 release baseline";
+
+#[test]
+fn v2_keyed_owner_is_still_accepted_on_the_install_host() {
+    // The re-keying itself changes nothing the reader judges.
+    let keyed = install_v2_keyed_owner("v2-t9-install-host");
+    let output = keyed.owner.run();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, V2_HELD_STATUS);
+}
+
+#[test]
+fn v2_lane_accepts_the_host_of_the_signed_current_release() {
+    let keyed = install_v2_keyed_owner("v2-t9-successor");
+    keyed.hand_over_successor();
+    keyed.boot_successor();
+    let before = observe_tree(&keyed.owner.fixture.state);
+    let output = keyed.owner.run();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The licence gate compares these bytes: the same as for the install host.
+    assert_eq!(output.stdout, V2_HELD_STATUS);
+    assert_eq!(
+        output.stdout,
+        fs::read(v2_golden().join("expected-authenticated-ota-status.json")).unwrap()
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(observe_tree(&keyed.owner.fixture.state), before);
+    assert_eq!(
+        fs::read_dir(&keyed.owner.fixture.scratch).unwrap().count(),
+        0
+    );
+    let calls = fs::read_to_string(&keyed.owner.fixture.calls).unwrap();
+    assert!(!calls.contains("FORBIDDEN"), "{calls}");
+}
+
+#[test]
+fn v2_lane_accepts_a_current_release_at_the_floor_itself() {
+    // `bundle_seq >= floor`: a host re-issued at the floor is not below it.
+    let keyed = install_v2_keyed_owner("v2-t9-at-floor");
+    keyed.hand_over(&keyed.private_key, |manifest| {
+        manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+    });
+    keyed.boot_successor();
+    assert_eq!(keyed.owner.run().status.code(), Some(0));
+}
+
+#[test]
+fn v2_lane_keeps_the_install_host_accepted_after_a_rollback() {
+    // The engine rolled back: the booted host is the receipt's again while the
+    // current release still names the successor, or names nothing readable.
+    let keyed = install_v2_keyed_owner("v2-t9-rollback");
+    keyed.hand_over_successor();
+    assert_eq!(keyed.owner.run().status.code(), Some(0));
+    fs::write(keyed.current_release("release-manifest.json"), b"{not json").unwrap();
+    let output = keyed.owner.run();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, V2_HELD_STATUS);
+}
+
+#[test]
+fn v2_lane_refuses_a_booted_host_the_current_release_does_not_name() {
+    let unknown = install_v2_keyed_owner("v2-t9-unknown-digest");
+    unknown.hand_over_successor();
+    unknown.boot(&format!("sha256:{}", "9".repeat(64)), SUCCESSOR_CHILD);
+    unknown
+        .owner
+        .assert_refused("unknown index digest", NOT_THE_CURRENT_HOST);
+
+    // The right index digest, pulled from another repository.
+    let foreign = install_v2_keyed_owner("v2-t9-other-repository");
+    foreign.hand_over_successor();
+    foreign.boot_ref(
+        &format!("registry.example.invalid/neural-ice-test/host-appliance@{SUCCESSOR_INDEX}"),
+        SUCCESSOR_CHILD,
+    );
+    foreign
+        .owner
+        .assert_refused("another repository", NOT_THE_CURRENT_HOST);
+
+    // No current release at all: only the receipt's host is the host.
+    let none = install_v2_keyed_owner("v2-t9-no-current-release");
+    none.boot_successor();
+    none.owner
+        .assert_refused("no current release", NOT_THE_CURRENT_HOST);
+
+    // A malformed platform manifest digest is no host.
+    let child = install_v2_keyed_owner("v2-t9-malformed-child");
+    child.hand_over_successor();
+    child.boot(SUCCESSOR_INDEX, "not-a-digest");
+    child
+        .owner
+        .assert_refused("malformed child", "booted manifest metadata is malformed");
+}
+
+#[test]
+fn v2_lane_refuses_a_current_release_below_the_floor() {
+    let keyed = install_v2_keyed_owner("v2-t9-below-floor");
+    keyed.hand_over(&keyed.private_key, |manifest| {
+        manifest["bundle_seq"] = json!(V2_FLOOR - 1);
+        manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+    });
+    keyed.boot_successor();
+    keyed
+        .owner
+        .assert_refused("bundle_seq 2 under floor 3", "bundle-seq");
+}
+
+#[test]
+fn v2_lane_refuses_a_current_release_signed_by_another_key() {
+    let keyed = install_v2_keyed_owner("v2-t9-other-key");
+    let other = keyed.owner.fixture.root.join("keyed/other.key");
+    openssl(&[
+        "ecparam",
+        "-name",
+        "prime256v1",
+        "-genkey",
+        "-noout",
+        "-out",
+        other.to_str().unwrap(),
+    ]);
+    keyed.hand_over(&other, |manifest| {
+        manifest["bundle_seq"] = json!(V2_FLOOR + 1);
+        manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+    });
+    keyed.boot_successor();
+    keyed.owner.assert_refused("another key", "signature");
+
+    // A manifest altered after it was signed.
+    let tampered = install_v2_keyed_owner("v2-t9-tampered");
+    tampered.hand_over_successor();
+    let path = tampered.current_release("release-manifest.json");
+    let mut bytes = fs::read(&path).unwrap();
+    let at = bytes
+        .windows(7)
+        .position(|window| window == b"train-4")
+        .unwrap();
+    bytes[at + 6] = b'5';
+    write_mode(&path, &bytes, 0o644);
+    tampered.boot_successor();
+    tampered
+        .owner
+        .assert_refused("manifest altered", "signature");
+}
+
+#[test]
+fn v2_lane_refuses_a_current_release_for_another_target_or_authority() {
+    let target = install_v2_keyed_owner("v2-t9-other-target");
+    target.hand_over(&target.private_key, |manifest| {
+        manifest["bundle_seq"] = json!(V2_FLOOR + 1);
+        manifest["hardware_target"] = json!("nvidia-gb200-arm64");
+        manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+    });
+    target.boot_successor();
+    target
+        .owner
+        .assert_refused("another hardware target", "hardware-target");
+
+    let authority = install_v2_keyed_owner("v2-t9-other-authority");
+    let foreign = "registry.example.invalid/neural-ice-test/host-appliance";
+    authority.hand_over(&authority.private_key, |manifest| {
+        manifest["bundle_seq"] = json!(V2_FLOOR + 1);
+        manifest["host"]["repository"] = json!(foreign);
+        manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+    });
+    authority.boot_ref(&format!("{foreign}@{SUCCESSOR_INDEX}"), SUCCESSOR_CHILD);
+    authority
+        .owner
+        .assert_refused("another authority", "authority");
+}
+
+#[test]
+fn v2_lane_refuses_a_current_release_that_is_not_a_plain_file_pair() {
+    let missing = install_v2_keyed_owner("v2-t9-no-signature");
+    missing.hand_over_successor();
+    fs::remove_file(missing.current_release("release-manifest.json.sig")).unwrap();
+    missing.boot_successor();
+    missing
+        .owner
+        .assert_refused("signature absent", NOT_THE_CURRENT_HOST);
+
+    let link = install_v2_keyed_owner("v2-t9-symlinked");
+    link.hand_over_successor();
+    let real = link.owner.fixture.root.join("keyed/real-manifest.json");
+    fs::rename(link.current_release("release-manifest.json"), &real).unwrap();
+    std::os::unix::fs::symlink(&real, link.current_release("release-manifest.json")).unwrap();
+    link.boot_successor();
+    link.owner
+        .assert_refused("manifest is a symlink", NOT_THE_CURRENT_HOST);
+
+    let big = install_v2_keyed_owner("v2-t9-oversized");
+    big.hand_over_successor();
+    write_mode(
+        &big.current_release("release-manifest.json"),
+        &vec![b' '; 1024 * 1024 + 2],
+        0o644,
+    );
+    big.boot_successor();
+    big.owner
+        .assert_refused("manifest oversized", NOT_THE_CURRENT_HOST);
+}
+
+#[test]
+fn v2_lane_still_refuses_a_successor_under_a_written_anchor_or_drifted_root() {
+    // The succession rule relaxes ONLY the host comparison.
+    let written = install_v2_keyed_owner("v2-t9-written");
+    written.hand_over_successor();
+    written.boot_successor();
+    let public = owner_public(
+        "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56",
+        "policywrite|authread|ownerread|no_da|nt=extend|written",
+    );
+    install_read_only_tpm(
+        &written.owner.fixture,
+        &written.owner.access,
+        &public,
+        Some(&"ab".repeat(32)),
+        V2_FLOOR,
+    );
+    written
+        .owner
+        .assert_refused("written anchor", "owner-state inspection does not match");
+
+    // A live root carrying another release key is not the receipt's key, even
+    // when the current release is signed by that very key.
+    let rekeyed = install_v2_keyed_owner("v2-t9-live-key");
+    let other = rekeyed.owner.fixture.root.join("keyed/other.key");
+    let other_pub = rekeyed.owner.fixture.root.join("keyed/other.pub");
+    openssl(&[
+        "ecparam",
+        "-name",
+        "prime256v1",
+        "-genkey",
+        "-noout",
+        "-out",
+        other.to_str().unwrap(),
+    ]);
+    openssl(&[
+        "ec",
+        "-in",
+        other.to_str().unwrap(),
+        "-pubout",
+        "-out",
+        other_pub.to_str().unwrap(),
+    ]);
+    fs::copy(
+        &other_pub,
+        rekeyed
+            .owner
+            .live_root
+            .join("usr/lib/neural-ice/keys/release-authorization.pub"),
+    )
+    .unwrap();
+    rekeyed.hand_over(&other, |manifest| {
+        manifest["bundle_seq"] = json!(V2_FLOOR + 1);
+        manifest["host"]["digest"] = json!(SUCCESSOR_INDEX);
+    });
+    rekeyed.boot_successor();
+    rekeyed
+        .owner
+        .assert_refused("live key is not the receipt's", "key-digest");
+}
+
+#[test]
+fn v2_lane_does_not_let_the_current_release_re_pick_the_install_hosts_platform_child() {
+    // The install host's index digest fixes its platform manifest: a signed
+    // current release that names that same host cannot admit another child.
+    let keyed = install_v2_keyed_owner("v2-t9-install-child");
+    keyed.hand_over(&keyed.private_key, |manifest| {
+        manifest["bundle_seq"] = json!(V2_FLOOR + 1);
+    });
+    keyed.boot(
+        keyed.owner.golden["inputs"]["host_index_digest"]
+            .as_str()
+            .unwrap(),
+        SUCCESSOR_CHILD,
+    );
+    keyed
+        .owner
+        .assert_refused("install digest, another child", NOT_THE_CURRENT_HOST);
+}

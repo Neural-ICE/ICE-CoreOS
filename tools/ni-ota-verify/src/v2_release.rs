@@ -158,6 +158,7 @@ pub(crate) struct VerifiedV2Release {
     pub(crate) manifest_sha256: String,
     pub(crate) manifest_sig_sha256: String,
     pub(crate) release_key_sha256: String,
+    pub(crate) hardware_target: String,
     /// The booted deployment the reader binds to (design P4): the image
     /// repository, its index digest and the platform child's digest.
     pub(crate) host_repository: String,
@@ -631,8 +632,9 @@ pub(crate) fn verify_retained(
     }
 }
 
-fn retained(paths: &RetainedPaths<'_>) -> Check<VerifiedV2Release> {
-    let scratch = paths.scratch_dir;
+/// The private scratch store of a retained verb: an absolute canonical path
+/// beneath `/run` (beneath anything in the test build) that is a trust boundary.
+fn scratch_store(scratch: &Path) -> Check<FileStateStore> {
     if !scratch.is_absolute()
         || scratch.components().any(|component| {
             matches!(
@@ -659,6 +661,11 @@ fn retained(paths: &RetainedPaths<'_>) -> Check<VerifiedV2Release> {
             "the retained v2 scratch directory is not private: {reason}"
         ))));
     }
+    Ok(store)
+}
+
+fn retained(paths: &RetainedPaths<'_>) -> Check<VerifiedV2Release> {
+    let store = scratch_store(paths.scratch_dir)?;
 
     let receipt_file = snapshot(
         &store,
@@ -780,9 +787,119 @@ fn retained(paths: &RetainedPaths<'_>) -> Check<VerifiedV2Release> {
         manifest_sha256: receipt.manifest_sha256,
         manifest_sig_sha256: receipt.manifest_sig_sha256,
         release_key_sha256: receipt.release_key_sha256,
+        hardware_target: receipt.hardware_target,
         host_repository: receipt.host_repository,
         host_index_digest: receipt.host_index_digest,
         host_manifest_digest: receipt.host_manifest_digest,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The succession rule (mission B, T9)
+// ---------------------------------------------------------------------------
+
+pub(crate) struct SuccessorPaths<'a> {
+    /// The current release the engine handed over, and its detached signature.
+    pub(crate) manifest: &'a Path,
+    pub(crate) manifest_sig: &'a Path,
+    /// The live root's release key, already proved to be the receipt's.
+    pub(crate) release_key: &'a Path,
+    pub(crate) scratch_dir: &'a Path,
+}
+
+/// The host a signed current-release manifest names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SuccessorHost {
+    pub(crate) repository: String,
+    pub(crate) index_digest: String,
+}
+
+/// An updated host is the host of the CURRENT release when that manifest is
+/// signed under the receipt's own release key, is no older than the TPM floor
+/// and names the receipt's hardware target and release authority. Nothing else
+/// about the install is relaxed: the receipt, the evidence, the floor and the
+/// live root are authenticated by `verify_retained` before this runs. `Ok(Err(_))`
+/// is a verdict (`class: detail`), `Err` a tooling failure.
+pub(crate) fn verify_successor(
+    paths: &SuccessorPaths<'_>,
+    baseline: &VerifiedV2Release,
+    floor: u64,
+) -> Result<Result<SuccessorHost, String>, InternalError> {
+    match successor(paths, baseline, floor) {
+        Ok(host) => Ok(Ok(host)),
+        Err(Failure::Refused(refusal)) => Ok(Err(refusal.render())),
+        Err(Failure::Internal(error)) => Err(error),
+    }
+}
+
+fn successor(
+    paths: &SuccessorPaths<'_>,
+    baseline: &VerifiedV2Release,
+    floor: u64,
+) -> Check<SuccessorHost> {
+    let store = scratch_store(paths.scratch_dir)?;
+    let key = snapshot(
+        &store,
+        paths.release_key,
+        "release key",
+        MAX_KEY,
+        "key-digest",
+    )?;
+    let manifest = snapshot(
+        &store,
+        paths.manifest,
+        "current release manifest",
+        MAX_MANIFEST + 1,
+        "manifest-digest",
+    )?;
+    let signature = snapshot(
+        &store,
+        paths.manifest_sig,
+        "current release signature",
+        MAX_SIGNATURE,
+        "sig-digest",
+    )?;
+    // The bytes judged below are the frozen ones, never the source again.
+    if sha256_hex(&key.read()?) != baseline.release_key_sha256 {
+        return refuse(
+            "key-digest",
+            "the release key is not the one the receipt records",
+        );
+    }
+    verify_signature(&key, &signature, &manifest)?;
+    let parsed = parse_manifest(&manifest.read()?)?;
+    if parsed.bundle_seq < floor {
+        return refuse(
+            "bundle-seq",
+            format!(
+                "the current release bundle_seq {} is below the TPM floor {floor}",
+                parsed.bundle_seq
+            ),
+        );
+    }
+    if parsed.hardware_target.as_deref() != Some(baseline.hardware_target.as_str()) {
+        return refuse(
+            "hardware-target",
+            "the current release names another hardware target",
+        );
+    }
+    if parsed.host_repository.is_empty()
+        || authority_of(&parsed.host_repository) != authority_of(&baseline.host_repository)
+    {
+        return refuse(
+            "authority",
+            "the current release host is not under the receipt's release authority",
+        );
+    }
+    if !digest_ref(&parsed.host_digest) {
+        return refuse(
+            "host-digest",
+            "the current release host digest is not sha256:<64 lowercase hex>",
+        );
+    }
+    Ok(SuccessorHost {
+        repository: parsed.host_repository,
+        index_digest: parsed.host_digest,
     })
 }
 
