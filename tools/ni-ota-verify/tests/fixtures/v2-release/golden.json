@@ -1,6 +1,18 @@
 {
   "expected": {
     "bundle_seq": 3,
+    "completed": {
+      "floor": {
+        "completion_digest_sha256": "dc18a1192251608b4f292d3331e2769c8e4f7a720d03c2d5244d4cefcd41710a",
+        "evidence_sha256": "6c95608f29907214b84fab080899acea34d522808fc88a2528e287043a4a622b",
+        "receipt_sha256": "df86a55470e8bdc9f6761104a7741383b76873cd0aef40e34079b62e15204cb6"
+      },
+      "manifest-digest": {
+        "completion_digest_sha256": "5dde10f86a27bb8d666df2d2b9d50945657484409eb462c51e65a35e874d4d96",
+        "evidence_sha256": "c01fac06fd36f5718adb128918062969cf4fc38e3f1f180af9bd8710b7a804ab",
+        "receipt_sha256": "f5e137e1ffaa6485fdb1901e5b06d3b031d10eb8762aa04b869366c55dd6d09c"
+      }
+    },
     "host_repository": "registry.example.test/neural-ice-test/host-appliance",
     "receipt_sha256": {
       "floor": "df86a55470e8bdc9f6761104a7741383b76873cd0aef40e34079b62e15204cb6",
