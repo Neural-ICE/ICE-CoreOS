@@ -44,21 +44,22 @@ The payload partition (GPT label `ni-payload`, read-only) carries:
 
 - `release-manifest.json` and `.sig`: the release key's signature. It is the only thing allowed to name the host digest and the component digests;
 - `lan-mirror/{mirror-config.json,.sig,ca.crt}`: the existing domain-separated signature;
-- `pcr-policy/{policy.env,tpm2-pcr-public-key.pem,tpm2-pcr-signature.json}`;
+- `pcr-policy/{policy.env,tpm2-pcr-public-key.pem,tpm2-pcr-signature.json}`. **These are not trusted on their own** (review 234, P1). Either the signed manifest binds them (the policy digest, the sha256 of the public key and of the signature, and the policy sequence), or the PCR-policy public key stays sealed in the UKI as it is today and only the signature JSON and `policy.env` travel on the payload, verified against it. Today's sealed hashes (`build-installer-usb.sh`) and the pre-mutation checks (`neural-ice-autoinstall.sh` around line 1821 and the TPM sequence check around line 1863) remain the reference. Recommendation: keep the PCR key sealed and have the manifest bind the digest and the sequence. This needs a field in the Fabric release-manifest contract.
 - optionally, `preload/`: the host and component OCI archives for offline installs, each checked against the digest the manifest names.
 
 ### Install sequence
 
 1. systemd-stub measures the UKI.
-2. The gate verifies the embedded key file against the sealed `relauth_keyid`. Nothing on the payload is read before step 3.
-3. It verifies the manifest signature and checks `bundle_seq ≥ min_bundle_seq`. It then checks that the host reference lies in the v2 namespace, is pinned by digest, and that `hardware_target` matches.
+2. The gate reads the sealed kargs closed-world: each security field exactly once and well-formed. An external cmdline that systemd-stub appends when Secure Boot is off must neither shadow nor duplicate them. This is the rule of `installer-trust.sh`. The gate then verifies the embedded key file against `relauth_keyid`. It requires exactly one `ni-payload` partition, which must be vfat, mounted read-only, nosuid, nodev and noexec. It reads each object once, as a bounded copy in tmpfs, refuses symlinks, and verifies and parses only that copy. Nothing on the payload is read before step 3.
+3. It verifies the manifest signature and refuses duplicate keys. It checks `bundle_seq ≥ min_bundle_seq`, that the host reference lies in the v2 namespace and is pinned by digest, and that the manifest's `hardware_target` equals the sealed one. It then checks the measured hardware fingerprint, using the existing hardware-identity files from the initrd.
 4. It runs the existing PCR 7 coverage gate (`NI-P7-COVERAGE`) and the TPM NV policy-generation check, before any disk write.
 5. It runs `bootc install to-disk` with the host `repository@digest` from the source the install mode names:
    - `payload`: an OCI archive on the payload, digest-checked;
    - `mirror`: the signed mirror configuration, then a pull by digest;
    - `registry`: a pull by digest.
-6. **Every pull** is checked by the host-side policy of Owner option B: `sigstoreSigned` with `keyPath` set to the v2 image-signing key (Scaleway KMS `ni-v2-image-signing`), with `signedIdentity` restricted to the v2 namespace. The installer's own `/etc/containers/policy.json` is the same policy.
-7. It runs the existing LUKS and TPM enrolment, policy activation, strict-policy restore and seed handoff, then reboots.
+6. Before any disk write, the **existing closed policy reader** (`image/installer/neural-ice-registry-authorisation.py`) checks the installer's and the host's `policy.json`: default reject, the expected key, the exact repository scope, and no weak `signedIdentity` mode. After deployment, the installed policy is validated again (review 234, P2).
+7. **Every pull** is checked by the host-side policy of Owner option B: `sigstoreSigned` with `keyPath` set to the v2 image-signing key (Scaleway KMS `ni-v2-image-signing`), with `signedIdentity` restricted to the v2 namespace. The installer's own `/etc/containers/policy.json` is the same policy.
+8. It runs the existing LUKS and TPM enrolment, policy activation, strict-policy restore and seed handoff, then reboots.
 
 ### Making a medium
 
@@ -83,6 +84,15 @@ There is no root and no loop device. It runs sgdisk, mkfs.vfat and mcopy. It too
 | Trusted time (ni-ota-verify with the v2 issuer) | Unchanged binary, built once per installer version |
 | Registry authorisation reader (refuses `insecureAcceptAnything`) | Satisfied by option B (keyed sigstore). Applies to the mirror and registry modes alike |
 | Strict policy restore on the target | Unchanged: the target gets the host's own policy (option B) |
+| Closed-world cmdline (each field once, external cmdline cannot shadow) | Kept, in the generic gate (prototype `verify-payload.sh`) |
+| Exact authorization document and signature binding (registry media) | Replaced by signed manifest + floor + currentness (see Anti-rollback). This is a **weakening unless (ii)/(iii) are adopted** |
+| Domain-separated signature contracts (manifest, mirror config) | Kept: each object verified under its own domain |
+| Index plus platform-child digest binding | Kept: the manifest names the index; the installer pulls the arm64 child and checks it against the index |
+| Measured hardware fingerprint enforcement | Kept: fingerprints in the initrd, keyed by the sealed `hardware_target` |
+| Mirror CA, READY closure, lab-only use, authority separation | Kept: signed mirror config; mirror mode allowed only for the lab-managed profile |
+| Source medium excluded from target selection; GPT/ESP allowlist; no hidden bootable content | Kept: the source disk is identified by its `ni-payload` partition and excluded; `assemble-media` writes exactly ESP + payload; payload inspection checks the layout |
+| Seed / preseal / release reconciliation | Preload archives are each checked against the manifest digest; preseal becomes "manifest-bound" |
+| Operator SSH key and other destructive parameters | Must be sealed (installer version) or bound by the signed manifest; never read unsigned from the payload |
 | `inspect-installer-media.py` | Split into an installer inspection (once per version) and a payload inspection (every medium: signatures, digests, hardware target) |
 | Hardware identity fingerprints | Unchanged, read from the initrd, keyed by `hardware_target` |
 | Verbose failure surface and diagnostics | Unchanged services in the initrd |
@@ -91,7 +101,15 @@ There is no root and no loop device. It runs sgdisk, mkfs.vfat and mcopy. It too
 
 - **A host, component, model or mirror change** needs a new signed manifest and a re-assembled payload (seconds). No installer rebuild.
 - **Installer rebuild**: only for a kernel or firmware change, an installer bug or a key rotation. That is rare and gets its own ICE-Release version and ceremony.
-- **Anti-rollback**: the manifest's `bundle_seq` must be at least the sealed floor, and the appliance keeps its existing TPM counters. Raising the floor needs a new installer version.
+- **Anti-rollback, the replay window stated explicitly (review 234, P1).**
+  - Today a registry medium seals the exact authorization and signature digests: the medium installs exactly one release.
+  - The generic installer accepts any manifest signed by the release key with `bundle_seq` at least the sealed floor. **An older signed release above the floor stays installable, and one valid payload can replace another, until the floor rises.** Raising the floor only with an installer rebuild leaves a long revocation window.
+  - Options for the Owner:
+    - (i) accept the window and raise the floor at every installer release;
+    - (ii) a signed **currentness** object on the payload, signed by the release key with trusted time and a short validity (the trusted-time verifier already exists), which bounds replay to its validity;
+    - (iii) a per-medium authorization bound to the target device (TPM EK hash), for customer media.
+  - Recommendation: (ii) for all media, plus (iii) for customer deliveries.
+  - On an already provisioned appliance, the TPM counters and policy generation still refuse a downgrade, as today.
 - **UKI size**: 113 MiB with the prototype package set. The full set (podman, skopeo, bootc, python3, GB10 firmware) is estimated at 300–450 MiB. The ESP is sized from the UKI, and the GB10 firmware must load it. **To verify on .72.** The fallback is a smaller set (python helpers ported to ni-ota-verify).
 - **Network in the initrd**: systemd-networkd plus the GB10 NIC driver, needed for the mirror and registry modes only.
 - **Offline mode**: preload archives on the payload, same digest checks.
