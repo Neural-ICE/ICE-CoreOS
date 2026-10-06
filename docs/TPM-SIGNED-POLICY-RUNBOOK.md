@@ -392,6 +392,8 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 
 - [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) — the accepted target
   unlock policy (Accepted) that supersedes the "one signed entry per PCR7 value" model <!-- pcr7-list:history -->
+- [OEM bench](RUNBOOK-OEM-BENCH.md), [RMA](RUNBOOK-RMA.md), [firmware update](RUNBOOK-FIRMWARE-UPDATE.md)
+  — operating procedures of OS-0045, each step stating which tooling is merged, in review or planned
 - `docs/ADR-0004-disk-encryption-tpm-luks.md` — disk encryption; its sealing section now
   points to OS-0045
 - `docs/ADR-0002-secure-boot-zero-touch.md` — the Microsoft shim submission plan,

@@ -23,3 +23,5 @@ jobs:
         run: bash ci/test-open-core-boundary.sh
       - name: Check the TPM unlock policy documents agree with OS-0045
         run: bash ci/test-docs-tpm-policy-adr.sh
+      - name: Check the T11 runbooks state the status of every tool they rely on
+        run: python3 -I ci/test-docs-tpm-scale-runbooks.py
