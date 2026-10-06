@@ -309,6 +309,14 @@ class IncompleteSnapshotsAreRefused(Base):
             with self.assertRaisesRegex(tool.BenchError, "db"):
                 capture_installed(efivars_b64=path)
 
+    def test_the_same_variable_listed_twice_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = (FIX / "efivars.b64").read_text().splitlines()[0]
+            path = pathlib.Path(tmp) / "efivars.b64"
+            path.write_text((FIX / "efivars.b64").read_text() + first + "\n")
+            with self.assertRaisesRegex(tool.BenchError, "twice"):
+                capture_installed(efivars_b64=path)
+
     def test_unknown_path_name_is_refused(self):
         with self.assertRaisesRegex(tool.BenchError, "path"):
             capture_installed(path="pxe")

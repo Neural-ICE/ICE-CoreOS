@@ -219,6 +219,8 @@ def read_efivars_b64(path):
         if not line.strip():
             continue
         key, _, b64 = line.partition(" ")
+        if key in found:
+            raise BenchError(f"{path}:{number}: variable {key} listed twice")
         found[key] = _b64(b64.strip(), f"{path}:{number}")
     return found
 
