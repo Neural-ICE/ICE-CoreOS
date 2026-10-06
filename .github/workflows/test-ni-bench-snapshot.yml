@@ -1,0 +1,44 @@
+name: test-ni-bench-snapshot
+
+# Bench snapshot, reference record and signed bench sheet (tools/ni-bench-snapshot):
+# stdlib-only Python plus the openssl binary, no TPM and no secret. Keys are
+# generated per run by the tests. It reuses the event-log parser and the signature
+# check of ota/neural-ice-tpm-policy.py, so a change to that file re-runs this suite.
+# tools/ni-pcr7-calc (T1) is a path too: its format contract is tested here when present.
+# The fixture is the PCR-7-only derivative of the event log of one physical GB10.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/ni-bench-snapshot/**'
+      - 'tools/ni-pcr7-calc/**'
+      - 'ota/neural-ice-tpm-policy.py'
+      - '.github/workflows/test-ni-bench-snapshot.yml'
+  pull_request:
+    paths:
+      - 'tools/ni-bench-snapshot/**'
+      - 'tools/ni-pcr7-calc/**'
+      - 'ota/neural-ice-tpm-policy.py'
+      - '.github/workflows/test-ni-bench-snapshot.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: test-ni-bench-snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Snapshot, record and sheet against the real GB10 evidence
+        run: python3 -I tools/ni-bench-snapshot/test-ni-bench-snapshot.py
