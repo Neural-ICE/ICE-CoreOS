@@ -34,7 +34,12 @@ require_fixed "  workflow_dispatch:" "$WORKFLOW"
 require_fixed "  repository_dispatch:" "$WORKFLOW"
 require_fixed "VARIANT: \${{ github.event_name == 'workflow_dispatch' && 'debug' || github.event.client_payload.variant }}" "$WORKFLOW"
 require_fixed "  validate-request:" "$WORKFLOW"
-require_fixed "runs-on: [self-hosted, Linux, X64]" "$WORKFLOW"
+# The validation guard has no checkout, no token and no state: it runs on a
+# disposable hosted runner (this repository is public; the organization runner
+# group refuses public repositories) and never on the shared self-hosted pool,
+# so a malformed request fails without queueing behind, or reserving, the Spark.
+require_exact_line "    runs-on: ubuntu-24.04" "$WORKFLOW"
+refute_fixed "runs-on: [self-hosted, Linux, X64]" "$WORKFLOW"
 require_fixed "permissions: {}" "$WORKFLOW"
 require_fixed 'if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUEST_REF" != refs/heads/main ]; then' "$WORKFLOW"
 require_fixed "needs: validate-request" "$WORKFLOW"

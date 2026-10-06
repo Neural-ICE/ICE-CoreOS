@@ -2,13 +2,15 @@ name: test-ni-ota-verify
 
 # Same-repository gate for the on-device OTA verifier (tools/ni-ota-verify —
 # ICE-Fabric OTA signing plan P2): fmt + clippy + tests on the
-# organization-owned x86_64 and ARM64 pools. The toolchain runs inside the same
+# disposable GitHub-hosted x86_64 and ARM64 runners (this repository is public,
+# so they cost nothing; the organization runner group refuses public
+# repositories). The toolchain runs inside the same
 # digest-pinned Rust image used by the bootc build, so runners stay toolchain-free.
 # The test-path-overrides build stubs cosign via NI_OTA_COSIGN, so no signing
 # infrastructure is needed here; the default build is tested too, and its release
-# binary must not even contain that name. Persistent self-hosted runners never execute pull_request-controlled
-# workflow definitions. Only the protected main ref may schedule these jobs;
-# workflow_dispatch is guarded at the job boundary as defense in depth.
+# binary must not even contain that name. Only the protected main ref may
+# schedule the push jobs; workflow_dispatch is guarded at the job boundary as
+# defense in depth.
 
 on:
   push:
@@ -35,10 +37,12 @@ permissions:
 jobs:
   # Pull requests run the SAME checks on a GitHub-hosted runner.
   #
-  # The self-hosted jobs below stay main-only on purpose: a pull request can edit
-  # the workflow definition itself, and a persistent runner would then execute
-  # author-controlled commands on Neural ICE infrastructure. That control is not
-  # relaxed here — it is respected by sending pull requests somewhere disposable.
+  # The per-architecture jobs below stay main-only on purpose: the architecture
+  # matrix is checked after merge, while a pull request exercises the same
+  # checks once, here, on a disposable runner. (They used to run on persistent
+  # self-hosted runners, which must never execute a pull request's workflow
+  # definition; that constraint is gone now that they run on hosted runners,
+  # and the main-only trigger is kept to bound the minutes spent.)
   #
   # Until this existed, the verifier that decides whether an appliance accepts an
   # update was only tested AFTER merge. A defect reached main before anyone could
@@ -99,7 +103,7 @@ jobs:
 
   linux-x86_64:
     if: github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       RUST_IMAGE: docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31
@@ -149,7 +153,7 @@ jobs:
 
   linux-arm64:
     if: github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
       RUST_IMAGE: docker.io/library/rust:1.93-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31
