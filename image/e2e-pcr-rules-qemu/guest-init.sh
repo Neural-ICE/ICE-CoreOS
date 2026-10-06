@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034 # variables consumed by the code extracted from the installer
 # PID 1 of the e2e guest (image/e2e-pcr-rules-qemu). It runs the installer's REAL
 # NI-P7-RULES gate -- the code extracted verbatim from ota/neural-ice-autoinstall.sh
 # into /gate.sh -- against the guest's real TPM, its real TCG event log and its real
@@ -49,7 +50,6 @@ if [[ "$MODE" == ids ]]; then
   exit 0
 fi
 
-# shellcheck disable=SC2034 # consumed by the code extracted from the installer
 # --- the installer's own functions and gate block, unmodified ------------------------------
 NEURALICE_CMDLINE_FILE=/proc/cmdline
 NI_INSTALLER_TEST_SEAM=""
