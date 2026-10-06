@@ -1,6 +1,6 @@
 # ni-pcr-rules — Owner-signed PCR 7 rules, evaluated on the machine's Secure Boot state
 
-Replaces "one signature per admitted PCR 7 value" with "one signature on rules".
+Replaces "one signature per admitted PCR 7 value" with "one signature on rules". <!-- pcr7-list:history -->
 Python 3 standard library and the `openssl` binary. The TCG2 parser and the PCR
 replay are the installer's (`ota/neural-ice-tpm-policy.py`), imported, not copied.
 
