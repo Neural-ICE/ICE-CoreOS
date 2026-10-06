@@ -364,13 +364,15 @@ tree as is. `ota_state` carries the real constants.
 ## 7. Shell library `ota/neural-ice-v2-owner-seal.sh`
 
 Sourced, idempotent, no side effect on sourcing. Inputs are `V2SEAL_*` variables set
-by the caller (unset or empty ⇒ refusal, never a default). Today: **stub, every entry
-point exits 2** (`ota/test-neural-ice-v2-owner-seal.sh`).
+by the caller (unset or empty ⇒ refusal, never a default). `v2seal_preflight` and
+`v2seal_commit` are implemented and driven by `ota/neural-ice-autoinstall.sh`
+(`ota/test-neural-ice-v2-owner-seal.sh`); any entry point that is not implemented
+exits 2.
 
 | Function | When | Inputs | Outputs | Exit |
 |---|---|---|---|---|
 | `v2seal_preflight` | before any destructive write | `V2SEAL_OTA_VERIFY`, `V2SEAL_MODE` (`manifest-digest`\|`floor`), `V2SEAL_MANIFEST`, `V2SEAL_MANIFEST_SIG`, `V2SEAL_RELEASE_KEY`, `V2SEAL_KEY_SHA256`, [`V2SEAL_MANIFEST_SHA256`, `V2SEAL_MANIFEST_SIG_SHA256`] \| [`V2SEAL_MIN_BUNDLE_SEQ`], `V2SEAL_HARDWARE_TARGET`, `V2SEAL_ACCESS_PROFILE`, `V2SEAL_TRUST_POLICY_ID`, `V2SEAL_VARIANT`, `V2SEAL_RELEASE_AUTHORITY`, `V2SEAL_CANDIDATE_ROOT`, `V2SEAL_HOST_INDEX_DIGEST`, `V2SEAL_HOST_MANIFEST_DIGEST`, `V2SEAL_WORK` (private dir), `V2SEAL_RECEIPT` (path under it) | sets `V2SEAL_BUNDLE_SEQ`, `V2SEAL_RECEIPT_SHA256`; writes the receipt at `V2SEAL_RECEIPT` | 0 / 1 / 2 |
-| `v2seal_commit` | after the deployment is written, mounted at `V2SEAL_TARGET_ROOT` | the preflight outputs + `V2SEAL_TARGET_ROOT`, `V2SEAL_OTA_TPM_STATE`, `V2SEAL_TPM_STATE` (helper paths) | persists §5; re-verifies with `verify-retained-v2-release` against the target; `cmp`s the persisted receipt with the preflight one; `ota-tpm-state prepare "$V2SEAL_BUNDLE_SEQ"`; `inspect-v2`: `baseline_floor == bundle_seq`, anchor pristine; `provisioning-status == preseal-prepared`; emits the install-identity inputs (`release_identity_sha256 = manifest_sha256`) | 0 / 1 / 2 |
+| `v2seal_commit` | after the deployment is written, mounted at `V2SEAL_TARGET_ROOT` | the preflight outputs + `V2SEAL_TARGET_ROOT`, `V2SEAL_OTA_TPM_STATE`, `V2SEAL_TPM_STATE` (helper paths) | persists §5; re-verifies the PERSISTED manifest pair against the deployed candidate (`verify-v2-release` over the persisted copies and `V2SEAL_TARGET_ROOT`: `verify-retained-v2-release` reads `/` and has no live-root seam, so it stays the boot-time reader of §3.2); `cmp`s the persisted receipt with the preflight one; `ota-tpm-state prepare "$V2SEAL_BUNDLE_SEQ"`; `inspect-v2`: `baseline_floor == bundle_seq`, anchor pristine; `provisioning-status == preseal-prepared`; emits the install-identity inputs (`release_identity_sha256 = manifest_sha256`) | 0 / 1 / 2 |
 | `v2seal_verify_retained` | ceremony and every boot | `V2SEAL_OTA_VERIFY`, `V2SEAL_EXPECTED_RECEIPT_SHA256`, `V2SEAL_SCRATCH_DIR` (persisted paths are §5) | `V2SEAL_BUNDLE_SEQ` | 0 / 1 / 2 |
 | `v2seal_refusal MSG…` | any failed check | — | stderr `v2seal: refused: MSG` | **exits 1**, never returns |
 
