@@ -237,7 +237,7 @@ make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=
   mmd -i "$ESP" ::/EFI ::/EFI/BOOT ::/EFI/neural-ice
   mcopy -i "$ESP" "$1" '::/EFI/BOOT/BOOTAA64.EFI'
   mcopy -i "$ESP" "$2" "::/EFI/neural-ice/$3"
-  local pair destination source made_ice_coreos=0 has_policy_key=0 has_policy_json=0
+  local pair destination source made_ice_coreos=0 made_pcr_rules=0 has_policy_key=0 has_policy_json=0
   shift 3
   local -a pairs=("$@")
   for pair in "${pairs[@]}"; do
@@ -260,6 +260,15 @@ make_esp() { # $1=uki path  $2=manifest path  $3=manifest name  [$4...]=::/path=
         if [ "$made_ice_coreos" = 0 ]; then
           mmd -i "$ESP" ::/ice-coreos
           made_ice_coreos=1
+        fi
+        ;;
+    esac
+    # The signed PCR7 rules pair lives one level down (ADR-0045, T5).
+    case "$destination" in
+      ::/ice-coreos/pcr-rules/*)
+        if [ "$made_pcr_rules" = 0 ]; then
+          mmd -i "$ESP" ::/ice-coreos/pcr-rules
+          made_pcr_rules=1
         fi
         ;;
     esac

@@ -290,11 +290,35 @@ KERNEL_CMDLINE_BYTES="$(sed -n 's/^NI_SEALED_CMDLINE_MAX_BYTES=\([0-9]*\)$/\1/p'
 ANCHOR_BUDGET="$(anchor_for lab-managed | sed 's/neural-ice-secureboot-lab-v1/neural-ice-secureboot-prod-v1/')"
 budget_vectors=0 budget_bytes=0
 budget_v2_vectors=0 budget_v2_bytes=0
+budget_rules_vectors=0 budget_rules_bytes=0
 
 vectors=0 accepted=0 refused=0
 while IFS=$'\t' read -r expected anchor label words; do
   case "$expected" in ''|'#'*) continue ;; esac
   vectors=$(( vectors + 1 ))
+  if [[ "$label" == budget-rules:* ]]; then
+    # 🔴 THE SIGNED PCR7 RULES PAIR COSTS BYTES TOO (ADR-0045, T5). The two
+    # optional terms add 85 + up to 44 bytes to a line the kernel truncates
+    # silently at 1957. The measured line is the owner-sealed v2 medium line --
+    # the one a rules-carrying medium is cut as -- with the WORST-CASE
+    # (19-digit) sequence, so a floor that grows never outgrows the budget.
+    budget_rules_vectors=$(( budget_rules_vectors + 1 ))
+    budget_rules_line="$ANCHOR_BUDGET $words $PCR_POLICY_FIELDS"
+    budget_rules_bytes=${#budget_rules_line}
+    [[ "$expected" == install \
+       && "$(classify_bash "$budget_rules_line")" == install \
+       && "$(classify_python "$budget_rules_line")" == install ]] \
+      || fail "[$label] the production-shaped line carrying the PCR rules pair is not an accepted Install line"
+    (( budget_rules_bytes <= BUDGET_MAX_BYTES )) \
+      || fail "[$label] the full line carrying the PCR rules pair measures ${budget_rules_bytes} bytes, above the ${BUDGET_MAX_BYTES}-byte budget (kernel bound 1957)"
+    for must in neuralice.pcr_rules= neuralice.pcr_rules_seq=9999999999999999999 \
+      neuralice.source=medium neuralice.v2rel_sha256= neuralice.v2rel_sig_sha256= \
+      neuralice.imgref= neuralice.systemsize= neuralice.sshkey= neuralice.device_channel= \
+      neuralice.release_authority= enforcing=0; do
+      [[ "$budget_rules_line" == *" $must"* ]] \
+        || fail "[$label] the rules budget vector does not carry $must"
+    done
+  fi
   if [[ "$label" == budget-v2:* ]]; then
     # The v2 owner-sealed medium (mission B, T3a) seals the manifest/signature
     # pair instead of the preseal set, on a medium source. It is a different line
@@ -451,6 +475,15 @@ done < "$CORPUS"
   || fail "the corpus must carry exactly one budget: vector (found $budget_vectors); the byte budget is otherwise unmeasured"
 (( budget_v2_vectors == 1 )) \
   || fail "the corpus must carry exactly one budget-v2: vector (found $budget_v2_vectors); the v2 line's byte budget is otherwise unmeasured"
+(( budget_rules_vectors == 1 )) \
+  || fail "the corpus must carry exactly one budget-rules: vector (found $budget_rules_vectors); the PCR rules pair's byte budget is otherwise unmeasured"
+# The rules pair's closed rules must each be refused BY NAME somewhere in the corpus.
+for named in pcr-rules-without-sequence pcr-rules-sequence-without-rules \
+  invalid-argument:neuralice.pcr_rules invalid-argument:neuralice.pcr_rules_seq \
+  duplicate-argument:neuralice.pcr_rules duplicate-argument:neuralice.pcr_rules_seq; do
+  grep -q "^refuse:${named}	" "$CORPUS" \
+    || fail "the corpus no longer carries a vector refused as ${named}"
+done
 # The v2 pair's closed rules must each be refused BY NAME somewhere in the corpus.
 for named in v2rel-sig-without-manifest v2rel-manifest-without-sig v2rel-hashes-identical \
   v2rel-requires-medium-source v2rel-with-preseal v2rel-with-release-authorization \
@@ -630,6 +663,143 @@ esp_bound "$mirror_line" \
   && fail "a swapped mirror CA on the ESP was accepted"
 
 # --------------------------------------------------------------------------- #
+# THE SIGNED PCR7 RULES PAIR (ADR-0045, T5). `ice-coreos/pcr-rules/rules.json`
+# is hash-bound by `neuralice.pcr_rules`; `rules.json.sig` is NOT pinned by hash
+# (the engine verifies it under the Owner key `neuralice.pcr_policy_key` already
+# pins) but is present if and only if the karg pair is. The sequence floor
+# `neuralice.pcr_rules_seq` may not exceed the sequence the rules carry, or the
+# installer would refuse the medium after the wipe was authorised.
+# --------------------------------------------------------------------------- #
+pcr_rules_check() { # $1=cmdline, rest: "<path>=<content>" pairs -> 0 accepted, 1 refused (a crash is a FAILURE, never a refusal)
+  local cmdline=$1 rc=0; shift
+  python3 - "$INSPECTOR" "$cmdline" "$@" <<'PYEOF' || rc=$?
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("inspector", sys.argv[1])
+inspector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(inspector)
+
+cmdline = sys.argv[2]
+files = {}
+for pair in sys.argv[3:]:
+    path, _, content = pair.partition("=")
+    files[path] = content.encode()
+
+try:
+    inspector.check_esp_hash_bound(set(files), lambda path: files[path], cmdline)
+    inspector.check_pcr_rules_material(set(files), lambda path: files[path], cmdline)
+except inspector.InspectionError as error:
+    print(f"REFUSED {error}", file=sys.stderr)
+    raise SystemExit(1)
+except Exception:
+    import traceback
+    traceback.print_exc()
+    raise SystemExit(2)
+PYEOF
+  (( rc <= 1 )) || fail "the inspector's PCR rules check crashed instead of judging (exit $rc)"
+  return "$rc"
+}
+RULES_JSON_PATH=ice-coreos/pcr-rules/rules.json
+RULES_SIG_PATH=ice-coreos/pcr-rules/rules.json.sig
+rules_content='{"schema":"ni-pcr-rules/1","sequence":7,"unbound_variables":"allow"}'
+rules_sig_content='ZmFrZSBvd25lciBzaWduYXR1cmU='
+rules_base="$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1"
+rules_line="$rules_base neuralice.pcr_rules=$(esp_digest "$rules_content") neuralice.pcr_rules_seq=7"
+pcr_rules_check "$rules_line" \
+  "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=$rules_sig_content" \
+  || fail "a medium whose rules pair is sealed, staged and consistent was refused"
+pcr_rules_check "$rules_base" \
+  || fail "a medium carrying no rules at all (the historical shape) was refused"
+pcr_rules_check "$rules_base neuralice.pcr_rules_seq=7" \
+  && fail "a sequence floor with no rules was accepted"
+# The floor is a MINIMUM: rules newer than the floor are fine, older are not.
+pcr_rules_check "${rules_line%neuralice.pcr_rules_seq=7}neuralice.pcr_rules_seq=3" \
+  "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=$rules_sig_content" \
+  || fail "rules newer than the sealed sequence floor were refused"
+pcr_rules_check "${rules_line%neuralice.pcr_rules_seq=7}neuralice.pcr_rules_seq=8" \
+  "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "rules older than the sealed sequence floor were accepted (a medium that refuses itself after the wipe)"
+# Both directions, for each of the two files.
+pcr_rules_check "$rules_line" "$RULES_JSON_PATH=$rules_content" \
+  && fail "a rules pair without its signature file was accepted"
+pcr_rules_check "$rules_line" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "a rules pair without its rules.json was accepted"
+pcr_rules_check "$rules_line" \
+  && fail "a sealed rules pair with no file on the ESP was accepted"
+pcr_rules_check "$rules_base" "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "rules files on the ESP with no sealed pair were accepted"
+pcr_rules_check "$rules_base" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "a rules signature alone on the ESP, sealed by nothing, was accepted"
+# The kargs travel as a pair, at every reader.
+pcr_rules_check "${rules_line% neuralice.pcr_rules_seq=7}" \
+  "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "a sealed rules digest without its sequence floor was accepted by the inspector"
+pcr_rules_check "$rules_base neuralice.pcr_rules_seq=7" \
+  "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "a sealed sequence floor without its rules digest was accepted by the inspector"
+# A swapped rules.json: the UKI is untouched, the bytes are not.
+pcr_rules_check "$rules_line" \
+  "$RULES_JSON_PATH={\"schema\":\"ni-pcr-rules/1\",\"sequence\":99,\"unbound_variables\":\"allow\"}" \
+  "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "a swapped rules.json on the ESP was accepted"
+# The signature is bound by the engine, not by hash: replacing it must not be
+# refused HERE (the installer's verification under the Owner key is the gate).
+pcr_rules_check "$rules_line" \
+  "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=another detached signature" \
+  || fail "the inspector pinned the rules signature by hash; that decision belongs to the Owner-key verification"
+# Shape of the rules document the engine will read.
+for bad_rules in 'not json at all' '[]' '{"schema":"ni-pcr-rules/1"}' \
+  '{"sequence":"7"}' '{"sequence":true}' '{"sequence":7.5}' '{"sequence":0}' '{"sequence":-7}'; do
+  bad_line="$rules_base neuralice.pcr_rules=$(esp_digest "$bad_rules") neuralice.pcr_rules_seq=1"
+  pcr_rules_check "$bad_line" "$RULES_JSON_PATH=$bad_rules" "$RULES_SIG_PATH=$rules_sig_content" \
+    && fail "a rules.json that is not a document with an integer sequence >= 1 was accepted: $bad_rules"
+done
+# Bounds: nothing empty, nothing over 1 MiB, on either file.
+pcr_rules_check "$rules_base neuralice.pcr_rules=$(esp_digest "") neuralice.pcr_rules_seq=1" \
+  "$RULES_JSON_PATH=" "$RULES_SIG_PATH=$rules_sig_content" \
+  && fail "an empty rules.json was accepted"
+pcr_rules_check "$rules_line" "$RULES_JSON_PATH=$rules_content" "$RULES_SIG_PATH=" \
+  && fail "an empty rules signature was accepted"
+python3 - "$INSPECTOR" <<'PYEOF' || fail "an oversized rules file was accepted, or the rules paths are not allow-listed"
+import hashlib
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("inspector", sys.argv[1])
+inspector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(inspector)
+
+for path in ("ice-coreos/pcr-rules/rules.json", "ice-coreos/pcr-rules/rules.json.sig"):
+    assert path in inspector.ESP_OPTIONAL, f"{path} is not an allow-listed ESP file"
+    assert path not in inspector.ESP_REQUIRED, f"{path} must stay optional"
+assert ("ice-coreos/pcr-rules/rules.json", "neuralice.pcr_rules") in inspector.ESP_HASH_BOUND
+assert all(path != "ice-coreos/pcr-rules/rules.json.sig" for path, _ in inspector.ESP_HASH_BOUND), \
+    "the rules signature must not be hash-bound"
+# FAT hands back its own case: the contract spelling must come out.
+assert inspector.canonical_esp_paths(
+    ["ICE-COREOS/PCR-RULES/RULES.JSON", "ICE-COREOS/PCR-RULES/RULES.JSON.SIG"]
+) == ["ice-coreos/pcr-rules/rules.json", "ice-coreos/pcr-rules/rules.json.sig"]
+
+limit = 1 << 20
+document = b'{"schema":"ni-pcr-rules/1","sequence":7}'
+oversized = b" " * limit + document
+for files in (
+    {"ice-coreos/pcr-rules/rules.json": oversized, "ice-coreos/pcr-rules/rules.json.sig": b"c2ln"},
+    {"ice-coreos/pcr-rules/rules.json": document, "ice-coreos/pcr-rules/rules.json.sig": b"s" * (limit + 1)},
+):
+    cmdline = (
+        "quiet neuralice.pcr_rules=%s neuralice.pcr_rules_seq=7"
+        % hashlib.sha256(files["ice-coreos/pcr-rules/rules.json"]).hexdigest()
+    )
+    try:
+        inspector.check_pcr_rules_material(set(files), lambda path: files[path], cmdline)
+    except inspector.InspectionError:
+        continue
+    raise SystemExit("an over-1-MiB rules file was accepted")
+PYEOF
+
+# --------------------------------------------------------------------------- #
 # THE v2 RELEASE MANIFEST PAIR (mission B, T3a). The manifest and its detached
 # signature travel on the mutable ESP at ice-coreos/v2-release-manifest.json(.sig)
 # and the signed UKI seals their SHA-256: a substituted manifest -- another
@@ -793,4 +963,4 @@ run_generator 'quiet rd.luks=1 root=/dev/mapper/system' "$TMP/installed"
 [[ -z "$(find "$TMP/installed/early" -mindepth 1 -print -quit)" ]] \
   || fail "installer-only masks leaked into an installed boot"
 
-echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate, the ESP artefact pins and the operator key's single transport all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes (v2 medium line ${budget_v2_bytes}), kernel bound ${KERNEL_CMDLINE_BYTES})"
+echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate, the ESP artefact pins and the operator key's single transport all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes (v2 medium line ${budget_v2_bytes}, v2 line with the PCR rules pair ${budget_rules_bytes}), kernel bound ${KERNEL_CMDLINE_BYTES})"

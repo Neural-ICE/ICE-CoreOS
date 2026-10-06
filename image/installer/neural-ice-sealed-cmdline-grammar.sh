@@ -283,7 +283,7 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
       # value may sit beside is a question about the LINE, answered in section 4.
       [[ "$value" == mirror ]]
       ;;
-    neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.preseal|neuralice.v2rel_sha256|neuralice.v2rel_sig_sha256|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature)
+    neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.preseal|neuralice.v2rel_sha256|neuralice.v2rel_sig_sha256|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature|neuralice.pcr_rules)
       # SHA-256 of an artefact the producer staged on the ESP (the v2 release
       # manifest and its detached signature included), or of the exact
       # release closure a mirror declares READY. Sealed into the UKI so the
@@ -294,7 +294,7 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
       [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
       (( value >= 16 && value <= 65536 ))
       ;;
-    neuralice.mirror_generation|neuralice.pcr_policy_seq)
+    neuralice.mirror_generation|neuralice.pcr_policy_seq|neuralice.pcr_rules_seq)
       [[ "$value" =~ ^[1-9][0-9]{0,18}$ ]]
       ;;
     neuralice.target)
@@ -326,6 +326,7 @@ _ni_sealed_install_optional_keys=(
   neuralice.seed_closure neuralice.seed_manifest neuralice.seed_trusted_now
   neuralice.seed_source
   neuralice.pcr_policy neuralice.pcr_policy_key neuralice.pcr_policy_signature neuralice.pcr_policy_seq
+  neuralice.pcr_rules neuralice.pcr_rules_seq
 )
 
 _ni_sealed_contains() { # $1=needle $2..=haystack
@@ -510,6 +511,23 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
       [[ -n "${optional_seen[$policy_key]:-}" ]] \
         || { _ni_sealed_refuse "missing-install-pcr-policy:$policy_key"; return 1; }
     done
+  fi
+
+  # THE SIGNED PCR7 RULES PAIR (ADR-0045, T5). Optional, Install only (the mode
+  # check above already refused it on a Live line), and a pair: the digest pins
+  # ice-coreos/pcr-rules/rules.json and the sequence is the floor
+  # the installer holds the rules to (self-consistency of the sealed value and the signed
+  # document; real rollback protection is the NV counter, T9, not built). One without the other is a rules file
+  # nothing protects against replay, or a floor protecting nothing.
+  local pcr_rules_seen="${optional_seen[neuralice.pcr_rules]:-}"
+  local pcr_rules_seq_seen="${optional_seen[neuralice.pcr_rules_seq]:-}"
+  if [[ -n "$pcr_rules_seen" && -z "$pcr_rules_seq_seen" ]]; then
+    _ni_sealed_refuse pcr-rules-without-sequence
+    return 1
+  fi
+  if [[ -z "$pcr_rules_seen" && -n "$pcr_rules_seq_seen" ]]; then
+    _ni_sealed_refuse pcr-rules-sequence-without-rules
+    return 1
   fi
 
   # ------------------------------------------------------------------------- #

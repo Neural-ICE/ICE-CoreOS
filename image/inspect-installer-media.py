@@ -126,6 +126,12 @@ ESP_OPTIONAL = frozenset(
         # signed UKI command line and rechecked below before acceptance.
         "ice-coreos/tpm2-pcr-public-key.pem",
         "ice-coreos/tpm2-pcr-signature.json",
+        # The Owner-signed PCR7 rules and their detached, domain-separated
+        # signature (ADR-0045, T5). rules.json is hash-bound below by
+        # neuralice.pcr_rules; the signature is not pinned by hash, the engine
+        # verifies it under the Owner key neuralice.pcr_policy_key pins.
+        "ice-coreos/pcr-rules/rules.json",
+        "ice-coreos/pcr-rules/rules.json.sig",
         # The v2 release manifest and its detached signature (mission B, T3a;
         # docs/ota/V2-RELEASE-ATTESTATION.md). Mutable ESP carriers whose sha256
         # the signed UKI seals as neuralice.v2rel_sha256 / v2rel_sig_sha256.
@@ -150,6 +156,7 @@ ESP_HASH_BOUND = (
     ("ice-coreos/mirror-ca.crt", "neuralice.mirror_ca_sha256"),
     ("ice-coreos/tpm2-pcr-public-key.pem", "neuralice.pcr_policy_key"),
     ("ice-coreos/tpm2-pcr-signature.json", "neuralice.pcr_policy_signature"),
+    ("ice-coreos/pcr-rules/rules.json", "neuralice.pcr_rules"),
 )
 # The two artefacts a preseal set binds by hash (`installer_authorization_sha256`
 # and `installer_authorization_signature_sha256`, checked by check_preseal_set).
@@ -765,6 +772,8 @@ SEALED_INSTALL_OPTIONAL_KEYS = (
     "neuralice.pcr_policy_key",
     "neuralice.pcr_policy_signature",
     "neuralice.pcr_policy_seq",
+    "neuralice.pcr_rules",
+    "neuralice.pcr_rules_seq",
 )
 # 🔴 ONE CANONICAL ORIGIN, SEALED RATHER THAN COMPILED IN (independent review
 # 2026-09-02, P0 #3). Every OS/source reference a medium may seal carries the
@@ -925,11 +934,16 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
         "neuralice.pcr_policy",
         "neuralice.pcr_policy_key",
         "neuralice.pcr_policy_signature",
+        "neuralice.pcr_rules",
     ):
         return bool(re.fullmatch(r"[0-9a-f]{64}", value))
     if key == "neuralice.systemsize":
         return bool(re.fullmatch(r"[1-9][0-9]{0,4}", value)) and 16 <= int(value) <= 65536
-    if key in ("neuralice.mirror_generation", "neuralice.pcr_policy_seq"):
+    if key in (
+        "neuralice.mirror_generation",
+        "neuralice.pcr_policy_seq",
+        "neuralice.pcr_rules_seq",
+    ):
         return bool(re.fullmatch(r"[1-9][0-9]{0,18}", value))
     if key == "neuralice.seed_trusted_now":
         return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value))
@@ -1062,6 +1076,15 @@ def classify_sealed_cmdline(cmdline: str) -> str:
                 raise SelectorRefusal(
                     f"missing-install-pcr-policy:{policy_key}"
                 )
+
+    # THE SIGNED PCR7 RULES PAIR (ADR-0045, T5): optional, Install only (refused
+    # on a Live line above), and a pair. The digest pins rules.json; the sequence
+    # is the floor the installer holds the rules to (self-consistency of the sealed value
+    # and the signed document; real rollback protection is the NV counter, T9).
+    if "neuralice.pcr_rules" in optional and "neuralice.pcr_rules_seq" not in optional:
+        raise SelectorRefusal("pcr-rules-without-sequence")
+    if "neuralice.pcr_rules_seq" in optional and "neuralice.pcr_rules" not in optional:
+        raise SelectorRefusal("pcr-rules-sequence-without-rules")
 
     # ----------------------------------------------------------------------- #
     # THE REGISTRY-INSTALL CONTRACT, stated once so the producer, the generator
@@ -1805,6 +1828,100 @@ def check_tpm_policy_document(paths: set[str], read_file, cmdline: str) -> None:
         )
 
 
+PCR_RULES_JSON_PATH = "ice-coreos/pcr-rules/rules.json"
+PCR_RULES_SIG_PATH = "ice-coreos/pcr-rules/rules.json.sig"
+PCR_RULES_KARG = "neuralice.pcr_rules"
+PCR_RULES_SEQ_KARG = "neuralice.pcr_rules_seq"
+# One bound for both files: the producer refuses anything larger and the
+# installer reads nothing larger (ADR-0045, T5).
+PCR_RULES_MAX_BYTES = 1 << 20
+# The detached signature: base64 of at most 1024 bytes is below 1400 characters; the
+# installer (esp_staged_file_unsealed) refuses above 4096 and so does the producer.
+PCR_RULES_SIGNATURE_MAX_BYTES = 4096
+PCR_RULES_SAFE_INTEGER = 2**53 - 1
+
+
+def check_pcr_rules_material(paths: set[str], read_file, cmdline: str) -> None:
+    """The Owner-signed PCR7 rules pair is sealed, staged and consistent, or absent.
+
+    ``rules.json`` is hash-bound by ``check_esp_hash_bound`` (neuralice.pcr_rules);
+    ``rules.json.sig`` is deliberately NOT pinned by hash -- the engine verifies it
+    under the Owner key ``neuralice.pcr_policy_key`` already pins -- so the only
+    thing that accounts for it on the mutable ESP is the sealed pair itself:
+    present if and only if the two kargs are, in both directions. The sequence
+    floor is a MINIMUM the installer holds the rules to, so rules whose own
+    ``sequence`` is below it are a medium that refuses itself after the wipe was
+    authorised.
+    """
+    sealed_words = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
+    digest = sealed_words.get(PCR_RULES_KARG)
+    floor = sealed_words.get(PCR_RULES_SEQ_KARG)
+    present = [path for path in (PCR_RULES_JSON_PATH, PCR_RULES_SIG_PATH) if path in paths]
+    if digest is None and floor is None:
+        if present:
+            raise InspectionError(
+                f"the ESP carries {present} but the sealed command line seals no "
+                f"{PCR_RULES_KARG} / {PCR_RULES_SEQ_KARG}; rules nothing pins are rules "
+                "anybody can replace"
+            )
+        return
+    if digest is None or floor is None:
+        raise InspectionError(
+            f"{PCR_RULES_KARG} and {PCR_RULES_SEQ_KARG} are sealed together or not at all"
+        )
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", floor):
+        raise InspectionError(f"{PCR_RULES_SEQ_KARG}={floor} is not a canonical sequence")
+    for path in (PCR_RULES_JSON_PATH, PCR_RULES_SIG_PATH):
+        if path not in paths:
+            raise InspectionError(
+                f"the sealed command line pins the PCR rules pair but the ESP carries no "
+                f"{path}; this medium would refuse itself at install time"
+            )
+    rules = read_file(PCR_RULES_JSON_PATH)
+    signature = read_file(PCR_RULES_SIG_PATH)
+    for path, data, bound in ((PCR_RULES_JSON_PATH, rules, PCR_RULES_MAX_BYTES),
+                              (PCR_RULES_SIG_PATH, signature, PCR_RULES_SIGNATURE_MAX_BYTES)):
+        if not data:
+            raise InspectionError(f"{path} is empty")
+        if len(data) > bound:
+            raise InspectionError(f"{path} exceeds its {bound}-byte bound")
+
+    def no_duplicates(pairs):
+        seen = {}
+        for key, value in pairs:
+            if key in seen:
+                raise InspectionError(f"{PCR_RULES_JSON_PATH} carries a duplicated JSON key: {key!r}")
+            seen[key] = value
+        return seen
+
+    def no_constant(name):
+        raise InspectionError(f"{PCR_RULES_JSON_PATH} carries a non-finite number: {name}")
+
+    # The reading the producer and the engine apply: no duplicated key at any depth, no
+    # NaN/Infinity, so every reader agrees which `sequence` is the document's.
+    try:
+        document = json.loads(
+            rules.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constant
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise InspectionError(
+            f"{PCR_RULES_JSON_PATH} is not valid JSON: {type(error).__name__}"
+        ) from error
+    sequence = document.get("sequence") if isinstance(document, dict) else None
+    if (isinstance(sequence, bool) or not isinstance(sequence, int)
+            or not 1 <= sequence <= PCR_RULES_SAFE_INTEGER):
+        raise InspectionError(
+            f"{PCR_RULES_JSON_PATH} carries no integer sequence in 1..{PCR_RULES_SAFE_INTEGER}; "
+            "the installer would refuse it"
+        )
+    if sequence < int(floor):
+        raise InspectionError(
+            f"{PCR_RULES_JSON_PATH} carries sequence {sequence}, below the {floor} the signed "
+            f"command line seals as {PCR_RULES_SEQ_KARG}; this medium would refuse itself "
+            "at install time"
+        )
+
+
 def check_required_pcr_policy_material(paths: set[str], mode: str) -> None:
     """Require both hash-bound PCR policy carriers on destructive media."""
     if mode != "install":
@@ -1998,6 +2115,7 @@ def check_esp(
     # and a real medium, and a control that only exists behind that fixture is a
     # control nobody notices the loss of.
     check_esp_hash_bound(set(paths), esp.read_file, cmdline)
+    check_pcr_rules_material(set(paths), esp.read_file, cmdline)
     check_preseal_set(set(paths), esp.read_file, cmdline, fields)
     check_v2_release_transport(
         cmdline,
