@@ -1,0 +1,8 @@
+{
+ "bundle_id": "0123456789abcdef0123456789abcdef",
+ "files": [
+  "identity.json",
+  "journal-host.jsonl",
+  "units.json"
+ ]
+}
