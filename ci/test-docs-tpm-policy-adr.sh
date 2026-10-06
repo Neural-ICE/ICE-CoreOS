@@ -9,7 +9,8 @@ cd "$(dirname "$0")/.."
 fail=0
 bad() { echo "FAIL: $*" >&2; fail=1; }
 
-adr=$(ls docs/adr/ADR-0045-*.md 2>/dev/null | head -n1 || true)
+adr=""
+for f in docs/adr/ADR-0045-*.md; do [ -e "$f" ] && { adr=$f; break; }; done
 [ -n "$adr" ] || { bad "docs/adr/ADR-0045-*.md is missing"; exit 1; }
 
 grep -qE '^- \*\*Status\*\*: Accepted \(2026-10-06, Owner\)' "$adr" || bad "$adr must be Status: Accepted (2026-10-06, Owner)"
@@ -24,7 +25,7 @@ done
 
 # ADR numbers are unique across BOTH directories that share the numbering (docs/ and docs/adr/;
 # a collision already happened: OS-0043).
-dups=$(ls docs/ADR-*.md docs/adr/ADR-*.md | sed -E 's#.*/(ADR-[0-9]+)-.*#\1#' | sort | uniq -d)
+dups=$(for f in docs/ADR-*.md docs/adr/ADR-*.md; do [ -e "$f" ] && printf '%s\n' "$f"; done | sed -E 's#.*/(ADR-[0-9]+)-.*#\1#' | sort | uniq -d)
 [ -z "$dups" ] || bad "duplicate ADR number(s) across docs/ and docs/adr/: $dups"
 
 # The superseded texts must point at the new decision, with the OS-00XX prefix (docs/adr/README.md:
