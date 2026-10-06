@@ -126,6 +126,17 @@ PRESEAL_HELPER="$REPO_ROOT/ota/neural-ice-preseal-handoff.py"
 RELEASE_AUTHORITY="${RELEASE_AUTHORITY:-}"
 RELEASE_AUTHORIZATION_FILE="${RELEASE_AUTHORIZATION_FILE:-}"
 RELEASE_AUTHORIZATION_SIGNATURE_FILE="${RELEASE_AUTHORIZATION_SIGNATURE_FILE:-}"
+# 🔴 THE v2 RELEASE MANIFEST PAIR (mission B, T3a; docs/ota/V2-RELEASE-ATTESTATION.md).
+# An owner-sealed v2 host cannot carry the v1 preseal set (it needs the v1 OTA
+# authority, which that host forbids), so the medium takes the v2 release manifest
+# and its detached signature instead: their SHA-256 are sealed in the signed UKI
+# line (neuralice.v2rel_sha256 / neuralice.v2rel_sig_sha256) and the two files are
+# staged on the ESP at ice-coreos/v2-release-manifest.json(.sig). Both or neither;
+# Install, sealed-lab, INSTALL_SOURCE=medium only; exclusive with PRESEAL_SET_* and
+# the RELEASE_AUTHORIZATION_* pair.
+V2_RELEASE_MANIFEST="${V2_RELEASE_MANIFEST:-}"
+V2_RELEASE_MANIFEST_SIG="${V2_RELEASE_MANIFEST_SIG:-}"
+V2_RELEASE_STAGE_ROOT=""
 # The bench-specific CA a LAN mirror is trusted with, and the exact release
 # closure that mirror declares READY. `.63` is transport, never authority: it is
 # pinned by CA digest and must DECLARE the closure being installed before the
@@ -190,6 +201,123 @@ RELEASE_AUTHORIZATION_STAGE_ROOT=""
 
 sha256_of() { # $1=path -> lowercase hex
   sha256sum -- "$1" | awk '{print tolower($1)}'
+}
+
+# --------------------------------------------------------------------------- #
+# The v2 release pair: shape, then meaning. `assert_v2_release_inputs` is the cheap
+# half and runs BEFORE the 40-minute image build; `seal_v2_release_kargs` runs it
+# again, then proves the manifest is the release THIS medium installs, verifies the
+# signature under the key the medium seals, and appends the two kargs. A medium
+# whose installer would refuse it (ota/neural-ice-autoinstall.sh, after T3b) must
+# never reach a USB stick: the refusal belongs here, before the disk of a bench is
+# at stake.
+# --------------------------------------------------------------------------- #
+assert_v2_release_inputs() {
+  [[ -n "$V2_RELEASE_MANIFEST" || -n "$V2_RELEASE_MANIFEST_SIG" ]] || return 0
+  [[ -n "$V2_RELEASE_MANIFEST" && -n "$V2_RELEASE_MANIFEST_SIG" ]] \
+    || { echo "ERROR: V2_RELEASE_MANIFEST and V2_RELEASE_MANIFEST_SIG must be supplied together; one hash pins nothing" >&2; exit 1; }
+  [[ "$MEDIA_MODE" == install && "$VARIANT" == sealed-lab && "$INSTALL_SOURCE" == medium ]] \
+    || { echo "ERROR: a v2 release manifest is only permitted on sealed-lab Install media with INSTALL_SOURCE=medium" >&2; exit 1; }
+  [[ -z "$PRESEAL_SET_DIR" && -z "$PRESEAL_SET_SHA256" \
+     && -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
+    || { echo "ERROR: a v2 release manifest excludes PRESEAL_SET_* and the RELEASE_AUTHORIZATION_* pair; two authentication routes for one TPM floor are refused" >&2; exit 1; }
+  local input limit
+  for input in "$V2_RELEASE_MANIFEST:1048576" "$V2_RELEASE_MANIFEST_SIG:1024"; do
+    limit="${input##*:}"; input="${input%:*}"
+    [[ -f "$input" && ! -L "$input" && -s "$input" ]] \
+      || { echo "ERROR: the v2 release manifest and its signature must be non-empty regular files, not links: $input" >&2; exit 1; }
+    (( $(stat -c %s -- "$input") <= limit )) \
+      || { echo "ERROR: $input is larger than the ${limit}-byte bound of the v2 release attestation contract" >&2; exit 1; }
+  done
+}
+
+seal_v2_release_kargs() {
+  [[ -n "$V2_RELEASE_MANIFEST" || -n "$V2_RELEASE_MANIFEST_SIG" ]] || return 0
+  assert_v2_release_inputs
+  local release_key="$SEALED_DIR/release-authorization.pub" signature_bin
+  [[ -f "$release_key" && ! -L "$release_key" && -s "$release_key" ]] \
+    || { echo "ERROR: the installer image carries no release key to verify the v2 release manifest under: $release_key" >&2; exit 1; }
+  V2_RELEASE_MANIFEST_SHA256="$(sha256_of "$V2_RELEASE_MANIFEST")"
+  V2_RELEASE_MANIFEST_SIG_SHA256="$(sha256_of "$V2_RELEASE_MANIFEST_SIG")"
+  [[ "$V2_RELEASE_MANIFEST_SHA256" != "$V2_RELEASE_MANIFEST_SIG_SHA256" ]] \
+    || { echo "ERROR: the v2 release manifest and its detached signature are the same bytes; that pins neither" >&2; exit 1; }
+  # The manifest the signature covers must say what this medium installs, and say
+  # it unambiguously: no duplicated key at any depth, the contract's schema, a
+  # bundle_seq that is an integer in 1..2^53-1 (the TPM floor's bound), and the
+  # host image, repository and hardware this medium is sealed to.
+  python3 -I - "$V2_RELEASE_MANIFEST" "$TARGET_IMGREF" "$HARDWARE_TARGET" "$RELEASE_AUTHORITY" <<'PYEOF' \
+    || { echo "ERROR: the v2 release manifest is not the release this medium installs (see above)" >&2; exit 1; }
+import json
+import re
+import sys
+
+path, imgref, hardware_target, authority = sys.argv[1:]
+
+
+def refuse(reason):
+    print(f"ERROR: v2 release manifest: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def no_duplicates(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        refuse("duplicated JSON key")
+    return dict(pairs)
+
+
+with open(path, "rb") as handle:
+    raw = handle.read(1048577)
+try:
+    manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
+except (ValueError, UnicodeDecodeError) as error:
+    refuse(f"not valid JSON ({error})")
+if not isinstance(manifest, dict):
+    refuse("not a JSON object")
+if manifest.get("schema") != "neural-ice-release-manifest-v1":
+    refuse("schema is not neural-ice-release-manifest-v1")
+release_id = manifest.get("release_id")
+if not isinstance(release_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", release_id):
+    refuse("release_id is absent or malformed")
+bundle_seq = manifest.get("bundle_seq")
+if type(bundle_seq) is not int or not 1 <= bundle_seq <= 2**53 - 1:
+    refuse("bundle_seq is not an integer in 1..2^53-1")
+if manifest.get("hardware_target") != hardware_target:
+    refuse("hardware_target is not the hardware target this medium is sealed to")
+host = manifest.get("host")
+if not isinstance(host, dict):
+    refuse("host is absent")
+repository, digest = host.get("repository"), host.get("digest")
+if not isinstance(repository, str) or not isinstance(digest, str):
+    refuse("host.repository or host.digest is absent")
+if repository.split("/", 1)[0] != authority:
+    refuse("host.repository is not at the release authority this medium names")
+if f"{repository}@{digest}" != imgref:
+    refuse("host.repository@host.digest is not the image this medium installs (TARGET_IMGREF)")
+PYEOF
+  # The signature, as the installer will check it: detached, base64 ASN.1-DER
+  # ECDSA-P256-SHA256 over the exact manifest bytes, under the key this medium
+  # seals. Strictly the contract's file form (no whitespace, no trailing LF).
+  signature_bin="$(mktemp "${TMPDIR:-/tmp}/ni-v2rel-sig.XXXXXX")"
+  python3 -I - "$V2_RELEASE_MANIFEST_SIG" "$signature_bin" <<'PYEOF' \
+    || { rm -f -- "$signature_bin"; echo "ERROR: the v2 release signature is not strict base64 (no whitespace, no trailing LF)" >&2; exit 1; }
+import base64
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    encoded = handle.read(1025)
+with open(sys.argv[2], "wb") as handle:
+    handle.write(base64.b64decode(encoded, validate=True))
+PYEOF
+  if ! openssl dgst -sha256 -verify "$release_key" -signature "$signature_bin" "$V2_RELEASE_MANIFEST" >/dev/null 2>&1; then
+    rm -f -- "$signature_bin"
+    echo "ERROR: the v2 release signature does not verify over the manifest bytes under the key this medium seals" >&2
+    exit 1
+  fi
+  rm -f -- "$signature_bin"
+  UKI_KARGS+=("neuralice.v2rel_sha256=${V2_RELEASE_MANIFEST_SHA256}" \
+    "neuralice.v2rel_sig_sha256=${V2_RELEASE_MANIFEST_SIG_SHA256}")
+  V2_RELEASE_STAGE_ROOT=staged
 }
 
 # --------------------------------------------------------------------------- #
@@ -1044,6 +1172,8 @@ if [[ -n "$PRESEAL_SET_DIR" || -n "$PRESEAL_SET_SHA256" ]]; then
     "$RELEASE_AUTHORIZATION_FILE" "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
     "$PRESEAL_STAGE_ROOT/preseal"
 fi
+# The cheap half of the v2 release pair's refusals, before the long image build.
+assert_v2_release_inputs
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -1626,6 +1756,10 @@ case "$MEDIA_MODE" in
           || { echo "ERROR: MIRROR_CA_FILE/MIRROR_READY_SHA256 require INSTALL_SOURCE=registry and INSTALL_MIRROR" >&2; exit 1; }
         if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
           seal_install_authorization "$TARGET_IMGREF" "$sealed_store_manifest_digest"
+        elif [[ -n "$V2_RELEASE_MANIFEST" ]]; then
+          # Appended right after neuralice.source=medium: manifest hash, then
+          # signature hash -- the token order the Fabric-v2 template states.
+          seal_v2_release_kargs
         else
           [[ -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
             || { echo "ERROR: a medium release authorization requires PRESEAL_SET_DIR/PRESEAL_SET_SHA256" >&2; exit 1; }
@@ -1645,6 +1779,8 @@ case "$MEDIA_MODE" in
           || { echo "ERROR: OS_IMAGE is not at the release authority ${RELEASE_AUTHORITY}: $OS_IMAGE" >&2; exit 1; }
         UKI_KARGS+=("neuralice.source=registry" "neuralice.osimage=${OS_IMAGE}")
 
+        [[ -z "$V2_RELEASE_MANIFEST" && -z "$V2_RELEASE_MANIFEST_SIG" ]] \
+          || { echo "ERROR: a v2 release manifest requires INSTALL_SOURCE=medium" >&2; exit 1; }
         seal_install_authorization "$OS_IMAGE"
 
         if [[ -n "$INSTALL_MIRROR" ]]; then
@@ -1702,6 +1838,7 @@ case "$MEDIA_MODE" in
     [[ -z "$RELEASE_AUTHORITY" ]] \
       || { echo "ERROR: a Live medium installs nothing; RELEASE_AUTHORITY is meaningless on one" >&2; exit 1; }
     [[ -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
+       && -z "$V2_RELEASE_MANIFEST" && -z "$V2_RELEASE_MANIFEST_SIG" \
        && -z "$MIRROR_CA_FILE" && -z "$MIRROR_READY_SHA256" ]] \
       || { echo "ERROR: a Live medium installs nothing; a release authorization and a mirror pin are meaningless on one" >&2; exit 1; }
     # Live is just as explicit as Install: the signature selects both the mode
@@ -1940,6 +2077,19 @@ if [[ -n "$RELEASE_AUTHORIZATION_STAGE_ROOT" ]]; then
     || { echo "ERROR: the release authorization on the ESP does not hash to the value sealed in the signature" >&2; exit 1; }
   echo "    staged the signed release authorization on the ESP (doc ${staged_doc}, sig ${staged_sig}; both sealed in the UKI)"
 fi
+# The v2 release pair, staged and READ BACK like the authorization pair above: the
+# value sealed in the signature must be the hash of the bytes that ended up on the
+# medium, not of the bytes this script intended to write.
+if [[ -n "$V2_RELEASE_STAGE_ROOT" ]]; then
+  sudo install -d -m 0755 "$MNT/ice-coreos"
+  sudo install -m 0444 "$V2_RELEASE_MANIFEST" "$MNT/ice-coreos/v2-release-manifest.json"
+  sudo install -m 0444 "$V2_RELEASE_MANIFEST_SIG" "$MNT/ice-coreos/v2-release-manifest.json.sig"
+  staged_v2_manifest="$(sudo sha256sum "$MNT/ice-coreos/v2-release-manifest.json" | awk '{print tolower($1)}')"
+  staged_v2_sig="$(sudo sha256sum "$MNT/ice-coreos/v2-release-manifest.json.sig" | awk '{print tolower($1)}')"
+  [[ "$staged_v2_manifest" == "$V2_RELEASE_MANIFEST_SHA256" && "$staged_v2_sig" == "$V2_RELEASE_MANIFEST_SIG_SHA256" ]] \
+    || { echo "ERROR: the v2 release manifest pair on the ESP does not hash to the values sealed in the signature" >&2; exit 1; }
+  echo "    staged the v2 release manifest pair on the ESP (manifest ${staged_v2_manifest}, sig ${staged_v2_sig}; both sealed in the UKI)"
+fi
 if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
   sudo python3 "$PRESEAL_HELPER" install \
     "$PRESEAL_STAGE_ROOT/preseal" "$PRESEAL_SET_SHA256" \
@@ -2010,6 +2160,14 @@ if [[ -n "$SSH_AUTHORIZED_KEYS_FILE" ]]; then
   INSPECT_ARGS+=(--expect-sshkey-sha256 "$SSH_AUTHORIZED_KEYS_SHA256")
 else
   INSPECT_ARGS+=(--expect-no-sshkey)
+fi
+# THE v2 RELEASE PAIR, READ BACK OFF THE MEDIUM: sealed and equal to the hashes this
+# build staged, or absent from the sealed line altogether.
+if [[ -n "$V2_RELEASE_STAGE_ROOT" ]]; then
+  INSPECT_ARGS+=(--expect-v2-release-manifest-sha256 "$V2_RELEASE_MANIFEST_SHA256"
+    --expect-v2-release-manifest-sig-sha256 "$V2_RELEASE_MANIFEST_SIG_SHA256")
+else
+  INSPECT_ARGS+=(--expect-no-v2-release)
 fi
 # Only the registry Install path has the signed release authorization needed by
 # the final Fabric reprojection. Keep the measurement beside the exact raw the

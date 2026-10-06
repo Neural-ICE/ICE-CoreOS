@@ -126,6 +126,11 @@ ESP_OPTIONAL = frozenset(
         # signed UKI command line and rechecked below before acceptance.
         "ice-coreos/tpm2-pcr-public-key.pem",
         "ice-coreos/tpm2-pcr-signature.json",
+        # The v2 release manifest and its detached signature (mission B, T3a;
+        # docs/ota/V2-RELEASE-ATTESTATION.md). Mutable ESP carriers whose sha256
+        # the signed UKI seals as neuralice.v2rel_sha256 / v2rel_sig_sha256.
+        "ice-coreos/v2-release-manifest.json",
+        "ice-coreos/v2-release-manifest.json.sig",
         "ice-coreos/preseal/preseal-set.json",
         "ice-coreos/preseal/delegation-snapshot.json",
         "ice-coreos/preseal/delegation-snapshot.sig",
@@ -140,6 +145,8 @@ ESP_OPTIONAL = frozenset(
 ESP_HASH_BOUND = (
     ("ice-coreos/release-authorization.json", "neuralice.relauth_sha256"),
     ("ice-coreos/release-authorization.sig", "neuralice.relauth_sig_sha256"),
+    ("ice-coreos/v2-release-manifest.json", "neuralice.v2rel_sha256"),
+    ("ice-coreos/v2-release-manifest.json.sig", "neuralice.v2rel_sig_sha256"),
     ("ice-coreos/mirror-ca.crt", "neuralice.mirror_ca_sha256"),
     ("ice-coreos/tpm2-pcr-public-key.pem", "neuralice.pcr_policy_key"),
     ("ice-coreos/tpm2-pcr-signature.json", "neuralice.pcr_policy_signature"),
@@ -744,6 +751,8 @@ SEALED_INSTALL_OPTIONAL_KEYS = (
     "neuralice.relauth_sha256",
     "neuralice.relauth_sig_sha256",
     "neuralice.preseal",
+    "neuralice.v2rel_sha256",
+    "neuralice.v2rel_sig_sha256",
     "neuralice.mirror_ca_sha256",
     "neuralice.mirror_ready",
     "neuralice.mirror_manifest",
@@ -903,6 +912,8 @@ def _sealed_value_is_valid(key: str, value: str) -> bool:
         "neuralice.relauth_sha256",
         "neuralice.relauth_sig_sha256",
         "neuralice.preseal",
+        "neuralice.v2rel_sha256",
+        "neuralice.v2rel_sig_sha256",
         "neuralice.mirror_ca_sha256",
         "neuralice.mirror_ready",
         "neuralice.mirror_manifest",
@@ -1075,6 +1086,25 @@ def classify_sealed_cmdline(cmdline: str) -> str:
             raise SelectorRefusal(f"origin-not-the-release-authority:{origin_key}")
 
     source = optional.get("neuralice.source")
+    # THE v2 RELEASE ATTESTATION PAIR (mission B, T3a;
+    # docs/ota/V2-RELEASE-ATTESTATION.md): the sha256 of the v2 release manifest
+    # and of its detached signature, sealed jointly, on a medium source, and
+    # exclusive with both other authentication routes (the v1 preseal set and the
+    # authorization pair). Evaluated BEFORE the registry/preseal rules so the
+    # refusal names the pair, exactly as the shell grammar does.
+    if "neuralice.v2rel_sha256" in optional or "neuralice.v2rel_sig_sha256" in optional:
+        if "neuralice.v2rel_sha256" not in optional:
+            raise SelectorRefusal("v2rel-sig-without-manifest")
+        if "neuralice.v2rel_sig_sha256" not in optional:
+            raise SelectorRefusal("v2rel-manifest-without-sig")
+        if optional["neuralice.v2rel_sha256"] == optional["neuralice.v2rel_sig_sha256"]:
+            raise SelectorRefusal("v2rel-hashes-identical")
+        if source != "medium":
+            raise SelectorRefusal("v2rel-requires-medium-source")
+        if "neuralice.preseal" in optional:
+            raise SelectorRefusal("v2rel-with-preseal")
+        if {"neuralice.relauth_sha256", "neuralice.relauth_sig_sha256"}.intersection(optional):
+            raise SelectorRefusal("v2rel-with-release-authorization")
     # THE RELEASE-AUTHORIZATION PAIR IS SEALED ONCE (FAB-0057 P1.1b, rule B).
     # A preseal set binds `installer_authorization_sha256` and its signature
     # hash and is itself hashed against `neuralice.preseal`, so a line sealing
@@ -1450,6 +1480,55 @@ def check_esp_hash_bound(paths: set[str], read_file, cmdline: str) -> None:
             raise InspectionError(
                 f"the ESP's {path} hashes to {observed}, not the {pinned} the signed "
                 "command line seals"
+            )
+
+
+V2_RELEASE_MANIFEST_KARG = "neuralice.v2rel_sha256"
+V2_RELEASE_SIG_KARG = "neuralice.v2rel_sig_sha256"
+
+
+def check_v2_release_transport(
+    cmdline: str,
+    expected_manifest_sha256: str | None = None,
+    expected_sig_sha256: str | None = None,
+    expect_absent: bool = False,
+) -> None:
+    """The v2 release pair the producer APPROVED is the pair the UKI seals.
+
+    ``check_esp_hash_bound`` proves the ESP files hash to whatever the sealed line
+    pins; it cannot know whether the line pins the release the operator meant to
+    cut. With ``expected_*`` the sealed ``neuralice.v2rel_sha256`` and
+    ``neuralice.v2rel_sig_sha256`` must equal the approved hashes (a medium sealing
+    another correctly signed release installs a floor nobody chose); with
+    ``expect_absent`` the line may carry neither (a v2 pair nobody asked for has no
+    business leaving the build host). With neither, nothing is asserted here and
+    the grammar and the hash bindings stay the authority.
+    """
+    if (expected_manifest_sha256 is None) != (expected_sig_sha256 is None):
+        raise ValueError("the v2 release manifest and signature expectations come together")
+    if expected_manifest_sha256 is not None and expect_absent:
+        raise ValueError("an expected v2 release pair and expect_absent are exclusive")
+    words = [word.split("=", 1) for word in cmdline.split() if "=" in word]
+    sealed = {
+        key: [value for k, value in words if k == key]
+        for key in (V2_RELEASE_MANIFEST_KARG, V2_RELEASE_SIG_KARG)
+    }
+    if expect_absent:
+        if any(sealed.values()):
+            raise InspectionError(
+                "the sealed command line carries a v2 release manifest pin nobody approved for this medium"
+            )
+        return
+    if expected_manifest_sha256 is None:
+        return
+    for key, expected in (
+        (V2_RELEASE_MANIFEST_KARG, expected_manifest_sha256),
+        (V2_RELEASE_SIG_KARG, expected_sig_sha256),
+    ):
+        if sealed[key] != [expected]:
+            raise InspectionError(
+                f"the sealed command line carries {key}={sealed[key]}, "
+                f"not the approved {expected}"
             )
 
 
@@ -1879,6 +1958,12 @@ def check_esp(
     # control nobody notices the loss of.
     check_esp_hash_bound(set(paths), esp.read_file, cmdline)
     check_preseal_set(set(paths), esp.read_file, cmdline, fields)
+    check_v2_release_transport(
+        cmdline,
+        arguments.expect_v2_release_manifest_sha256,
+        arguments.expect_v2_release_manifest_sig_sha256,
+        arguments.expect_no_v2_release,
+    )
     check_tpm_policy_document(set(paths), esp.read_file, cmdline)
     check_sshkey_transport(
         set(paths), cmdline, arguments.expect_sshkey_sha256, arguments.expect_no_sshkey
@@ -1969,14 +2054,41 @@ def main() -> int:
         action="store_true",
         help="neither the sealed cmdline nor the ESP may carry an operator SSH key",
     )
+    v2_release = parser.add_mutually_exclusive_group()
+    v2_release.add_argument(
+        "--expect-v2-release-manifest-sha256",
+        help="the sealed cmdline must pin neuralice.v2rel_sha256 to this value (needs --expect-v2-release-manifest-sig-sha256)",
+    )
+    v2_release.add_argument(
+        "--expect-no-v2-release",
+        action="store_true",
+        help="the sealed cmdline may not pin a v2 release manifest",
+    )
+    parser.add_argument(
+        "--expect-v2-release-manifest-sig-sha256",
+        help="the sealed cmdline must pin neuralice.v2rel_sig_sha256 to this value",
+    )
     parser.add_argument("--payload-partition-name", default=PAYLOAD_PARTITION_NAME)
     parser.add_argument("--measurements-output", type=Path)
     arguments = parser.parse_args()
+    if (arguments.expect_v2_release_manifest_sha256 is None) != (
+        arguments.expect_v2_release_manifest_sig_sha256 is None
+    ):
+        print(
+            "ERROR: --expect-v2-release-manifest-sha256 and --expect-v2-release-manifest-sig-sha256 come together",
+            file=sys.stderr,
+        )
+        return 2
+    if arguments.expect_no_v2_release and arguments.expect_v2_release_manifest_sig_sha256:
+        print("ERROR: --expect-no-v2-release excludes the v2 release expectations", file=sys.stderr)
+        return 2
 
     for value, label in (
         (arguments.expect_verity_root_hash, "--expect-verity-root-hash"),
         (arguments.expect_payload_digest, "--expect-payload-digest"),
         (arguments.expect_sshkey_sha256, "--expect-sshkey-sha256"),
+        (arguments.expect_v2_release_manifest_sha256, "--expect-v2-release-manifest-sha256"),
+        (arguments.expect_v2_release_manifest_sig_sha256, "--expect-v2-release-manifest-sig-sha256"),
     ):
         if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
             print(f"ERROR: {label} must be 64 lowercase hex", file=sys.stderr)

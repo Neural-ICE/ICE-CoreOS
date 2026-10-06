@@ -71,6 +71,68 @@ render customer-locked "$TARGET" "$KEYID" "$GOOD_HASH" "$PAYLOAD_DIGEST" "$POLIC
   && fail "an extra karg restating the sealed authorization schema was sealed"
 
 # --------------------------------------------------------------------------- #
+# 1b) THE v2 RELEASE PAIR (mission B, T3a). An owner-sealed v2 medium seals the
+#     sha256 of the release manifest and of its detached signature as two extra
+#     kargs. The renderer emits extras VERBATIM and in the order given, and that
+#     order is a contract: the sealed line is a signed artefact a reviewer diffs,
+#     and the Fabric-v2 template that fills it states the same tokens in the same
+#     order. So the order is asserted literally -- manifest, then signature, after
+#     the source -- and a pair that is not well-formed is refused at build time,
+#     where refusing is free: one hash alone pins nothing, the signature before
+#     the manifest is a second spelling of the same line, and the pair beside
+#     the v1 preseal set or the authorization pair is two authentication routes
+#     for one TPM floor.
+# --------------------------------------------------------------------------- #
+V2_MANIFEST_SHA="$(printf 'v2-release-manifest' | sha256sum | awk '{print $1}')"
+V2_SIG_SHA="$(printf 'v2-release-manifest-sig' | sha256sum | awk '{print $1}')"
+render_v2() { render lab-managed "$TARGET" "$KEYID" "$GOOD_HASH" "$PAYLOAD_DIGEST" "$POLICY_ID" "$@"; }
+V2_LINE="$(render_v2 quiet enforcing=0 neuralice.source=medium \
+  "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA")" \
+  || fail "a well-formed v2 release pair was refused by the renderer"
+v2_expected="neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_profile=lab-managed neuralice.hardware_target=$TARGET neuralice.payload=$PAYLOAD_DIGEST neuralice.relauth_keyid=$KEYID neuralice.relauth_schema=neural-ice-installer-release-authorization-v2 neuralice.rootverity=$GOOD_HASH neuralice.trust_policy_id=$POLICY_ID quiet enforcing=0 neuralice.source=medium neuralice.v2rel_sha256=$V2_MANIFEST_SHA neuralice.v2rel_sig_sha256=$V2_SIG_SHA"
+[ "$V2_LINE" = "$v2_expected" ] || fail "the v2 release pair is not rendered in its canonical order:
+  got:      $V2_LINE
+  expected: $v2_expected"
+# The sealed anchor is still read exactly once from that line, the v2 pair beside it.
+bash "$LIB" field neuralice.relauth_keyid "$V2_LINE" >/dev/null \
+  || fail "the sealed key id can no longer be read from a line carrying the v2 pair"
+
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" >/dev/null 2>&1 \
+  && fail "a v2 manifest hash without its signature hash was sealed"
+render_v2 "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" >/dev/null 2>&1 \
+  && fail "a v2 signature hash without its manifest hash was sealed"
+render_v2 "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" >/dev/null 2>&1 \
+  && fail "a v2 pair with the signature before the manifest was sealed"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
+  "neuralice.v2rel_sha256=$OTHER_HASH" >/dev/null 2>&1 \
+  && fail "a second v2 manifest hash was sealed"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
+  "neuralice.v2rel_sig_sha256=$OTHER_HASH" >/dev/null 2>&1 \
+  && fail "a second v2 signature hash was sealed"
+render_v2 "neuralice.v2rel_sha256=deadbeef" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" >/dev/null 2>&1 \
+  && fail "a truncated v2 manifest hash was sealed"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=${V2_SIG_SHA^^}" >/dev/null 2>&1 \
+  && fail "an uppercase v2 signature hash was sealed"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_MANIFEST_SHA" >/dev/null 2>&1 \
+  && fail "one hash pinning both the v2 manifest and its signature was sealed"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
+  "neuralice.preseal=$OTHER_HASH" >/dev/null 2>&1 \
+  && fail "the v2 pair was sealed beside the v1 preseal set"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
+  "neuralice.relauth_sha256=$OTHER_HASH" "neuralice.relauth_sig_sha256=$OTHER_HASH" >/dev/null 2>&1 \
+  && fail "the v2 pair was sealed beside the authorization pair"
+render_v2 "neuralice.v2rel_sha256=$V2_MANIFEST_SHA" "neuralice.v2rel_sig_sha256=$V2_SIG_SHA" \
+  "neuralice.relauth_sha256=$OTHER_HASH" >/dev/null 2>&1 \
+  && fail "the v2 pair was sealed beside the authorization document hash"
+# A line with no v2 pair is untouched: the existing preseal / authorization
+# renderings keep working byte for byte.
+render_v2 quiet neuralice.source=medium "neuralice.preseal=$OTHER_HASH" >/dev/null \
+  || fail "the renderer refused a preseal line that carries no v2 pair"
+render_v2 quiet neuralice.source=registry "neuralice.relauth_sha256=$V2_MANIFEST_SHA" \
+  "neuralice.relauth_sig_sha256=$V2_SIG_SHA" >/dev/null \
+  || fail "the renderer refused an authorization-pair line that carries no v2 pair"
+
+# --------------------------------------------------------------------------- #
 # 2) SHADOWING. systemd-stub honours the embedded .cmdline and ignores an
 #    externally supplied one ONLY while Secure Boot is enforcing. With Secure
 #    Boot off — a state physical access can reach — the two are concatenated.

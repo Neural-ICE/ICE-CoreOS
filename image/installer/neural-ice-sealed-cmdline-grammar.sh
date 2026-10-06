@@ -283,8 +283,9 @@ ni_sealed_value_is_valid() { # $1=key  $2=value
       # value may sit beside is a question about the LINE, answered in section 4.
       [[ "$value" == mirror ]]
       ;;
-    neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.preseal|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature)
-      # SHA-256 of an artefact the producer staged on the ESP, or of the exact
+    neuralice.relauth_sha256|neuralice.relauth_sig_sha256|neuralice.preseal|neuralice.v2rel_sha256|neuralice.v2rel_sig_sha256|neuralice.mirror_ca_sha256|neuralice.mirror_ready|neuralice.mirror_manifest|neuralice.pcr_policy|neuralice.pcr_policy_key|neuralice.pcr_policy_signature)
+      # SHA-256 of an artefact the producer staged on the ESP (the v2 release
+      # manifest and its detached signature included), or of the exact
       # release closure a mirror declares READY. Sealed into the UKI so the
       # mutable ESP cannot decide any of them.
       [[ "$value" =~ ^[0-9a-f]{64}$ ]]
@@ -319,6 +320,7 @@ _ni_sealed_install_optional_keys=(
   neuralice.systemsize neuralice.target neuralice.sshkey
   neuralice.relauth_sha256 neuralice.relauth_sig_sha256
   neuralice.preseal
+  neuralice.v2rel_sha256 neuralice.v2rel_sig_sha256
   neuralice.mirror_ca_sha256 neuralice.mirror_ready neuralice.mirror_manifest
   neuralice.mirror_generation
   neuralice.seed_closure neuralice.seed_manifest neuralice.seed_trusted_now
@@ -562,6 +564,41 @@ ni_sealed_cmdline_classify() { # $1=cmdline string
   # ESP staging and signature verification. A line that restates them is
   # refused BY NAME; without a preseal set nothing changes.
   # ------------------------------------------------------------------------- #
+  # ------------------------------------------------------------------------- #
+  # 🔴 THE v2 RELEASE ATTESTATION PAIR (mission B, T3a;
+  # docs/ota/V2-RELEASE-ATTESTATION.md). An owner-sealed v2 host cannot carry the
+  # v1 preseal set (it needs the v1 OTA authority, which that host forbids), so the
+  # medium seals the sha256 of the v2 release manifest and of its detached
+  # signature instead. The two files travel on the mutable ESP; these two hashes
+  # are what makes the signed UKI, not the ESP, decide which release is installed.
+  #
+  # The pair is joint (one without the other pins nothing), two different objects,
+  # medium-source only (the contract's mode `manifest-digest` is the offline
+  # installer's), and EXCLUSIVE with both other authentication routes: the v1
+  # preseal set and the authorization pair. A line sealing two routes is a line
+  # whose installer would have to choose which one decides the TPM floor.
+  # These rules run BEFORE the registry/preseal rules below so the refusal names
+  # the v2 pair instead of a side effect of it.
+  # ------------------------------------------------------------------------- #
+  local v2rel_manifest_seen="${optional_seen[neuralice.v2rel_sha256]:-}"
+  local v2rel_sig_seen="${optional_seen[neuralice.v2rel_sig_sha256]:-}"
+  if [[ -n "$v2rel_manifest_seen" || -n "$v2rel_sig_seen" ]]; then
+    [[ -n "$v2rel_manifest_seen" ]] \
+      || { _ni_sealed_refuse v2rel-sig-without-manifest; return 1; }
+    [[ -n "$v2rel_sig_seen" ]] \
+      || { _ni_sealed_refuse v2rel-manifest-without-sig; return 1; }
+    [[ "$(ni_sealed_argument_value neuralice.v2rel_sha256 "${words[@]}")" \
+       != "$(ni_sealed_argument_value neuralice.v2rel_sig_sha256 "${words[@]}")" ]] \
+      || { _ni_sealed_refuse v2rel-hashes-identical; return 1; }
+    [[ "$(ni_sealed_argument_value neuralice.source "${words[@]}" || true)" == medium ]] \
+      || { _ni_sealed_refuse v2rel-requires-medium-source; return 1; }
+    [[ -z "${optional_seen[neuralice.preseal]:-}" ]] \
+      || { _ni_sealed_refuse v2rel-with-preseal; return 1; }
+    [[ -z "${optional_seen[neuralice.relauth_sha256]:-}" \
+       && -z "${optional_seen[neuralice.relauth_sig_sha256]:-}" ]] \
+      || { _ni_sealed_refuse v2rel-with-release-authorization; return 1; }
+  fi
+
   local preseal_seen="${optional_seen[neuralice.preseal]:-}"
   if (( registry_source == 1 )); then
     [[ -n "${optional_seen[neuralice.osimage]:-}" ]] \
