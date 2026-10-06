@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PCR 7 rules engine: Owner-signed rules, evaluated on a state PCR 7 vouches for.
+"""PCR 7 rules engine: Owner-signed rules, evaluated on the machine's Secure Boot state.
 
     sign      RULES --key PEM --out SIG      what the Owner runs, offline
     verify    RULES SIG                      signature, schema, anti-rollback
@@ -11,22 +11,34 @@ hold (C), the revocations `dbx` must hold at least (F: the floor), the boot-path
 authorities PCR 7 may log (A), and a sequence number. Nothing in it names a machine
 or a PCR value, so one signature covers every unit of a firmware family.
 
-Rules are only worth what they are evaluated on. EFI variables read from the running
-system are claims; the TPM's PCR 7 is the proof. So the engine first demands
+What PCR 7 does and does not prove. The engine first demands
 
     replay(firmware event log) == live PCR 7          <-- the log is the one PCR 7 saw
     sha256(event data) == the logged digest           <-- the data read is what was extended
 
-and only then reads the state, binding each variable to what the firmware measured:
+so the event log is genuine. That says what the firmware MEASURED, nothing more: on a
+GB10 it measures SecureBoot, PK, KEK, db and dbx with zero-length data (PR #245), so PCR 7
+does not vouch for their contents. The engine then reads the variables directly from
+efivars and binds each to what the firmware measured, when it measured anything:
 
   * a variable the log carries WITH its bytes must equal the EFI variable: a variable
     edited after boot is refused ("attested");
-  * a variable the log carries by NAME ONLY cannot be checked against PCR 7 and is
-    "observed". That is what the GB10 firmware does for SecureBoot, PK, KEK, db and dbx
-    (ASUS GX10DGX.0104, NVIDIA 5.36_0ACUM018: zero-length data). The rules choose
-    whether that is acceptable (`unbound_variables`); the verdict always says which
-    checks were attested and which only observed. On such firmware the attested
-    evidence is the authority chain: the certificates that verified the boot path.
+  * a variable the log carries by NAME ONLY (zero-length data, an empty variable
+    included) cannot be checked against PCR 7 and is "observed". That is what the GB10
+    firmware does for SecureBoot, PK, KEK, db and dbx (ASUS GX10DGX.0104, NVIDIA
+    5.36_0ACUM018). The rules choose whether that is acceptable (`unbound_variables`);
+    the verdict lists the checks that were only observed (`observed`). On such firmware
+    the attested evidence is the authority chain: the certificates that verified the
+    boot path.
+
+Observed variables are trusted for a reason that is NOT the TPM: the installer is a
+signed UKI running under enforced Secure Boot, an authenticated write to PK/KEK/db/dbx
+needs a PK/KEK signature, setup and audit mode are refused, and the firmware setup is
+behind the per-device UEFI administrator password. PK and KEK are constrained to the
+sets the rules approve. The residual attacks (physical SPI write, firmware bugs) are out
+of scope: see the README, "Threat model of the directly read EFI variables".
+
+Callers decide on the verdict's `binding` and `observed`, never on `accepted` alone.
 
 The signature is domain-separated: it covers `neural-ice-pcr-rules/v1\\0 || RULES`
 (the exact bytes), so a signature this key made for anything else (a PolicyPCR digest,
@@ -65,11 +77,17 @@ MAX_RULES_BYTES = 1 << 20
 MAX_VARIABLE_BYTES = 4 << 20
 DEFAULT_EVENTLOG = policy.DEFAULT_EVENTLOG
 DEFAULT_EFIVARS = "/sys/firmware/efi/efivars"
+# A fixed location first, so a PATH an attacker controls cannot swap the verifier.
+OPENSSL = next((p for p in ("/usr/bin/openssl", "/bin/openssl") if os.access(p, os.X_OK)), "openssl")
 
 GUID_GLOBAL = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
 GUID_SECURITY_DB = "d719b2cb-3d3a-4596-a3bc-dad00e67656f"
 VARIABLES = (("SecureBoot", GUID_GLOBAL), ("PK", GUID_GLOBAL), ("KEK", GUID_GLOBAL),
              ("db", GUID_SECURITY_DB), ("dbx", GUID_SECURITY_DB))
+SHIM_GUID = "605dab50-e046-4300-abb6-3dd810dd8b23"
+# The vendor GUID an authority event of this name carries. A `db` event under another GUID
+# is not the Secure Boot database verifying an image.
+AUTHORITY_GUIDS = {"db": GUID_SECURITY_DB, "SbatLevel": SHIM_GUID, "MokListRT": SHIM_GUID}
 GUID_X509 = "a5c059a1-94e4-4aa7-87b5-ab155c2bf072"
 GUID_SHA256 = "c1c41626-504c-4092-aca9-41f936934328"
 GUID_X509_SHA256 = "3bd2a492-96c0-4079-b420-fcf98ef103ed"
@@ -124,8 +142,8 @@ def parse_rules(raw):
                               parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError) as error:
         raise RulesError("rules-schema", f"rules schema: not strict JSON ({error})") from error
-    allowed = {"schema", "sequence", "unbound_variables", "approved_certs", "dbx_floor",
-               "authorities", "note"}
+    allowed = {"schema", "sequence", "unbound_variables", "approved_certs", "approved_pk",
+               "approved_kek", "dbx_floor", "authorities", "note"}
     if not isinstance(document, dict) or set(document) - allowed:
         raise RulesError("rules-schema", "rules schema: expected an object with only "
                                          f"{sorted(allowed)}")
@@ -141,6 +159,8 @@ def parse_rules(raw):
     if not isinstance(note, str) or len(note) > 200:
         raise RulesError("rules-schema", "rules schema: note must be a string of 200 characters")
     approved = _id_list(document.get("approved_certs"), "approved_certs", CERT_ID_RE)
+    approved_pk = _id_list(document.get("approved_pk"), "approved_pk", CERT_ID_RE)
+    approved_kek = _id_list(document.get("approved_kek"), "approved_kek", CERT_ID_RE)
     floor = _id_list(document.get("dbx_floor"), "dbx_floor", DBX_ID_RE)
     authorities = document.get("authorities")
     if not isinstance(authorities, list) or not authorities:
@@ -155,12 +175,14 @@ def parse_rules(raw):
         by_name[entry["name"]] = frozenset(_id_list(entry["ids"], f"authorities.{entry['name']}",
                                                     ID_RE))
     return {"sequence": sequence, "unbound": document["unbound_variables"],
-            "approved": frozenset(approved), "floor": frozenset(floor), "authorities": by_name}
+            "approved": frozenset(approved),
+            "approved_pk": frozenset(approved_pk), "approved_kek": frozenset(approved_kek),
+            "floor": frozenset(floor), "authorities": by_name}
 
 
 def _openssl(args, data):
     try:
-        return subprocess.run(["openssl", *args], input=data, capture_output=True, check=False)
+        return subprocess.run([OPENSSL, *args], input=data, capture_output=True, check=False)
     except OSError as error:
         raise RulesError("rules-signature", f"cannot execute openssl: {error}") from error
 
@@ -173,21 +195,40 @@ def sign_rules(raw, key_path):
     return base64.b64encode(result.stdout).decode("ascii") + "\n"
 
 
-def spki_sha256(pubkey_path):
-    result = _openssl(["pkey", "-pubin", "-in", str(pubkey_path), "-outform", "DER"], b"")
+def _read_pubkey(pubkey_path):
+    """The public key bytes, read ONCE: the bytes that are pinned are the bytes that verify."""
+    try:
+        with open(pubkey_path, "rb") as handle:
+            data = handle.read(MAX_RULES_BYTES + 1)
+    except OSError as error:
+        raise RulesError("rules-signature", f"the public key cannot be read: {error}") from error
+    if not data or len(data) > MAX_RULES_BYTES:
+        raise RulesError("rules-signature", "the public key cannot be read")
+    return data
+
+
+def spki_sha256(pubkey_pem):
+    result = _openssl(["pkey", "-pubin", "-outform", "DER"], pubkey_pem)
     if result.returncode != 0 or not result.stdout:
         raise RulesError("rules-signature", "the public key cannot be read")
     return hashlib.sha256(result.stdout).hexdigest()
 
 
-def load_rules(raw, signature_text, pubkey_path, min_sequence, pubkey_sha256=None,
+def load_rules(raw, signature_text, pubkey_path, min_sequence, pubkey_sha256,
                expect_rules_sha256=None):
     """Verify THEN parse the same bytes. Returns (rules, sha256 hex of the bytes).
 
-    Order matters: nothing in `raw` is interpreted before its signature verifies."""
+    Order matters: nothing in `raw` is interpreted before its signature verifies. The key
+    pin is mandatory, and so is a sequence floor >= 1 (0 would switch anti-rollback off)."""
     if len(raw) > MAX_RULES_BYTES:
         raise RulesError("rules-schema", f"rules schema: more than {MAX_RULES_BYTES} bytes")
-    if pubkey_sha256 is not None and spki_sha256(pubkey_path) != pubkey_sha256:
+    if isinstance(min_sequence, bool) or not isinstance(min_sequence, int) or min_sequence < 1:
+        raise RulesError("rules-sequence", "rollback: the sequence floor must be an integer >= 1, "
+                                           "0 would accept any rules")
+    if not isinstance(pubkey_sha256, str) or not HEX64_RE.fullmatch(pubkey_sha256):
+        raise RulesError("rules-signature", "signature: the key pin must be 64 hex characters")
+    pubkey_pem = _read_pubkey(pubkey_path)
+    if spki_sha256(pubkey_pem) != pubkey_sha256:
         raise RulesError("rules-signature", "signature: the public key is not the pinned one")
     try:
         signature = base64.b64decode(signature_text.strip(), validate=True)
@@ -195,11 +236,12 @@ def load_rules(raw, signature_text, pubkey_path, min_sequence, pubkey_sha256=Non
         raise RulesError("rules-signature", "signature: not base64") from error
     if not signature or len(signature) > 1024:
         raise RulesError("rules-signature", "signature: empty or oversized")
-    with tempfile.NamedTemporaryFile(prefix="ni-pcr-rules-sig.") as handle:
-        handle.write(signature)
-        handle.flush()
-        result = _openssl(["dgst", "-sha256", "-verify", str(pubkey_path), "-signature",
-                           handle.name], DOMAIN + raw)
+    with tempfile.TemporaryDirectory(prefix="ni-pcr-rules-sig.") as scratch:
+        sig_file, key_file = pathlib.Path(scratch) / "sig", pathlib.Path(scratch) / "key.pem"
+        sig_file.write_bytes(signature)
+        key_file.write_bytes(pubkey_pem)
+        result = _openssl(["dgst", "-sha256", "-verify", str(key_file), "-signature",
+                           str(sig_file)], DOMAIN + raw)
     if result.returncode != 0:
         raise RulesError("rules-signature", "signature: does not verify over the rules "
                                             "under the pcr-rules domain")
@@ -304,7 +346,7 @@ def authority_id(name, payload):
 
 
 def read_log(blob):
-    """(events of PCR 7, config {name: (guid, data)}, authorities [(name, id)])."""
+    """(events of PCR 7, config {name: (guid, data)}, authorities [(name, id, guid)])."""
     events = [e for e in policy.parse_eventlog(blob) if e["pcr"] == PCR]
     config, authorities = {}, []
     for ev in events:
@@ -316,8 +358,8 @@ def read_log(blob):
                 raise StateError(f"variable {name} measured twice")
             config[name] = (guid, data)
         elif ev["type"] == policy.EV_EFI_VARIABLE_AUTHORITY:
-            _, name, payload = split_variable(ev["data"])
-            authorities.append((name, authority_id(name, payload)))
+            guid, name, payload = split_variable(ev["data"])
+            authorities.append((name, authority_id(name, payload), guid))
         else:
             raise StateError(f"event type 0x{ev['type']:08x} in PCR {PCR} is not modelled")
     return events, config, authorities
@@ -364,10 +406,10 @@ def evaluate_state(rules, blob, state, live_pcr7, verdict):
         actual = state[name] or b""
         if logged is None or logged[0] != guid:
             contradicted.append(f"{name}: no config event in the log")
-        elif logged[1] == actual:
-            attested[name] = True
         elif not logged[1]:
             unbound.append(name)       # the log names it without its bytes: nothing to compare
+        elif logged[1] == actual:
+            attested[name] = True
         else:
             contradicted.append(f"{name}: differs from what the firmware measured")
     verdict.add("variables-bound", not contradicted, "; ".join(contradicted))
@@ -382,13 +424,24 @@ def evaluate_state(rules, blob, state, live_pcr7, verdict):
 
     try:
         secure_boot = state["SecureBoot"] == b"\x01"
-        verified = any(n == "db" for n, _ in authorities)
-        verdict.add("secure-boot", secure_boot and verified,
-                    f"SecureBoot={state['SecureBoot']!r}, db authority events: "
-                    f"{sum(n == 'db' for n, _ in authorities)}", binding("SecureBoot"))
+        db_events = sum(n == "db" and g == AUTHORITY_GUIDS["db"] for n, _, g in authorities)
+        verdict.add("secure-boot", secure_boot and db_events > 0,
+                    f"SecureBoot={state['SecureBoot']!r}, db authority events: {db_events}",
+                    binding("SecureBoot"))
         pk = esl_ids(state["PK"]) if state["PK"] else []
         verdict.add("pk-present", bool(pk), f"{len(pk)} platform key(s)", binding("PK"))
-        setup_clear = (bool(pk) and state["SetupMode"] in (None, b"\x00")
+        bad_pk = set(pk) - rules["approved_pk"]
+        verdict.add("pk-approved", bool(pk) and not bad_pk,
+                    f"not approved: {_first(bad_pk)}" if bad_pk else f"{len(pk)} platform key(s)",
+                    binding("PK"))
+        kek = esl_ids(state["KEK"]) if state["KEK"] else []
+        bad_kek = set(kek) - rules["approved_kek"]
+        verdict.add("kek-approved", bool(kek) and not bad_kek,
+                    f"not approved: {_first(bad_kek)}" if bad_kek else f"{len(kek)} key(s)",
+                    binding("KEK"))
+        # SetupMode is mandatory in UEFI >= 2.3.1: its absence is not "not in setup mode".
+        # AuditMode is absent on some firmware; when present it must be 0.
+        setup_clear = (bool(pk) and state["SetupMode"] == b"\x00"
                        and state["AuditMode"] in (None, b"\x00"))
         verdict.add("setup-mode", setup_clear,
                     f"PK entries {len(pk)}, SetupMode={state['SetupMode']!r}, "
@@ -407,11 +460,15 @@ def evaluate_state(rules, blob, state, live_pcr7, verdict):
         verdict.add("variables-parse", False, str(error))
         return None
 
-    rejected = [f"{n}={i[:24]}…" for n, i in authorities if i not in rules["authorities"].get(n, ())]
+    rejected = [f"{n}={i[:24]}…" for n, i, _ in authorities
+                if i not in rules["authorities"].get(n, ())]
+    wrong_guid = [f"{n} under {g}" for n, _, g in authorities if AUTHORITY_GUIDS.get(n, g) != g]
+    if wrong_guid:
+        rejected += wrong_guid
     verdict.add("authorities-approved", not rejected,
                 f"not approved: {_first(rejected)}" if rejected
                 else f"{len(authorities)} authority events", "attested")
-    foreign = [i[:24] + "…" for n, i in authorities if n == "db" and i not in set(db)]
+    foreign = [i[:24] + "…" for n, i, _ in authorities if n == "db" and i not in set(db)]
     verdict.add("authority-in-db", not foreign,
                 f"verified by a certificate absent from db: {_first(foreign)}" if foreign else "",
                 binding("db"))
@@ -419,11 +476,11 @@ def evaluate_state(rules, blob, state, live_pcr7, verdict):
 
 
 def evaluate(raw, signature_text, pubkey, min_sequence, blob, efivars_dir, live_pcr7,
-             pubkey_sha256=None, expect_rules_sha256=None):
+             pubkey_sha256, expect_rules_sha256=None):
     """The verdict dict. Never raises: anything unreadable is a refused check."""
     verdict = Verdict()
-    out = {"accepted": False, "binding": None, "rules_sha256": None, "sequence": None,
-           "checks": verdict.checks}
+    out = {"accepted": False, "binding": None, "observed": [], "rules_sha256": None,
+           "sequence": None, "checks": verdict.checks}
     try:
         rules, digest = load_rules(raw, signature_text, pubkey, min_sequence, pubkey_sha256,
                                    expect_rules_sha256)
@@ -437,6 +494,7 @@ def evaluate(raw, signature_text, pubkey, min_sequence, blob, efivars_dir, live_
         out["binding"] = evaluate_state(rules, blob, read_state(efivars_dir), live_pcr7, verdict)
     except (StateError, policy.EventLogError) as error:
         verdict.add("inputs", False, str(error))
+    out["observed"] = [c["name"] for c in verdict.checks if c["binding"] == "observed"]
     out["accepted"] = verdict.accepted
     return out
 
@@ -501,8 +559,10 @@ def cmd_ids(args):
     _, _, authorities = read_log(blob)
     print(json.dumps({
         "approved_certs": esl_ids(state["db"] or b""),
+        "approved_pk": esl_ids(state["PK"] or b""),
+        "approved_kek": esl_ids(state["KEK"] or b""),
         "dbx": esl_ids(state["dbx"] or b""),
-        "authorities": [{"name": n, "id": i} for n, i in authorities],
+        "authorities": [{"name": n, "id": i} for n, i, _ in authorities],
     }, indent=2))
     return 0
 
@@ -517,8 +577,9 @@ def main(argv=None):
         p.add_argument("--signature", required=True)
         p.add_argument("--pubkey", required=True, help="Owner public key, PEM")
         p.add_argument("--min-sequence", required=True, type=int,
-                       help="lowest rules sequence acceptable (the sealed anti-rollback anchor)")
-        p.add_argument("--pubkey-sha256", help="pin: sha256 of the SubjectPublicKeyInfo DER")
+                       help="lowest rules sequence acceptable, >= 1 (the sealed anti-rollback anchor)")
+        p.add_argument("--pubkey-sha256", required=True,
+                       help="pin: sha256 of the SubjectPublicKeyInfo DER of the Owner key")
         p.add_argument("--expect-rules-sha256", help="pin: the digest the release manifest binds")
 
     def state(p):
