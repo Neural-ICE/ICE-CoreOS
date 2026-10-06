@@ -32,6 +32,7 @@ GUID_SECURITY_DB = "d719b2cb-3d3a-4596-a3bc-dad00e67656f"
 GUID_X509 = "a5c059a1-94e4-4aa7-87b5-ab155c2bf072"
 GUID_SHA256 = "c1c41626-504c-4092-aca9-41f936934328"
 GUID_OWNER = "11111111-2222-3333-4444-555555555555"
+GUID_SHIM = "605dab50-e046-4300-abb6-3dd810dd8b23"
 
 spec = importlib.util.spec_from_file_location("ni_pcr_rules", TOOL)
 rules_mod = importlib.util.module_from_spec(spec)
@@ -55,6 +56,10 @@ def new_key(directory, name, kind="ec"):
         openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", key)
     openssl("pkey", "-in", key, "-pubout", "-out", pub)
     return key, pub
+
+
+def spki_pin(pub):
+    return hashlib.sha256(openssl("pkey", "-pubin", "-in", pub, "-outform", "DER").stdout).hexdigest()
 
 
 def self_signed_der(common_name):
@@ -143,6 +148,11 @@ class World:
         test.addCleanup(shutil.rmtree, self.dir, True)
         self.key, self.pub = new_key(self.dir, "owner")
         self.vars = read_b64_efivars(FIX / "ni67.efivars.b64")
+        # The GB10 capture has no SetupMode/AuditMode (it was taken without them), and the
+        # engine refuses a missing SetupMode: complete it with the values of a deployed machine.
+        # SYNTHETIC, unlike the rest of the fixture; the physical capture is a T5 prerequisite.
+        self.vars.setdefault(f"SetupMode-{GUID_GLOBAL}", b"\x06\x00\x00\x00\x00")
+        self.vars.setdefault(f"AuditMode-{GUID_GLOBAL}", b"\x06\x00\x00\x00\x00")
         self.log = (FIX / "ni67.pcr7-only.eventlog.bin").read_bytes()
         self.pcr7 = LIVE67
         self.rules = json.loads((FIX / "ni67.rules.json").read_text())
@@ -165,7 +175,7 @@ class World:
 
     def args(self, command="evaluate", extra=()):
         a = [command, "--rules", self.rules_path, "--signature", self.sig_path, "--pubkey", self.pub,
-             "--min-sequence", self.min_sequence]
+             "--pubkey-sha256", spki_pin(self.pub), "--min-sequence", self.min_sequence]
         if command == "evaluate":
             write_efivars(self.dir / "efivars", self.vars)
             (self.dir / "eventlog.bin").write_bytes(self.log)
@@ -267,6 +277,62 @@ class SignatureAndSequence(unittest.TestCase):
         self.w.sig_path.write_text("not base64 !!\n")
         self.assertEqual(self.verify().returncode, 1)
 
+    def test_a_valid_signature_with_foreign_characters_is_refused(self):
+        # Lenient base64 would drop the "!" and verify: strict decoding must refuse it.
+        good = self.w.sig_path.read_text().strip()
+        self.w.sig_path.write_text(good[:10] + "!" + good[10:] + "\n")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not base64", result.stderr)
+
+    def test_an_oversized_signature_is_refused(self):
+        self.w.sig_path.write_text(base64.b64encode(b"\x30" * 2000).decode() + "\n")
+        result = self.verify()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("oversized", result.stderr)
+
+    def test_the_signature_is_checked_before_the_rules_are_read(self):
+        # Rules that violate the schema AND carry a bad signature: the refusal must be the
+        # signature's. If the document were parsed first, it would be the schema's.
+        w = World(self)
+        w.rules["surprise"] = 1
+        other, _ = new_key(w.dir, "other")
+        w.sign(key=other, through_tool=False)
+        result = run(*w.args("verify"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("signature", result.stderr)
+        self.assertNotIn("schema", result.stderr)
+
+    def test_the_signing_key_pin_is_mandatory(self):
+        args = self.w.args("verify")
+        i = args.index("--pubkey-sha256")
+        del args[i:i + 2]
+        self.assertNotEqual(run(*args).returncode, 0)
+
+    def test_a_sequence_floor_below_one_is_refused(self):
+        # --min-sequence 0 (or negative) switches the anti-rollback off.
+        for floor in (0, -1):
+            self.w.min_sequence = floor
+            result = self.verify()
+            self.assertEqual(result.returncode, 1, floor)
+            self.assertIn("rollback", result.stderr)
+
+    def test_a_pin_that_is_not_a_sha256_is_refused(self):
+        self.assertEqual(self.verify(extra=("--pubkey-sha256", "abc")).returncode, 1)
+
+    def test_a_signing_key_swapped_after_the_pin_is_read_cannot_verify(self):
+        # The key file is read once: the bytes pinned are the bytes that verify.
+        raw = self.w.rules_path.read_bytes()
+        sig = self.w.sig_path.read_text()
+        pin = spki_pin(self.w.pub)
+        other, other_pub = new_key(self.w.dir, "other")
+        sig_other = openssl("dgst", "-sha256", "-sign", other,
+                            stdin=b"neural-ice-pcr-rules/v1\0" + raw).stdout
+        with self.assertRaises(rules_mod.RulesError):
+            rules_mod.load_rules(raw, base64.b64encode(sig_other).decode(), self.w.pub, 1, pin)
+        rules, _ = rules_mod.load_rules(raw, sig, self.w.pub, 1, pin)
+        self.assertEqual(rules["sequence"], self.w.rules["sequence"])
+
 
 class SchemaIsStrict(unittest.TestCase):
     def refuse(self, mutate):
@@ -293,6 +359,24 @@ class SchemaIsStrict(unittest.TestCase):
         for field in ("approved_certs", "dbx_floor", "authorities"):
             self.refuse(lambda r, f=field: r.update({f: []}))
 
+    def test_pk_and_kek_sets_are_mandatory_and_non_empty(self):
+        for field in ("approved_pk", "approved_kek"):
+            self.refuse(lambda r, f=field: r.pop(f))
+            self.refuse(lambda r, f=field: r.update({f: []}))
+            self.refuse(lambda r, f=field: r.update({f: ["x509:XYZ"]}))
+            self.refuse(lambda r, f=field: r.update({f: ["text-sha256:" + "0" * 64]}))
+
+    def test_duplicate_ids_are_refused(self):
+        for field in ("approved_certs", "approved_pk", "approved_kek", "dbx_floor"):
+            self.refuse(lambda r, f=field: r[f].append(r[f][0]))
+        self.refuse(lambda r: r["authorities"][0]["ids"].append(r["authorities"][0]["ids"][0]))
+
+    def test_duplicate_authority_names_are_refused(self):
+        self.refuse(lambda r: r["authorities"].append(dict(r["authorities"][0])))
+
+    def test_an_authority_with_an_extra_key_is_refused(self):
+        self.refuse(lambda r: r["authorities"][0].update(extra=1))
+
     def test_malformed_ids_are_refused(self):
         self.refuse(lambda r: r["approved_certs"].append("x509:XYZ"))
         self.refuse(lambda r: r["dbx_floor"].append("md5:" + "0" * 32))
@@ -314,8 +398,21 @@ class SchemaIsStrict(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("schema", result.stderr)
 
-    def test_oversized_rules_are_refused(self):
-        self.refuse(lambda r: r.update(note="x" * (2 << 20)))
+    def test_oversized_rules_are_refused_by_size_not_by_schema(self):
+        # Valid rules padded with whitespace: only the size ceiling can refuse them.
+        w = World(self)
+        w.rules_path = w.dir / "rules.json"
+        w.rules_path.write_bytes(json.dumps(w.rules).encode() + b" " * (rules_mod.MAX_RULES_BYTES + 1))
+        w.sig_path = w.dir / "rules.json.sig"
+        sig = openssl("dgst", "-sha256", "-sign", w.key,
+                      stdin=b"neural-ice-pcr-rules/v1\0" + w.rules_path.read_bytes()).stdout
+        w.sig_path.write_text(base64.b64encode(sig).decode() + "\n")
+        result = run(*w.args("verify"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("more than", result.stderr)
+
+    def test_a_long_note_is_refused(self):
+        self.refuse(lambda r: r.update(note="x" * 201))
 
     def test_the_owner_tool_refuses_to_sign_a_bad_document(self):
         w = World(self)
@@ -349,7 +446,7 @@ class EvaluateRealGb10(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("unbound-variables", failed(verdict))
 
-    def test_lying_variables_replay_differs_from_live_pcr7_are_refused(self):
+    def test_a_wrong_live_pcr7_is_refused(self):
         w = World(self)
         w.pcr7 = LIVE67[:-1] + ("0" if LIVE67[-1] != "0" else "1")
         result, verdict = w.evaluate()
@@ -479,6 +576,115 @@ class EvaluateRealGb10(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("rules-signature", failed(verdict))
 
+    def test_the_pk_must_be_one_the_rules_approve(self):
+        # R1 of the review: a self-signed attacker PK and KEK, db and dbx untouched.
+        w = World(self)
+        w.vars[f"PK-{GUID_GLOBAL}"] = esl_blob([(GUID_X509, GUID_OWNER, self_signed_der("attacker"))])
+        result, verdict = w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pk-approved", failed(verdict))
+        self.assertNotIn("kek-approved", failed(verdict))
+
+    def test_the_kek_must_be_ones_the_rules_approve(self):
+        w = World(self)
+        kek = esl_entries(w.vars[f"KEK-{GUID_GLOBAL}"])
+        kek.append((GUID_X509, GUID_OWNER, self_signed_der("attacker")))
+        w.vars[f"KEK-{GUID_GLOBAL}"] = esl_blob(kek)
+        result, verdict = w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("kek-approved", failed(verdict))
+        self.assertNotIn("pk-approved", failed(verdict))
+
+    def test_attacker_pk_and_kek_together_are_refused(self):
+        w = World(self)
+        w.vars[f"PK-{GUID_GLOBAL}"] = esl_blob([(GUID_X509, GUID_OWNER, self_signed_der("a-pk"))])
+        w.vars[f"KEK-{GUID_GLOBAL}"] = esl_blob([(GUID_X509, GUID_OWNER, self_signed_der("a-kek"))])
+        result, verdict = w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertLessEqual({"pk-approved", "kek-approved"}, failed(verdict))
+
+    def test_a_subset_of_the_approved_keks_is_accepted(self):
+        w = World(self)
+        kek = esl_entries(w.vars[f"KEK-{GUID_GLOBAL}"])
+        self.assertGreater(len(kek), 1)
+        w.vars[f"KEK-{GUID_GLOBAL}"] = esl_blob(kek[:1])
+        result, verdict = w.evaluate()
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_an_empty_or_missing_kek_is_refused(self):
+        for blob in (b"\x27\x00\x00\x00", None):
+            w = World(self)
+            if blob is None:
+                del w.vars[f"KEK-{GUID_GLOBAL}"]
+            else:
+                w.vars[f"KEK-{GUID_GLOBAL}"] = blob
+            result, verdict = w.evaluate()
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("kek-approved", failed(verdict))
+
+    def test_pk_and_kek_on_this_firmware_are_observed_not_attested(self):
+        result, verdict = World(self).evaluate()
+        by_name = {c["name"]: c for c in verdict["checks"]}
+        self.assertTrue(by_name["pk-approved"]["ok"] and by_name["kek-approved"]["ok"])
+        self.assertEqual(by_name["pk-approved"]["binding"], "observed")
+        self.assertEqual(by_name["kek-approved"]["binding"], "observed")
+
+    def test_an_accepted_verdict_lists_what_was_only_observed(self):
+        # The caller must decide on `binding` / `observed`, never on `accepted` alone.
+        result, verdict = World(self).evaluate()
+        self.assertTrue(verdict["accepted"])
+        self.assertEqual(verdict["binding"], "names-only")
+        self.assertLessEqual({"pk-approved", "kek-approved", "db-subset-of-approved",
+                              "dbx-superset-of-floor", "setup-mode", "unbound-variables"},
+                             set(verdict["observed"]))
+        self.assertNotIn("authorities-approved", verdict["observed"])
+
+    def test_a_missing_setup_mode_is_refused(self):
+        # SetupMode is mandatory in UEFI 2.3.1+: its absence is not "not in setup mode".
+        w = World(self)
+        del w.vars[f"SetupMode-{GUID_GLOBAL}"]
+        result, verdict = w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("setup-mode", failed(verdict))
+
+    def test_audit_mode_is_refused(self):
+        w = World(self)
+        w.vars[f"AuditMode-{GUID_GLOBAL}"] = b"\x06\x00\x00\x00\x01"
+        result, verdict = w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("setup-mode", failed(verdict))
+
+    def test_audit_mode_may_be_absent_but_not_odd(self):
+        # Some firmware has no AuditMode variable at all (the x86 desktop this was written on).
+        w = World(self)
+        del w.vars[f"AuditMode-{GUID_GLOBAL}"]
+        self.assertEqual(w.evaluate()[0].returncode, 0)
+        w = World(self)
+        w.vars[f"AuditMode-{GUID_GLOBAL}"] = b"\x06\x00\x00\x00\x00\x00"
+        self.assertEqual(w.evaluate()[0].returncode, 1)
+
+    def test_an_efivar_that_is_a_symbolic_link_is_refused(self):
+        w = World(self)
+        w.sign()
+        args = w.args("evaluate")
+        link = w.dir / "efivars" / f"KEK-{GUID_GLOBAL}"
+        target = w.dir / "kek.bin"
+        target.write_bytes(link.read_bytes())
+        link.unlink()
+        link.symlink_to(target)
+        result = run(*args)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("symbolic link", result.stderr)
+
+    def test_an_efivar_with_an_impossible_size_is_refused(self):
+        for blob, label in ((b"\x27\x00", "short"),
+                            (b"\x27\x00\x00\x00" + b"\x00" * rules_mod.MAX_VARIABLE_BYTES, "long")):
+            w = World(self)
+            w.vars[f"KEK-{GUID_GLOBAL}"] = blob
+            result, verdict = w.evaluate()
+            self.assertEqual(result.returncode, 1, label)
+            self.assertIn("impossible size", result.stderr)
+
     def test_missing_inputs_fail_closed(self):
         w = World(self)
         w.sign()
@@ -514,9 +720,11 @@ class FirmwareThatMeasuresContents(unittest.TestCase):
         self.cert = self_signed_der("contents-mode")
         self.db = esl_blob([(GUID_X509, GUID_OWNER, self.cert)])
         self.dbx = esl_blob([(GUID_SHA256, GUID_OWNER, bytes(range(32)))])
-        self.pk = esl_blob([(GUID_X509, GUID_OWNER, self_signed_der("pk"))])
-        self.kek = esl_blob([(GUID_X509, GUID_OWNER, self_signed_der("kek"))])
+        self.pk_der, self.kek_der = self_signed_der("pk"), self_signed_der("kek")
+        self.pk = esl_blob([(GUID_X509, GUID_OWNER, self.pk_der)])
+        self.kek = esl_blob([(GUID_X509, GUID_OWNER, self.kek_der)])
         v.clear()
+        v[f"SetupMode-{GUID_GLOBAL}"] = b"\x06\x00\x00\x00\x00"
         v[f"PK-{GUID_GLOBAL}"] = self.pk
         v[f"KEK-{GUID_GLOBAL}"] = self.kek
         v[f"db-{GUID_SECURITY_DB}"] = self.db
@@ -526,21 +734,27 @@ class FirmwareThatMeasuresContents(unittest.TestCase):
         self.w.rules = {
             "schema": "ni-pcr-rules/1", "sequence": 3, "unbound_variables": "refuse",
             "approved_certs": [cert_id(self.cert)],
+            "approved_pk": [cert_id(self.pk_der)], "approved_kek": [cert_id(self.kek_der)],
             "dbx_floor": ["sha256:" + bytes(range(32)).hex()],
             "authorities": [{"name": "db", "ids": [cert_id(self.cert)]}],
         }
 
-    def set_log(self, logged=None):
+    def set_log(self, logged=None, guids=None, skip=(), extra=()):
         v = self.w.vars
-        logged = logged or {}
+        logged, guids = logged or {}, guids or {}
         events = []
         for name, guid in (("SecureBoot", GUID_GLOBAL), ("PK", GUID_GLOBAL), ("KEK", GUID_GLOBAL),
                            ("db", GUID_SECURITY_DB), ("dbx", GUID_SECURITY_DB)):
+            if name in skip:
+                continue
             data = logged.get(name, v[f"{name}-{guid}"][4:])
-            events.append((7, rules_mod.policy.EV_EFI_VARIABLE_DRIVER_CONFIG, variable_data(guid, name, data)))
+            events.append((7, rules_mod.policy.EV_EFI_VARIABLE_DRIVER_CONFIG,
+                           variable_data(guids.get(name, guid), name, data)))
         events.append((7, rules_mod.policy.EV_SEPARATOR, b"\x00" * 4))
         events.append((7, rules_mod.policy.EV_EFI_VARIABLE_AUTHORITY,
-                       variable_data(GUID_SECURITY_DB, "db", uuid.UUID(GUID_OWNER).bytes_le + self.cert)))
+                       variable_data(guids.get("authority", GUID_SECURITY_DB), "db",
+                                     uuid.UUID(GUID_OWNER).bytes_le + self.cert)))
+        events.extend(extra)
         self.w.log = tcg2_log(events)
         self.w.pcr7 = replay7(events).hex()
 
@@ -566,6 +780,148 @@ class FirmwareThatMeasuresContents(unittest.TestCase):
         result, verdict = self.w.evaluate()
         self.assertEqual(result.returncode, 1)
         self.assertIn("variables-bound", failed(verdict))
+
+    def test_a_variable_measured_under_another_guid_is_refused(self):
+        self.set_log(guids={"db": GUID_OWNER})
+        result, verdict = self.w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("variables-bound", failed(verdict))
+
+    def test_a_variable_the_log_does_not_carry_is_refused(self):
+        self.set_log(skip=("KEK",))
+        result, verdict = self.w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("variables-bound", failed(verdict))
+
+    def test_a_variable_measured_twice_is_refused(self):
+        dup = (7, rules_mod.policy.EV_EFI_VARIABLE_DRIVER_CONFIG,
+               variable_data(GUID_SECURITY_DB, "db", self.db))
+        self.set_log(extra=[dup])
+        result, verdict = self.w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("measured twice", result.stderr)
+
+    def test_a_pcr7_event_the_engine_does_not_model_is_refused(self):
+        self.set_log(extra=[(7, 0x00000007, b"unmodelled")])   # EV_S_CRTM_VERSION-like type
+        result, verdict = self.w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not modelled", result.stderr)
+
+    def test_a_db_authority_event_under_another_guid_is_refused(self):
+        self.set_log(guids={"authority": GUID_OWNER})
+        result, verdict = self.w.evaluate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("secure-boot", failed(verdict))
+
+    def test_a_zero_length_measurement_never_counts_as_attested(self):
+        # The firmware names dbx without its bytes while the variable is empty too: nothing was
+        # compared, so this is "observed", not "attested" (vide == vide proves nothing).
+        self.w.vars[f"dbx-{GUID_SECURITY_DB}"] = b"\x27\x00\x00\x00"
+        self.set_log(logged={"dbx": b""})
+        self.w.rules["dbx_floor"] = ["sha256:" + bytes(range(32)).hex()]
+        result, verdict = self.w.evaluate()
+        by_name = {c["name"]: c for c in verdict["checks"]}
+        self.assertEqual(by_name["dbx-superset-of-floor"]["binding"], "observed")
+        self.assertIn("unbound-variables", failed(verdict))
+
+    def test_pk_and_kek_measured_with_their_contents_are_attested(self):
+        result, verdict = self.w.evaluate()
+        by_name = {c["name"]: c for c in verdict["checks"]}
+        self.assertEqual(by_name["pk-approved"]["binding"], "attested")
+        self.assertEqual(by_name["kek-approved"]["binding"], "attested")
+
+
+class EslParserIsStrict(unittest.TestCase):
+    def esl(self, list_size=None, header=0, sig_size=None, entries=1, payload=b"\x00" * 16):
+        sig = payload
+        sig_size = len(sig) if sig_size is None else sig_size
+        body = sig * entries
+        size = 28 + header + len(body) if list_size is None else list_size
+        return (uuid.UUID(GUID_X509).bytes_le + struct.pack("<III", size, header, sig_size)
+                + b"\x00" * header + body)
+
+    def refused(self, body):
+        import signal
+
+        signal.alarm(10)       # a parser that loops forever on sig_size == 0 must fail, not hang
+        try:
+            with self.assertRaises(rules_mod.StateError):
+                rules_mod.parse_esl(body)
+        finally:
+            signal.alarm(0)
+
+    def test_a_well_formed_list_parses(self):
+        self.assertEqual(len(rules_mod.parse_esl(self.esl(payload=b"\x01" * 40, entries=2))), 2)
+
+    def test_truncated_header(self):
+        self.refused(self.esl()[:20])
+
+    def test_list_size_smaller_than_the_header(self):
+        self.refused(self.esl(list_size=20))
+
+    def test_list_size_beyond_the_data(self):
+        self.refused(self.esl(list_size=10_000))
+
+    def test_zero_signature_size_does_not_loop(self):
+        self.refused(self.esl(sig_size=0))
+
+    def test_signature_size_below_an_owner_guid(self):
+        self.refused(self.esl(sig_size=8))
+
+    def test_signature_area_not_a_multiple_of_the_signature_size(self):
+        self.refused(self.esl(payload=b"\x01" * 40, sig_size=32))
+
+    def test_a_header_larger_than_the_list(self):
+        self.refused(self.esl(header=4000, list_size=60))
+
+
+class EventDataIsStrict(unittest.TestCase):
+    def test_short_event_data(self):
+        with self.assertRaises(rules_mod.StateError):
+            rules_mod.split_variable(b"\x00" * 31)
+
+    def test_lengths_that_do_not_add_up(self):
+        data = variable_data(GUID_GLOBAL, "PK", b"abc") + b"x"
+        with self.assertRaises(rules_mod.StateError):
+            rules_mod.split_variable(data)
+        with self.assertRaises(rules_mod.StateError):
+            rules_mod.split_variable(variable_data(GUID_GLOBAL, "PK", b"abc")[:-1])
+
+    def test_a_name_that_is_not_utf16(self):
+        data = (uuid.UUID(GUID_GLOBAL).bytes_le + struct.pack("<QQ", 1, 0) + b"\x00\xd8")
+        with self.assertRaises(rules_mod.StateError):
+            rules_mod.split_variable(data)
+
+    def test_a_well_formed_event(self):
+        self.assertEqual(rules_mod.split_variable(variable_data(GUID_GLOBAL, "PK", b"abc")),
+                         (GUID_GLOBAL, "PK", b"abc"))
+
+
+class WhatTheDocumentationClaims(unittest.TestCase):
+    """The engine's own text must not claim more than a GB10's PCR 7 proves (review of #247)."""
+
+    TEXTS = {"README": (HERE / "README.md").read_text(), "tool": TOOL.read_text()}
+
+    def test_no_text_says_pcr7_vouches_for_the_variables(self):
+        for name, text in self.TEXTS.items():
+            flat = " ".join(text.lower().split())
+            for claim in ("pcr 7 vouches", "pcr7 vouches", "the tpm's pcr 7 is the proof",
+                          "variables cannot lie"):
+                self.assertNotIn(claim, flat, f"{name}: {claim!r}")
+
+    def test_the_readme_states_the_efivar_trust_argument(self):
+        flat = " ".join(self.TEXTS["README"].lower().split())
+        for needle in ("threat model of the directly read efi variables",
+                       "signed uki", "secure boot", "authenticated", "pk", "kek",
+                       "setup mode", "audit mode", "uefi administrator password",
+                       "zero-length", "out of scope", "spi", "firmware bug",
+                       "restore factory keys", "after the unlock"):
+            self.assertIn(needle, flat, needle)
+
+    def test_the_readme_marks_each_residual_attack(self):
+        text = self.TEXTS["README"]
+        for label in ("detected", "agent after unlock", "out of scope"):
+            self.assertIn(label, text.lower())
 
 
 if __name__ == "__main__":
