@@ -15,7 +15,6 @@ import importlib.util
 import json
 import os
 import pathlib
-import re
 import shutil
 import struct
 import subprocess
@@ -213,8 +212,8 @@ class SnapshotFromEvidence(Base):
 
 class IncompleteSnapshotsAreRefused(Base):
     def efivars_without(self, tmp, name):
-        lines = [l for l in (FIX / "efivars.b64").read_text().splitlines()
-                 if not l.startswith(name + "-")]
+        lines = [line for line in (FIX / "efivars.b64").read_text().splitlines()
+                 if not line.startswith(name + "-")]
         path = pathlib.Path(tmp) / "efivars.b64"
         path.write_text("\n".join(lines) + "\n")
         return path
@@ -228,11 +227,11 @@ class IncompleteSnapshotsAreRefused(Base):
     def test_secure_boot_disabled_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             lines = []
-            for l in (FIX / "efivars.b64").read_text().splitlines():
-                if l.startswith("SecureBoot-"):
-                    k, _, _v = l.partition(" ")
-                    l = k + " " + base64.b64encode(b"\x06\x00\x00\x00\x00").decode()
-                lines.append(l)
+            for line in (FIX / "efivars.b64").read_text().splitlines():
+                if line.startswith("SecureBoot-"):
+                    k, _, _v = line.partition(" ")
+                    line = k + " " + base64.b64encode(b"\x06\x00\x00\x00\x00").decode()
+                lines.append(line)
             path = pathlib.Path(tmp) / "efivars.b64"
             path.write_text("\n".join(lines) + "\n")
             with self.assertRaisesRegex(tool.BenchError, "SecureBoot"):
@@ -241,11 +240,11 @@ class IncompleteSnapshotsAreRefused(Base):
     def test_empty_pk_is_setup_mode_and_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             lines = []
-            for l in (FIX / "efivars.b64").read_text().splitlines():
-                if l.startswith("PK-"):
-                    k, _, _v = l.partition(" ")
-                    l = k + " " + base64.b64encode(b"\x27\x00\x00\x00").decode()
-                lines.append(l)
+            for line in (FIX / "efivars.b64").read_text().splitlines():
+                if line.startswith("PK-"):
+                    k, _, _v = line.partition(" ")
+                    line = k + " " + base64.b64encode(b"\x27\x00\x00\x00").decode()
+                lines.append(line)
             path = pathlib.Path(tmp) / "efivars.b64"
             path.write_text("\n".join(lines) + "\n")
             with self.assertRaisesRegex(tool.BenchError, "PK"):
@@ -703,7 +702,7 @@ class CommandLine(Base):
                     "--installed-snapshot", str(tmp / "installed.json"), "--root", str(store)]
             r = cli("store", *args, "--pubkey", str(self.other_pub))
             self.assertEqual(r.returncode, 1)
-            self.assertIn("signature", r.stderr)
+            self.assertRegex(r.stderr, "signer|signature")  # pinned signer != trusted key
             self.assertEqual(os.listdir(store), [])
             r = cli("store", *args, "--pubkey", str(self.owner_pub))
             self.assertEqual(r.returncode, 0, r.stderr)
@@ -716,7 +715,7 @@ class CommandLine(Base):
     def test_capture_refuses_an_incomplete_snapshot_with_exit_1_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             ev = evidence_inputs()
-            lines = [l for l in (FIX / "efivars.b64").read_text().splitlines() if not l.startswith("db-")]
+            lines = [line for line in (FIX / "efivars.b64").read_text().splitlines() if not line.startswith("db-")]
             (pathlib.Path(tmp) / "e.b64").write_text("\n".join(lines) + "\n")
             out = pathlib.Path(tmp) / "snap.json"
             r = cli("capture", "--path", "installed", "--efivars-b64", str(pathlib.Path(tmp) / "e.b64"),
