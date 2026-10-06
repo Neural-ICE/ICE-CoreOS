@@ -562,6 +562,46 @@ if [[ "$(id -u)" -ne 0 ]]; then
   pass "verify_retained: digest mismatch, other receipt, internal error, missing files and inputs, every posture -- refused or failed closed"
 fi
 
+# --- OPTIONAL integration: the REAL verifier (T1), same golden vectors ---------------
+# NI_V2_REAL_VERIFIER=/path/to/ni-ota-verify (built from the T1 branch, cosign on PATH)
+# replays the library against the real `verify-v2-release`. Unset: skipped, and said so.
+if [[ -n "${NI_V2_REAL_VERIFIER:-}" ]]; then
+  [[ -x "$NI_V2_REAL_VERIFIER" ]] || fail "NI_V2_REAL_VERIFIER is not executable"
+  command -v cosign >/dev/null 2>&1 || fail "the real verifier needs cosign on PATH"
+  real_env() { v2_env "${1:-manifest-digest}"; export V2SEAL_OTA_VERIFY="$NI_V2_REAL_VERIFIER"; }
+  real_env
+  run_lib v2seal_preflight
+  expect_rc 0 "" "preflight against the real verifier"
+  [[ "$OUT" == "SURVIVED:$G_SEQ|$G_RECEIPT_MD" ]] || fail "the real verifier's outputs are '$OUT', not the golden ones"
+  cmp -s "$TMP/work/receipt.json" "$FIX/expected-receipt-manifest-digest.json" \
+    || fail "the real verifier wrote a receipt that is not the golden bytes"
+  real_env floor
+  run_lib v2seal_preflight
+  expect_rc 0 "" "floor-mode preflight against the real verifier"
+  [[ "$OUT" == "SURVIVED:$G_SEQ|$G_RECEIPT_FLOOR" ]] || fail "the real verifier's floor outputs are '$OUT'"
+  # one flipped byte in the manifest: refused by the real verifier, never reaching a pass
+  real_env
+  { cat "$FIX/release-manifest.json"; printf '\n'; } > "$TMP/altered-real.json"
+  run_lib v2seal_preflight "V2SEAL_MANIFEST='$TMP/altered-real.json';"
+  expect_rc 1 "REFUSED" "an altered manifest against the real verifier"
+  # a candidate carrying the v1 anchor
+  real_env
+  rm -rf "$TMP/real-cand"; cp -a "$FIX/candidate-root" "$TMP/real-cand"
+  mkdir -p "$TMP/real-cand/etc/neural-ice/keys"; : > "$TMP/real-cand/etc/neural-ice/keys/ota-root.pub"
+  run_lib v2seal_preflight "V2SEAL_CANDIDATE_ROOT='$TMP/real-cand';"
+  expect_rc 1 "candidate-anchor" "a candidate with ota-root.pub against the real verifier"
+  # the full flow with the real verifier and the mock TPM
+  v2_commit_env
+  export V2SEAL_OTA_VERIFY="$NI_V2_REAL_VERIFIER"
+  run_flow
+  [[ "$RC" -eq 0 ]] || fail "preflight + commit against the real verifier failed: $ERR"
+  cmp -s "$TMP/ota/v2-release/receipt.json" "$FIX/expected-receipt-manifest-digest.json" \
+    || fail "the persisted receipt is not the golden one with the real verifier"
+  pass "REAL verifier (T1): golden receipts in both modes, altered manifest and v1 anchor refused, full preflight+commit"
+else
+  printf 'SKIP: real-verifier integration (set NI_V2_REAL_VERIFIER to a T1-built ni-ota-verify)\n'
+fi
+
 # --- static hygiene ------------------------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -x "$LIB" || fail "shellcheck refused the library"
