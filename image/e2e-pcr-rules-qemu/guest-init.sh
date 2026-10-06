@@ -49,6 +49,7 @@ if [[ "$MODE" == ids ]]; then
   exit 0
 fi
 
+# shellcheck disable=SC2034 # consumed by the code extracted from the installer
 # --- the installer's own functions and gate block, unmodified ------------------------------
 NEURALICE_CMDLINE_FILE=/proc/cmdline
 NI_INSTALLER_TEST_SEAM=""
