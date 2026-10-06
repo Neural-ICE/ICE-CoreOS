@@ -15,7 +15,7 @@ C'est un rangement historique incohérent, pas une distinction de sens :
 | Emplacement | Contenu |
 |---|---|
 | **`docs/ADR-*.md`** (répertoire parent) | **11 ADR** — `ADR-0002` … `ADR-0013`. Secure Boot, LUKS/TPM, canaux, kernel 4k, licence FSL, multi-arch, enveloppe GB10, identité bootc, état OTA atomique, racine TPM |
-| **`docs/adr/ADR-*.md`** (ici) | **3 ADR** — `ADR-0041` (firmware GSP), `ADR-0042` (pilote R580), `ADR-0043` (console KMS/vconsole) |
+| **`docs/adr/ADR-*.md`** (ici) | **4 ADR** — `ADR-0041` (firmware GSP), `ADR-0042` (pilote R580), `ADR-0043` (console KMS/vconsole), `ADR-0044` (installeur générique, UKI signé une fois + charge utile signée) |
 
 Les deux jeux sont indexés sous le préfixe `OS-` dans le vault.
 
@@ -63,8 +63,9 @@ décision **propre à l'OS** (boot, kernel, chiffrement, bootc, initramfs, firmw
 
 ⚠️ **Vérifiez le numéro contre les DEUX** : le plus haut sur `origin/main` **et** les numéros
 **réservés** par un brouillon ou une PR non fusionnée. `origin/main` seul ne suffit pas — c'est
-exactement comme ça que `OS-0043` s'est retrouvé attribué deux fois. Le prochain libre est `0044`,
-sous réserve du brouillon `ADR-DRAFT-os-0044-*` déposé dans `raw_mission_report_to_ingest/`.
+exactement comme ça que `OS-0043` s'est retrouvé attribué deux fois. Le prochain libre est `0045`.
+🔴 `OS-0044` est lui aussi attribué deux fois : l'installeur générique (ici, Accepted) et le brouillon
+`ADR-DRAFT-os-0044-chemin-firmware-et-politique-tpm` (vault, Draft, aucune décision) — arbitrage Owner.
 
 Déposez ensuite un rapport dans `raw_mission_report_to_ingest/` pour que le vault l'intègre — une
 session **dépose**, elle n'écrit jamais dans le vault.

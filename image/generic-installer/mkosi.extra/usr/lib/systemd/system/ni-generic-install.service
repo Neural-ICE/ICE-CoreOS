@@ -1,0 +1,12 @@
+[Unit]
+Description=Neural ICE generic installer: install the verified host image
+DefaultDependencies=no
+Requires=ni-generic-payload-verify.service
+After=ni-generic-payload-verify.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/neural-ice-generic/install-host.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=infinity

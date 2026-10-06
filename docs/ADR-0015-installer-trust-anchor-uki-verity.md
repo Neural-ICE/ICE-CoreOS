@@ -1,6 +1,11 @@
 # ADR-0015 — Installer trust anchor: signed UKI, dm-verity root, authorized releases
 
 - **Status**: Accepted (implementation complete; production-chain evidence pending)
+- **Amendment, 2026-10-06**: [ADR-0044](adr/ADR-0044-generic-installer-uki-signed-payload.md) replaces the host-derived
+  installer chain. §1 (dm-verity installer root, sealed `rootverity` and `payload`) and amendments A and B lose
+  their force when that chain is removed, in the same change; everything else here (access profile anchor, closed-world
+  cmdline, TPM amendments K, M, N, O, PCR 7 coverage) stays in force. Until then those sections still describe the
+  code of `image/build-installer-*.sh`.
 - **Date**: 2026-08-31
 - **Decider**: Business/Security Owner (human)
 - **Implements**: [DESIGN-NOTE-0001](DESIGN-NOTE-0001-sealed-access-trust-anchor.md)
