@@ -1,0 +1,44 @@
+name: test-ni-support-verify
+
+# Support-bundle reader (tools/ni-support-verify): stdlib-only Python plus the openssl
+# and age binaries. No TPM, no secret and no customer content: the signing key and the
+# age identity are generated per run, the golden fixture was signed by a destroyed key.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/ni-support-verify/**'
+      - 'ota/neural-ice-access-profile-anchor.sh'
+      - '.github/workflows/test-ni-support-verify.yml'
+  pull_request:
+    paths:
+      - 'tools/ni-support-verify/**'
+      - 'ota/neural-ice-access-profile-anchor.sh'
+      - '.github/workflows/test-ni-support-verify.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: test-ni-support-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install age
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends age
+
+      - name: Verify, decrypt and scan good and corrupted bundles
+        run: python3 -I tools/ni-support-verify/test-ni-support-verify.py
