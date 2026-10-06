@@ -886,6 +886,13 @@ for u in product-a.service product-b.service product-c.service; do
   [[ -z $out ]] || fail "owner $u declared across files must own tty1: $out"
   set_state "$u" loaded inactive dead
 done
+# a valid tty1_owners followed by a fault in the same file: the whole file is refused, the owner is NOT applied
+make_v2_fixture; v2_ready_scene
+write_decl "$BAD_NAME" $'version=1\ntty1_owners=product-x.service\nbogus_key=1'
+set_state product-x.service loaded active running
+out="$(run_screen 1 0)"
+expect "$out" 'FAILURE  NI-E06  (status declaration: unknown key bogus_key' "a faulty file is reported"
+expect "$out" 'unit:    zz-bad.conf' "the faulty file is named"
 # malformed tty1_owners: refused and reported, never half-applied
 refuse "tty1 owner that is not a service" "$BAD_NAME" $'version=1\ntty1_owners=x.socket' "bad tty1_owners"
 refuse "tty1 owner with a path" "$BAD_NAME" $'version=1\ntty1_owners=../x.service' "bad tty1_owners"

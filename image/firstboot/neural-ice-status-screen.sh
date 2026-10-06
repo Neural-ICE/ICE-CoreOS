@@ -22,7 +22,7 @@
 # management NIC's receive rate from /sys/class/net/*/statistics/rx_bytes deltas
 # and redraws the whole screen. It exits by itself when the box is READY or as
 # soon as the unit that owns tty1 (getty@tty1 on the debug variant, the product
-# TUI on the branded appliance) is active. Error codes: status-error-codes.md.
+# TUI on the branded appliance, or a unit the image declares: tty1_owners=) is active. Error codes: status-error-codes.md.
 #
 # PRODUCT DECLARATIONS. The OS carries no product knowledge (ADR-0032). A branded
 # derivation tells this screen what its product needs through declaration files
@@ -92,7 +92,7 @@ path() { printf '%s%s' "$ROOT_PREFIX" "$1"; }
 CEREMONY_TIMEOUT=${NI_STATUS_CEREMONY_TIMEOUT:-1800}
 [[ $CEREMONY_TIMEOUT =~ ^[0-9]+$ ]] || die "NI_STATUS_CEREMONY_TIMEOUT must be an integer number of seconds"
 # Seconds READY stays on screen before the script exits on its own when no
-# tty1 owner shows up (branded appliance: the TUI replaces us earlier).
+# tty1 owner shows up (branded appliance: the TUI or the declared owner replaces us earlier).
 READY_LINGER=${NI_STATUS_READY_LINGER:-10}
 [[ $READY_LINGER =~ ^[0-9]+$ ]] || die "NI_STATUS_READY_LINGER must be an integer number of seconds"
 
