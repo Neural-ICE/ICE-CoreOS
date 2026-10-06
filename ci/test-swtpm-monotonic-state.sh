@@ -676,4 +676,195 @@ PY
 expect_refusal "v1 runtime reader accepted NI-DONE2" \
   hw runtime-status "$PROFILE" "$TARGET" "$POLICY" "$v2_digest" "$v2_install" "$v2_freshness"
 
-echo "SWTPM_TPM_STATE_TEST_OK (real TPM 2.0 + real cryptsetup LUKS2 headers; anchor signer fixture is explicitly synthetic; signed physical recovery and GB10 gates remain)"
+# --------------------------------------------------------------------------- #
+# Mission B, lane 2: an owner-sealed v2 host (image marker
+# owner-sealed-ota-state-v2, docs/ota/V2-RELEASE-ATTESTATION.md) on a real TPM.
+# The TPM objects (floor 0x01500001, anchor 0x01500002), ClearControl-before-NV06
+# ordering, NI-DONE2, OwnerAuth destruction and the NV write lock are the real
+# ones and identical to the preseal lane above; only the attestation that names
+# the floor differs: the v2 release receipt, authenticated by a contract
+# conformant FAKE of `ni-ota-verify verify-retained-v2-release` (the real verb is
+# T1's; its cryptography is not exercised here). The v2 lane has no relaxed
+# branch: every refusal below also runs under NEURALICE_SEALED_OTA_STATE=relaxed.
+# --------------------------------------------------------------------------- #
+tpm2_clearcontrol -C p c >/dev/null 2>&1 || fail "cannot lift disableClear with platform authorization for the next fixture"
+clear_tpm
+PCR_POLICY_CANDIDATE=$((PCR_POLICY_CANDIDATE + 32))
+persist_prerequisites
+FB_V2_CALLS="$TMP/v2-calls"
+cat > "$FB_OTA_VERIFY" <<'EOF'
+#!/usr/bin/env python3
+import hashlib, json, os, re, sys
+calls = os.environ["NI_TEST_V2_CALLS"]
+def refuse(cls):
+    sys.stderr.write("ni-ota-verify: v2 release REFUSED: %s: fixture\n" % cls); sys.exit(1)
+open(calls, "a").write(" ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:2] != ["verify-retained-v2-release"]: sys.exit(2)
+need = ["--manifest", "--manifest-sig", "--release-key", "--expected-receipt-sha256", "--receipt", "--scratch-dir"]
+a = sys.argv[2:]
+f = dict(zip(a[0::2], a[1::2]))
+if len(a) % 2 or len(f) != len(a) // 2 or set(f) - set(need + ["--root"]) or set(need) - set(f): sys.exit(2)
+sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+raw = open(f["--receipt"], "rb").read()
+if hashlib.sha256(raw).hexdigest() != f["--expected-receipt-sha256"]: refuse("receipt-digest")
+r = json.loads(raw)
+if (sha(f["--manifest"]), sha(f["--manifest-sig"]), sha(f["--release-key"])) != (r["manifest_sha256"], r["manifest_sig_sha256"], r["release_key_sha256"]):
+    refuse("manifest-digest")
+if os.path.exists(os.environ["NI_TEST_V2_REFUSE"]): refuse("signature")
+m = lambda n: open(os.path.join(f["--root"], "usr/lib/neural-ice", n)).read().strip()
+if (m("ota-state-profile"), m("access-policy"), m("hardware-target"), m("signed-boot-trust-policy-id")) != (
+        "owner-sealed-ota-state-v2", r["access_profile"], r["hardware_target"], r["signed_boot_trust_policy_id"]):
+    refuse("candidate-marker")
+print(json.dumps({"bundle_seq": r["bundle_seq"], "receipt_sha256": f["--expected-receipt-sha256"], "verdict": "pass"},
+                 sort_keys=True, separators=(",", ":")))
+EOF
+chmod +x "$FB_OTA_VERIFY"
+export NI_TEST_V2_CALLS="$FB_V2_CALLS" NI_TEST_V2_REFUSE="$TMP/v2-refuse"
+FB_OTA_PROFILE="$TMP/ota-state-profile-v2"
+FB_CANDIDATE_ROOT="$TMP/candidate-v2"
+FB_RELEASE_KEY="$TMP/release-authorization.pub"
+v2_firstboot() { NI_FIRSTBOOT_TPM_TEST_RELEASE_KEY="$FB_RELEASE_KEY" firstboot "$@"; }
+v2_expect_refusal() { # <description> <args...>: refused under strict AND relaxed, TPM still preseal-prepared
+  local description=$1 posture
+  shift
+  for posture in strict relaxed; do
+    NI_CEREMONY_POSTURE="$posture" expect_refusal "$description ($posture)" v2_firstboot "$@"
+    [[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+      || fail "$description ($posture) mutated the owner TPM state"
+  done
+}
+prepare_v2_state() { # <bundle_seq of the receipt>
+  local seq=$1 msha ssha ksha
+  prepare_firstboot_fixture
+  mkdir -m 0700 "$FB_STATE/v2-release-input-v1" "$FB_STATE/v2-release"
+  printf '{"schema":"neural-ice-release-manifest-v1","bundle_seq":%s}' "$seq" > "$FB_STATE/v2-release-input-v1/release-manifest.json"
+  printf 'c2lnbmF0dXJl' > "$FB_STATE/v2-release-input-v1/release-manifest.json.sig"
+  printf 'fixture release key\n' > "$FB_RELEASE_KEY"
+  msha="$(sha256sum "$FB_STATE/v2-release-input-v1/release-manifest.json" | awk '{print $1}')"
+  ssha="$(sha256sum "$FB_STATE/v2-release-input-v1/release-manifest.json.sig" | awk '{print $1}')"
+  ksha="$(sha256sum "$FB_RELEASE_KEY" | awk '{print $1}')"
+  python3 - "$FB_STATE/v2-release/receipt.json" "$seq" "$msha" "$ssha" "$ksha" "$PROFILE" "$TARGET" "$POLICY" <<'PY'
+import json, sys
+path, seq, m, sg, k, profile, target, policy = sys.argv[1:]
+r = {"access_profile": profile, "bundle_seq": int(seq), "hardware_target": target,
+     "host_index_digest": "sha256:" + "a1" * 32, "host_manifest_digest": "sha256:" + "b2" * 32,
+     "host_repository": "registry.example.test/neural-ice-test/host-appliance",
+     "manifest_sha256": m, "manifest_sig_sha256": sg, "release_id": "v2-test-train-3",
+     "release_key_sha256": k, "schema": "neural-ice-v2-release-receipt-v1",
+     "seal": {"min_bundle_seq": None, "mode": "manifest-digest", "sealed_manifest_sha256": m},
+     "signed_boot_trust_policy_id": policy, "variant": "sealed-lab"}
+open(path, "w").write(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  chmod 0600 "$FB_STATE/v2-release-input-v1"/* "$FB_STATE/v2-release/receipt.json"
+  printf '{"install_source":"medium","installed_at":"1970-01-01T00:00:00Z","installer_sealed_identity_sha256":"%064d","release_identity_sha256":"%s","schema":"neural-ice-owner-ceremony-install-identity-v1"}\n' \
+    0 "$msha" > "$FB_STATE/owner-ceremony-install-identity-v1.json"
+  chmod 0600 "$FB_STATE/owner-ceremony-install-identity-v1.json"
+  rm -rf -- "${FB_CANDIDATE_ROOT:?}"
+  mkdir -p "$FB_CANDIDATE_ROOT/usr/lib/neural-ice"
+  printf '%s\n' "$PROFILE" > "$FB_CANDIDATE_ROOT/usr/lib/neural-ice/access-policy"
+  printf '%s\n' "$TARGET" > "$FB_CANDIDATE_ROOT/usr/lib/neural-ice/hardware-target"
+  printf '%s\n' "$POLICY" > "$FB_CANDIDATE_ROOT/usr/lib/neural-ice/signed-boot-trust-policy-id"
+  printf 'owner-sealed-ota-state-v2\n' > "$FB_CANDIDATE_ROOT/usr/lib/neural-ice/ota-state-profile"
+  printf 'owner-sealed-ota-state-v2\n' > "$FB_OTA_PROFILE"
+  rm -f "$FB_V2_CALLS" "$TMP/v2-refuse"
+}
+
+# Receipt and TPM floor disagree: the real helper refuses before it mutates.
+prepare_v2_state 41
+"$FB_OTA_STATE" prepare 42 >/dev/null
+[[ "$(NI_TPM_STATE_TEST_OTA_HELPER="$FB_OTA_STATE" hw provisioning-status)" == preseal-prepared ]] \
+  || fail "real owner state for the v2 lane was not classified exactly"
+v2_expect_refusal "a receipt bundle_seq different from the TPM floor was accepted" boot
+# From here the receipt names the TPM floor.
+prepare_v2_state 42
+printf 'owner-sealed-ota-state-v2\n\n' > "$FB_OTA_PROFILE"
+v2_expect_refusal "a noncanonical v2 profile marker was accepted" boot
+printf 'owner-sealed-ota-state-v2\n' > "$FB_OTA_PROFILE"
+printf 'owner-sealed-ota-state-v1\n' > "$FB_OTA_PROFILE"
+v2_expect_refusal "a v1 marker was accepted for a host that carries only the v2 inputs" boot
+printf 'owner-sealed-ota-state-v2\n' > "$FB_OTA_PROFILE"
+for missing in v2-release-input-v1/release-manifest.json v2-release-input-v1/release-manifest.json.sig v2-release/receipt.json; do
+  mv "$FB_STATE/$missing" "$TMP/v2-input.absent"
+  v2_expect_refusal "an absent persisted v2 input ($missing) was accepted" boot
+  mv "$TMP/v2-input.absent" "$FB_STATE/$missing"
+done
+: > "$TMP/v2-refuse"
+v2_expect_refusal "a failing v2 verifier was tolerated" boot
+rm -f "$TMP/v2-refuse"
+printf 'owner-sealed-ota-state-v1\n' > "$FB_CANDIDATE_ROOT/usr/lib/neural-ice/ota-state-profile"
+v2_expect_refusal "a live root that is not on the v2 lane was accepted" boot
+printf 'owner-sealed-ota-state-v2\n' > "$FB_CANDIDATE_ROOT/usr/lib/neural-ice/ota-state-profile"
+[[ ! -e "$FB_STATE/owner-ceremony-evidence-v2.json" ]] || fail "a refused v2 ceremony left completion evidence behind"
+! grep -Eq 'preseal' "$FB_V2_CALLS" || fail "the v2 lane called a preseal verb: $(cat "$FB_V2_CALLS")"
+
+# The legitimate first boot (relaxed on purpose: the posture must change nothing).
+rm -f "$FB_V2_CALLS"
+NI_CEREMONY_POSTURE=relaxed v2_firstboot >/dev/null || fail "owner-sealed v2 first boot did not complete"
+[[ "$(wc -l < "$FB_V2_CALLS" | tr -d ' ')" == 2 ]] \
+  || fail "the v2 lane did not authenticate before and after finalization: $(cat "$FB_V2_CALLS")"
+[[ "$(NI_CEREMONY_POSTURE=relaxed v2_firstboot status)" == complete ]] || fail "owner-sealed v2 completion did not validate"
+[[ "$(wc -l < "$FB_V2_CALLS" | tr -d ' ')" == 3 ]] || fail "the retained check did not re-verify the receipt"
+v2_evidence="$FB_STATE/owner-ceremony-evidence-v2.json"
+python3 - "$v2_evidence" "$FB_STATE/v2-release/receipt.json" <<'PY' || fail "the lane-2 evidence is not the contract object"
+import hashlib, json, sys
+raw = open(sys.argv[1], "rb").read(); d = json.loads(raw); r = open(sys.argv[2], "rb").read()
+v = d["v2_release"]
+assert d["schema"] == "neural-ice-owner-ceremony-evidence-v2-lane2" and "ota_preseal" not in d
+assert set(v) == {"bundle_seq", "manifest_sha256", "manifest_sig_sha256", "receipt_schema", "receipt_sha256", "release_id", "release_key_sha256"}
+assert v["bundle_seq"] == d["ota_state"]["baseline_floor"] == 42 and v["receipt_sha256"] == hashlib.sha256(r).hexdigest()
+assert d["install_identity"]["release_identity_sha256"] == v["manifest_sha256"]
+assert d["ota_state"]["clear_protected_at_completion"] is True and d["ota_state"]["anchor_state_at_completion"] == "pristine"
+PY
+grep -q '^NI-DONE2' < <(tpm2_nvread 0x01500006 -C 0x01500006 -s 8 2>/dev/null) \
+  || fail "owner-sealed v2 ceremony did not persist NI-DONE2"
+
+# The TPM protections are the real ones: no Clear, no NV floor write, no undefine.
+expect_refusal "tpm2_clear (lockout) succeeded on a v2-lane appliance" tpm2_clear -c l
+expect_refusal "tpm2_clear (platform) succeeded on a v2-lane appliance" tpm2_clear -c p
+printf '\000\000\000\000\000\000\000\001' > "$TMP/floor-rollback.bin"
+expect_refusal "the NV floor was rewritten on a v2-lane appliance" \
+  tpm2_nvwrite 0x01500001 -C o -i "$TMP/floor-rollback.bin"
+expect_refusal "the NV floor was undefined on a v2-lane appliance" tpm2_nvundefine 0x01500001 -C o
+[[ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["baseline_floor"])' "$("$FB_OTA_STATE" inspect-v2)")" == 42 ]] \
+  || fail "the NV floor does not hold the receipt bundle_seq"
+
+# Second boot after an orderly TPM restart; then every integrity break refuses,
+# in relaxed too: evidence, receipt, manifest, verifier and the lane marker.
+stop_swtpm
+start_swtpm
+for posture in strict relaxed; do
+  [[ "$(NI_CEREMONY_POSTURE=$posture v2_firstboot status)" == complete ]] \
+    || fail "v2-lane retained validation failed after an orderly SWTPM restart ($posture)"
+done
+cp "$v2_evidence" "$TMP/v2-evidence.good"
+cp "$FB_STATE/v2-release/receipt.json" "$TMP/v2-receipt.good"
+cp "$FB_STATE/v2-release-input-v1/release-manifest.json" "$TMP/v2-manifest.good"
+for posture in strict relaxed; do
+  export NI_CEREMONY_POSTURE=$posture
+  python3 - "$v2_evidence" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["v2_release"]["release_id"] = "forged"
+open(p, "w").write(json.dumps(d, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  expect_refusal "altered v2 completion evidence validated ($posture)" v2_firstboot status
+  cp "$TMP/v2-evidence.good" "$v2_evidence"
+  printf '\n' >> "$FB_STATE/v2-release/receipt.json"
+  expect_refusal "a receipt that is not the TPM-bound one validated ($posture)" v2_firstboot status
+  cp "$TMP/v2-receipt.good" "$FB_STATE/v2-release/receipt.json"
+  printf 'x' >> "$FB_STATE/v2-release-input-v1/release-manifest.json"
+  expect_refusal "a manifest swapped after the install validated ($posture)" v2_firstboot status
+  cp "$TMP/v2-manifest.good" "$FB_STATE/v2-release-input-v1/release-manifest.json"
+  : > "$TMP/v2-refuse"
+  expect_refusal "a refusing v2 verifier validated ($posture)" v2_firstboot status
+  rm -f "$TMP/v2-refuse"
+  printf 'owner-sealed-ota-state-v1\n' > "$FB_OTA_PROFILE"
+  expect_refusal "lane-2 evidence validated under a v1 marker ($posture)" v2_firstboot status
+  printf 'owner-sealed-ota-state-v2\n' > "$FB_OTA_PROFILE"
+  [[ "$(v2_firstboot status)" == complete ]] || fail "the restored v2 completion no longer validates ($posture)"
+done
+unset NI_CEREMONY_POSTURE
+expect_refusal "the v1 runtime reader accepted the lane-2 completion" \
+  hw runtime-status "$PROFILE" "$TARGET" "$POLICY" \
+  "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(b"neural-ice:tpm:owner-ceremony-completion:v2\0"+open(sys.argv[1],"rb").read()).hexdigest())' "$v2_evidence")" 1 1
+
+echo "SWTPM_TPM_STATE_TEST_OK (real TPM 2.0 + real cryptsetup LUKS2 headers; owner-sealed v2 lane with a contract-conformant fake of the v2 verifier; anchor signer fixture is explicitly synthetic; signed physical recovery and GB10 gates remain)"
