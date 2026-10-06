@@ -55,7 +55,7 @@ host="$(jq -r '.host.repository + "@" + .host.digest' "$M")"
 [[ "$seq" =~ ^[1-9][0-9]{0,15}$ ]] && [ "$seq" -ge "$minseq" ] || die "bundle_seq $seq below the sealed floor $minseq"
 [ "$mt" = "$target" ] || die "manifest hardware_target $mt is not the sealed $target"
 [[ "$host" =~ ^rg\.fr-par\.scw\.cloud/neural-ice-v2-lab/host-appliance@sha256:[0-9a-f]{64}$ ]] || die "host reference outside the v2 namespace: $host"
+[[ "$rid" =~ ^[A-Za-z0-9._-]+$ ]] || die "release_id has unsafe characters"
 hostdigest="${host#*@}"
 printf 'RELEASE_ID=%s\nBUNDLE_SEQ=%s\nHARDWARE_TARGET=%s\nHOST_REF=%s\nHOST_DIGEST=%s\n' "$rid" "$seq" "$mt" "$host" "$hostdigest" > /run/ni-verified/release.env
-[[ "$rid" =~ ^[A-Za-z0-9._-]+$ ]] || die "release_id has unsafe characters"
 say "NI-GENERIC-PAYLOAD-OK release=$rid seq=$seq target=$mt host=$host"

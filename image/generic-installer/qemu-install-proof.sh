@@ -4,6 +4,9 @@
 # (same firmware variables, same swtpm state) until the system reaches multi-user or the budget ends.
 # AAVMF without Secure Boot, KVM, swtpm TPM 2.0. Run as root (/dev/kvm).
 # Usage: qemu-install-proof.sh OUTDIR MEDIUM.img [TARGET_GIB] [INSTALL_BUDGET_S] [BOOT_BUDGET_S]
+# Refusal proof: EXPECT_REFUSAL='<regex of the refusal text>' makes phase 1 succeed only when the installer prints
+# exactly that refusal, no install verdict, and leaves the target disk untouched (nothing allocated, all zeros).
+# Exit codes: 0 proven, 1 not proven, 2 installed and booted, but the host's own trust gate refused (NI-E02).
 set -euo pipefail
 OUT="${1:?outdir}"; MEDIUM="${2:?medium image}"; GIB="${3:-64}"; IB="${4:-2400}"; BB="${5:-420}"
 mkdir -p "$OUT"; R="$(mktemp -d /tmp/ni-geninst-q.XXXXXX)"   # swtpm's AppArmor profile allows /tmp
@@ -33,7 +36,15 @@ echo "== phase 1: install"; t0=$SECONDS; MARK="ni-generic(-install)?: REFUSED" q
 echo "phase 1 seconds: $(( SECONDS - t0 ))"
 clean "$OUT/phase1.log" | grep -aE '^ni-generic(-install)?:' > "$OUT/phase1.verdicts" || true
 cat "$OUT/phase1.verdicts"
-grep -q 'NI-GENERIC-PAYLOAD-OK' "$OUT/phase1.verdicts" && grep -q 'NI-GENERIC-INSTALL-OK' "$OUT/phase1.verdicts" && ! grep -q 'REFUSED' "$OUT/phase1.verdicts" \
+if [ -n "${EXPECT_REFUSAL:-}" ]; then
+  [ "$(grep -c 'REFUSED' "$OUT/phase1.verdicts")" = 1 ] && grep -qE "REFUSED: .*(${EXPECT_REFUSAL})" "$OUT/phase1.verdicts" && ! grep -q 'INSTALL-OK' "$OUT/phase1.verdicts" \
+    || { echo "REFUSAL NOT PROVEN"; exit 1; }
+  [ "$(du -s --block-size=1 "$TARGET" | cut -f1)" = 0 ] || { echo "TARGET DISK WAS WRITTEN"; exit 1; }
+  case "$(cmp "$TARGET" /dev/zero 2>&1 || true)" in *"EOF on"*) ;; *) echo "TARGET DISK WAS WRITTEN"; exit 1 ;; esac
+  echo "REFUSAL PROVEN, target disk untouched"; exit 0
+fi
+[ "$(grep -c 'NI-GENERIC-PAYLOAD-OK' "$OUT/phase1.verdicts")" = 1 ] && [ "$(grep -c 'NI-GENERIC-INSTALL-OK' "$OUT/phase1.verdicts")" = 1 ] && ! grep -q 'REFUSED' "$OUT/phase1.verdicts" \
+  && grep -qE "^ni-generic-install: NI-GENERIC-INSTALL-OK release=${EXPECT_RELEASE:-[A-Za-z0-9._-]+} host=.*@${EXPECT_HOST_DIGEST:-sha256:[0-9a-f]+} " "$OUT/phase1.verdicts" \
   || { echo "INSTALL NOT PROVEN"; exit 1; }
 echo "target allocated: $(du -h --apparent-size "$TARGET" | cut -f1) apparent, $(du -h "$TARGET" | cut -f1) on disk"
 echo "== phase 2: first boot of the installed disk"; t1=$SECONDS
@@ -43,7 +54,9 @@ echo "phase 2 seconds: $(( SECONDS - t1 ))"
 clean "$OUT/phase2.log" > "$OUT/phase2.clean.log"
 grep -aE 'Reached target .*(Multi-User|Basic System|Initrd Root)|login:|Welcome to|ostree-prepare-root|panic|emergency|NI-E0|Failed to start' "$OUT/phase2.clean.log" | head -30
 if grep -aqE 'Reached target .*Multi-User|login: ' "$OUT/phase2.clean.log"; then echo "FIRST BOOT REACHED MULTI-USER"
-elif grep -aq 'Welcome to ' "$OUT/phase2.clean.log" && grep -aq 'NI-E02' "$OUT/phase2.clean.log"; then
+elif grep -aq 'Welcome to Neural ICE CoreOS' "$OUT/phase2.clean.log" \
+     && grep -aq 'FAILURE NI-E02 (TPM ceremony) unit=neural-ice-firstboot-tpm-ceremony.service' "$OUT/phase2.clean.log" \
+     && [ -z "$(grep -aE 'NI-E0[0-9]' "$OUT/phase2.clean.log" | grep -av 'NI-E02')" ]; then
   # The installed host switched root and ran its own first-boot trust gate, which refused: the installer does not yet
   # provision the TPM ceremony, the PCR policy or the LUKS data volume (ADR-0044 release-blocking items).
   echo "FIRST BOOT: HOST RAN, ITS TRUST GATE REFUSED (NI-E02, provisioning not wired)"; exit 2

@@ -17,6 +17,8 @@ VARIANT="${VARIANT:-sealed-lab}"; CONSOLE_KARG="${CONSOLE_KARG:-}"; STAGE="${INS
 TARGET_DEBUG="${TARGET_DEBUG:-0}"
 [[ "$MINSEQ" =~ ^[1-9][0-9]{0,15}$ ]] && [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad floor or version" >&2; exit 2; }
 [[ "$CONSOLE_KARG" =~ ^(console=[A-Za-z0-9,]+)?$ ]] && [[ "$TARGET_DEBUG" =~ ^[01]$ ]] || { echo "bad console or debug flag" >&2; exit 2; }
+[[ "$TARGET" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && "$STAGE" =~ ^[a-z]+(-[a-z]+)*$ && "$VARIANT" =~ ^[a-z]+(-[a-z]+)*$ ]] || { echo "bad target, stage or variant" >&2; exit 2; }
+for v in "$OUT" "$CTX" "$PCRKEY" "${MKOSI_CACHE:-}"; do [[ "$v" =~ ^[A-Za-z0-9._/@+-]*$ ]] || { echo "unsupported character in a path" >&2; exit 2; }; done
 [ -s "$PCRKEY" ] && [ ! -L "$PCRKEY" ] || { echo "PCR policy key missing" >&2; exit 2; }
 # The same gate the host build passes: re-hashes every staged byte and re-checks the signed boot binding. Its
 # tools (sbverify, sbattach) behave differently in the build container, so build-in-container.sh runs it on the
@@ -26,21 +28,22 @@ if [ -n "${CONTEXT_RESULT:-}" ]; then
   cp -- "$CONTEXT_RESULT" "$OUT.context.txt"
   want="$(sed -n 's/^ARTIFACT_MANIFEST_SHA256=//p' "$OUT.context.txt")"
   [ "$(sha256sum "$CTX/manifest.sha256" | cut -d' ' -f1)" = "$want" ] || { echo "the verification result is not for this staged generation" >&2; exit 3; }
-  ( cd "$CTX" && find rpms nvidia-userspace/usr/lib/firmware -type f -print0 | xargs -0 sha256sum ) | LC_ALL=C sort > "$OUT.consumed.sha256"
+  ( cd "$CTX" && find generation.env rpms nvidia-userspace/usr/lib/firmware -type f -print0 | xargs -0 sha256sum ) | LC_ALL=C sort > "$OUT.consumed.sha256"
   awk -F'\t' '$1 == "F" { print $2 "  " $3 }' "$CTX/manifest.sha256" | LC_ALL=C sort > "$OUT.manifest.sha256"
   [ -s "$OUT.consumed.sha256" ] && [ -z "$(LC_ALL=C comm -23 "$OUT.consumed.sha256" "$OUT.manifest.sha256")" ] \
     || { echo "a consumed file does not match the staged generation manifest" >&2; exit 3; }
 else
   "$REPO/ci/verify-build-context.sh" "$CTX" "$VARIANT" > "$OUT.context.txt" || { echo "staged generation not approved for $VARIANT" >&2; exit 3; }
 fi
+POLICY_RE='^[a-z0-9]+(-[a-z0-9]+)*$'
 gen() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; n++ } END { exit n == 1 ? 0 : 1 }' "$CTX/generation.env"; }
 NEVRA="$(gen kernel_nevra)"; UNAME="$(gen kernel_uname_r)"; NV="${NEVRA#*:}"   # 0:6.12.0-249... -> 6.12.0-249...
 [[ "$NV" =~ ^[0-9][0-9A-Za-z._+-]*$ ]] || { echo "bad kernel nevra $NEVRA" >&2; exit 3; }
 KEYID="$(sha256sum "$HERE/mkosi.extra/usr/lib/neural-ice-generic/release-authorization.pub" | cut -d' ' -f1)"
 PCRID="$(sha256sum "$PCRKEY" | cut -d' ' -f1)"
 ID="$(gen generation_id)"; POLICY="$(sed -n 's/^SIGNED_BOOT_TRUST_POLICY_ID=//p' "$OUT.context.txt")"
-[ -n "$POLICY" ] || { echo "context verification named no trust policy" >&2; exit 3; }
-mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"; rm -rf "$OUT/stage"
+[[ "$POLICY" =~ $POLICY_RE ]] || { echo "context verification named no trust policy" >&2; exit 3; }
+mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"; rm -rf "$OUT/stage" "$OUT/workspace"; mkdir -p "$OUT/workspace"
 # Firmware and console files go in as an extra tree: the GSP blobs are the host's, byte for byte.
 S="$OUT/stage"; install -d -m 0755 "$S/usr/lib/firmware" "$S/usr/lib/neural-ice-generic" "$S/usr/lib/modprobe.d" "$S/etc"
 cp -a "$CTX/nvidia-userspace/usr/lib/firmware/nvidia" "$S/usr/lib/firmware/"
@@ -53,6 +56,7 @@ KARGS="$KARGS neuralice.installer_version=$VERSION neuralice.access_profile=lab-
 KARGS="$KARGS neuralice.install_stage=$STAGE neuralice.target_debug=$TARGET_DEBUG ${CONSOLE_KARG} systemd.unit=ni-generic-installer.target systemd.firstboot=off"
 cat > "$OUT/local.conf" <<CONF
 [Build]
+WorkspaceDirectory=$OUT/workspace
 ${MKOSI_CACHE:+PackageCacheDirectory=$MKOSI_CACHE}
 
 [Content]
