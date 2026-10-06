@@ -275,3 +275,345 @@ fn status_is_the_literal_the_gate_and_model_fetch_compare() {
         "owner_state_reader.rs no longer holds the status literal of the contract"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The completed-appliance vector (contract §6, §6.5) and the sealed cmdline (§11).
+// ---------------------------------------------------------------------------
+
+const MODES: [&str; 2] = ["manifest-digest", "floor"];
+const OTA_DIR: &str = "var/lib/neural-ice/ota";
+
+fn completed(mode: &str, relative: &str) -> Vec<u8> {
+    read(&format!("completed/{mode}/{relative}"))
+}
+
+/// The one canonical form of the contract (§6.2): sorted keys, compact, ASCII, one
+/// final LF. `serde_json` without `preserve_order` is what T1's reader re-serialises
+/// with, so a byte-equal round trip is exactly the reader's acceptance test.
+fn is_canonical(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    let mut canonical = serde_json::to_vec(&value).unwrap();
+    canonical.push(b'\n');
+    canonical == bytes && bytes.is_ascii()
+}
+
+fn keys(value: &Value) -> Vec<&str> {
+    value
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+fn completed_evidence_is_canonical_and_closed() {
+    let golden = json("golden.json");
+    for mode in MODES {
+        let bytes = completed(mode, &format!("{OTA_DIR}/owner-ceremony-evidence-v2.json"));
+        assert!(bytes.len() <= 16 * 1024, "{mode}: evidence over 16 KiB");
+        assert!(is_canonical(&bytes), "{mode}: evidence is not canonical");
+        assert!(
+            !bytes[..bytes.len() - 1].contains(&b'\n'),
+            "{mode}: inner LF"
+        );
+        let evidence: Value = serde_json::from_slice(&bytes).unwrap();
+        // serde_json iterates a map in sorted order, so these are the sorted key sets.
+        assert_eq!(
+            keys(&evidence),
+            [
+                "access_profile_anchor",
+                "data_luks",
+                "device_root_name",
+                "install_identity",
+                "ota_state",
+                "schema",
+                "srk_name",
+                "system_luks",
+                "tpm_state",
+                "v2_release"
+            ],
+            "{mode}: top-level key set (no `ota_preseal`)"
+        );
+        assert_eq!(
+            text(&evidence, "schema"),
+            "neural-ice-owner-ceremony-evidence-v2-lane2"
+        );
+        assert_eq!(
+            keys(&evidence["access_profile_anchor"]),
+            ["json_sha256", "signature_sha256", "spki_sha256"]
+        );
+        assert_eq!(
+            keys(&evidence["install_identity"]),
+            [
+                "install_source",
+                "installed_at",
+                "installer_sealed_identity_sha256",
+                "release_identity_sha256",
+                "schema"
+            ]
+        );
+        assert_eq!(
+            keys(&evidence["ota_state"]).len(),
+            16,
+            "{mode}: ota_state has sixteen keys"
+        );
+        assert_eq!(
+            keys(&evidence["tpm_state"]),
+            [
+                "freshness_counter",
+                "freshness_public_sha256",
+                "install_counter",
+                "install_public_sha256",
+                "profile_binding",
+                "schema"
+            ]
+        );
+        for luks in ["data_luks", "system_luks"] {
+            assert_eq!(
+                keys(&evidence[luks]),
+                [
+                    "keyslot",
+                    "pcr_bank",
+                    "pcrs",
+                    "policy_hash",
+                    "policy_public_key_sha256",
+                    "schema",
+                    "sealed_object_sha256",
+                    "srk_sha256",
+                    "token_sha256"
+                ]
+            );
+        }
+        let release = &evidence["v2_release"];
+        assert_eq!(
+            keys(release),
+            [
+                "bundle_seq",
+                "manifest_sha256",
+                "manifest_sig_sha256",
+                "receipt_schema",
+                "receipt_sha256",
+                "release_id",
+                "release_key_sha256"
+            ]
+        );
+        let inputs = &golden["inputs"];
+        assert_eq!(release["bundle_seq"], golden["expected"]["bundle_seq"]);
+        assert_eq!(
+            text(release, "manifest_sha256"),
+            text(inputs, "sealed_manifest_sha256")
+        );
+        assert_eq!(
+            text(release, "manifest_sig_sha256"),
+            text(inputs, "sealed_manifest_sig_sha256")
+        );
+        assert_eq!(
+            text(release, "release_key_sha256"),
+            text(inputs, "sealed_key_sha256")
+        );
+        assert_eq!(
+            text(release, "receipt_schema"),
+            "neural-ice-v2-release-receipt-v1"
+        );
+        assert_eq!(
+            text(release, "release_id"),
+            text(&golden["expected"], "release_id")
+        );
+        // The invariants of §6.4 the parser enforces.
+        assert_eq!(
+            evidence["ota_state"]["baseline_floor"], release["bundle_seq"],
+            "{mode}: floor == bundle_seq"
+        );
+        let identity = &evidence["install_identity"];
+        assert_eq!(
+            text(identity, "release_identity_sha256"),
+            text(release, "manifest_sha256"),
+            "{mode}: release identity is the manifest digest"
+        );
+        assert_eq!(text(identity, "install_source"), "medium");
+        assert_eq!(text(identity, "installed_at"), "1970-01-01T00:00:00Z");
+        // The TPM objects are those of the v1 lane, unchanged.
+        let ota = &evidence["ota_state"];
+        assert_eq!(text(ota, "profile"), "owner-sealed-ota-state-v1");
+        assert_eq!(text(ota, "floor_index"), "0x01500001");
+        assert_eq!(text(ota, "floor_attributes"), "0x62008");
+        assert_eq!(text(ota, "anchor_index"), "0x01500002");
+        assert_eq!(text(ota, "anchor_attributes"), "0x2060048");
+        assert_eq!(text(ota, "anchor_state_at_completion"), "pristine");
+        assert_eq!(
+            text(ota, "anchor_name_at_completion"),
+            text(ota, "anchor_pristine_name")
+        );
+        assert_eq!(ota["clear_protected_at_completion"], Value::Bool(true));
+    }
+}
+
+#[test]
+fn completed_digest_chain_and_completion_record_match() {
+    let golden = json("golden.json");
+    for mode in MODES {
+        let evidence = completed(mode, &format!("{OTA_DIR}/owner-ceremony-evidence-v2.json"));
+        let expected = &golden["expected"]["completed"][mode];
+        assert_eq!(hex_sha256(&evidence), text(expected, "evidence_sha256"));
+        let mut message = b"neural-ice:tpm:owner-ceremony-completion:v2\0".to_vec();
+        message.extend_from_slice(&evidence);
+        let digest = hex_sha256(&message);
+        assert_eq!(digest, text(expected, "completion_digest_sha256"));
+        // What `completion-inspect` prints, byte for byte (§6.1).
+        assert_eq!(
+            completed(mode, "completion-inspection.json"),
+            format!(
+                "{{\"completion_version\":2,\"evidence_digest_sha256\":\"{digest}\",\"schema\":\"neural-ice-owner-ceremony-completion-inspection-v1\"}}\n"
+            )
+            .into_bytes(),
+            "{mode}: completion record"
+        );
+        // The receipt digest the evidence carries is the digest of receipt.json.
+        let receipt = completed(mode, &format!("{OTA_DIR}/v2-release/receipt.json"));
+        assert_eq!(hex_sha256(&receipt), text(expected, "receipt_sha256"));
+        assert_eq!(
+            text(&golden["expected"]["receipt_sha256"], mode),
+            text(expected, "receipt_sha256")
+        );
+        let parsed: Value = serde_json::from_slice(&evidence).unwrap();
+        assert_eq!(
+            text(&parsed["v2_release"], "receipt_sha256"),
+            hex_sha256(&receipt)
+        );
+    }
+}
+
+#[test]
+fn completed_persisted_layout_is_the_contract_footprint() {
+    for mode in MODES {
+        // Copies of the top-level files: no drift between the two sets.
+        let input = format!("{OTA_DIR}/v2-release-input-v1");
+        assert_eq!(
+            completed(mode, &format!("{input}/release-manifest.json")),
+            read("release-manifest.json")
+        );
+        assert_eq!(
+            completed(mode, &format!("{input}/release-manifest.json.sig")),
+            read("release-manifest.json.sig")
+        );
+        assert_eq!(
+            completed(mode, &format!("{OTA_DIR}/v2-release/receipt.json")),
+            read(&format!("expected-receipt-{mode}.json"))
+        );
+        // The installer's canonical identity file is the object the evidence embeds.
+        let identity = completed(
+            mode,
+            &format!("{OTA_DIR}/owner-ceremony-install-identity-v1.json"),
+        );
+        assert!(is_canonical(&identity), "{mode}: identity not canonical");
+        let evidence: Value = serde_json::from_slice(&completed(
+            mode,
+            &format!("{OTA_DIR}/owner-ceremony-evidence-v2.json"),
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&identity).unwrap(),
+            evidence["install_identity"]
+        );
+        // Exactly the v2-lane files, and none of the other lane's.
+        let mut files = Vec::new();
+        collect(&dir().join(format!("completed/{mode}")), "", &mut files);
+        files.sort();
+        let mut expected: Vec<String> = [
+            "completion-inspection.json".to_string(),
+            format!("{OTA_DIR}/owner-ceremony-evidence-v2.json"),
+            format!("{OTA_DIR}/owner-ceremony-install-identity-v1.json"),
+            format!("{OTA_DIR}/v2-release-input-v1/release-manifest.json"),
+            format!("{OTA_DIR}/v2-release-input-v1/release-manifest.json.sig"),
+            format!("{OTA_DIR}/v2-release/receipt.json"),
+        ]
+        .into();
+        expected.sort();
+        assert_eq!(files, expected, "{mode}: completed tree");
+        assert!(!files.iter().any(|f| f.contains("preseal")));
+    }
+}
+
+fn collect(root: &Path, prefix: &str, out: &mut Vec<String>) {
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+        if entry.file_type().unwrap().is_dir() {
+            collect(&entry.path(), &format!("{name}/"), out);
+        } else {
+            out.push(name);
+        }
+    }
+}
+
+/// The names the contract fixes for T3a/T3b/T5 (§11) must not drift from DESIGN-B:
+/// a rename here is a contract change, so the test pins the document.
+#[test]
+fn contract_pins_the_sealed_cmdline_keys_and_esp_paths() {
+    let doc = String::from_utf8(
+        fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/ota/V2-RELEASE-ATTESTATION.md"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for needle in [
+        "`neuralice.v2rel_sha256`",
+        "`neuralice.v2rel_sig_sha256`",
+        "`ice-coreos/v2-release-manifest.json`",
+        "`ice-coreos/v2-release-manifest.json.sig`",
+        "`neuralice.preseal`",
+        "`neuralice.relauth_sha256` / `neuralice.relauth_sig_sha256`",
+        "`neuralice.source=medium`",
+        "neuralice.source=medium neuralice.v2rel_sha256=@V2REL_SHA@ neuralice.v2rel_sig_sha256=@V2REL_SIG_SHA@",
+        "owner-sealed-ota-state-v2",
+        "**High-S is accepted.**",
+    ] {
+        assert!(doc.contains(needle), "the contract no longer says {needle}");
+    }
+}
+
+/// The golden signature is HIGH-S on purpose (contract §2, "High-S is accepted"): a KMS
+/// emits either form, and a verifier that pre-filtered to low-S would refuse genuine
+/// output. If this fails after a regeneration, the generator did not keep the property.
+#[test]
+fn golden_signature_is_high_s() {
+    let work = scratch("high-s");
+    fs::write(work.join("sig.b64"), read("release-manifest.json.sig")).unwrap();
+    let decoded = Command::new("openssl")
+        .args(["base64", "-d", "-A", "-in"])
+        .arg(work.join("sig.b64"))
+        .arg("-out")
+        .arg(work.join("sig.der"))
+        .output()
+        .expect("the golden test needs the openssl CLI");
+    assert!(decoded.status.success());
+    let der = fs::read(work.join("sig.der")).unwrap();
+    let _ = fs::remove_dir_all(&work);
+    // SEQUENCE { INTEGER r, INTEGER s }, short-form lengths for a P-256 signature.
+    assert_eq!(der[0], 0x30);
+    let mut at = if der[1] < 0x80 {
+        2
+    } else {
+        2 + usize::from(der[1] & 0x7f)
+    };
+    assert_eq!(der[at], 0x02);
+    at += 2 + usize::from(der[at + 1]);
+    assert_eq!(der[at], 0x02);
+    let s = &der[at + 2..at + 2 + usize::from(der[at + 1])];
+    let s: Vec<u8> = s.iter().copied().skip_while(|byte| *byte == 0).collect();
+    assert_eq!(s.len(), 32, "s is a full-width scalar");
+    // Half the P-256 group order, big-endian.
+    let half_order: [u8; 32] = [
+        0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31,
+        0x92, 0xa8,
+    ];
+    assert!(
+        s.as_slice() > half_order.as_slice(),
+        "the golden s is low-S"
+    );
+}
