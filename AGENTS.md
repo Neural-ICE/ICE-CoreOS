@@ -15,7 +15,7 @@ Racine du vault : `/data/github/@Neural-ICE_Dev/ICE-Obsidian/Neural-ICE_Dev/`
 | Le schéma qui gouverne l'ensemble | `AGENTS.md` |
 | **Ce repo** — état vérifié, pièges, contrats | `wiki/composants/ice-coreos.md` |
 | **Les écarts ouverts** sur ce périmètre | `wiki/ecarts/` — filtrer sur `repos: [ICE-CoreOS]` |
-| **Les décisions qui contraignent** | `wiki/decisions/index-adr.md` |
+| **Les décisions passées** — contexte à challenger, pas source de vérité : une décision fausse se corrige par un nouvel ADR, l'ancien est supprimé (règle Owner 06.10.2026, ICE-Workspace AGENTS.md) | `wiki/decisions/index-adr.md` |
 | **Ce qui tourne ailleurs en ce moment** | `wiki/missions/chantiers-en-cours.md` |
 
 > **C'est ce qui manquait** : une session ouverte ici n'avait aucun accès aux missions, à
