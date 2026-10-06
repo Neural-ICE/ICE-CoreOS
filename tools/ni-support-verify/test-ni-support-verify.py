@@ -1067,6 +1067,91 @@ EXCERPTS = "journal-app-excerpts.jsonl"
 REMOVED = "retirée par l'utilisateur"
 
 
+class RealClientExport(ToolTest):
+    """What the REAL client export code (ICE-Client PR #288) makes of the REAL collector's bundle
+    (fixtures/collector-v2). Nothing here is hand-built: see fixtures/client-v2/README.md for the producer."""
+
+    FIXTURE = HERE / "fixtures" / "client-v2"
+    PIN = (HERE / "fixtures" / "collector-v2" / "pin.txt").read_text().split()[0]
+
+    def check(self, name, *extra):
+        return run("verify", self.FIXTURE / name, "--pin-spki-sha256", self.PIN, "--format", "json", *extra)
+
+    def test_the_client_export_without_edits_verifies(self):
+        proc = self.check("client-unedited.tar.gz")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = self.verdict(proc)
+        self.assertEqual(verdict["removed_by_user"], [])
+        self.assertEqual(verdict["unsigned"], ["client.json"])
+        self.assertEqual(verdict["warnings"], [])
+
+    def test_lines_the_user_removed_verify_and_are_reported(self):
+        proc = self.check("client-removed-1-3.tar.gz")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = self.verdict(proc)
+        self.assertEqual(verdict["verdict"], "verified")
+        self.assertEqual(verdict["removed_by_user"], [{"file": EXCERPTS, "position": 1}, {"file": EXCERPTS, "position": 3}])
+        self.assertEqual(verdict["warnings"], [])
+        text = run("verify", self.FIXTURE / "client-removed-1-3.tar.gz", "--pin-spki-sha256", self.PIN)
+        self.assertEqual(text.stdout.count(REMOVED), 2, text.stdout)
+
+    def test_an_unticked_section_is_an_empty_file_that_verifies(self):
+        proc = self.check("client-all-removed.tar.gz")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = self.verdict(proc)
+        self.assertEqual([r["position"] for r in verdict["removed_by_user"]], [0, 1, 2, 3, 4])
+        shown = run("show", self.FIXTURE / "client-all-removed.tar.gz", EXCERPTS, "--pin-spki-sha256", self.PIN)
+        self.assertEqual((shown.returncode, shown.stdout.strip()), (0, ""), shown.stderr)
+
+    def test_the_client_block_is_unsigned_and_changes_nothing(self):
+        raw = gzip.decompress((self.FIXTURE / "client-removed-1-3.tar.gz").read_bytes())
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            block = json.loads(tf.extractfile("client.json").read())
+        self.assertEqual(block["edits"], {"excerpt_lines_removed": 2, "excerpts_withdrawn": False})
+
+    def test_the_real_envelope_is_accepted_up_to_the_decryption(self):
+        """The real zip holds LISEZ-MOI.txt and the age file: the layer passes, the dropped key cannot open it."""
+        spec = importlib.util.spec_from_file_location("ni_support_verify", TOOL)
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        age_bytes = tool.unzip_envelope((self.FIXTURE / "client-removed-1-3-throwaway-key.zip").read_bytes())
+        self.assertTrue(age_bytes.startswith(b"age-encryption.org/v1\n-> X25519 "))
+        with zipfile.ZipFile(self.FIXTURE / "client-removed-1-3-throwaway-key.zip") as zf:
+            self.assertEqual(sorted(zf.namelist()), ["LISEZ-MOI.txt", "diagnostic.tar.gz.age"])
+            readme = zf.read("LISEZ-MOI.txt").decode("utf-8")
+        self.assertIn("Aucune donnée n'est envoyée automatiquement ; ce fichier chiffré ne contient aucun document, prompt ni transcription.", readme)
+        stranger = self.tmp / "stranger.key"
+        subprocess.run(["age-keygen", "-o", str(stranger)], capture_output=True, check=True)
+        proc = run("verify", self.FIXTURE / "client-removed-1-3-throwaway-key.zip", "--pin-spki-sha256", self.PIN,
+                   "--key", stranger, "--format", "json")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        checks = {c["name"]: c["ok"] for c in self.verdict(proc)["checks"]}
+        self.assertEqual(checks, {"decrypt": False}, "past the zip layer (an envelope refusal would be an `input` failure), stopped at the key")
+
+    def test_what_the_client_may_never_do_is_still_refused_on_real_output(self):
+        """Take the client's real export and do what a hostile or buggy client would: each is refused."""
+        raw = gzip.decompress((self.FIXTURE / "client-removed-1-3.tar.gz").read_bytes())
+        members = {}
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            for info in tf.getmembers():
+                members[info.name] = tf.extractfile(info).read()
+        lines = members[EXCERPTS].split(b"\n")[:-1]
+        cases = {
+            "a kept line reworded": members[EXCERPTS].replace(b"CASE", b"CAse", 1) if b"CASE" in members[EXCERPTS]
+            else members[EXCERPTS].replace(b"ERROR", b"ERRoR", 1),
+            "kept lines reordered": b"".join(line + b"\n" for line in reversed(lines)),
+            "a kept line twice": b"".join(line + b"\n" for line in lines + lines[:1]),
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label):
+                edited = {**members, EXCERPTS: body}
+                gz = make_gz(make_tar([tar_member(n, d, mtime=EPOCH_REAL) for n, d in sorted(edited.items())]))
+                path = self.prod.write("hostile.tar.gz", gz)
+                proc = run("verify", path, "--pin-spki-sha256", self.PIN, "--format", "json")
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertEqual(self.failed_check(proc), "files")
+
+
 class CollectorExcerptLines(ToolTest):
     """Per-line digests of the opt-in excerpts (collector contract, ICE-Fabric-v2 `config/support-bundle/README.md`,
     « Excerpts »). The bundle is the REAL host collector's output (fixtures/collector-v2/, made by
