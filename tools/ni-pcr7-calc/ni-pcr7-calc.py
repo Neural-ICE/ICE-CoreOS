@@ -19,15 +19,25 @@ PCR 7 is the fold   pcr = H(pcr || H(event_data))   over three kinds of event:
              verified GRUB and the kernel
 
 🔴 What `data` carries in a config event is a FIRMWARE property, not a given.
-Measured on two GB10 firmware builds (NVIDIA 5.36_0ACUM018, ASUS GX10DGX.0104):
-PK/KEK/db/dbx and SecureBoot are logged with a ZERO-length data, names only. On
-that firmware a dbx append, a KEK rotation or a PK swap does NOT move PCR 7; the
-authority events do. `firmware.variable_measurement` makes the assumption
-explicit, and "contents" (what the TCG PC Client spec and EDK2 describe) is NOT
-proven on any GB10.
+OBSERVED on two GB10 event logs (NVIDIA 5.36_0ACUM018, ASUS GX10DGX.0104):
+SecureBoot, PK, KEK, db and dbx are logged with a ZERO-length data, names only,
+with identical digests on both machines. DEDUCED from that structure (no real
+update was ever compared before/after): a dbx append, a KEK rotation or a PK
+swap does not move PCR 7 on that firmware; the authority events do. The same
+deduction means "replayed PCR 7 == live PCR 7" says nothing about the CONTENT of
+those variables (SecureBoot value, PK enrolled, user mode, db, dbx).
+`firmware.variable_measurement` makes the assumption explicit, and "contents"
+(what the TCG PC Client spec and EDK2 describe) is NOT proven on any GB10.
+
+What replay binds: the sha256 digest of every PCR 7 event must be H(its data),
+so every data byte is covered by the replayed value. It does NOT bind the event
+type or PCR index (a digest hashes the data only), nor the TCG2 header beyond
+the checks in `check_header`; `verify`/`extract` additionally refuse a type the
+reference model does not know.
 
 The event-log parsing and the PCR replay are the ones the installer already
-ships (ota/neural-ice-tpm-policy.py); they are imported, not copied.
+ships (ota/neural-ice-tpm-policy.py); they are imported, not copied. This tool
+therefore needs a checkout of the repository, not just this file.
 """
 
 import argparse
@@ -61,6 +71,19 @@ BOOT_PATHS = ("uki-direct", "shim-grub", "custom")
 # The authority events each boot path logs, in order; a "custom" path is free.
 BOOT_SHAPES = {"uki-direct": ("db",), "shim-grub": ("db", "SbatLevel", "MokListRT")}
 ESL_SIG_TYPE_SHA256 = "c1c41626-504c-4092-aca9-41f936934328"
+SPEC_ID_SIGNATURE = b"Spec ID Event03\x00"
+EV_NO_ACTION = 0x00000003
+REFERENCE_KEYS = {"schema", "bank", "firmware", "variables", "separator_hex",
+                  "boot_path", "authorities"}
+VARIABLE_KEYS = {"guid", "data_hex"}
+AUTHORITY_KEYS = {"name", "guid", "text", "signature_owner", "cert_der_hex"}
+FIRMWARE_KEYS = {"variable_measurement"}
+
+NAMES_ONLY_NOTE = (
+    "note: {names} are logged with a zero-length data: PCR 7 binds their NAMES, "
+    "not their contents. A PCR 7 equal to the live one is therefore NOT evidence "
+    "of SecureBoot=1, an enrolled PK, user mode, or of the contents of db/dbx "
+    "(see README, 'What the GB10 firmware actually measures').")
 
 
 class Pcr7Error(RuntimeError):
@@ -107,6 +130,23 @@ def esl_append(esl_hex, entry_hex, sig_type=ESL_SIG_TYPE_SHA256):
     return esl_hex + esl.hex()
 
 
+def _only_keys(obj, allowed, where):
+    """A misspelt key must not silently fall back to its default."""
+    if not isinstance(obj, dict):
+        raise Pcr7Error(f"{where}: must be a JSON object")
+    unknown = sorted(set(obj) - allowed)
+    if unknown:
+        raise Pcr7Error(f"{where}: unknown key {unknown}; allowed {sorted(allowed)}")
+
+
+def _no_duplicates(pairs):
+    keys = [key for key, _ in pairs]
+    duplicated = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicated:
+        raise Pcr7Error(f"duplicate JSON key {duplicated}")
+    return dict(pairs)
+
+
 def _hex(value, where):
     try:
         return bytes.fromhex(value)
@@ -134,11 +174,16 @@ def authority_payload(authority, where):
 def compute(reference, variable_measurement=None, append_esl=None):
     """PCR 7 a boot would produce. `append_esl` maps a variable name to hex
     appended to its ESL before measuring (what-if)."""
+    if not isinstance(reference, dict):
+        raise Pcr7Error("the reference must be a JSON object")
+    _only_keys(reference, REFERENCE_KEYS, "reference")
     if reference.get("schema") != SCHEMA:
         raise Pcr7Error(f"schema must be {SCHEMA!r}")
     if reference.get("bank", BANK) != BANK:
         raise Pcr7Error("only the sha256 bank is modelled")
-    measurement = variable_measurement or reference.get("firmware", {}).get("variable_measurement")
+    firmware = reference.get("firmware", {})
+    _only_keys(firmware, FIRMWARE_KEYS, "firmware")
+    measurement = variable_measurement or firmware.get("variable_measurement")
     if measurement not in MEASUREMENTS:
         raise Pcr7Error(f"firmware.variable_measurement must be one of {MEASUREMENTS}")
     boot_path = reference.get("boot_path")
@@ -150,6 +195,7 @@ def compute(reference, variable_measurement=None, append_esl=None):
 
     events = []
     for name, entry in variables.items():
+        _only_keys(entry, VARIABLE_KEYS, f"variables.{name}")
         guid = _guid(entry.get("guid", CONFIG_GUID.get(name)), f"variables.{name}.guid")
         if measurement == "contents":
             if "data_hex" not in entry:
@@ -176,6 +222,7 @@ def compute(reference, variable_measurement=None, append_esl=None):
                         f"this reference lists {[a.get('name') for a in authorities]}")
     for index, authority in enumerate(authorities):
         where = f"authorities[{index}]"
+        _only_keys(authority, AUTHORITY_KEYS, where)
         name = authority.get("name")
         if not isinstance(name, str) or not name:
             raise Pcr7Error(f"{where}.name: missing")
@@ -188,16 +235,78 @@ def compute(reference, variable_measurement=None, append_esl=None):
 
 # --- event log side ---------------------------------------------------------
 
+def check_header(blob):
+    """Refuse a log whose TCG_PCR_EVENT spec-id header is not the crypto-agile
+    one: EV_NO_ACTION on PCR 0 with an all-zero digest, the 'Spec ID Event03'
+    signature, spec major version 2 and an algorithm list that matches the
+    parser's digest sizes. platformClass, the minor version, errata, uintnSize
+    and the vendor-info bytes are not checked: they do not enter any digest."""
+    if len(blob) < 32:
+        raise policy.EventLogError("event log is too short to contain its header")
+    pcr, etype = struct.unpack_from("<II", blob, 0)
+    size = struct.unpack_from("<I", blob, 28)[0]
+    if (pcr, etype) != (0, EV_NO_ACTION) or blob[8:28] != b"\x00" * 20:
+        raise policy.EventLogError("the header record is not an EV_NO_ACTION with a zero digest")
+    if size < 29 or 32 + size > len(blob):
+        raise policy.EventLogError("the spec-id header size is not plausible")
+    event = blob[32:32 + size]
+    if event[:16] != SPEC_ID_SIGNATURE:
+        raise policy.EventLogError("the header is not a 'Spec ID Event03' record")
+    if event[21] != 2:
+        raise policy.EventLogError("the header does not announce TCG spec major version 2")
+    count = struct.unpack_from("<I", event, 24)[0]
+    if count < 1 or 29 + 4 * count > size:
+        raise policy.EventLogError("the header's algorithm list does not fit its size")
+    if 29 + 4 * count + event[28 + 4 * count] != size:
+        raise policy.EventLogError("the header's vendor-info size does not add up")
+    for index in range(count):
+        alg_id, digest_size = struct.unpack_from("<HH", event, 28 + 4 * index)
+        if alg_id not in policy.ALGS or policy.ALGS[alg_id][1] != digest_size:
+            raise policy.EventLogError("the header lists an algorithm the parser does not know")
+
+
+def parse_log(blob):
+    check_header(blob)
+    return policy.parse_eventlog(blob)
+
+
 def parse_pcr7(blob):
-    events = [e for e in policy.parse_eventlog(blob) if e["pcr"] == PCR]
+    events = [e for e in parse_log(blob) if e["pcr"] == PCR]
     if not events:
         raise Pcr7Error(f"no event addresses PCR {PCR}")
     return events
 
 
 def replay_log(blob):
-    """PCR 7 by extending every logged digest, in log order."""
-    return policy.replay(policy.parse_eventlog(blob), PCR, BANK)[0]
+    """PCR 7 by extending every logged digest, in log order. Each digest must be
+    H(data) first: the installer's policy.replay extends the digests as logged,
+    which leaves the event data of a validated log unbound. The event type and
+    the PCR index stay unbound (a digest hashes the data only)."""
+    events = parse_log(blob)
+    for index, ev in enumerate(e for e in events if e["pcr"] == PCR):
+        if ev["digests"].get(BANK) != hashlib.new(BANK, ev["data"]).digest():
+            raise Pcr7Error(f"PCR {PCR} event {index + 1}: the logged {BANK} digest is not "
+                            "the hash of its data; the log is not self-consistent")
+    return policy.replay(events, PCR, BANK)[0]
+
+
+def contentless_variables(events):
+    """Names of the Secure Boot configuration variables logged with no data."""
+    names = []
+    for ev in events:
+        if ev["type"] == policy.EV_EFI_VARIABLE_DRIVER_CONFIG:
+            try:
+                _, name, data = _split_variable(ev["data"])
+            except Pcr7Error:
+                continue
+            if not data:
+                names.append(name)
+    return names
+
+
+def warn_if_names_only(names):
+    if names:
+        print(NAMES_ONLY_NOTE.format(names="/".join(names)), file=sys.stderr)
 
 
 def _split_variable(data):
@@ -292,10 +401,11 @@ def _authority_entry(data, where):
 
 def filter_log(blob, pcr):
     """The log's header plus only the events of one PCR, byte-identical."""
+    events = parse_log(blob)
     header_len = 32 + struct.unpack_from("<I", blob, 28)[0]
     ids = {name: alg for alg, (name, _) in policy.ALGS.items()}
     out = bytearray(blob[:header_len])
-    for ev in policy.parse_eventlog(blob):
+    for ev in events:
         if ev["pcr"] != pcr:
             continue
         out += struct.pack("<III", ev["pcr"], ev["type"], len(ev["digests"]))
@@ -341,7 +451,8 @@ def _explain(result):
 
 
 def cmd_compute(args):
-    reference = json.loads(pathlib.Path(args.reference).read_text())
+    reference = json.loads(pathlib.Path(args.reference).read_text(),
+                           object_pairs_hook=_no_duplicates)
     append = {}
     for item in args.append_esl or []:
         name, sep, value = item.partition("=")
@@ -353,6 +464,8 @@ def cmd_compute(args):
     if append and result.measurement == "names-only":
         print("note: this firmware measures variable NAMES only; --append-esl cannot "
               "move PCR 7 (see 'What the GB10 firmware actually measures')", file=sys.stderr)
+    if result.measurement == "names-only":
+        warn_if_names_only([v for v in reference["variables"]])
     print(result.pcr7.hex())
     if args.explain:
         _explain(result)
@@ -365,12 +478,16 @@ def cmd_replay(args):
     blob = pathlib.Path(args.eventlog).read_bytes()
     value = replay_log(blob)
     print(value.hex())
+    warn_if_names_only(contentless_variables(parse_log(blob)))
     if args.explain:
         for i, ev in enumerate(parse_pcr7(blob), 1):
             print(f"  {i:2d}  0x{ev['type']:08x} {policy.variable_name(ev) or '':<12s} "
                   f"{ev['digests'][BANK].hex()}")
     expected = _expected(args)
-    if expected is not None and expected != value:
+    if expected is None:
+        print("note: no --expect/--live: nothing was compared, this only prints the replayed "
+              "value", file=sys.stderr)
+    elif expected != value:
         print(f"🔴 replay {value.hex()} is NOT the expected {expected.hex()}", file=sys.stderr)
         return 1
     return 0
@@ -399,6 +516,7 @@ def cmd_verify(args):
     print(f"  compute(extract): {computed.hex()}")
     print(f"  boot path {reference['boot_path']}, variable measurement "
           f"{reference['firmware']['variable_measurement']}")
+    warn_if_names_only(contentless_variables(parse_pcr7(blob)))
     if replayed != expected or computed != expected:
         print("🔴 the calculator does NOT reproduce the live PCR 7 of this log",
               file=sys.stderr)
@@ -449,7 +567,8 @@ def main(argv=None):
     except (Pcr7Error, policy.EventLogError, OSError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    except (KeyError, TypeError, AttributeError, ValueError) as error:
+    except (KeyError, TypeError, AttributeError, ValueError, RecursionError,
+            struct.error) as error:
         print(f"error: malformed input ({type(error).__name__}: {error})", file=sys.stderr)
         return 1
 

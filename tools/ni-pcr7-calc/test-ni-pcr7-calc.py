@@ -71,8 +71,9 @@ class ComputeFromExtract(unittest.TestCase):
                 pcr7.extract_reference(log_bytes(host))["boot_path"], "shim-grub")
 
     def test_gb10_firmware_measures_variable_names_only(self):
-        # The measured finding: PK/KEK/db/dbx are logged with a ZERO-length
-        # data, identically on two different firmware builds.
+        # What the two fixtures SHOW: PK/KEK/db/dbx are logged with a ZERO-length
+        # data, with identical digests on two different firmware builds. What
+        # that implies for an update is a deduction, pinned by WhatMovesPcr7.
         refs = [pcr7.extract_reference(log_bytes(h)) for h in HOSTS]
         for ref in refs:
             self.assertEqual(ref["firmware"]["variable_measurement"], "names-only")
@@ -85,7 +86,11 @@ class WhatMovesPcr7(unittest.TestCase):
     def reference(self):
         return pcr7.extract_reference(log_bytes("ni67"))
 
-    def test_dbx_append_is_invisible_on_names_only_firmware(self):
+    def test_model_ignores_dbx_data_when_the_firmware_logs_names_only(self):
+        # Pins the MODEL, not an observation: in names-only mode `compute`
+        # discards data_hex by construction, so this cannot fail. That a real dbx
+        # update leaves PCR 7 unmoved is DEDUCED from the zero-length events of
+        # the fixtures; no before/after update was ever measured on hardware.
         ref = self.reference()
         base = pcr7.compute(ref).pcr7
         ref["variables"]["dbx"]["data_hex"] = pcr7.esl_append(
@@ -93,7 +98,9 @@ class WhatMovesPcr7(unittest.TestCase):
             "00" * 16 + "11" * 32)
         self.assertEqual(pcr7.compute(ref).pcr7, base)
 
-    def test_dbx_append_changes_pcr7_when_the_firmware_measures_contents(self):
+    def test_model_of_a_contents_firmware_moves_with_dbx(self):
+        # The model of a firmware that measures contents (TCG PC Client / EDK2):
+        # NOT proven on any GB10.
         ref = self.reference()
         ref["firmware"]["variable_measurement"] = "contents"
         for name in ("SecureBoot", "PK", "KEK", "db", "dbx"):
@@ -132,10 +139,13 @@ class WhatMovesPcr7(unittest.TestCase):
         self.assertNotEqual(pcr7.compute(ref).pcr7, base)
 
 
-class PredictAnotherMachine(unittest.TestCase):
-    def test_reference_of_one_gb10_plus_the_other_ones_authorities_predicts_its_live_pcr7(self):
-        # Nothing of ni67 but its authority chain goes in: the Secure Boot
-        # variables come from ni63 (a different vendor, a different firmware).
+class ConfigEventsAreConstantAcrossTheTwoMachines(unittest.TestCase):
+    def test_ni63_variables_with_the_authority_events_logged_by_ni67_give_the_live_pcr7_of_ni67(self):
+        # What this shows: the config events are identical on the two logs and the
+        # encoding is lossless. It is NOT a prediction from certificates: the
+        # authority events (including each SignatureOwner GUID and the SBAT text,
+        # which are not derivable from a certificate) are taken from the log of
+        # the machine being "predicted".
         ref = pcr7.extract_reference(log_bytes("ni63"))
         ref["authorities"] = pcr7.extract_reference(log_bytes("ni67"))["authorities"]
         self.assertEqual(pcr7.compute(ref).pcr7, live("ni67"))
@@ -165,13 +175,14 @@ class InstallerMediumPath(unittest.TestCase):
             acc = hashlib.sha256(acc + hashlib.sha256(event).digest()).digest()
         self.assertEqual(pcr7.compute(ref).pcr7, acc)
 
-    def test_uki_direct_with_the_lab_db_certificate_matches_the_gx10_installer_pcr7_measured_on_2026_09_04(self):
+    def test_uki_direct_with_the_lab_db_entry_matches_the_digits_recorded_for_the_gx10_installer_on_2026_09_04(self):
         # raw_mission_report_to_ingest/REPORT-p0-installer-usb67-seq4-codex-root-20260904-2235.md
         # (physical GX10, installer USB booted from the firmware): "PCR7 live
         # 07bd0bb2…eedd1db et PolicyPCR b83b5281…217937" -- only the first 8 and
         # last 7 hex digits are recorded there, so only those are compared. The
-        # calculator is given nothing but the lab db certificate of the log of
-        # the installed system.
+        # calculator is given the db authority entry of the log of the installed
+        # system (the lab certificate AND its SignatureOwner GUID, which comes
+        # from the log, not from the certificate); no installer log exists.
         ref = pcr7.extract_reference(log_bytes("ni67"))
         ref["boot_path"] = "uki-direct"
         ref["authorities"] = ref["authorities"][:1]
