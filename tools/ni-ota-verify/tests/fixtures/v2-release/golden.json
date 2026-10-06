@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "bundle_seq": 3,
+    "host_repository": "registry.example.test/neural-ice-test/host-appliance",
+    "receipt_sha256": {
+      "floor": "df86a55470e8bdc9f6761104a7741383b76873cd0aef40e34079b62e15204cb6",
+      "manifest-digest": "f5e137e1ffaa6485fdb1901e5b06d3b031d10eb8762aa04b869366c55dd6d09c"
+    },
+    "release_id": "v2-test-train-3",
+    "status_sha256": "c88d20c5e8fb3db182f33064bc1ca8dd356efed5b45cc21fd826151f36d0b294",
+    "verify_stdout": {
+      "floor": {
+        "bundle_seq": 3,
+        "idempotent": false,
+        "receipt_sha256": "df86a55470e8bdc9f6761104a7741383b76873cd0aef40e34079b62e15204cb6",
+        "verdict": "pass"
+      },
+      "manifest-digest": {
+        "bundle_seq": 3,
+        "idempotent": false,
+        "receipt_sha256": "f5e137e1ffaa6485fdb1901e5b06d3b031d10eb8762aa04b869366c55dd6d09c",
+        "verdict": "pass"
+      }
+    }
+  },
+  "inputs": {
+    "access_profile": "lab-managed",
+    "hardware_target": "nvidia-gb10-arm64",
+    "host_index_digest": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "host_manifest_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "release_authority": "registry.example.test",
+    "sealed_key_sha256": "3d8b1443c32bcac427ee515663f18a3d25ddc54bddd1cb7fe958f90db7d45bca",
+    "sealed_manifest_sha256": "fe3bc994dcfb6366d1acba9c3bae74efecf79a9e8b0e52f1c5cf0fa33dc6538e",
+    "sealed_manifest_sig_sha256": "a0af78917be3bb8837d1fc2a0cfbe221e94ca4cbb0c20094dd09473ae04996f5",
+    "sealed_min_bundle_seq": 2,
+    "trust_policy_id": "neural-ice-secureboot-lab-v1",
+    "variant": "sealed-lab"
+  },
+  "schema": "neural-ice-v2-release-golden-v1"
+}

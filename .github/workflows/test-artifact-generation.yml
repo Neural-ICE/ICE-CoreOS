@@ -82,6 +82,8 @@ on:
       - "ota/test-installer-device-root-guard.sh"
       - "ota/test-installer-mirror-iface-guard.sh"
       - "ota/test-firstboot-ceremony-failopen.sh"
+      - "ota/neural-ice-v2-owner-seal.sh"
+      - "ota/test-neural-ice-v2-owner-seal.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
       - "ci/test-oci-signature-policy.sh"
@@ -172,6 +174,8 @@ on:
       - "ota/test-installer-device-root-guard.sh"
       - "ota/test-installer-mirror-iface-guard.sh"
       - "ota/test-firstboot-ceremony-failopen.sh"
+      - "ota/neural-ice-v2-owner-seal.sh"
+      - "ota/test-neural-ice-v2-owner-seal.sh"
       - "ci/artifact-generation.sh"
       - "ci/canonicalize-vmlinuz.sh"
       - "ci/stage-artifacts.sh"
@@ -272,10 +276,10 @@ jobs:
             image/test-tpm-policy-initramfs.sh \
             image/test-verify-preloaded-media.sh ota/neural-ice-access-profile-anchor.sh ota/neural-ice-autoinstall.sh \
             ota/neural-ice-device-root-tpm.sh ota/neural-ice-firstboot-tpm-ceremony.sh ota/neural-ice-lab-baseline-handoff.sh \
-            ota/neural-ice-tpm-policy-check.sh ota/neural-ice-tpm-state.sh ota/neural-ice-ota-tpm-state.sh ota/test-autoinstall-kargs.sh \
+            ota/neural-ice-tpm-policy-check.sh ota/neural-ice-tpm-state.sh ota/neural-ice-ota-tpm-state.sh ota/neural-ice-v2-owner-seal.sh ota/test-autoinstall-kargs.sh \
             ota/test-firstboot-ceremony-failopen.sh ota/test-installer-device-root-guard.sh ota/test-installer-mirror-iface-guard.sh ota/test-installer-pcr7-coverage.sh \
             ota/test-neural-ice-access-profile-anchor.sh ota/test-neural-ice-device-root-tpm.sh ota/test-neural-ice-lab-baseline-handoff.sh \
-            ota/test-neural-ice-tpm-state.sh ota/test-neural-ice-ota-tpm-state.sh ota/test-tpm-signed-policy.sh
+            ota/test-neural-ice-tpm-state.sh ota/test-neural-ice-ota-tpm-state.sh ota/test-neural-ice-v2-owner-seal.sh ota/test-tpm-signed-policy.sh
           # The initramfs hooks and the payload library are POSIX sh, on purpose:
           # they run in the initramfs /bin/sh AND are sourced by bash on the build
           # host and by the installer. Checking them as `sh` is what catches a
@@ -490,6 +494,7 @@ jobs:
           ./ota/test-installer-pcr7-coverage.sh
           ./ota/test-neural-ice-tpm-state.sh
           ./ota/test-neural-ice-ota-tpm-state.sh
+          ./ota/test-neural-ice-v2-owner-seal.sh
           ./ota/test-neural-ice-preseal-handoff.py
           ./ota/test-neural-ice-access-profile-anchor.sh
           # 🔴 AND THE THREE HAND-MAINTAINED LISTS ABOVE ARE CHECKED AGAINST THE
