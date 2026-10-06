@@ -776,6 +776,9 @@ done
 for packaged in \
   'COPY ota/neural-ice-preseal-handoff.py /usr/libexec/neural-ice-preseal-handoff' \
   'COPY ota/neural-ice-ota-tpm-state.sh /usr/libexec/neural-ice-ota-tpm-state' \
+  'COPY ota/neural-ice-v2-owner-seal.sh /usr/libexec/neural-ice-v2-owner-seal.sh' \
+  'chmod 0644 /usr/libexec/neural-ice-v2-owner-seal.sh' \
+  'bash -n /usr/libexec/neural-ice-v2-owner-seal.sh;' \
   '/usr/libexec/neural-ice-preseal-handoff --help' \
   'ni-ota-verify verify-preseal-baseline --set <path>' \
   'printf '\''%s\n'\'' owner-sealed-ota-state-v1' \
