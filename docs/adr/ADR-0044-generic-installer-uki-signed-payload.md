@@ -150,7 +150,7 @@ Build host DGX Spark .77 (arm64, KVM), work directory `/var/tmp/ni-geninst-20261
 |---|---|
 | Kernel in the installer | `6.12.0-249.gb10.0.test.el10.aarch64`, from the staged generation `30439159936.1`, the same RPMs `image/Containerfile.bootc` installs |
 | Firmware | `nvidia/580.159.03/gsp_ga10x.bin` and `gsp_tu10x.bin` (101 MiB tree), plus `nvidia.ko` of the same kernel, all in the initrd |
-| **UKI size, full package set** | **311,242,240 bytes = 296.8 MiB** (initrd 296 MB zstd, 640 MB unpacked; kernel 14.9 MB). Under the 450 MiB budget (D6) |
+| **UKI size, full package set** | **311,245,824 bytes = 296.8 MiB** (initrd 296 MB zstd, 640 MB unpacked; kernel 14.9 MB). Under the 450 MiB budget (D6) |
 | Package set | systemd, udev, podman, crun, skopeo, python3, openssl, jq, cryptsetup, tpm2-tools, dosfstools, e2fsprogs |
 | Kernel provenance | after the build, the canonical `vmlinuz` emitted with the UKI hashes to the generation's `vmlinuz_unsigned_sha256` `1b2aaddf…` (checked by `build-in-container.sh`) |
 | Build, warm package cache | 41 s (UKI build only; the container tool install adds about 1 to 2 min). mkosi 25.3, systemd-ukify 257.13 (versions in the evidence file) |
