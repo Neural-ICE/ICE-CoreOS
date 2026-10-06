@@ -255,7 +255,34 @@ preseal_refusal() { # <message>
   printf 'neural-ice-firstboot-tpm-ceremony: preseal attestation RELAXED (ADR-0050 lab-trust), continuing: %s\n' "$*" >&2
 }
 
+# The installer identity is judged by ONE closed validator, called both before
+# the one-time TPM mutation and by build_evidence, so a malformed or
+# non-canonical identity refuses while the boot can still be retried from the
+# same preseal-prepared state instead of after ceremony-prepare.
+validate_install_identity() { # $1=identity path
+  python3 - "$1" <<'PY'
+import json,re,sys
+def pairs(items):
+    out={}
+    for k,v in items:
+        if k in out: raise ValueError("duplicate JSON key")
+        out[k]=v
+    return out
+with open(sys.argv[1],encoding="utf-8") as f: identity=json.load(f,object_pairs_hook=pairs)
+identity_keys={"install_source","installed_at","installer_sealed_identity_sha256","release_identity_sha256","schema"}
+if not isinstance(identity,dict) or set(identity) != identity_keys: raise SystemExit("installer identity is not a closed document")
+if identity.get("schema") != "neural-ice-owner-ceremony-install-identity-v1": raise SystemExit("wrong installer identity schema")
+if identity["install_source"] not in ("medium","registry"): raise SystemExit("wrong install source")
+if not re.fullmatch(r"[0-9a-f]{64}",identity["installer_sealed_identity_sha256"]): raise SystemExit("bad sealed identity digest")
+if not re.fullmatch(r"[0-9a-f]{64}",identity["release_identity_sha256"]): raise SystemExit("bad release identity digest")
+if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",identity["installed_at"]): raise SystemExit("bad install timestamp")
+canonical=(json.dumps(identity,sort_keys=True,separators=(",",":"))+"\n").encode()
+if open(sys.argv[1],"rb").read() != canonical: raise SystemExit("installer identity is not canonical")
+PY
+}
+
 build_evidence() { # $1=TPM state snapshot
+  validate_install_identity "$INSTALL_IDENTITY" || return
   python3 - "$1" "$INSTALL_IDENTITY" "$WORK/system-luks-evidence.json" \
     "$WORK/data-luks-evidence.json" "$WORK/srk.name" "$WORK/device-root.name" \
     "$STATE_DIR/access-profile-v1.json" "$STATE_DIR/access-profile-v1.sig" \
@@ -271,15 +298,6 @@ def load(path):
     with open(path,encoding="utf-8") as f: return json.load(f,object_pairs_hook=pairs)
 snapshot=json.loads(sys.argv[1],object_pairs_hook=pairs)
 identity=load(sys.argv[2]); system=load(sys.argv[3]); data=load(sys.argv[4])
-identity_keys={"install_source","installed_at","installer_sealed_identity_sha256","release_identity_sha256","schema"}
-if set(identity) != identity_keys: raise SystemExit("installer identity is not a closed document")
-if identity.get("schema") != "neural-ice-owner-ceremony-install-identity-v1": raise SystemExit("wrong installer identity schema")
-if identity["install_source"] not in ("medium","registry"): raise SystemExit("wrong install source")
-if not re.fullmatch(r"[0-9a-f]{64}",identity["installer_sealed_identity_sha256"]): raise SystemExit("bad sealed identity digest")
-if not re.fullmatch(r"[0-9a-f]{64}",identity["release_identity_sha256"]): raise SystemExit("bad release identity digest")
-if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",identity["installed_at"]): raise SystemExit("bad install timestamp")
-canonical=(json.dumps(identity,sort_keys=True,separators=(",",":"))+"\n").encode()
-if open(sys.argv[2],"rb").read() != canonical: raise SystemExit("installer identity is not canonical")
 if snapshot.get("schema") != "neural-ice-tpm-state-snapshot-v1": raise SystemExit("wrong TPM snapshot schema")
 def digest(path): return hashlib.sha256(open(path,"rb").read()).hexdigest()
 obj={"access_profile_anchor":{"json_sha256":digest(sys.argv[7]),"signature_sha256":digest(sys.argv[8]),"spki_sha256":digest(sys.argv[9])},
@@ -489,6 +507,8 @@ elif lane == "v2release":
         raise SystemExit("v2 release receipt does not bind the completion floor")
     if base["install_identity"]["release_identity_sha256"] != r["manifest_sha256"]:
         raise SystemExit("installer release identity is not the v2 release manifest")
+    if base["install_identity"]["install_source"] != "medium" or base["install_identity"]["installed_at"] != "1970-01-01T00:00:00Z":
+        raise SystemExit("installer identity is not the v2 medium identity")
     base["schema"]="neural-ice-owner-ceremony-evidence-v2-lane2"
     base["v2_release"]={"bundle_seq":seq,"manifest_sha256":r["manifest_sha256"],
      "manifest_sig_sha256":r["manifest_sig_sha256"],"receipt_schema":r["schema"],
@@ -559,6 +579,10 @@ if type(r.get("bundle_seq")) is not int or r["bundle_seq"] != int(sys.argv[3]):
     raise SystemExit("receipt bundle_seq is not the floor")
 if i.get("release_identity_sha256") != r.get("manifest_sha256"):
     raise SystemExit("installer release identity is not the v2 release manifest")
+# The v2 lane installs from the medium only, with the fixed installer stamp
+# (docs/ota/V2-RELEASE-ATTESTATION.md, install_identity).
+if i.get("install_source") != "medium" or i.get("installed_at") != "1970-01-01T00:00:00Z":
+    raise SystemExit("installer identity is not the v2 medium identity")
 PY
 }
 
@@ -702,6 +726,12 @@ fi
 # particular ownerAuthSet=1, or any single surviving index, refuses here.
 provisioning="$($TPM_STATE provisioning-status)" \
   || die "TPM is neither authenticated-complete nor an exact supported pre-ceremony state; signed physical recovery is required"
+# The installer identity is judged before any lane-specific check and before
+# ceremony-prepare: the TPM mutation is one-time, and a refusal after it turns a
+# retryable boot into a signed physical recovery.
+validate_install_identity "$INSTALL_IDENTITY" \
+  || die "the installer identity is not canonical; refusing before the one-time TPM mutation"
+
 owner_profile=0
 if owner_profile_supported; then
   [[ "$provisioning" == preseal-prepared ]] \

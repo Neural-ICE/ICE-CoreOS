@@ -603,6 +603,37 @@ for posture in strict relaxed; do
   expect_v2_refusal "install identity not bound to the manifest" 'release identity' "$posture" boot
 done
 
+# (j4) the installer identity as a whole is judged before the one-time TPM
+#      mutation too, not only its release digest: a non-canonical document, a
+#      timestamp that is not the installer stamp and a non-medium source all
+#      refuse with the TPM untouched (expect_v2_refusal asserts no prepare/enroll).
+write_identity() { # <source> <installed_at> [raw-suffix]
+  local manifest_sha; manifest_sha="$(sha256sum "$STATE/v2-release-input-v1/release-manifest.json" | awk '{print $1}')"
+  printf '{"install_source":"%s","installed_at":"%s","installer_sealed_identity_sha256":"%s","release_identity_sha256":"%s","schema":"neural-ice-owner-ceremony-install-identity-v1"}\n%s' \
+    "$1" "$2" "$ZERO64" "$manifest_sha" "${3:-}" > "$STATE/owner-ceremony-install-identity-v1.json"
+}
+for posture in strict relaxed; do
+  build_fixture_v2
+  write_identity medium 1970-01-01T00:00:00Z
+  printf '{"schema":"neural-ice-owner-ceremony-install-identity-v1", "install_source":"medium"}\n' > "$TMP/noncanonical.json"
+  cp "$TMP/noncanonical.json" "$STATE/owner-ceremony-install-identity-v1.json"; chmod 0600 "$STATE/owner-ceremony-install-identity-v1.json"
+  expect_v2_refusal "non-closed install identity" 'installer identity is not canonical' "$posture" boot
+  build_fixture_v2
+  write_identity medium 1970-01-01T00:00:00Z ' '
+  chmod 0600 "$STATE/owner-ceremony-install-identity-v1.json"
+  expect_v2_refusal "non-canonical install identity bytes" 'installer identity is not canonical' "$posture" boot
+  build_fixture_v2
+  write_identity medium 2099-12-31T23:59:59Z; chmod 0600 "$STATE/owner-ceremony-install-identity-v1.json"
+  expect_v2_refusal "installed_at is not the installer stamp" 'v2 medium identity' "$posture" boot
+  build_fixture_v2
+  write_identity registry 1970-01-01T00:00:00Z; chmod 0600 "$STATE/owner-ceremony-install-identity-v1.json"
+  expect_v2_refusal "registry source on the v2 lane" 'v2 medium identity' "$posture" boot
+  build_fixture_v2
+  write_identity medium 1970-01-01T00:00:00Z; chmod 0600 "$STATE/owner-ceremony-install-identity-v1.json"
+  sed -i 's/1970-01-01T00:00:00Z/1970-13-99/' "$STATE/owner-ceremony-install-identity-v1.json"
+  expect_v2_refusal "malformed installed_at" 'installer identity is not canonical' "$posture" boot
+done
+
 # (k) the floor is the receipt's bundle_seq: when the TPM reports another floor
 #     (inspect-v2 says 42, the receipt 41) the ceremony refuses even in relaxed.
 for posture in strict relaxed; do

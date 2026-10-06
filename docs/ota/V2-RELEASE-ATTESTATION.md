@@ -190,7 +190,10 @@ Built like `build_evidence_v2` with `ota_preseal` **replaced** by `v2_release`
 Invariants checked by the ceremony at completion and by the reader at every boot:
 `ota_state.baseline_floor == v2_release.bundle_seq == receipt.bundle_seq`;
 `v2_release.receipt_sha256` is the digest `verify-retained-v2-release` is given;
-`install_identity.release_identity_sha256 == v2_release.manifest_sha256`. Rust:
+`install_identity.release_identity_sha256 == v2_release.manifest_sha256`;
+`install_identity.install_source == "medium"` and
+`install_identity.installed_at == "1970-01-01T00:00:00Z"` (T2 pins both, and judges the
+whole identity before the one-time TPM mutation). Rust:
 `OwnerCeremonyEvidenceV2Lane2` with `deny_unknown_fields`; `VerifiedOwnerCompletion`
 carries an attestation enum `{Preseal{…}, V2Release{…}}`. (The shape of the
 `tpm_state`/`luks` sub-objects is that of evidence v2 and is not restated here.)
