@@ -97,6 +97,7 @@ run_gate() {
     INSTALLER_STATE_DIR="$TMP/state"
     PCR_RULES_TOOL="$ENGINE"
     PCR_RULES_RUNTIME="$TMP/rules.json"
+    PCR_RULES_VERDICT_RUNTIME="$TMP/state/verdict.json"
     PCR_RULES_SIGNATURE_RUNTIME="$TMP/rules.json.sig"
     PCR_POLICY_KEY_RUNTIME="$TMP/owner.pub"
     PCR_RULES_DIGEST="$RULES_SHA"
@@ -141,7 +142,7 @@ rc="$(run_gate conforming)"
   || { cat "$TMP/err-conforming" >&2; fail "the conforming GB10 state was refused (rc=$rc, want 99 = reached the destructive stubs)"; }
 grep -Fq "rules_sha=$RULES_SHA seq=7 binding=names-only" "$TMP/out-conforming" \
   || { cat "$TMP/out-conforming" >&2; fail "accept did not report the rules digest, their sequence and the names-only binding"; }
-grep -Eq 'observed=[a-zA-Z-]*(secure-boot|pk-present|db-subset-of-approved)' "$TMP/out-conforming" \
+grep -Eq 'observed=.*(secure-boot|pk-approved|db-subset-of-approved)' "$TMP/out-conforming" \
   || fail "accept did not list the observed (unattested) checks"
 grep -Fq 'NI-P7-RULES: accepted' "$TMP/err-conforming" || fail "the console log does not say the gate accepted"
 grep -Fq 'names-only' "$TMP/err-conforming" \
@@ -163,7 +164,9 @@ import json, sys
 r = json.load(open(sys.argv[1])); r["surprise"] = 1
 json.dump(r, open(sys.argv[2], "w"))
 PY
-sign_rules "$TMP/schema.rules.json" "$TMP/owner.key" "$TMP/schema.rules.json.sig"
+# The Owner's tool refuses to sign a schema violation: sign the raw bytes, as a buggy signer would.
+{ printf 'neural-ice-pcr-rules/v1\0'; cat "$TMP/schema.rules.json"; } \
+  | openssl dgst -sha256 -sign "$TMP/owner.key" | base64 -w0 > "$TMP/schema.rules.json.sig"
 expect_refusal schema rules-schema "PCR_RULES_RUNTIME=$TMP/schema.rules.json" \
   "PCR_RULES_SIGNATURE_RUNTIME=$TMP/schema.rules.json.sig" \
   "PCR_RULES_DIGEST=$(sha256sum "$TMP/schema.rules.json" | awk '{print $1}')"
@@ -247,7 +250,8 @@ python3 -I - "$AUTOINSTALL" <<'PY'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 coverage = text.index("\nverify_live_pcr7_coverage\n")
-gate = text.index("\nverify_pcr_rules\n") if "\nverify_pcr_rules\n" in text else -1
+found = re.search(r"\n  verify_pcr_rules\n", text)
+gate = found.start() if found else -1
 if gate < 0:
     raise SystemExit("FAIL: the installer never calls verify_pcr_rules")
 if gate < coverage:

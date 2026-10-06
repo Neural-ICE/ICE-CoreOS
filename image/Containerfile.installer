@@ -135,6 +135,14 @@ COPY ota/neural-ice-autoinstall.sh      /usr/local/bin/neural-ice-autoinstall.sh
 # the complete helper in immutable /usr avoids a second cryptographic
 # implementation on the destructive path.
 COPY ota/neural-ice-tpm-policy.py /usr/lib/neural-ice/tpm-policy.py
+# NI-P7-RULES (ADR-0045, T5): the Owner-signed rules engine, in the repository's
+# own layout so it imports the very helper above (it resolves
+# <root>/ota/neural-ice-tpm-policy.py from its own path) instead of a second copy
+# of the TCG parser and the PCR replay.
+COPY tools/ni-pcr-rules/ni-pcr-rules.py \
+     /usr/lib/neural-ice/pcr-rules/tools/ni-pcr-rules/ni-pcr-rules.py
+RUN install -d -m 0755 /usr/lib/neural-ice/pcr-rules/ota \
+ && ln -s ../../tpm-policy.py /usr/lib/neural-ice/pcr-rules/ota/neural-ice-tpm-policy.py
 # Keep the destructive pre-activation token readback on the same checkout as
 # the installer. A stale helper inherited from BASE_IMAGE can invert the
 # PolicyAuthorize contract and reject a correctly enrolled target.
@@ -241,6 +249,7 @@ COPY ota/neural-ice-device-root-installer-only.conf \
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/neural-ice-autoinstall.sh \
       /usr/lib/neural-ice/tpm-policy.py \
+      /usr/lib/neural-ice/pcr-rules/tools/ni-pcr-rules/ni-pcr-rules.py \
       /usr/local/libexec/neural-ice-lab-baseline-handoff \
       /usr/libexec/neural-ice-preseal-handoff \
       /usr/libexec/neural-ice-luks-token-evidence \
@@ -265,6 +274,7 @@ RUN set -euxo pipefail; \
     python3 -c 'import ast,sys; [ast.parse(open(path).read()) for path in sys.argv[1:]]' \
       /usr/lib/neural-ice/registry-authorisation.py \
       /usr/lib/neural-ice/tpm-policy.py \
+      /usr/lib/neural-ice/pcr-rules/tools/ni-pcr-rules/ni-pcr-rules.py \
       /usr/libexec/neural-ice-luks-token-evidence \
       /usr/libexec/neural-ice-preseal-handoff; \
     bash -n /usr/libexec/neural-ice-ota-tpm-state; \
@@ -287,6 +297,10 @@ RUN set -euxo pipefail; \
       | grep -Fq -- '--signature-json'; \
     /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
       | grep -Fq -- '--public-key'; \
+    # The rules engine must load its helper through the layout link and answer.
+    python3 -I /usr/lib/neural-ice/pcr-rules/tools/ni-pcr-rules/ni-pcr-rules.py evaluate --help \
+      | grep -Fq -- '--min-sequence'; \
+    test "$(readlink /usr/lib/neural-ice/pcr-rules/ota/neural-ice-tpm-policy.py)" = ../../tpm-policy.py; \
     # 🔴 THE MARKER THAT MAKES THE INSTALLER'S TEST SEAM IMPOSSIBLE HERE.
     # ota/neural-ice-autoinstall.sh consults an environment override for its
     # command-line file, sealed grammar, library directory, verity mount points,
