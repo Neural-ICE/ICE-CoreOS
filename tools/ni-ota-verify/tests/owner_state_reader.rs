@@ -3085,3 +3085,574 @@ fn verify_verdict_keeps_the_authenticated_status_answerable() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, held);
 }
+
+// ---------------------------------------------------------------------------
+// The v2 attestation lane (mission B, T1): marker `owner-sealed-ota-state-v2`,
+// evidence `neural-ice-owner-ceremony-evidence-v2-lane2`, the golden pair and
+// receipt of `tests/fixtures/v2-release/`. The status bytes are the SAME as the
+// v1 lane's: the licence gate and model-fetch compare them and change nothing.
+// ---------------------------------------------------------------------------
+
+const V2_FLOOR: u64 = 3;
+
+fn v2_golden() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2-release")
+}
+
+struct V2Owner {
+    fixture: Fixture,
+    profile: PathBuf,
+    payload: PathBuf,
+    ostree: OstreeFixture,
+    live_root: PathBuf,
+    access: AccessFiles,
+    golden: Value,
+    mode: &'static str,
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn v2_evidence(owner: &V2Owner, floor: u64) -> Value {
+    let golden = &owner.golden;
+    let luks = json!({
+        "keyslot":"0","pcr_bank":"sha256","pcrs":[7],"policy_hash":"11".repeat(32),
+        "policy_public_key_sha256":"22".repeat(32),"schema":"neural-ice-luks-token-evidence-v1",
+        "sealed_object_sha256":"33".repeat(32),"srk_sha256":"44".repeat(32),"token_sha256":"55".repeat(32)
+    });
+    let manifest_sha = golden["inputs"]["sealed_manifest_sha256"].as_str().unwrap();
+    json!({
+        "access_profile_anchor":owner.access.evidence_anchor,"data_luks":luks,
+        "device_root_name":format!("000b{}", "11".repeat(32)),
+        "install_identity":{"install_source":"medium","installed_at":"1970-01-01T00:00:00Z",
+            "installer_sealed_identity_sha256":"66".repeat(32),"release_identity_sha256":manifest_sha,
+            "schema":"neural-ice-owner-ceremony-install-identity-v1"},
+        "ota_state":{"anchor_attributes":"0x2060048","anchor_index":"0x01500002",
+            "anchor_name_at_completion":"000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+            "anchor_policy_sha256":"b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7",
+            "anchor_pristine_name":"000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+            "anchor_size":32,"anchor_state_at_completion":"pristine",
+            "anchor_written_name":"000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56",
+            "baseline_floor":floor,"clear_protected_at_completion":true,"floor_attributes":"0x62008",
+            "floor_index":"0x01500001","floor_name":"000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4",
+            "floor_policy_sha256":"f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230",
+            "floor_size":8,"profile":"owner-sealed-ota-state-v1"},
+        "schema":"neural-ice-owner-ceremony-evidence-v2-lane2","srk_name":format!("000b{}", "aa".repeat(32)),
+        "system_luks":luks,"tpm_state":{"freshness_counter":floor,"freshness_public_sha256":"bb".repeat(32),
+            "install_counter":1,"install_public_sha256":"cc".repeat(32),"profile_binding":"dd".repeat(32),
+            "schema":"neural-ice-tpm-state-snapshot-v1"},
+        "v2_release":{"bundle_seq":V2_FLOOR,"manifest_sha256":manifest_sha,
+            "manifest_sig_sha256":golden["inputs"]["sealed_manifest_sig_sha256"],
+            "receipt_schema":"neural-ice-v2-release-receipt-v1",
+            "receipt_sha256":golden["expected"]["receipt_sha256"][owner.mode],
+            "release_id":golden["expected"]["release_id"],
+            "release_key_sha256":golden["inputs"]["sealed_key_sha256"]}
+    })
+}
+
+/// Write the completion evidence, its inspection and the two helper stubs.
+fn install_v2_completion(owner: &V2Owner, evidence: &Value, inspected_floor: u64) {
+    let fixture = &owner.fixture;
+    let bytes = canonical(evidence);
+    write_mode(
+        &fixture.state.join("owner-ceremony-evidence-v2.json"),
+        &bytes,
+        0o600,
+    );
+    let mut message = b"neural-ice:tpm:owner-ceremony-completion:v2\0".to_vec();
+    message.extend_from_slice(&bytes);
+    fs::write(
+        fixture.root.join("completion-inspection.json"),
+        canonical(
+            &json!({"completion_version":2,"evidence_digest_sha256":hash(&message),
+            "schema":"neural-ice-owner-ceremony-completion-inspection-v1"}),
+        ),
+    )
+    .unwrap();
+    write_mode(&fixture.root.join("tpm-state"), format!(
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = completion-inspect ] || exit 97\nprintf 'completion %s\\n' \"$*\" >> '{}'\ncat '{}'\n",
+        fixture.calls.display(), fixture.root.join("completion-inspection.json").display()).as_bytes(), 0o755);
+    fs::write(fixture.root.join("owner-inspection.json"), canonical(&json!({
+        "anchor_attributes":"0x2060048","anchor_index":"0x01500002",
+        "anchor_name":"000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "anchor_policy_sha256":"b6a2e7142ee56fd978047488483daa5b42b8dc4cc7ddcceddfb91793cf1ff1b7",
+        "anchor_sha256":null,"anchor_size":32,"anchor_state":"pristine","baseline_floor":inspected_floor,
+        "clear_protected":true,"floor_attributes":"0x62008","floor_index":"0x01500001",
+        "floor_name":"000be283f20a38b93f8cef085efb4aee9f5944cc3b3b28b850bf3c0eeb2054cd7fc4",
+        "floor_policy_sha256":"f83217e5a2a04342f7daa55ccfb3cd4b8a1f1e8ebb28c7719a9abbdbd638a230",
+        "floor_size":8,"owner_sealed":true,"profile":"owner-sealed-ota-state-v1",
+        "schema":"neural-ice-owner-ota-state-inspection-v2"
+    }))).unwrap();
+    write_mode(&fixture.root.join("owner-state"), format!(
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = inspect-v2 ] || exit 97\nprintf 'owner-inspect %s\\n' \"$*\" >> '{}'\ncat '{}'\n",
+        fixture.calls.display(), fixture.root.join("owner-inspection.json").display()).as_bytes(), 0o755);
+}
+
+/// A completed v2-lane appliance: the persisted pair and receipt, the lane-2
+/// evidence, the pristine owner anchor, the lane marker, and a booted deployment
+/// that is exactly the host the receipt names.
+fn install_v2_owner(name: &str, mode: &'static str) -> V2Owner {
+    let fixture = Fixture::new(name, "");
+    let access = install_access_profile(&fixture, "lab-managed");
+    let golden: Value =
+        serde_json::from_slice(&fs::read(v2_golden().join("golden.json")).unwrap()).unwrap();
+    let input = fixture.state.join("v2-release-input-v1");
+    let receipt_dir = fixture.state.join("v2-release");
+    for directory in [&input, &receipt_dir] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for (name, target) in [
+        ("release-manifest.json", input.join("release-manifest.json")),
+        (
+            "release-manifest.json.sig",
+            input.join("release-manifest.json.sig"),
+        ),
+    ] {
+        write_mode(&target, &fs::read(v2_golden().join(name)).unwrap(), 0o600);
+    }
+    write_mode(
+        &receipt_dir.join("receipt.json"),
+        &fs::read(v2_golden().join(format!("expected-receipt-{mode}.json"))).unwrap(),
+        0o600,
+    );
+    let live_root = fixture.root.join("live");
+    copy_tree(&v2_golden().join("candidate-root"), &live_root);
+    let public = owner_public(
+        "000b038de2091c1c8ef2e8fd8869f17bef3a576ae287530fa17f05ae3b9712014b5d",
+        "policywrite|authread|ownerread|no_da|nt=extend",
+    );
+    install_read_only_tpm(&fixture, &access, &public, None, V2_FLOOR);
+    let profile = fixture.root.join("ota-state-profile");
+    write_mode(&profile, b"owner-sealed-ota-state-v2\n", 0o444);
+    // The v2 lane reads no PAYLOAD_ID: the path names nothing on purpose.
+    let payload = fixture.root.join("no-such-PAYLOAD_ID");
+    let ostree = install_ostree_fixture(&fixture);
+    let host = format!(
+        "{}@{}",
+        golden["expected"]["host_repository"].as_str().unwrap(),
+        golden["inputs"]["host_index_digest"].as_str().unwrap()
+    );
+    write_mode(
+        &ostree.origin,
+        format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{host}\n")
+            .as_bytes(),
+        0o644,
+    );
+    fs::write(
+        &ostree.metadata,
+        format!(
+            "'{}'\n",
+            golden["inputs"]["host_manifest_digest"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let owner = V2Owner {
+        fixture,
+        profile,
+        payload,
+        ostree,
+        live_root,
+        access,
+        golden,
+        mode,
+    };
+    let evidence = v2_evidence(&owner, V2_FLOOR);
+    install_v2_completion(&owner, &evidence, V2_FLOOR);
+    owner
+}
+
+impl V2Owner {
+    fn command(&self) -> Command {
+        let mut command =
+            owner_status_command(&self.fixture, &self.profile, &self.payload, &self.ostree);
+        command
+            .env(
+                "NI_OTA_OWNER_STATE_HELPER",
+                self.fixture.root.join("owner-state"),
+            )
+            .env("NI_OTA_AUTH_STATUS_V2_ROOT", &self.live_root);
+        command
+    }
+
+    fn run(&self) -> Output {
+        self.command().output().unwrap()
+    }
+
+    fn state(&self, relative: &str) -> PathBuf {
+        self.fixture.state.join(relative)
+    }
+
+    fn assert_refused(&self, label: &str, reason: &str) {
+        let before = observe_tree(&self.fixture.state);
+        let output = self.run();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "{label}");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(message.contains(reason), "{label}: {message}");
+        assert_eq!(observe_tree(&self.fixture.state), before, "{label}");
+        assert_eq!(
+            fs::read_dir(&self.fixture.scratch).unwrap().count(),
+            0,
+            "{label}"
+        );
+    }
+}
+
+const V2_HELD_STATUS: &[u8] = HELD_STATUS;
+
+#[test]
+fn v2_lane_status_is_the_exact_held_bytes_for_both_seal_modes() {
+    for mode in ["manifest-digest", "floor"] {
+        let owner = install_v2_owner(&format!("v2-lane-{mode}"), mode);
+        let before = observe_tree(&owner.fixture.state);
+        let output = owner.run();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The bytes the licence gate and model-fetch compare: unchanged.
+        assert_eq!(output.stdout, V2_HELD_STATUS, "{mode}");
+        assert_eq!(
+            output.stdout,
+            fs::read(v2_golden().join("expected-authenticated-ota-status.json")).unwrap()
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(observe_tree(&owner.fixture.state), before);
+        assert_eq!(fs::read_dir(&owner.fixture.scratch).unwrap().count(), 0);
+        let calls = fs::read_to_string(&owner.fixture.calls).unwrap();
+        assert!(!calls.contains("FORBIDDEN"), "{calls}");
+        assert_eq!(
+            calls.matches("owner-inspect inspect-v2").count(),
+            2,
+            "{calls}"
+        );
+    }
+}
+
+/// Rewrite the evidence with `edit` applied and re-bind the completion record.
+fn rebind_v2_evidence(owner: &V2Owner, floor: u64, edit: impl FnOnce(&mut Value)) {
+    let mut evidence = v2_evidence(owner, floor);
+    edit(&mut evidence);
+    install_v2_completion(owner, &evidence, floor);
+}
+
+#[test]
+fn v2_lane_refuses_a_marker_and_evidence_that_name_different_lanes() {
+    // The v1 marker on a v2-lane appliance: the pre-T0 shape of the failure.
+    let owner = install_v2_owner("v2-marker-v1", "manifest-digest");
+    fs::remove_file(&owner.profile).unwrap();
+    write_mode(&owner.profile, b"owner-sealed-ota-state-v1\n", 0o444);
+    owner.assert_refused(
+        "v1 marker, lane2 evidence",
+        "lacks one exact version-2 completion binding",
+    );
+
+    // An unknown marker is no lane at all.
+    let unknown = install_v2_owner("v2-marker-unknown", "manifest-digest");
+    fs::remove_file(&unknown.profile).unwrap();
+    write_mode(&unknown.profile, b"owner-sealed-ota-state-v3\n", 0o444);
+    unknown.assert_refused("unknown marker", "not the owner-sealed contract");
+
+    // The marker must be the sealed 0444 file, exactly 26 bytes.
+    let writable = install_v2_owner("v2-marker-mode", "manifest-digest");
+    fs::set_permissions(&writable.profile, fs::Permissions::from_mode(0o644)).unwrap();
+    writable.assert_refused(
+        "writable marker",
+        "cannot authenticate immutable OTA profile marker",
+    );
+}
+
+#[test]
+fn v2_lane_refuses_preseal_evidence_beside_the_v2_marker_and_the_reverse() {
+    // v2 marker + a preseal directory: mixed lanes.
+    let mixed = install_v2_owner("v2-with-preseal", "manifest-digest");
+    fs::create_dir(mixed.state("preseal")).unwrap();
+    fs::set_permissions(mixed.state("preseal"), fs::Permissions::from_mode(0o700)).unwrap();
+    mixed.assert_refused("preseal directory", "mixed with preseal evidence");
+
+    // Lane-2 evidence that also carries ota_preseal is not the lane-2 schema.
+    let both = install_v2_owner("v2-evidence-both", "manifest-digest");
+    rebind_v2_evidence(&both, V2_FLOOR, |evidence| {
+        evidence["ota_preseal"] = json!({"receipt_schema":"neural-ice-ota-preseal-receipt-v1",
+            "receipt_sha256":"88".repeat(32),"set_sha256":"99".repeat(32)});
+    });
+    both.assert_refused("ota_preseal and v2_release", "evidence is malformed");
+
+    // The v1 evidence under the v2 marker has no v2 attestation.
+    let v1 = install_v2_owner("v2-marker-v1-evidence", "manifest-digest");
+    let access = &v1.access;
+    let (receipt_sha, set_sha) = (hash(b"receipt"), hash(b"set"));
+    let luks = json!({"keyslot":"0","pcr_bank":"sha256","pcrs":[7],"policy_hash":"11".repeat(32),
+        "policy_public_key_sha256":"22".repeat(32),"schema":"neural-ice-luks-token-evidence-v1",
+        "sealed_object_sha256":"33".repeat(32),"srk_sha256":"44".repeat(32),"token_sha256":"55".repeat(32)});
+    let mut evidence = v2_evidence(&v1, V2_FLOOR);
+    evidence["schema"] = json!("neural-ice-owner-ceremony-evidence-v2");
+    evidence.as_object_mut().unwrap().remove("v2_release");
+    evidence["ota_preseal"] = json!({"receipt_schema":"neural-ice-ota-preseal-receipt-v1",
+        "receipt_sha256":receipt_sha,"set_sha256":set_sha});
+    evidence["access_profile_anchor"] = access.evidence_anchor.clone();
+    evidence["data_luks"] = luks.clone();
+    evidence["system_luks"] = luks;
+    install_v2_completion(&v1, &evidence, V2_FLOOR);
+    v1.assert_refused(
+        "preseal evidence, v2 marker",
+        "lacks one exact version-2 completion binding",
+    );
+}
+
+#[test]
+fn v2_lane_refuses_a_receipt_or_pair_that_is_not_the_one_the_evidence_binds() {
+    let receipt = install_v2_owner("v2-receipt-tampered", "manifest-digest");
+    let path = receipt.state("v2-release/receipt.json");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[10] ^= 0x01;
+    write_mode(&path, &bytes, 0o600);
+    receipt.assert_refused("receipt byte flipped", "receipt-digest");
+
+    let other_mode = install_v2_owner("v2-receipt-other-mode", "manifest-digest");
+    write_mode(
+        &other_mode.state("v2-release/receipt.json"),
+        &fs::read(v2_golden().join("expected-receipt-floor.json")).unwrap(),
+        0o600,
+    );
+    other_mode.assert_refused(
+        "floor receipt under manifest-digest evidence",
+        "receipt-digest",
+    );
+
+    let manifest = install_v2_owner("v2-manifest-tampered", "floor");
+    let path = manifest.state("v2-release-input-v1/release-manifest.json");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[10] ^= 0x01;
+    write_mode(&path, &bytes, 0o600);
+    manifest.assert_refused("manifest byte flipped", "manifest-digest");
+
+    let signature = install_v2_owner("v2-signature-tampered", "floor");
+    write_mode(
+        &signature.state("v2-release-input-v1/release-manifest.json.sig"),
+        b"bm90IGEgc2lnbmF0dXJl",
+        0o600,
+    );
+    signature.assert_refused("signature replaced", "sig-digest");
+
+    let missing = install_v2_owner("v2-receipt-missing", "manifest-digest");
+    fs::remove_file(missing.state("v2-release/receipt.json")).unwrap();
+    missing.assert_refused("receipt absent", "receipt");
+}
+
+#[test]
+fn v2_lane_refuses_a_floor_that_is_not_the_manifest_bundle_seq() {
+    // Evidence, inspection and TPM agree with each other but not with the receipt.
+    let evidence_floor = install_v2_owner("v2-floor-evidence", "manifest-digest");
+    rebind_v2_evidence(&evidence_floor, V2_FLOOR + 1, |evidence| {
+        evidence["v2_release"]["bundle_seq"] = json!(V2_FLOOR + 1);
+    });
+    evidence_floor.assert_refused("floor 4 vs manifest 3", "owner baseline floor differs");
+
+    // The evidence says the manifest's seq, the TPM floor says another.
+    let tpm_floor = install_v2_owner("v2-floor-tpm", "manifest-digest");
+    let evidence = v2_evidence(&tpm_floor, V2_FLOOR);
+    install_v2_completion(&tpm_floor, &evidence, V2_FLOOR + 1);
+    tpm_floor.assert_refused("inspected floor 4", "owner-state inspection does not match");
+
+    // v2_release.bundle_seq not the floor: the evidence contradicts itself.
+    let contradiction = install_v2_owner("v2-floor-contradiction", "manifest-digest");
+    rebind_v2_evidence(&contradiction, V2_FLOOR, |evidence| {
+        evidence["v2_release"]["bundle_seq"] = json!(V2_FLOOR + 1);
+    });
+    contradiction.assert_refused("bundle_seq 4 vs floor 3", "violates its closed contract");
+}
+
+#[test]
+fn v2_lane_refuses_evidence_that_names_another_release() {
+    for (label, edit) in [
+        ("manifest digest", "manifest_sha256"),
+        ("signature digest", "manifest_sig_sha256"),
+        ("key digest", "release_key_sha256"),
+        ("receipt digest", "receipt_sha256"),
+    ] {
+        let owner = install_v2_owner(&format!("v2-evidence-{edit}"), "manifest-digest");
+        rebind_v2_evidence(&owner, V2_FLOOR, |evidence| {
+            evidence["v2_release"][edit] = json!("e".repeat(64));
+            if edit == "manifest_sha256" {
+                evidence["install_identity"]["release_identity_sha256"] = json!("e".repeat(64));
+            }
+        });
+        let before = observe_tree(&owner.fixture.state);
+        let output = owner.run();
+        assert_eq!(output.status.code(), Some(1), "{label}");
+        assert!(output.stdout.is_empty(), "{label}");
+        assert_eq!(observe_tree(&owner.fixture.state), before, "{label}");
+    }
+    // The install identity must be the manifest digest (contract §6).
+    let identity = install_v2_owner("v2-evidence-identity", "manifest-digest");
+    rebind_v2_evidence(&identity, V2_FLOOR, |evidence| {
+        evidence["install_identity"]["release_identity_sha256"] = json!("77".repeat(32));
+    });
+    identity.assert_refused("release identity", "violates its closed contract");
+}
+
+#[test]
+fn v2_lane_binds_the_booted_deployment_to_the_receipt_host() {
+    let origin = install_v2_owner("v2-booted-origin", "manifest-digest");
+    let other = format!(
+        "{}@sha256:{}",
+        origin.golden["expected"]["host_repository"]
+            .as_str()
+            .unwrap(),
+        "9".repeat(64)
+    );
+    write_mode(
+        &origin.ostree.origin,
+        format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{other}\n")
+            .as_bytes(),
+        0o644,
+    );
+    origin.assert_refused(
+        "another index digest",
+        "booted deployment differs from authenticated v2 release baseline",
+    );
+
+    let repository = install_v2_owner("v2-booted-repository", "manifest-digest");
+    let foreign = format!(
+        "registry.example.invalid/neural-ice-test/host-appliance@{}",
+        repository.golden["inputs"]["host_index_digest"]
+            .as_str()
+            .unwrap()
+    );
+    write_mode(
+        &repository.ostree.origin,
+        format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{foreign}\n")
+            .as_bytes(),
+        0o644,
+    );
+    repository.assert_refused("another repository", "booted deployment differs");
+
+    let child = install_v2_owner("v2-booted-child", "manifest-digest");
+    fs::write(
+        &child.ostree.metadata,
+        format!("'sha256:{}'\n", "8".repeat(64)),
+    )
+    .unwrap();
+    child.assert_refused("another platform manifest", "booted deployment differs");
+}
+
+#[test]
+fn v2_lane_refuses_a_live_root_that_drifted_from_the_receipt() {
+    for marker in [
+        "hardware-target",
+        "appliance-variant",
+        "signed-boot-trust-policy-id",
+        "access-policy",
+        "ota-state-profile",
+    ] {
+        let owner = install_v2_owner(&format!("v2-live-{marker}"), "manifest-digest");
+        fs::write(
+            owner.live_root.join(format!("usr/lib/neural-ice/{marker}")),
+            b"drifted\n",
+        )
+        .unwrap();
+        owner.assert_refused(marker, "candidate-marker");
+    }
+    let key = install_v2_owner("v2-live-key", "manifest-digest");
+    fs::write(
+        key.live_root
+            .join("usr/lib/neural-ice/keys/release-authorization.pub"),
+        b"another\n",
+    )
+    .unwrap();
+    key.assert_refused("live key", "key-digest");
+
+    // The v2 host forbids the v1 anchors: one planted after install refuses.
+    let anchor = install_v2_owner("v2-live-anchor", "manifest-digest");
+    fs::create_dir_all(anchor.live_root.join("etc/neural-ice/keys")).unwrap();
+    fs::write(
+        anchor.live_root.join("etc/neural-ice/keys/ota-root.pub"),
+        b"x",
+    )
+    .unwrap();
+    anchor.assert_refused("ota-root.pub", "candidate-anchor");
+}
+
+#[test]
+fn v2_lane_refuses_a_written_owner_anchor_and_generation_state() {
+    let written = install_v2_owner("v2-anchor-written", "manifest-digest");
+    let public = owner_public(
+        "000b11afd155aca82a503f2029cc11395389654c3a25fc54b9eca6d33abdff498d56",
+        "policywrite|authread|ownerread|no_da|nt=extend|written",
+    );
+    install_read_only_tpm(
+        &written.fixture,
+        &written.access,
+        &public,
+        Some(&"ab".repeat(32)),
+        V2_FLOOR,
+    );
+    written.assert_refused("written anchor", "owner-state inspection does not match");
+
+    let state = install_v2_owner("v2-generation-state", "manifest-digest");
+    fs::create_dir(state.state("state-v1")).unwrap();
+    fs::set_permissions(state.state("state-v1"), fs::Permissions::from_mode(0o700)).unwrap();
+    state.assert_refused("generation state", "mixed with generation state");
+}
+
+#[test]
+fn v2_lane_has_no_relaxed_branch() {
+    // NEURALICE_SEALED_OTA_STATE defaults to `relaxed` elsewhere and turns an
+    // unreadable attestation into a fail-open there. Here it changes nothing.
+    for posture in ["relaxed", "strict", ""] {
+        let owner = install_v2_owner("v2-posture", "manifest-digest");
+        let path = owner.state("v2-release/receipt.json");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[10] ^= 0x01;
+        write_mode(&path, &bytes, 0o600);
+        let output = owner
+            .command()
+            .env("NEURALICE_SEALED_OTA_STATE", posture)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "posture `{posture}`");
+        assert!(output.stdout.is_empty(), "posture `{posture}`");
+    }
+}
+
+#[test]
+fn v2_lane_does_not_read_the_payload_marker() {
+    // `no-such-PAYLOAD_ID` is not a file: the v1 reader would refuse on it.
+    let owner = install_v2_owner("v2-no-payload", "manifest-digest");
+    assert!(!owner.payload.exists());
+    assert_eq!(owner.run().status.code(), Some(0));
+}
+
+#[test]
+fn preseal_lane_refuses_v2_release_state_beside_it() {
+    // The lanes are disjoint in both directions: a v1-marker appliance that
+    // carries the v2 attestation directories is mixed, not answered.
+    let owner = install_pristine_owner("v1-with-v2-state");
+    assert_eq!(owner.run().status.code(), Some(0));
+    let directory = owner.fixture.state.join("v2-release");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = observe_tree(&owner.fixture.state);
+    let output = owner.run();
+    assert_owner_status_refused(&owner.fixture, &output, &before);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mixed with v2-release evidence"));
+}
