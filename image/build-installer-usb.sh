@@ -161,6 +161,61 @@ RELEASE_CLOSURE_FILE="${RELEASE_CLOSURE_FILE:-}"
 # every object from INSTALL_MIRROR and this medium carries no seed partition
 # (FAB-0057 P1.1, docs/SEED-FROM-MIRROR.md). Sealed by seal_offline_seed_kargs.
 SEED_SOURCE="${SEED_SOURCE:-}"
+# 🔴 THE OWNER-SIGNED PCR7 RULES PAIR (mission "TPM policy at scale", ADR-0045,
+# T5). Optional, Install media only, both files or neither. `rules.json` is the
+# document the installer's PCR7 engine evaluates and `rules.json.sig` its
+# detached, domain-separated Owner signature. The producer reads each ONCE
+# (no link followed, at most 1 MiB, never empty) into a private copy, seals the
+# SHA-256 of rules.json and the rules' OWN `sequence` -- the anti-rollback floor,
+# read from the JSON and never asked for as a second input that could disagree
+# with it -- as neuralice.pcr_rules / neuralice.pcr_rules_seq, and stages both
+# files on the ESP at ice-coreos/pcr-rules/. The signature file's hash is NOT
+# sealed: the engine verifies it under the Owner key neuralice.pcr_policy_key
+# already pins. Supplied as the options below or as the same-named environment
+# variables the rest of this producer takes; both spellings at once is two
+# sources for one input and a refusal. Parsed FIRST, before any counter moves.
+PCR_RULES_FILE="${PCR_RULES_FILE:-}"
+PCR_RULES_SIGNATURE_FILE="${PCR_RULES_SIGNATURE_FILE:-}"
+PCR_RULES_STAGE_ROOT=""
+# The private, task-owned copy every later step reads (see pcr_rules_acquire).
+PCR_RULES_PRIVATE_DIR=""
+PCR_RULES_SHA256=""
+PCR_RULES_SIGNATURE_SHA256=""
+PCR_RULES_SEQ=""
+_pcr_rules_option_seen=""
+_pcr_rules_signature_option_seen=""
+while (( $# > 0 )); do
+  case "$1" in
+    --pcr-rules)
+      [[ $# -ge 2 && -n "$2" ]] \
+        || { echo "ERROR: --pcr-rules requires a file argument" >&2; exit 2; }
+      [[ -z "$_pcr_rules_option_seen" ]] \
+        || { echo "ERROR: --pcr-rules was given more than once" >&2; exit 2; }
+      [[ -z "$PCR_RULES_FILE" ]] \
+        || { echo "ERROR: --pcr-rules and PCR_RULES_FILE are two sources for one input; set exactly one" >&2; exit 2; }
+      PCR_RULES_FILE="$2"; _pcr_rules_option_seen=1
+      shift 2
+      ;;
+    --pcr-rules-signature)
+      [[ $# -ge 2 && -n "$2" ]] \
+        || { echo "ERROR: --pcr-rules-signature requires a file argument" >&2; exit 2; }
+      [[ -z "$_pcr_rules_signature_option_seen" ]] \
+        || { echo "ERROR: --pcr-rules-signature was given more than once" >&2; exit 2; }
+      [[ -z "$PCR_RULES_SIGNATURE_FILE" ]] \
+        || { echo "ERROR: --pcr-rules-signature and PCR_RULES_SIGNATURE_FILE are two sources for one input; set exactly one" >&2; exit 2; }
+      PCR_RULES_SIGNATURE_FILE="$2"; _pcr_rules_signature_option_seen=1
+      shift 2
+      ;;
+    *)
+      echo "ERROR: unknown option: $1 (this producer takes --pcr-rules FILE and --pcr-rules-signature FILE; everything else is an environment input)" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ -n "$PCR_RULES_FILE" || -n "$PCR_RULES_SIGNATURE_FILE" ]]; then
+  [[ -n "$PCR_RULES_FILE" && -n "$PCR_RULES_SIGNATURE_FILE" ]] \
+    || { echo "ERROR: the PCR rules and their signature (--pcr-rules / --pcr-rules-signature, PCR_RULES_FILE / PCR_RULES_SIGNATURE_FILE) must be supplied together; one file pins nothing" >&2; exit 1; }
+fi
 PCR_POLICY_DIGEST="${PCR_POLICY_DIGEST:-}"
 PCR_POLICY_PUBLIC_KEY_FILE="${PCR_POLICY_PUBLIC_KEY_FILE:-}"
 PCR_POLICY_PUBLIC_KEY_SHA256="${PCR_POLICY_PUBLIC_KEY_SHA256:-}"
@@ -453,6 +508,130 @@ seal_v2_release_kargs() {
   UKI_KARGS+=("neuralice.v2rel_sha256=${V2_RELEASE_MANIFEST_SHA256}" \
     "neuralice.v2rel_sig_sha256=${V2_RELEASE_MANIFEST_SIG_SHA256}")
   V2_RELEASE_STAGE_ROOT=staged
+}
+
+# --------------------------------------------------------------------------- #
+# The signed PCR7 rules pair (ADR-0045, T5): the same three steps as the v2
+# release pair above, and the same single-read contract -- each file is opened
+# ONCE without following a link into a private copy, so the hash, the sequence,
+# the sealed karg and the ESP file are all that copy, and a source rewritten
+# after the read decides nothing.
+#   pcr_rules_acquire        one bounded read of both files, hash, sequence
+#   assert_pcr_rules_inputs  scope, then acquire; before the long image build
+#   seal_pcr_rules_kargs     appends the two kargs beside the pcr_policy terms
+# The signature is NOT verified here and its hash is NOT sealed: it is verified
+# at install time by the engine under the Owner key neuralice.pcr_policy_key pins.
+# --------------------------------------------------------------------------- #
+pcr_rules_acquire() {
+  PCR_RULES_PRIVATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ni-pcr-rules.XXXXXX")" \
+    || { echo "ERROR: cannot create the private directory for the PCR rules pair" >&2; exit 1; }
+  chmod 0700 -- "$PCR_RULES_PRIVATE_DIR"
+  python3 -I - "$PCR_RULES_FILE" "$PCR_RULES_PRIVATE_DIR/rules.json" \
+    "$PCR_RULES_SIGNATURE_FILE" "$PCR_RULES_PRIVATE_DIR/rules.json.sig" 1048576 <<'PYEOF' \
+    || exit 1
+import os
+import stat
+import sys
+
+
+def refuse(reason):
+    print(f"ERROR: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+source_rules, copy_rules, source_signature, copy_signature, bound = sys.argv[1:]
+bound = int(bound)
+for source, destination in ((source_rules, copy_rules), (source_signature, copy_signature)):
+    try:
+        # O_NOFOLLOW: a link is refused by the open itself, not by a test an
+        # attacker can race. O_NONBLOCK: a FIFO is refused below, not waited on.
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        refuse(f"the PCR rules and their signature must be non-empty regular files, not links: {source}")
+    # fstat BEFORE fdopen: a directory opens fine and only fails once Python
+    # wraps it, with a traceback instead of the refusal an operator can read.
+    facts = os.fstat(descriptor)
+    if not stat.S_ISREG(facts.st_mode) or facts.st_size == 0:
+        refuse(f"the PCR rules and their signature must be non-empty regular files, not links: {source}")
+    if facts.st_size > bound:
+        refuse(f"{source} is larger than the {bound}-byte bound of the signed PCR rules")
+    with os.fdopen(descriptor, "rb") as handle:
+        data = handle.read(bound + 1)
+    if len(data) > bound:
+        refuse(f"{source} is larger than the {bound}-byte bound of the signed PCR rules")
+    if not data:
+        refuse(f"the PCR rules and their signature must be non-empty regular files, not links: {source}")
+    with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        out.write(data)
+PYEOF
+  PCR_RULES_SHA256="$(sha256_of "$PCR_RULES_PRIVATE_DIR/rules.json")"
+  PCR_RULES_SIGNATURE_SHA256="$(sha256_of "$PCR_RULES_PRIVATE_DIR/rules.json.sig")"
+}
+
+assert_pcr_rules_inputs() {
+  [[ -n "$PCR_RULES_FILE" || -n "$PCR_RULES_SIGNATURE_FILE" ]] || return 0
+  [[ -n "$PCR_RULES_FILE" && -n "$PCR_RULES_SIGNATURE_FILE" ]] \
+    || { echo "ERROR: PCR_RULES_FILE and PCR_RULES_SIGNATURE_FILE must be supplied together; one file pins nothing" >&2; exit 1; }
+  [[ "$MEDIA_MODE" == install ]] \
+    || { echo "ERROR: signed PCR rules are only permitted on Install media; a Live medium enrols and unlocks nothing" >&2; exit 1; }
+  [[ -z "$PCR_RULES_PRIVATE_DIR" ]] || return 0
+  pcr_rules_acquire
+  [[ "$PCR_RULES_SHA256" != "$PCR_RULES_SIGNATURE_SHA256" ]] \
+    || { echo "ERROR: the PCR rules and their detached signature are the same bytes; that pins neither" >&2; exit 1; }
+  # The rules are read the way the engine reads them: a JSON object, no key
+  # duplicated at any depth (the engine's parser and this one would otherwise
+  # disagree about which `sequence` is the document's), no NaN/Infinity, and a
+  # `sequence` that is an integer in 1..2^53-1 -- 0 would switch anti-rollback
+  # off, and the floor is sealed and compared as a safe integer everywhere.
+  PCR_RULES_SEQ="$(python3 -I - "$PCR_RULES_PRIVATE_DIR/rules.json" <<'PYEOF'
+import json
+import sys
+
+
+def refuse(reason):
+    print(f"ERROR: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def no_duplicates(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            refuse(f"the PCR rules carry a duplicated JSON key: {key!r}")
+        seen[key] = value
+    return seen
+
+
+def no_constant(name):
+    refuse(f"the PCR rules carry a non-finite number: {name}")
+
+
+with open(sys.argv[1], "rb") as handle:
+    raw = handle.read()
+try:
+    document = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constant)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    refuse(f"the PCR rules are not valid JSON: {error}")
+if not isinstance(document, dict):
+    refuse("the PCR rules must be a JSON object")
+sequence = document.get("sequence")
+if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence <= 2**53 - 1:
+    refuse("the PCR rules carry no `sequence` that is an integer in 1..9007199254740991")
+print(sequence)
+PYEOF
+)" || { echo "ERROR: the signed PCR rules are not a document this medium can seal (see above)" >&2; exit 1; }
+  [[ "$PCR_RULES_SEQ" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || { echo "ERROR: the PCR rules' sequence is not a canonical decimal: $PCR_RULES_SEQ" >&2; exit 1; }
+}
+
+seal_pcr_rules_kargs() {
+  [[ -n "$PCR_RULES_FILE" || -n "$PCR_RULES_SIGNATURE_FILE" ]] || return 0
+  assert_pcr_rules_inputs
+  [[ "$PCR_RULES_SHA256" =~ ^[0-9a-f]{64}$ && "$PCR_RULES_SEQ" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || { echo "ERROR: the PCR rules digest or sequence is absent; nothing is sealed" >&2; exit 1; }
+  UKI_KARGS+=("neuralice.pcr_rules=${PCR_RULES_SHA256}" \
+    "neuralice.pcr_rules_seq=${PCR_RULES_SEQ}")
+  PCR_RULES_STAGE_ROOT=staged
 }
 
 # --------------------------------------------------------------------------- #
@@ -1166,6 +1345,10 @@ cleanup_lab_baseline_stage() {
     rm -rf -- "$V2_RELEASE_PRIVATE_DIR"
     V2_RELEASE_PRIVATE_DIR=""
   fi
+  if [[ -n "$PCR_RULES_PRIVATE_DIR" ]]; then
+    rm -rf -- "$PCR_RULES_PRIVATE_DIR"
+    PCR_RULES_PRIVATE_DIR=""
+  fi
 }
 trap cleanup_lab_baseline_stage EXIT
 
@@ -1313,6 +1496,10 @@ if [[ -n "$PRESEAL_SET_DIR" || -n "$PRESEAL_SET_SHA256" ]]; then
 fi
 # The cheap half of the v2 release pair's refusals, before the long image build.
 assert_v2_release_inputs
+# ...and of the signed PCR rules pair's (ADR-0045, T5): shape, scope, one bounded
+# read and the rules' own sequence, before 40 minutes are spent on a medium that
+# would be refused.
+assert_pcr_rules_inputs
 
 # Build the dual-mode installer image FROM the chosen immutable base. Reusing a
 # locally present digest is safe because the content address cannot drift.
@@ -1887,6 +2074,10 @@ case "$MEDIA_MODE" in
       "neuralice.pcr_policy_key=${PCR_POLICY_PUBLIC_KEY_SHA256}" \
       "neuralice.pcr_policy_signature=${PCR_POLICY_SIGNATURE_SHA256}" \
       "neuralice.pcr_policy_seq=${PCR_POLICY_SEQ}")
+    # The signed PCR7 rules pair, sealed right beside the policy terms it
+    # completes (a no-op when none was supplied). Before the source terms so the
+    # v2 pair keeps its contractual position right after neuralice.source.
+    seal_pcr_rules_kargs
     case "$INSTALL_SOURCE" in
       medium)
         [[ -z "$OS_IMAGE" && -z "$INSTALL_MIRROR" ]] \
@@ -1981,8 +2172,9 @@ case "$MEDIA_MODE" in
       || { echo "ERROR: a Live medium installs nothing; RELEASE_AUTHORITY is meaningless on one" >&2; exit 1; }
     [[ -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" \
        && -z "$V2_RELEASE_MANIFEST" && -z "$V2_RELEASE_MANIFEST_SIG" \
+       && -z "$PCR_RULES_FILE" && -z "$PCR_RULES_SIGNATURE_FILE" \
        && -z "$MIRROR_CA_FILE" && -z "$MIRROR_READY_SHA256" ]] \
-      || { echo "ERROR: a Live medium installs nothing; a release authorization and a mirror pin are meaningless on one" >&2; exit 1; }
+      || { echo "ERROR: a Live medium installs nothing; a release authorization, signed PCR rules and a mirror pin are meaningless on one" >&2; exit 1; }
     # Live is just as explicit as Install: the signature selects both the mode
     # and its only permitted target. The early generator uses this closed pair
     # to suppress inherited installed-appliance lifecycles without inventing a
@@ -2294,6 +2486,22 @@ if [[ "$MEDIA_MODE" == install ]]; then
   [[ "$(sudo sha256sum "$MNT/ice-coreos/tpm2-pcr-public-key.pem" | awk '{print tolower($1)}')" == "$PCR_POLICY_PUBLIC_KEY_SHA256" \
      && "$(sudo sha256sum "$MNT/ice-coreos/tpm2-pcr-signature.json" | awk '{print tolower($1)}')" == "$PCR_POLICY_SIGNATURE_SHA256" ]] \
     || { echo "ERROR: signed PCR policy read-back differs from the sealed hashes" >&2; exit 1; }
+fi
+# The signed PCR7 rules pair, staged and READ BACK like the files above: the digest
+# sealed in the signature must be the hash of the bytes that ended up on the
+# medium, not of the bytes this script intended to write. The signature file's
+# hash is not sealed (the engine verifies it under the pinned Owner key), but it
+# is read back too: a medium whose staged signature is not the one validated is
+# not the medium that was approved.
+if [[ -n "$PCR_RULES_STAGE_ROOT" ]]; then
+  sudo install -d -m 0755 "$MNT/ice-coreos/pcr-rules"
+  sudo install -m 0444 "$PCR_RULES_PRIVATE_DIR/rules.json" "$MNT/ice-coreos/pcr-rules/rules.json"
+  sudo install -m 0444 "$PCR_RULES_PRIVATE_DIR/rules.json.sig" "$MNT/ice-coreos/pcr-rules/rules.json.sig"
+  staged_rules="$(sudo sha256sum "$MNT/ice-coreos/pcr-rules/rules.json" | awk '{print tolower($1)}')"
+  staged_rules_sig="$(sudo sha256sum "$MNT/ice-coreos/pcr-rules/rules.json.sig" | awk '{print tolower($1)}')"
+  [[ "$staged_rules" == "$PCR_RULES_SHA256" && "$staged_rules_sig" == "$PCR_RULES_SIGNATURE_SHA256" ]] \
+    || { echo "ERROR: the PCR rules pair on the ESP does not hash to the bytes this build validated and sealed" >&2; exit 1; }
+  echo "    staged the signed PCR rules on the ESP (rules ${staged_rules}, sequence floor ${PCR_RULES_SEQ} sealed in the UKI; signature ${staged_rules_sig} verified at install under the pinned Owner key)"
 fi
 if [[ -n "$LAB_BASELINE_STAGE_ROOT" ]]; then
   sudo bash "$LAB_BASELINE_HELPER" stage-media \
