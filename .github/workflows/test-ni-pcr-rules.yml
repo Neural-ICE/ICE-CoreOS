@@ -1,0 +1,40 @@
+name: test-ni-pcr-rules
+
+# PCR 7 rules engine (tools/ni-pcr-rules): stdlib-only Python plus the openssl
+# binary, no TPM and no secret (the signing key is generated per run). It reuses
+# the event-log parser of ota/neural-ice-tpm-policy.py, so a change to that file
+# re-runs this suite. The fixtures are public data from one physical GB10.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/ni-pcr-rules/**'
+      - 'ota/neural-ice-tpm-policy.py'
+      - '.github/workflows/test-ni-pcr-rules.yml'
+  pull_request:
+    paths:
+      - 'tools/ni-pcr-rules/**'
+      - 'ota/neural-ice-tpm-policy.py'
+      - '.github/workflows/test-ni-pcr-rules.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: test-ni-pcr-rules-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Evaluate the signed rules against the real GB10 state
+        run: python3 -I tools/ni-pcr-rules/test-ni-pcr-rules.py
