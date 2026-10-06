@@ -53,8 +53,13 @@ grep -qx 'StandardInput=null' "$UNIT" || fail "status screen must not read the c
 # put tty1 back into canonical mode with echo under the running console. A
 # single key such as the console's [P] then waited for an Enter that never
 # came (GX10 .67, 2026-09-24).
-grep -qx 'TTYReset=no' "$UNIT" \
-  || fail "status screen resets tty1 when it exits, under the console that now owns it (TTYReset= must be no)"
+# systemd keeps the LAST assignment: the last TTYReset= line must be no, and no line may say yes
+# (this repository's drop-ins for the unit included).
+[[ "$(grep '^TTYReset=' "$UNIT" | tail -1)" == 'TTYReset=no' ]] \
+  || fail "status screen resets tty1 when it exits, under the console that now owns it (the last TTYReset= must be no)"
+! grep -q '^TTYReset=yes' "$UNIT" || fail "status screen unit still carries a TTYReset=yes line"
+! grep -rqs '^TTYReset=yes' "$(dirname "$UNIT")/$(basename "$UNIT").d" \
+  || fail "a drop-in of the status screen unit sets TTYReset=yes"
 grep -qx 'TTYVHangup=no' "$UNIT" || fail "status screen would hang up tty1 under its owner"
 grep -qx 'TTYVTDisallocate=no' "$UNIT" || fail "status screen would disallocate tty1 under its owner"
 grep -qx 'ExecStart=/usr/local/bin/neural-ice-status-screen.sh' "$UNIT" || fail "unexpected ExecStart"
