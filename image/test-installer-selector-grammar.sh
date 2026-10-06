@@ -289,11 +289,38 @@ KERNEL_CMDLINE_BYTES="$(sed -n 's/^NI_SEALED_CMDLINE_MAX_BYTES=\([0-9]*\)$/\1/p'
   || fail "the grammar no longer states NI_SEALED_CMDLINE_MAX_BYTES as a literal, or the budget is not below it"
 ANCHOR_BUDGET="$(anchor_for lab-managed | sed 's/neural-ice-secureboot-lab-v1/neural-ice-secureboot-prod-v1/')"
 budget_vectors=0 budget_bytes=0
+budget_v2_vectors=0 budget_v2_bytes=0
 
 vectors=0 accepted=0 refused=0
 while IFS=$'\t' read -r expected anchor label words; do
   case "$expected" in ''|'#'*) continue ;; esac
   vectors=$(( vectors + 1 ))
+  if [[ "$label" == budget-v2:* ]]; then
+    # The v2 owner-sealed medium (mission B, T3a) seals the manifest/signature
+    # pair instead of the preseal set, on a medium source. It is a different line
+    # from the registry one above and has its own measurement: a pair that fits
+    # the grammar and not the kernel's delivery bound is a medium that boots
+    # with its last pins truncated away.
+    budget_v2_vectors=$(( budget_v2_vectors + 1 ))
+    budget_v2_line="$ANCHOR_BUDGET $words $PCR_POLICY_FIELDS"
+    budget_v2_bytes=${#budget_v2_line}
+    [[ "$expected" == install \
+       && "$(classify_bash "$budget_v2_line")" == install \
+       && "$(classify_python "$budget_v2_line")" == install ]] \
+      || fail "[$label] the production-shaped v2 line is not an accepted Install line"
+    (( budget_v2_bytes <= BUDGET_MAX_BYTES )) \
+      || fail "[$label] the full v2 line measures ${budget_v2_bytes} bytes, above the ${BUDGET_MAX_BYTES}-byte budget (kernel bound 1957)"
+    for must in neuralice.source=medium neuralice.v2rel_sha256= neuralice.v2rel_sig_sha256= \
+      neuralice.imgref= neuralice.systemsize= neuralice.sshkey= neuralice.device_channel= \
+      neuralice.release_authority= enforcing=0; do
+      [[ "$budget_v2_line" == *" $must"* ]] \
+        || fail "[$label] the v2 budget vector does not carry $must"
+    done
+    for never in neuralice.preseal= neuralice.relauth_sha256= neuralice.relauth_sig_sha256=; do
+      [[ "$budget_v2_line" != *"$never"* ]] \
+        || fail "[$label] the v2 budget vector carries $never beside the v2 pair"
+    done
+  fi
   if [[ "$label" == budget:* ]]; then
     budget_vectors=$(( budget_vectors + 1 ))
     budget_line="$ANCHOR_BUDGET $words $PCR_POLICY_FIELDS"
@@ -422,6 +449,15 @@ done < "$CORPUS"
 (( refused >= 45 )) || fail "the corpus no longer covers the hostile mutations"
 (( budget_vectors == 1 )) \
   || fail "the corpus must carry exactly one budget: vector (found $budget_vectors); the byte budget is otherwise unmeasured"
+(( budget_v2_vectors == 1 )) \
+  || fail "the corpus must carry exactly one budget-v2: vector (found $budget_v2_vectors); the v2 line's byte budget is otherwise unmeasured"
+# The v2 pair's closed rules must each be refused BY NAME somewhere in the corpus.
+for named in v2rel-sig-without-manifest v2rel-manifest-without-sig v2rel-hashes-identical \
+  v2rel-requires-medium-source v2rel-with-preseal v2rel-with-release-authorization \
+  v2rel-not-permitted-outside-lab-managed; do
+  grep -q "^refuse:${named}	" "$CORPUS" \
+    || fail "the corpus no longer carries a vector refused as ${named}"
+done
 # The five restatements must each be refused BY NAME somewhere in the corpus:
 # a generic refusal would let a future edit drop the rule and stay green.
 for named in seed-source-mirror-restates-mirror-ready preseal-restates-relauth seed-closure-restates-manifest; do
@@ -593,6 +629,101 @@ esp_bound "$mirror_line" \
   "ice-coreos/mirror-ca.crt=a CA for somebody else entirely" \
   && fail "a swapped mirror CA on the ESP was accepted"
 
+# --------------------------------------------------------------------------- #
+# THE v2 RELEASE MANIFEST PAIR (mission B, T3a). The manifest and its detached
+# signature travel on the mutable ESP at ice-coreos/v2-release-manifest.json(.sig)
+# and the signed UKI seals their SHA-256: a substituted manifest -- another
+# correctly signed release, an older bundle_seq -- must not survive the cut-time
+# readback, and neither may a pin with no file or a file with no pin.
+# --------------------------------------------------------------------------- #
+v2_manifest_content='{"schema":"neural-ice-release-manifest-v1","release_id":"synthetic"}'
+v2_sig_content='ZmFrZSBkZXRhY2hlZCBzaWduYXR1cmU='
+v2_pinned_line="$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=medium"
+v2_pinned_line="$v2_pinned_line neuralice.v2rel_sha256=$(esp_digest "$v2_manifest_content")"
+v2_pinned_line="$v2_pinned_line neuralice.v2rel_sig_sha256=$(esp_digest "$v2_sig_content")"
+esp_bound "$v2_pinned_line" \
+  "ice-coreos/v2-release-manifest.json=$v2_manifest_content" \
+  "ice-coreos/v2-release-manifest.json.sig=$v2_sig_content" \
+  || fail "an ESP whose v2 release pair hashes to the sealed values was refused"
+esp_bound "$v2_pinned_line" \
+  "ice-coreos/v2-release-manifest.json=a DIFFERENT but correctly signed release" \
+  "ice-coreos/v2-release-manifest.json.sig=$v2_sig_content" \
+  && fail "a swapped v2 release manifest on the ESP was accepted"
+esp_bound "$v2_pinned_line" \
+  "ice-coreos/v2-release-manifest.json=$v2_manifest_content" \
+  "ice-coreos/v2-release-manifest.json.sig=a DIFFERENT signature" \
+  && fail "a swapped v2 release signature on the ESP was accepted"
+esp_bound "$v2_pinned_line" "ice-coreos/v2-release-manifest.json=$v2_manifest_content" \
+  && fail "a medium pinning a v2 signature its ESP does not carry was accepted"
+esp_bound "$v2_pinned_line" "ice-coreos/v2-release-manifest.json.sig=$v2_sig_content" \
+  && fail "a medium pinning a v2 manifest its ESP does not carry was accepted"
+esp_bound "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.source=medium" \
+  "ice-coreos/v2-release-manifest.json=$v2_manifest_content" \
+  "ice-coreos/v2-release-manifest.json.sig=$v2_sig_content" \
+  && fail "an unpinned v2 release pair on the ESP was accepted"
+
+# The approved-hash readback and the ESP allow-list, as the producer asks for
+# them (--expect-v2-release-* / --expect-no-v2-release).
+v2_transport() { # $1=cmdline $2=expected manifest sha or "" $3=expected sig sha or "" $4=expect-absent 0|1
+  python3 - "$INSPECTOR" "$@" <<'PYEOF'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("inspector", sys.argv[1])
+inspector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(inspector)
+cmdline, manifest, sig, absent = sys.argv[2:]
+try:
+    inspector.check_v2_release_transport(cmdline, manifest or None, sig or None, absent == "1")
+except inspector.InspectionError as error:
+    print(f"REFUSED {error}", file=sys.stderr)
+    raise SystemExit(1)
+PYEOF
+}
+v2_manifest_sha="$(esp_digest "$v2_manifest_content")"
+v2_sig_sha="$(esp_digest "$v2_sig_content")"
+v2_transport "$v2_pinned_line" "$v2_manifest_sha" "$v2_sig_sha" 0 \
+  || fail "a sealed v2 pair equal to the approved hashes was refused"
+v2_transport "$v2_pinned_line" "$(esp_digest other)" "$v2_sig_sha" 0 \
+  && fail "a sealed v2 manifest hash differing from the approved one was accepted"
+v2_transport "$v2_pinned_line" "$v2_manifest_sha" "$(esp_digest other)" 0 \
+  && fail "a sealed v2 signature hash differing from the approved one was accepted"
+v2_transport "$pinned_line" "$v2_manifest_sha" "$v2_sig_sha" 0 \
+  && fail "an approved v2 pair absent from the sealed line was accepted"
+v2_transport "$v2_pinned_line" "" "" 1 \
+  && fail "a sealed v2 pair nobody approved was accepted"
+v2_transport "$pinned_line" "" "" 1 \
+  || fail "a medium with no v2 pair was refused when none was expected"
+v2_transport "$v2_pinned_line" "" "" 0 \
+  || fail "a sealed v2 pair was refused when the producer stated no expectation"
+
+# THE POSITION OF THE PAIR (contract section 11). Both grammars count occurrences
+# and accept the pair anywhere; the finished medium's line is compared with the
+# produced order HERE, whether or not the producer stated an expectation: the
+# pair immediately after neuralice.source=medium, manifest hash then signature
+# hash, before any neuralice.seed_* token.
+v2_pair="neuralice.v2rel_sha256=$v2_manifest_sha neuralice.v2rel_sig_sha256=$v2_sig_sha"
+v2_head="$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1"
+seed_token="neuralice.seed_closure=$(esp_digest seed)"
+v2_transport "$v2_head neuralice.source=medium $v2_pair $seed_token" "" "" 0 \
+  || fail "the produced order (source, pair, seed tokens) was refused"
+v2_transport "$v2_head $v2_pair neuralice.source=medium" "" "" 0 \
+  && fail "a v2 pair sealed BEFORE neuralice.source=medium was accepted"
+v2_transport "$v2_head neuralice.source=medium $seed_token $v2_pair" "" "" 0 \
+  && fail "a v2 pair sealed AFTER an offline seed token was accepted"
+v2_transport "$v2_head neuralice.source=medium neuralice.v2rel_sig_sha256=$v2_sig_sha neuralice.v2rel_sha256=$v2_manifest_sha" "" "" 0 \
+  && fail "a v2 pair with the signature hash before the manifest hash was accepted"
+v2_transport "$v2_head neuralice.source=medium neuralice.v2rel_sha256=$v2_manifest_sha quiet neuralice.v2rel_sig_sha256=$v2_sig_sha" "" "" 0 \
+  && fail "a token interposed between the two v2 hashes was accepted"
+v2_transport "$v2_head neuralice.source=medium quiet $v2_pair" "" "" 0 \
+  && fail "a token interposed between the medium source and the v2 pair was accepted"
+v2_transport "$v2_head $v2_pair" "" "" 0 \
+  && fail "a v2 pair on a line with no neuralice.source=medium was accepted"
+v2_transport "$v2_head neuralice.source=medium $v2_pair" "$v2_manifest_sha" "$v2_sig_sha" 0 \
+  || fail "the approved v2 pair in its produced position was refused"
+v2_transport "$v2_head $v2_pair neuralice.source=medium" "$v2_manifest_sha" "$v2_sig_sha" 0 \
+  && fail "the approved v2 pair in the wrong position was accepted"
+
 # A medium that pins nothing and carries nothing is the ordinary medium install.
 esp_bound "$ANCHOR quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1" \
   || fail "an ordinary medium install with no pinned ESP artefacts was refused"
@@ -662,4 +793,4 @@ run_generator 'quiet rd.luks=1 root=/dev/mapper/system' "$TMP/installed"
 [[ -z "$(find "$TMP/installed/early" -mindepth 1 -print -quit)" ]] \
   || fail "installer-only masks leaked into an installed boot"
 
-echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate, the ESP artefact pins and the operator key's single transport all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes, kernel bound ${KERNEL_CMDLINE_BYTES})"
+echo "SELECTOR_GRAMMAR_TEST_OK (${vectors} corpus vectors: ${accepted} accepted, ${refused} refused; 3 grammar implementations agree; generator, preflight, installer gate, the ESP artefact pins and the operator key's single transport all exercised; full production line measures ${budget_bytes} of ${BUDGET_MAX_BYTES} budget bytes (v2 medium line ${budget_v2_bytes}), kernel bound ${KERNEL_CMDLINE_BYTES})"

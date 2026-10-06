@@ -788,6 +788,317 @@ cache_kept="$(find "$CACHE/store/sealed-store" -mindepth 1 -maxdepth 1 -type d |
 echo "  incremental build: the sealed store cache is opt-in, keyed by document, bounded, and re-proved on every reuse"
 
 
+# --------------------------------------------------------------------------- #
+# 🔴 THE v2 RELEASE PAIR, PRODUCER SIDE (mission B, T3a;
+# docs/ota/V2-RELEASE-ATTESTATION.md). An owner-sealed v2 medium has no preseal
+# set: the producer takes the release manifest and its detached signature
+# (V2_RELEASE_MANIFEST / V2_RELEASE_MANIFEST_SIG), seals their SHA-256 in the
+# signed UKI line (neuralice.v2rel_sha256 / neuralice.v2rel_sig_sha256, after the
+# medium source) and stages the two files on the ESP. It refuses to CUT a medium
+# whose installer would refuse it: unsigned, signed by another key, not the
+# release the sealed image belongs to, the wrong hardware, or in company the
+# grammar forbids.
+#
+# Lifted verbatim, like the seed sealing above, and ABOVE the sealed-medium
+# fixture so it runs on a host without veritysetup. The first vector is the T0
+# golden manifest: the producer and the verifier read the same contract bytes.
+# --------------------------------------------------------------------------- #
+V2P="$TMP/v2-producer"; mkdir -p "$V2P"
+awk '/^sha256_of\(\) \{/,/^}$/' "$BUILDER" > "$V2P/lifted.sh"
+for v2_function in v2_release_acquire assert_v2_release_inputs v2_release_check_signature \
+  verify_v2_release_against_base_image seal_v2_release_kargs; do
+  awk "/^${v2_function}\\(\\) \\{/,/^}\$/" "$BUILDER" >> "$V2P/lifted.sh"
+done
+for v2_function in sha256_of v2_release_acquire assert_v2_release_inputs v2_release_check_signature \
+  verify_v2_release_against_base_image seal_v2_release_kargs; do
+  grep -q "^${v2_function}()" "$V2P/lifted.sh" \
+    || fail "the producer no longer defines ${v2_function}; the v2 release pair would be unsealed"
+done
+bash -n "$V2P/lifted.sh" || fail "the lifted v2 release functions do not parse"
+V2_GOLDEN="$ROOT/tools/ni-ota-verify/tests/fixtures/v2-release"
+[ -f "$V2_GOLDEN/golden.json" ] || fail "the T0 golden vectors are missing: $V2_GOLDEN"
+
+v2_golden_value() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["inputs"][sys.argv[2]])' "$V2_GOLDEN/golden.json" "$1"; }
+V2_GOLDEN_REPOSITORY="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected"]["host_repository"])' "$V2_GOLDEN/golden.json")"
+V2_GOLDEN_DIGEST="$(v2_golden_value host_index_digest)"
+V2_GOLDEN_TARGET="$(v2_golden_value hardware_target)"
+V2_GOLDEN_AUTHORITY="$(v2_golden_value release_authority)"
+
+# A throwaway key and a manifest this suite signs itself, so each negative states
+# its one difference and nothing else. `v2_make_release DIR [key=value…]` writes
+# DIR/{manifest,sig,release-authorization.pub}; overrides are JSON paths
+# (host.digest=…, bundle_seq=…, drop:schema).
+openssl ecparam -name prime256v1 -genkey -noout -out "$V2P/test.key" 2>/dev/null \
+  || fail "cannot generate the v2 release test key"
+openssl ec -in "$V2P/test.key" -pubout -out "$V2P/test.pub" 2>/dev/null \
+  || fail "cannot derive the v2 release test public key"
+openssl ecparam -name prime256v1 -genkey -noout -out "$V2P/other.key" 2>/dev/null \
+  || fail "cannot generate the second v2 release test key"
+v2_make_release() { # $1=dir $2=signing key, rest: JSON overrides (a.b=value | a.b:=<json> | drop:a.b)
+  local dir=$1 key=$2; shift 2
+  mkdir -p "$dir"
+  python3 -I - "$dir/manifest" "$V2_GOLDEN_REPOSITORY" "$V2_GOLDEN_DIGEST" "$V2_GOLDEN_TARGET" "$@" <<'PYEOF'
+import json
+import sys
+
+path, repository, digest, target, *overrides = sys.argv[1:]
+manifest = json.loads(
+    '{"bundle_seq":3,"hardware_target":"%s","host":{"digest":"%s","repository":"%s"},'
+    '"release_id":"v2-test-train-3","schema":"neural-ice-release-manifest-v1"}'
+    % (target, digest, repository)
+)
+for item in overrides:
+    if item.startswith("drop:"):
+        node = manifest
+        parts = item[5:].split(".")
+        for part in parts[:-1]:
+            node = node[part]
+        del node[parts[-1]]
+        continue
+    raw, _, value = item.partition(":=") if ":=" in item else item.partition("=")
+    parsed = json.loads(value) if ":=" in item else value
+    node = manifest
+    parts = raw.split(".")
+    for part in parts[:-1]:
+        node = node[part]
+    node[parts[-1]] = parsed
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+PYEOF
+  openssl dgst -sha256 -sign "$key" -out "$dir/sig.der" "$dir/manifest" 2>/dev/null \
+    || fail "cannot sign the v2 release test manifest"
+  base64 -w0 < "$dir/sig.der" > "$dir/sig"
+  rm -f "$dir/sig.der"
+}
+# `sudo` and `podman` as the lifted producer functions call them: a sudo that runs
+# its command, and a podman that answers the one question the producer asks of the
+# base image (`run ... BASE_IMAGE cat <release key path>`) with a key file.
+mkdir -p "$V2P/bin"
+printf '#!/bin/sh\nexec "$@"\n' > "$V2P/bin/sudo"
+cat > "$V2P/bin/podman" <<'FAKEPODMAN'
+#!/bin/bash
+# run --rm --entrypoint '' <image> cat <path>
+if [ "${1:-}" = run ] && [ "${*: -2:1}" = cat ] \
+   && [ "${*: -1}" = /usr/lib/neural-ice/keys/release-authorization.pub ] \
+   && [ "${*: -3:1}" = "$BASE_IMAGE" ]; then
+  [ -f "$V2_BASE_KEY" ] || exit 1
+  exec cat -- "$V2_BASE_KEY"
+fi
+echo "unexpected podman call: $*" >&2
+exit 125
+FAKEPODMAN
+chmod +x "$V2P/bin/sudo" "$V2P/bin/podman"
+# Variables are consumed by the exact production functions sourced below.
+# shellcheck disable=SC2034
+v2_seal() { # [VAR=value …] -> runs the LIFTED producer function; prints the kargs it sealed
+  (
+    set -uo pipefail
+    MEDIA_MODE=install VARIANT=sealed-lab INSTALL_SOURCE=medium
+    HARDWARE_TARGET="$V2_GOLDEN_TARGET" RELEASE_AUTHORITY="$V2_GOLDEN_AUTHORITY"
+    TARGET_IMGREF="$V2_GOLDEN_REPOSITORY@$V2_GOLDEN_DIGEST"
+    PRESEAL_SET_DIR="" PRESEAL_SET_SHA256="" RELEASE_AUTHORIZATION_FILE="" RELEASE_AUTHORIZATION_SIGNATURE_FILE=""
+    SEALED_DIR="$V2P/sealed" V2_BASE_KEY="$V2P/test.pub" V2_RELEASE_PRIVATE_DIR=""
+    V2_RELEASE_MANIFEST="$V2P/good/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/good/sig"
+    local_assignment=""
+    for local_assignment in "$@"; do printf -v "${local_assignment%%=*}" '%s' "${local_assignment#*=}"; done
+    UKI_KARGS=(sentinel)
+    # shellcheck disable=SC1091
+    source "$V2P/lifted.sh"
+    # The producer runs three steps, two of them BEFORE the image build: the
+    # inputs (one read, the contract's content rules), the signature under the
+    # key BASE_IMAGE carries, and only then the seal under the key the medium
+    # carries. The base image is stood in for by a podman that prints a key file;
+    # EARLY=0 skips the two early steps to exercise the seal on its own.
+    TMPDIR="$V2P/tmp"; mkdir -p "$TMPDIR"
+    trap 'rm -rf -- "$V2_RELEASE_PRIVATE_DIR"' EXIT
+    PATH="$V2P/bin:$PATH"
+    BASE_IMAGE="registry.example.test/neural-ice-test/base@sha256:$(printf 'e%.0s' {1..64})"
+    export BASE_IMAGE V2_BASE_KEY
+    if [ "${EARLY:-1}" = 1 ]; then
+      assert_v2_release_inputs || exit $?
+      # A hook run once the files have been read: the source is rewritten HERE.
+      eval "${AFTER_READ:-true}"
+      verify_v2_release_against_base_image || exit $?
+    fi
+    seal_v2_release_kargs || exit $?
+    printf '%s\n' "${UKI_KARGS[*]}"
+    printf 'STAGE=%s MANIFEST_SHA=%s SIG_SHA=%s\n' "${V2_RELEASE_STAGE_ROOT:-unset}" \
+      "${V2_RELEASE_MANIFEST_SHA256:-unset}" "${V2_RELEASE_MANIFEST_SIG_SHA256:-unset}"
+  )
+}
+v2_refused() { # $1=label $2=text the refusal must carry, rest as v2_seal -> the producer must REFUSE for THAT reason
+  local label=$1 reason=$2 rc=0; shift 2
+  v2_seal "$@" >"$V2P/out" 2>"$V2P/err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "[v2 producer] $label: the producer accepted it ($(cat "$V2P/out"))"
+  grep -q "^ERROR:.*${reason}" "$V2P/err" \
+    || fail "[v2 producer] $label: refused, but not for '${reason}': $(cat "$V2P/err")"
+}
+
+mkdir -p "$V2P/sealed" "$V2P/good"
+cp "$V2P/test.pub" "$V2P/sealed/release-authorization.pub"
+v2_make_release "$V2P/good" "$V2P/test.key"
+v2_good_manifest_sha="$(sha256sum "$V2P/good/manifest" | awk '{print $1}')"
+v2_good_sig_sha="$(sha256sum "$V2P/good/sig" | awk '{print $1}')"
+
+v2_out="$(v2_seal)" || fail "[v2 producer] a correctly signed manifest bound to the target was refused: $(v2_seal 2>&1 | head -3)"
+[ "$(sed -n 1p <<<"$v2_out")" = "sentinel neuralice.v2rel_sha256=${v2_good_manifest_sha} neuralice.v2rel_sig_sha256=${v2_good_sig_sha}" ] \
+  || fail "[v2 producer] the sealed kargs are not the manifest then the signature hash, appended after the existing ones: $v2_out"
+grep -q "^STAGE=staged MANIFEST_SHA=${v2_good_manifest_sha} SIG_SHA=${v2_good_sig_sha}\$" <<<"$v2_out" \
+  || fail "[v2 producer] the producer does not hand the staged hashes to the ESP step: $v2_out"
+
+# The T0 golden pair, replayed under the golden key: the producer and the
+# verifier read the same contract bytes.
+cp "$V2_GOLDEN/release-authorization.pub" "$V2P/sealed-golden.pub"
+mkdir -p "$V2P/sealed-golden"; cp "$V2P/sealed-golden.pub" "$V2P/sealed-golden/release-authorization.pub"
+v2_seal SEALED_DIR="$V2P/sealed-golden" V2_BASE_KEY="$V2P/sealed-golden.pub" V2_RELEASE_MANIFEST="$V2_GOLDEN/release-manifest.json" \
+  V2_RELEASE_MANIFEST_SIG="$V2_GOLDEN/release-manifest.json.sig" >"$V2P/out" 2>"$V2P/err" \
+  || { cat "$V2P/err" >&2; fail "[v2 producer] the T0 golden release manifest was refused"; }
+grep -q "neuralice.v2rel_sha256=$(v2_golden_value sealed_manifest_sha256) neuralice.v2rel_sig_sha256=$(v2_golden_value sealed_manifest_sig_sha256)" "$V2P/out" \
+  || fail "[v2 producer] the producer seals other hashes than the golden vectors state: $(cat "$V2P/out")"
+
+# Joint, or nothing.
+v2_refused "manifest without signature" "supplied together" V2_RELEASE_MANIFEST_SIG=""
+v2_refused "signature without manifest" "supplied together" V2_RELEASE_MANIFEST=""
+# Exclusive with the other two authentication routes.
+v2_refused "beside a preseal set" "excludes PRESEAL_SET" PRESEAL_SET_DIR="$V2P/good" PRESEAL_SET_SHA256="$(printf '%064d' 9)"
+v2_refused "beside the authorization pair" "excludes PRESEAL_SET" RELEASE_AUTHORIZATION_FILE="$V2P/good/manifest" RELEASE_AUTHORIZATION_SIGNATURE_FILE="$V2P/good/sig"
+# Medium source, Install, sealed-lab only.
+v2_refused "registry source" "only permitted on sealed-lab Install media" INSTALL_SOURCE=registry
+v2_refused "Live medium" "only permitted on sealed-lab Install media" MEDIA_MODE=live
+v2_refused "prod variant" "only permitted on sealed-lab Install media" VARIANT=prod
+# Files.
+printf '' > "$V2P/empty"
+ln -sf "$V2P/good/manifest" "$V2P/link"
+head -c $(( 1048576 + 1 )) /dev/zero | tr '\0' 'x' > "$V2P/huge"
+head -c 1025 /dev/zero | tr '\0' 'A' > "$V2P/bigsig"
+v2_refused "empty manifest" "non-empty regular files" V2_RELEASE_MANIFEST="$V2P/empty"
+v2_refused "empty signature" "non-empty regular files" V2_RELEASE_MANIFEST_SIG="$V2P/empty"
+v2_refused "missing manifest" "non-empty regular files" V2_RELEASE_MANIFEST="$V2P/none"
+v2_refused "symlinked manifest" "non-empty regular files" V2_RELEASE_MANIFEST="$V2P/link"
+v2_refused "manifest over 1 MiB" "larger than the 1048576-byte bound" V2_RELEASE_MANIFEST="$V2P/huge"
+v2_refused "signature over 1 KiB" "larger than the 1024-byte bound" V2_RELEASE_MANIFEST_SIG="$V2P/bigsig"
+v2_refused "the same bytes for both objects" "same bytes" V2_RELEASE_MANIFEST_SIG="$V2P/good/manifest"
+# The manifest must be the release the sealed image belongs to.
+for v2_case in \
+  "host digest of another image|TARGET_IMGREF|host.digest=sha256:$(printf 'c%.0s' {1..64})" \
+  "host repository of another image|TARGET_IMGREF|host.repository=registry.example.test/neural-ice-test/other-appliance" \
+  "host repository at another authority|release authority|host.repository=other.example.test/neural-ice-test/host-appliance" \
+  "another hardware target|hardware_target|hardware_target=some-other-box" \
+  "another schema|schema|schema=neural-ice-release-manifest-v9" \
+  "no schema|schema|drop:schema" \
+  "bundle_seq 0|bundle_seq|bundle_seq:=0" \
+  "bundle_seq 2^53|bundle_seq|bundle_seq:=9007199254740992" \
+  "bundle_seq as a string|bundle_seq|bundle_seq=3" \
+  "bundle_seq as a float|bundle_seq|bundle_seq:=3.0" \
+  "bad release_id|release_id|release_id=has space"; do
+  v2_label="${v2_case%%|*}"; v2_rest="${v2_case#*|}"
+  v2_reason="${v2_rest%%|*}"; v2_override="${v2_rest#*|}"
+  v2_make_release "$V2P/case" "$V2P/test.key" "$v2_override"
+  v2_refused "manifest with $v2_label" "$v2_reason" V2_RELEASE_MANIFEST="$V2P/case/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/case/sig"
+done
+# Duplicate keys at any depth: the JSON the signature covers must be unambiguous.
+printf '{"bundle_seq":3,"bundle_seq":4,"hardware_target":"%s","host":{"digest":"%s","repository":"%s"},"release_id":"v2-test-train-3","schema":"neural-ice-release-manifest-v1"}' \
+  "$V2_GOLDEN_TARGET" "$V2_GOLDEN_DIGEST" "$V2_GOLDEN_REPOSITORY" > "$V2P/dup-manifest"
+openssl dgst -sha256 -sign "$V2P/test.key" "$V2P/dup-manifest" | base64 -w0 > "$V2P/dup-sig"
+v2_refused "duplicate key" "duplicated JSON key" V2_RELEASE_MANIFEST="$V2P/dup-manifest" V2_RELEASE_MANIFEST_SIG="$V2P/dup-sig"
+printf 'not json' > "$V2P/notjson"
+openssl dgst -sha256 -sign "$V2P/test.key" "$V2P/notjson" | base64 -w0 > "$V2P/notjson-sig"
+v2_refused "manifest that is not JSON" "not valid JSON" V2_RELEASE_MANIFEST="$V2P/notjson" V2_RELEASE_MANIFEST_SIG="$V2P/notjson-sig"
+# The signature is verified under THE KEY THE MEDIUM SEALS, over the exact bytes.
+v2_make_release "$V2P/otherkey" "$V2P/other.key"
+v2_refused "signed by another key" "does not verify" V2_RELEASE_MANIFEST="$V2P/otherkey/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/otherkey/sig"
+cp "$V2P/good/manifest" "$V2P/flipped"; printf ' ' >> "$V2P/flipped"
+v2_refused "manifest changed after signing (one trailing byte)" "does not verify" V2_RELEASE_MANIFEST="$V2P/flipped"
+printf 'not*base64*at*all' > "$V2P/badb64"
+v2_refused "signature that is not base64" "strict base64" V2_RELEASE_MANIFEST_SIG="$V2P/badb64"
+printf 'AAAA' > "$V2P/shortsig"
+v2_refused "signature that is not a DER ECDSA signature" "does not verify" V2_RELEASE_MANIFEST_SIG="$V2P/shortsig"
+# THE JSON THE VERIFIER (serde_json) READS, READ THE SAME WAY (review 240, P3-2).
+# Python's json accepts what serde_json refuses; a manifest signed that way would
+# cut a medium the installer refuses at its pre-wipe check. Each one is signed, so
+# the ONLY reason to refuse it is its content.
+v2_raw_manifest() { # $1=dir $2=extra members (JSON text, may be empty) $3=release_id
+  local dir=$1 extra=$2 release_id=${3-v2-test-train-3}
+  mkdir -p "$dir"
+  printf '{"bundle_seq":3,%s"hardware_target":"%s","host":{"digest":"%s","repository":"%s"},"release_id":"%s","schema":"neural-ice-release-manifest-v1"}' \
+    "$extra" "$V2_GOLDEN_TARGET" "$V2_GOLDEN_DIGEST" "$V2_GOLDEN_REPOSITORY" "$release_id" > "$dir/manifest"
+  openssl dgst -sha256 -sign "$V2P/test.key" "$dir/manifest" 2>/dev/null | base64 -w0 > "$dir/sig"
+}
+v2_big_integer="1$(printf '0%.0s' {1..400})"
+for v2_case in \
+  'NaN|"extra":NaN,' \
+  'Infinity|"extra":Infinity,' \
+  'minus Infinity|"extra":-Infinity,' \
+  'a float out of range (1e999)|"extra":1e999,' \
+  'a negative float out of range|"extra":-1e999,' \
+  'an integer out of range|"extra":'"$v2_big_integer"',' \
+  'an isolated surrogate in a value|"extra":"\ud800",' \
+  'an isolated trailing surrogate in a value|"extra":"\udc00x",' \
+  'an isolated surrogate in a member name|"\ud800":1,'; do
+  v2_label="${v2_case%%|*}"; v2_extra="${v2_case#*|}"
+  v2_raw_manifest "$V2P/raw" "$v2_extra"
+  v2_refused "manifest carrying $v2_label" "not valid JSON" \
+    V2_RELEASE_MANIFEST="$V2P/raw/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/raw/sig"
+done
+# ...while a PAIRED surrogate (a real astral character) and a finite float are JSON
+# serde_json reads, and must not be refused by the same rules.
+v2_raw_manifest "$V2P/raw" '"extra":"\ud83d\ude00","ratio":1.5e3,'
+v2_seal V2_RELEASE_MANIFEST="$V2P/raw/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/raw/sig" >/dev/null 2>"$V2P/err" \
+  || { cat "$V2P/err" >&2; fail "[v2 producer] a manifest with a paired surrogate and a finite float was refused"; }
+# release_id is 1..128 characters of [A-Za-z0-9._-] (contract rule 7), not 1..infinity.
+v2_raw_manifest "$V2P/raw" '' "$(printf 'a%.0s' {1..128})"
+v2_seal V2_RELEASE_MANIFEST="$V2P/raw/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/raw/sig" >/dev/null 2>"$V2P/err" \
+  || { cat "$V2P/err" >&2; fail "[v2 producer] a 128-character release_id was refused"; }
+v2_raw_manifest "$V2P/raw" '' "$(printf 'a%.0s' {1..129})"
+v2_refused "a 129-character release_id" "release_id" V2_RELEASE_MANIFEST="$V2P/raw/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/raw/sig"
+v2_raw_manifest "$V2P/raw" '' ""
+v2_refused "an empty release_id" "release_id" V2_RELEASE_MANIFEST="$V2P/raw/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/raw/sig"
+v2_make_release "$V2P/case" "$V2P/test.key" 'host.digest=sha256:'"$(printf 'C%.0s' {1..64})"
+v2_refused "an uppercase host digest" "host.digest" V2_RELEASE_MANIFEST="$V2P/case/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/case/sig" \
+  TARGET_IMGREF="$V2_GOLDEN_REPOSITORY@sha256:$(printf 'C%.0s' {1..64})"
+
+# EVERYTHING BUT THE SEALED KEY IS JUDGED BEFORE THE IMAGE BUILD (review 240, P3-3).
+# The seal runs after the 40-minute build, when the sealed key exists; the content
+# rules and the signature must not wait for it. SEALED_DIR is absent here, so any
+# refusal below can only have come from the early steps.
+v2_refused "[early] manifest of another hardware, no sealed dir yet" "hardware_target" \
+  SEALED_DIR="$V2P/none" HARDWARE_TARGET=some-other-box
+v2_refused "[early] manifest of another image, no sealed dir yet" "TARGET_IMGREF" \
+  SEALED_DIR="$V2P/none" TARGET_IMGREF="$V2_GOLDEN_REPOSITORY@sha256:$(printf 'c%.0s' {1..64})"
+v2_refused "[early] signed by another key than BASE_IMAGE carries, no sealed dir yet" "under the key BASE_IMAGE carries" \
+  SEALED_DIR="$V2P/none" V2_RELEASE_MANIFEST="$V2P/otherkey/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/otherkey/sig"
+v2_refused "[early] a BASE_IMAGE from which the release key cannot be read" "cannot read the release key out of BASE_IMAGE" \
+  SEALED_DIR="$V2P/none" V2_BASE_KEY="$V2P/no-such-key"
+: > "$V2P/empty-key"
+v2_refused "[early] a BASE_IMAGE whose release key is empty" "no usable release key" \
+  SEALED_DIR="$V2P/none" V2_BASE_KEY="$V2P/empty-key"
+# The seal, alone, still judges the signature under the key the medium really seals...
+v2_refused "[seal] signed by another key than the sealed one" "under the key this medium seals" EARLY=0 \
+  V2_RELEASE_MANIFEST="$V2P/otherkey/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/otherkey/sig"
+# ...and refuses a sealed key that is not the one the early check used.
+v2_refused "[seal] a sealed key other than BASE_IMAGE's" "not the one BASE_IMAGE carries" \
+  SEALED_DIR="$V2P/sealed-golden" V2_BASE_KEY="$V2P/test.pub"
+
+# ONE READ OF EACH FILE (contract: "Single read of every input"; review 240, P4-1).
+# The source is rewritten right after the producer has read it: what is hashed,
+# validated, verified, sealed and staged must still be the bytes that were read.
+mkdir -p "$V2P/swap"
+cp "$V2P/good/manifest" "$V2P/swap/manifest"; cp "$V2P/good/sig" "$V2P/swap/sig"
+v2_swapped_out="$(v2_seal V2_RELEASE_MANIFEST="$V2P/swap/manifest" V2_RELEASE_MANIFEST_SIG="$V2P/swap/sig" \
+  AFTER_READ="cp $V2P/dup-manifest $V2P/swap/manifest; cp $V2P/dup-sig $V2P/swap/sig")" \
+  || fail "[v2 producer] a source rewritten after the read made the producer refuse the bytes it had validated"
+[ "$(sed -n 1p <<<"$v2_swapped_out")" = "sentinel neuralice.v2rel_sha256=${v2_good_manifest_sha} neuralice.v2rel_sig_sha256=${v2_good_sig_sha}" ] \
+  || fail "[v2 producer] a source rewritten after the read changed what was sealed: $v2_swapped_out"
+[ "$(sha256sum "$V2P/swap/manifest" | awk '{print $1}')" != "$v2_good_manifest_sha" ] \
+  || fail "[v2 producer] the single-read probe did not rewrite its source"
+# No private copy survives a producer that exits (the trap of the producer removes it).
+[ -z "$(find "$V2P/tmp" -mindepth 1 -print -quit)" ] \
+  || fail "[v2 producer] a refused or sealed v2 release left its private copy behind: $(ls "$V2P/tmp")"
+rm -f "$V2P/sealed/release-authorization.pub"
+v2_refused "no sealed release key to verify under" "carries no release key"
+cp "$V2P/test.pub" "$V2P/sealed/release-authorization.pub"
+echo "  v2 release pair (producer): sealed after the source, joint, exclusive, signature verified under the sealed key, bound to the target and hardware"
+
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
 
@@ -1187,6 +1498,103 @@ grep -q "neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${r
   || fail "the inspector did not surface the sealed digest-pinned appliance image"
 grep -q 'neuralice.mirror=bench.example.test:5000' "$TMP/inspect-registry.out" \
   || fail "the inspector did not surface the sealed mirror transport"
+
+# 🔴 THE v2 RELEASE PAIR ON A REAL SIGNED MEDIUM (mission B, T3a). An
+# owner-sealed v2 medium seals the SHA-256 of the release manifest and of its
+# detached signature on a medium source, and carries both on the ESP at
+# ice-coreos/v2-release-manifest.json(.sig). It must be ACCEPTED, and each way
+# the mutable ESP can disagree with the signed line must be refused: a swapped
+# manifest (another correctly signed release), a swapped signature, a pin with no
+# file, a file with no pin -- and the pair beside the v1 authorization pair.
+python3 - "$TMP/v2-manifest.json" "$TMP/v2-manifest.json.sig" <<'PYEOF'
+import sys
+
+for index, path in enumerate(sys.argv[1:]):
+    with open(path, "wb") as handle:
+        handle.write(f"neural-ice v2 release fixture artefact {index}\n".encode())
+PYEOF
+v2_manifest_sha="$(sha256sum "$TMP/v2-manifest.json" | awk '{print $1}')"
+v2_manifest_sig_sha="$(sha256sum "$TMP/v2-manifest.json.sig" | awk '{print $1}')"
+v2_pair="neuralice.v2rel_sha256=${v2_manifest_sha} neuralice.v2rel_sig_sha256=${v2_manifest_sig_sha}"
+# The produced order (build-installer-usb.sh: ... imgref, pcr_policy*, source, pair):
+# the renderer refuses a pair anywhere but right after the medium source, so the
+# fixture states the pair where the producer puts it.
+v2_install_head="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS neuralice.release_authority=release.example.test neuralice.imgref=release.example.test/neural-ice/neural-ice-coreos@${registry_digest}"
+v2_install_line="$v2_install_head neuralice.source=medium"
+v2_esp_files=(
+  "::/ice-coreos/v2-release-manifest.json=$TMP/v2-manifest.json"
+  "::/ice-coreos/v2-release-manifest.json.sig=$TMP/v2-manifest.json.sig"
+)
+build_uki installer-v2rel "$v2_install_line $v2_pair" >/dev/null \
+  || fail "the v2 release medium UKI failed to build"
+make_esp "$SEALED/installer-v2rel.efi" "$SEALED/installer-v2rel.efi.manifest" \
+  installer-install.efi.manifest "${v2_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect --expect-v2-release-manifest-sha256 "$v2_manifest_sha" \
+  --expect-v2-release-manifest-sig-sha256 "$v2_manifest_sig_sha" >"$TMP/inspect-v2rel.out" \
+  || { cat "$TMP/inspect-v2rel.out"; fail "a correctly sealed v2 release medium was refused"; }
+grep -q "neuralice.v2rel_sha256=${v2_manifest_sha}" "$TMP/inspect-v2rel.out" \
+  || fail "the inspector did not surface the sealed v2 manifest pin"
+inspect >/dev/null 2>&1 \
+  || fail "a v2 release medium was refused when the producer stated no v2 expectation"
+# An approved pair the line does not seal, and a sealed pair nobody approved.
+inspect --expect-v2-release-manifest-sha256 "$(printf 'x' | sha256sum | awk '{print $1}')" \
+  --expect-v2-release-manifest-sig-sha256 "$v2_manifest_sig_sha" >/dev/null 2>&1 \
+  && fail "a v2 medium sealing another manifest than the approved one was accepted"
+inspect --expect-no-v2-release >/dev/null 2>&1 \
+  && fail "a v2 medium nobody approved was accepted"
+# The pin is a real comparison: swap the manifest on the ESP, the UKI untouched.
+printf 'a substituted but correctly signed v2 release manifest\n' > "$TMP/v2-manifest-swapped.json"
+make_esp "$SEALED/installer-v2rel.efi" "$SEALED/installer-v2rel.efi.manifest" \
+  installer-install.efi.manifest \
+  "::/ice-coreos/v2-release-manifest.json=$TMP/v2-manifest-swapped.json" \
+  "::/ice-coreos/v2-release-manifest.json.sig=$TMP/v2-manifest.json.sig"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a v2 medium whose ESP manifest was swapped after the cut was accepted"
+make_esp "$SEALED/installer-v2rel.efi" "$SEALED/installer-v2rel.efi.manifest" \
+  installer-install.efi.manifest \
+  "::/ice-coreos/v2-release-manifest.json=$TMP/v2-manifest.json" \
+  "::/ice-coreos/v2-release-manifest.json.sig=$TMP/relauth.sig"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a v2 medium whose ESP signature was swapped after the cut was accepted"
+# A pin with no file would refuse itself at install time; a file with no pin is
+# an artefact anybody can replace.
+make_esp "$SEALED/installer-v2rel.efi" "$SEALED/installer-v2rel.efi.manifest" \
+  installer-install.efi.manifest "::/ice-coreos/v2-release-manifest.json=$TMP/v2-manifest.json"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a v2 medium missing the signature its UKI pins was accepted"
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest "${v2_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "an unpinned v2 release pair on the ESP was accepted"
+# The pair beside the v1 authorization pair is two routes for one floor. The
+# renderer refuses to cut such a line at all...
+build_uki installer-v2rel-with-relauth "$v2_install_line $v2_pair ${registry_relauth}" >/dev/null 2>&1 \
+  && fail "the UKI renderer sealed the v2 pair beside the authorization pair"
+# ...and so does a pair on a registry source, and a pair that is not right after
+# the medium source (its position is a contract the grammar readers cannot see).
+build_uki installer-v2rel-registry \
+  "${v2_install_head} neuralice.source=registry neuralice.osimage=release.example.test/neural-ice/neural-ice-coreos@${registry_digest} $v2_pair" >/dev/null 2>&1 \
+  && fail "the UKI renderer sealed the v2 pair on a registry source"
+build_uki installer-v2rel-before-source "$v2_install_head $v2_pair neuralice.source=medium" >/dev/null 2>&1 \
+  && fail "the UKI renderer sealed the v2 pair BEFORE neuralice.source=medium"
+build_uki installer-v2rel-after-seed \
+  "$v2_install_line neuralice.seed_closure=$(printf 'd%.0s' {1..64}) $v2_pair" >/dev/null 2>&1 \
+  && fail "the UKI renderer sealed the v2 pair after an offline seed token"
+# A medium whose line was rendered in the produced order, seed tokens after the
+# pair, is the one the inspector accepts (the grammar admits the seed beside it).
+build_uki installer-v2rel-seed \
+  "$v2_install_line $v2_pair neuralice.seed_closure=$(printf 'd%.0s' {1..64}) neuralice.seed_trusted_now=2026-10-06T10:00:00Z" >/dev/null \
+  || fail "the produced order (source, pair, seed tokens) was refused by the UKI renderer"
+# Restore the good registry medium for the assertions that follow.
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest "${registry_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+echo "  v2 release pair: accepted sealed, refused swapped / unpinned / unsealed / misplaced / beside the authorization pair"
 
 # FINAL MEASUREMENTS ARE FROM THE ACCEPTED BYTES, NOT THE BUILD INPUTS. Ask the
 # real inspector to publish them, then independently parse the PE section table
@@ -1885,6 +2293,58 @@ media_inspect_line="$(grep -n 'python3 "$REPO_ROOT/image/inspect-installer-media
    && "$uki_build_line" -lt "$preseal_install_line" \
    && "$preseal_install_line" -lt "$media_inspect_line" ]] \
   || fail "the producer does not snapshot, UKI-bind, stage and independently inspect preseal evidence in order"
+
+# 🔴 THE v2 RELEASE PAIR IS ON THE PATH, IN ORDER (mission B, T3a). A sealing
+# function nothing calls is a medium that silently carries no v2 pin: the early
+# shape check must precede the long image build, the seal must follow the medium
+# source in the kargs, the ESP staging must precede the inspection that reads the
+# pair back, and the inspector must be asked for exactly the staged hashes.
+grep -Fq 'V2_RELEASE_MANIFEST="${V2_RELEASE_MANIFEST:-}"' "$USB" \
+  || fail "the media producer takes no V2_RELEASE_MANIFEST input"
+grep -Fq 'V2_RELEASE_MANIFEST_SIG="${V2_RELEASE_MANIFEST_SIG:-}"' "$USB" \
+  || fail "the media producer takes no V2_RELEASE_MANIFEST_SIG input"
+v2_early_line="$(grep -nx 'assert_v2_release_inputs' "$USB" | head -1 | cut -d: -f1)"
+v2_image_build_line="$(grep -n 'ni_step "build installer image' "$USB" | head -1 | cut -d: -f1)"
+v2_source_line="$(grep -n 'UKI_KARGS+=("neuralice.source=medium")' "$USB" | head -1 | cut -d: -f1)"
+v2_seal_line="$(grep -nx '          seal_v2_release_kargs' "$USB" | head -1 | cut -d: -f1)"
+v2_uki_line="$(grep -n 'bash "$REPO_ROOT/image/build-installer-uki.sh"' "$USB" | head -1 | cut -d: -f1)"
+v2_stage_line="$(grep -n 'ice-coreos/v2-release-manifest.json"$' "$USB" | head -1 | cut -d: -f1)"
+v2_inspect_line="$(grep -n 'python3 "$REPO_ROOT/image/inspect-installer-media.py"' "$USB" | head -1 | cut -d: -f1)"
+[[ -n "$v2_early_line" && -n "$v2_image_build_line" && -n "$v2_source_line" && -n "$v2_seal_line" \
+   && -n "$v2_uki_line" && -n "$v2_stage_line" && -n "$v2_inspect_line" \
+   && "$v2_early_line" -lt "$v2_image_build_line" && "$v2_source_line" -lt "$v2_seal_line" \
+   && "$v2_seal_line" -lt "$v2_uki_line" && "$v2_uki_line" -lt "$v2_stage_line" \
+   && "$v2_stage_line" -lt "$v2_inspect_line" ]] \
+  || fail "the producer does not check, seal (after the medium source), UKI-bind, stage and inspect the v2 release pair in order"
+# The content rules and the signature are judged BEFORE the image build (review 240,
+# P3-3): the base image is local after the pull, the key is read out of it, and the
+# build of the installer image comes after.
+v2_base_verify_line="$(grep -nx 'verify_v2_release_against_base_image' "$USB" | head -1 | cut -d: -f1)"
+v2_installer_build_line="$(grep -n 'sudo podman build --pull=never --platform linux/arm64' "$USB" | head -1 | cut -d: -f1)"
+[[ -n "$v2_base_verify_line" && -n "$v2_installer_build_line" \
+   && "$v2_early_line" -lt "$v2_base_verify_line" && "$v2_base_verify_line" -lt "$v2_installer_build_line" ]] \
+  || fail "the producer does not verify the v2 release signature before building the installer image"
+# The position of the pair on the produced line (contract section 11): nothing
+# else is appended between the medium source and the pair, and the offline seed
+# tokens come after it. The renderer refuses any other order at build time
+# (test-installer-trust.sh); this is the producer's side of the same statement.
+v2_seed_line="$(grep -n '^        seal_offline_seed_kargs medium$' "$USB" | head -1 | cut -d: -f1)"
+[[ -n "$v2_seed_line" && "$v2_seal_line" -lt "$v2_seed_line" ]] \
+  || fail "the producer seals the offline seed tokens before the v2 release pair"
+! sed -n "$(( v2_source_line + 1 )),$(( v2_seal_line - 1 ))p" "$USB" | grep -Fq 'UKI_KARGS+=' \
+  || fail "the producer appends a karg between neuralice.source=medium and the v2 release pair"
+grep -Fq 'ice-coreos/v2-release-manifest.json.sig"' "$USB" \
+  || fail "the producer stages no v2 release signature on the ESP"
+grep -Fq '"$V2_RELEASE_PRIVATE_DIR/release-manifest.json" "$MNT/ice-coreos/v2-release-manifest.json"' "$USB" \
+  || fail "the producer stages the v2 manifest from its source path, not from the private copy it validated"
+grep -Fq -- '--expect-v2-release-manifest-sha256 "$V2_RELEASE_MANIFEST_SHA256"' "$USB" \
+  || fail "the media producer does not have the inspector read the sealed v2 manifest hash back"
+grep -Fq -- '--expect-v2-release-manifest-sig-sha256 "$V2_RELEASE_MANIFEST_SIG_SHA256"' "$USB" \
+  || fail "the media producer does not have the inspector read the sealed v2 signature hash back"
+grep -Fq -- 'INSPECT_ARGS+=(--expect-no-v2-release)' "$USB" \
+  || fail "the media producer does not have the inspector refuse a v2 pin on a medium that approved none"
+grep -Fq 'a v2 release manifest requires INSTALL_SOURCE=medium' "$USB" \
+  || fail "the producer lets a registry medium take a v2 release manifest"
 
 HOOK="$ROOT/image/initramfs/90neural-ice-installer-verity/neural-ice-installer-verity.sh"
 [ -f "$HOOK" ] || fail "there is no initramfs hook to open the sealed payload"
