@@ -148,12 +148,20 @@ class World:
         self.rules = json.loads((FIX / "ni67.rules.json").read_text())
         self.min_sequence = 1
 
-    def sign(self, rules=None, key=None):
+    def sign(self, rules=None, key=None, through_tool=True):
+        """Write and sign the rules. `through_tool=False` signs with openssl directly, which
+        is how a hostile or buggy signer would produce rules the Owner's tool refuses."""
         self.rules_path = self.dir / "rules.json"
         self.rules_path.write_text(json.dumps(self.rules if rules is None else rules, indent=2) + "\n")
         self.sig_path = self.dir / "rules.json.sig"
-        result = run("sign", "--rules", self.rules_path, "--key", key or self.key, "--out", self.sig_path)
-        assert result.returncode == 0, result.stderr
+        if through_tool:
+            result = run("sign", "--rules", self.rules_path, "--key", key or self.key,
+                         "--out", self.sig_path)
+            assert result.returncode == 0, result.stderr
+        else:
+            sig = openssl("dgst", "-sha256", "-sign", key or self.key,
+                          stdin=b"neural-ice-pcr-rules/v1\0" + self.rules_path.read_bytes()).stdout
+            self.sig_path.write_text(base64.b64encode(sig).decode() + "\n")
 
     def args(self, command="evaluate", extra=()):
         a = [command, "--rules", self.rules_path, "--signature", self.sig_path, "--pubkey", self.pub,
@@ -265,7 +273,7 @@ class SchemaIsStrict(unittest.TestCase):
         w = World(self)
         rules = json.loads(json.dumps(w.rules))
         mutate(rules)
-        w.sign(rules)
+        w.sign(rules, through_tool=False)
         result = run(*w.args("verify"))
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("schema", result.stderr)
@@ -308,6 +316,15 @@ class SchemaIsStrict(unittest.TestCase):
 
     def test_oversized_rules_are_refused(self):
         self.refuse(lambda r: r.update(note="x" * (2 << 20)))
+
+    def test_the_owner_tool_refuses_to_sign_a_bad_document(self):
+        w = World(self)
+        w.rules["dbx_floor"] = []
+        w.rules_path = w.dir / "bad.json"
+        w.rules_path.write_text(json.dumps(w.rules))
+        result = run("sign", "--rules", w.rules_path, "--key", w.key, "--out", w.dir / "bad.sig")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((w.dir / "bad.sig").exists())
 
 
 class EvaluateRealGb10(unittest.TestCase):
