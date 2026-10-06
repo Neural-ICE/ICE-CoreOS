@@ -781,8 +781,9 @@ for packaged in \
   'bash -n /usr/libexec/neural-ice-v2-owner-seal.sh;' \
   '/usr/libexec/neural-ice-preseal-handoff --help' \
   'ni-ota-verify verify-preseal-baseline --set <path>' \
-  'printf '\''%s\n'\'' owner-sealed-ota-state-v1' \
-  '| cmp - /usr/lib/neural-ice/ota-state-profile'; do
+  'printf '\''%s\n'\'' owner-sealed-ota-state-v1 | cmp -s - /usr/lib/neural-ice/ota-state-profile' \
+  'printf '\''%s\n'\'' owner-sealed-ota-state-v2 | cmp -s - /usr/lib/neural-ice/ota-state-profile' \
+  "{ echo 'installer base carries an unsupported ota-state-profile' >&2; exit 1; }"; do
   grep -Fq -- "$packaged" "$INSTALLER_CF" \
     || fail "the installer image does not package and attest its preseal prerequisite: $packaged"
 done

@@ -278,8 +278,9 @@ RUN set -euxo pipefail; \
       test "$?" -eq 2; \
     fi; \
     grep -Fq 'ni-ota-verify verify-preseal-baseline --set <path>' <<<"$_ota_usage"; \
-    printf '%s\n' owner-sealed-ota-state-v1 \
-      | cmp - /usr/lib/neural-ice/ota-state-profile; \
+    { printf '%s\n' owner-sealed-ota-state-v1 | cmp -s - /usr/lib/neural-ice/ota-state-profile \
+      || printf '%s\n' owner-sealed-ota-state-v2 | cmp -s - /usr/lib/neural-ice/ota-state-profile; } \
+      || { echo 'installer base carries an unsupported ota-state-profile' >&2; exit 1; }; \
     /usr/libexec/neural-ice-preseal-handoff --help \
       | grep -Fq 'snapshot-persistent'; \
     /usr/lib/neural-ice/tpm-policy.py verify-live-coverage --help \
