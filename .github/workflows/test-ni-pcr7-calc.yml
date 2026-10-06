@@ -1,0 +1,40 @@
+name: test-ni-pcr7-calc
+
+# Offline PCR 7 calculator (tools/ni-pcr7-calc): stdlib-only Python, no TPM and no
+# secret. It reuses the event-log parser of ota/neural-ice-tpm-policy.py, so a
+# change to that file re-runs this suite. The fixtures are PCR-7-only derivatives
+# of the event logs of two physical GB10 machines.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/ni-pcr7-calc/**'
+      - 'ota/neural-ice-tpm-policy.py'
+      - '.github/workflows/test-ni-pcr7-calc.yml'
+  pull_request:
+    paths:
+      - 'tools/ni-pcr7-calc/**'
+      - 'ota/neural-ice-tpm-policy.py'
+      - '.github/workflows/test-ni-pcr7-calc.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: test-ni-pcr7-calc-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Replay and compute PCR 7 against the real GB10 event logs
+        run: python3 -I tools/ni-pcr7-calc/test-ni-pcr7-calc.py
