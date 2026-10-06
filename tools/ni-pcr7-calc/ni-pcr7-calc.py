@@ -282,8 +282,9 @@ def _authority_entry(data, where):
         except UnicodeDecodeError as error:
             raise Pcr7Error(f"{where}: SbatLevel is not UTF-8") from error
     else:
-        if len(payload) <= 16:
-            raise Pcr7Error(f"{where}: authority {name} holds no certificate")
+        if len(payload) <= 16 or payload[16] != 0x30:
+            raise Pcr7Error(f"{where}: authority {name} is not an owner GUID followed by "
+                            "a DER certificate (SEQUENCE); not modelled")
         entry["signature_owner"] = str(uuid.UUID(bytes_le=payload[:16]))
         entry["cert_der_hex"] = payload[16:].hex()
     return entry
@@ -321,11 +322,11 @@ def live_pcr7():
 # --- command line -----------------------------------------------------------
 
 def _expected(args):
-    if args.expect and args.live:
+    if args.expect is not None and args.live:
         raise Pcr7Error("give --expect or --live, not both")
     if args.live:
         return live_pcr7()
-    if args.expect:
+    if args.expect is not None:
         value = _hex(args.expect, "--expect")
         if len(value) != 32:
             raise Pcr7Error("--expect must be 64 hex characters")
@@ -343,7 +344,10 @@ def cmd_compute(args):
     reference = json.loads(pathlib.Path(args.reference).read_text())
     append = {}
     for item in args.append_esl or []:
-        name, _, value = item.partition("=")
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise Pcr7Error(f"--append-esl expects VAR=HEX, got {item!r}")
+        _hex(value, f"--append-esl {name}")
         append[name] = value
     result = compute(reference, args.variable_measurement, append)
     if append and result.measurement == "names-only":

@@ -1,7 +1,7 @@
 # ni-pcr7-calc — offline PCR 7 calculator
 
 Computes the TPM PCR 7 (sha256 bank) a GB10 boot produces **without the machine**,
-from a reference description, and proves itself against a real event log. Python 3
+from a reference description, and checks itself against a real event log. Python 3
 standard library only. The TCG2 parser and the PCR replay are the ones the installer
 ships (`ota/neural-ice-tpm-policy.py`), imported, not copied.
 
@@ -10,7 +10,7 @@ T=tools/ni-pcr7-calc/ni-pcr7-calc.py
 python3 -I $T replay   LOG [--expect HEX | --live] [--explain]   # PCR 7 from a TCG2 event log
 python3 -I $T extract  LOG [--out ref.json]                      # reference description from a log
 python3 -I $T compute  ref.json [--explain] [--policy-digest]    # PCR 7 from a description
-python3 -I $T verify   LOG --expect HEX | --live                 # replay == compute(extract) == live
+python3 -I $T verify   LOG --expect HEX | --live                 # replay == compute(extract) == live (the second equality is an encoding round-trip)
 python3 -I $T filter-log LOG --out small.bin [--pcr 7]           # keep one PCR's events (redaction)
 ```
 
@@ -46,7 +46,7 @@ GX10 firmware `GX10DGX.0104`) the `SecureBoot`, `PK`, `KEK`, `db` and `dbx` even
 contents. Their digests are identical on both machines although the variables differ.
 So on that firmware **PK/KEK/db/dbx updates do not move PCR 7**; what moves it is the
 authority chain (which db certificate verified shim, shim's `SbatLevel`, the vendor
-certificate) and the Secure Boot on/off state through the presence of authority events.
+certificate). Secure Boot *disabled* (no authority events) is not covered by any fixture.
 `variable_measurement: "contents"` (TCG PC Client, EDK2) is implemented but **not
 proven on any GB10**; use `compute --variable-measurement contents` only as a what-if.
 

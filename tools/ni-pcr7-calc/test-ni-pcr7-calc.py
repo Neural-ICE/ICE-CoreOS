@@ -12,6 +12,8 @@ import pathlib
 import struct
 import subprocess
 import sys
+import os
+import stat
 import tempfile
 import unittest
 import uuid
@@ -216,7 +218,7 @@ class VariableSynthesis(unittest.TestCase):
 
 class Refusals(unittest.TestCase):
     def test_truncated_log_is_refused(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(pcr7.policy.EventLogError):
             pcr7.replay_log(log_bytes("ni67")[:-7])
 
     def test_log_whose_digest_is_not_the_hash_of_its_data_is_refused_by_extract(self):
@@ -240,7 +242,7 @@ class Refusals(unittest.TestCase):
     def test_log_without_pcr7_events_is_refused(self):
         blob = log_bytes("ni67")
         header = blob[:32 + struct.unpack_from("<I", blob, 28)[0]]
-        with self.assertRaises(Exception):
+        with self.assertRaises(pcr7.policy.EventLogError):
             pcr7.replay_log(header)
 
 
@@ -256,7 +258,53 @@ class FilterLog(unittest.TestCase):
         self.assertNotIn(b"secret", filtered)
 
 
+class EslEncoding(unittest.TestCase):
+    def test_esl_append_writes_one_signature_list_of_the_right_size(self):
+        entry = "00" * 16 + "11" * 32  # owner GUID + SHA-256 hash
+        esl = bytes.fromhex(pcr7.esl_append("", entry))
+        self.assertEqual(esl[:16], uuid.UUID("c1c41626-504c-4092-aca9-41f936934328").bytes_le)
+        list_size, header_size, sig_size = struct.unpack_from("<III", esl, 16)
+        self.assertEqual((list_size, header_size, sig_size), (28 + 48, 0, 48))
+        self.assertEqual(esl[28:], bytes.fromhex(entry))
+        self.assertEqual(len(esl), list_size)
+
+    def test_a_second_append_concatenates_lists(self):
+        entry = "00" * 16 + "11" * 32
+        once = pcr7.esl_append("", entry)
+        self.assertEqual(pcr7.esl_append(once, entry), once + once)
+
+
 class CommandLine(unittest.TestCase):
+    def test_an_empty_expected_value_is_refused_not_ignored(self):
+        for command in ("replay", "verify"):
+            with self.subTest(command=command):
+                r = cli(command, str(FIX / "ni67.pcr7-only.eventlog.bin"), "--expect", "")
+                self.assertEqual(r.returncode, 1)
+
+    def test_replay_mismatch_exits_1(self):
+        r = cli("replay", str(FIX / "ni67.pcr7-only.eventlog.bin"),
+                "--expect", live("ni63").hex())
+        self.assertEqual(r.returncode, 1)
+
+    def test_append_esl_needs_var_equals_hex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "ref.json"
+            cli("extract", str(FIX / "ni67.pcr7-only.eventlog.bin"), "--out", str(out))
+            for bad in ("dbx", "dbx=zz", "=00"):
+                with self.subTest(bad=bad):
+                    self.assertEqual(cli("compute", str(out), "--append-esl", bad).returncode, 1)
+
+    def test_verify_live_reads_the_tpm_through_tpm2_pcrread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp) / "tpm2_pcrread"
+            fake.write_text("#!/bin/sh\nprintf '  sha256:\\n    7 : 0x%s\\n' "
+                            + live("ni67").hex().upper() + "\n")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}")
+            r = subprocess.run([sys.executable, "-I", str(TOOL), "verify",
+                                str(FIX / "ni67.pcr7-only.eventlog.bin"), "--live"],
+                               capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(r.returncode, 0, r.stderr)
     def test_verify_succeeds_when_both_proofs_hold(self):
         for host in HOSTS:
             with self.subTest(host=host):
