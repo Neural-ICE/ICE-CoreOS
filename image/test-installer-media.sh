@@ -870,6 +870,24 @@ PYEOF
   base64 -w0 < "$dir/sig.der" > "$dir/sig"
   rm -f "$dir/sig.der"
 }
+# `sudo` and `podman` as the lifted producer functions call them: a sudo that runs
+# its command, and a podman that answers the one question the producer asks of the
+# base image (`run ... BASE_IMAGE cat <release key path>`) with a key file.
+mkdir -p "$V2P/bin"
+printf '#!/bin/sh\nexec "$@"\n' > "$V2P/bin/sudo"
+cat > "$V2P/bin/podman" <<'FAKEPODMAN'
+#!/bin/bash
+# run --rm --entrypoint '' <image> cat <path>
+if [ "${1:-}" = run ] && [ "${*: -2:1}" = cat ] \
+   && [ "${*: -1}" = /usr/lib/neural-ice/keys/release-authorization.pub ] \
+   && [ "${*: -3:1}" = "$BASE_IMAGE" ]; then
+  [ -f "$V2_BASE_KEY" ] || exit 1
+  exec cat -- "$V2_BASE_KEY"
+fi
+echo "unexpected podman call: $*" >&2
+exit 125
+FAKEPODMAN
+chmod +x "$V2P/bin/sudo" "$V2P/bin/podman"
 # Variables are consumed by the exact production functions sourced below.
 # shellcheck disable=SC2034
 v2_seal() { # [VAR=value …] -> runs the LIFTED producer function; prints the kargs it sealed
@@ -893,16 +911,9 @@ v2_seal() { # [VAR=value …] -> runs the LIFTED producer function; prints the k
     # EARLY=0 skips the two early steps to exercise the seal on its own.
     TMPDIR="$V2P/tmp"; mkdir -p "$TMPDIR"
     trap 'rm -rf -- "$V2_RELEASE_PRIVATE_DIR"' EXIT
+    PATH="$V2P/bin:$PATH"
     BASE_IMAGE="registry.example.test/neural-ice-test/base@sha256:$(printf 'e%.0s' {1..64})"
-    # shellcheck disable=SC2329 # invoked by the lifted producer function
-    sudo() { "$@"; }
-    # shellcheck disable=SC2329 # invoked through sudo by the lifted producer function
-    podman() {
-      [ "${1:-}" = run ] && [ "${*: -2:1}" = cat ] && [ "${*: -1}" = /usr/lib/neural-ice/keys/release-authorization.pub ] \
-        && [ "${*: -3:1}" = "$BASE_IMAGE" ] || { echo "unexpected podman call: $*" >&2; return 125; }
-      [ -f "$V2_BASE_KEY" ] || return 1
-      cat -- "$V2_BASE_KEY"
-    }
+    export BASE_IMAGE V2_BASE_KEY
     if [ "${EARLY:-1}" = 1 ]; then
       assert_v2_release_inputs || exit $?
       # A hook run once the files have been read: the source is rewritten HERE.
