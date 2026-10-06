@@ -2181,11 +2181,15 @@ try:
 except (OSError, ValueError, AssertionError, KeyError):
     refuse("verdict-malformed")
 
+# Several checks can fail together; the console gets the most specific class. The
+# "names only" refusal is last on purpose: a machine in setup mode logs its empty
+# PK/db the same way, and `secure-boot-state` is the better diagnosis.
+PRIORITY = ("state-unreadable", "rules-signature", "rules-schema", "rules-rollback", "rules-digest",
+            "eventlog-mismatch", "variables-contradict-log", "secure-boot-state", "variable-rule",
+            "authority-rule", "unbound-variables-refused", "verdict-malformed")
 if not accepted:
-    for check in checks:
-        if not check["ok"]:
-            refuse(SLUGS.get(check["name"], "verdict-malformed"))
-    refuse("verdict-malformed")
+    failed = {SLUGS.get(check["name"], "verdict-malformed") for check in checks if not check["ok"]}
+    refuse(next((slug for slug in PRIORITY if slug in failed), "verdict-malformed"))
 
 try:
     assert set(verdict) == {"accepted", "binding", "observed", "rules_sha256", "sequence", "checks"}

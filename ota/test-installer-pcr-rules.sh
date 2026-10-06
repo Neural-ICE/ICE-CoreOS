@@ -198,6 +198,12 @@ PY
 }
 expect_refusal setup-mode secure-boot-state \
   "PCR_RULES_EFIVARS=$(mutate_vars SetupMode 'b"\x01"')"
+# Two failures at once (strict rules on a names-only log AND setup mode): the most
+# specific class wins, so the operator is told about setup mode, not about names.
+expect_refusal setup-and-strict secure-boot-state "PCR_RULES_RUNTIME=$TMP/strict.rules.json" \
+  "PCR_RULES_SIGNATURE_RUNTIME=$TMP/strict.rules.json.sig" \
+  "PCR_RULES_DIGEST=$(sha256sum "$TMP/strict.rules.json" | awk '{print $1}')" \
+  "PCR_RULES_EFIVARS=$(mutate_vars SetupMode 'b"\x01"')"
 expect_refusal secure-boot-off secure-boot-state \
   "PCR_RULES_EFIVARS=$(mutate_vars SecureBoot 'b"\x00"')"
 expect_refusal pk-removed secure-boot-state \
