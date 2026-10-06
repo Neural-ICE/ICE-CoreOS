@@ -79,6 +79,7 @@ jobs:
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
               ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_AUTH_STATUS_V2_ROOT /tmp/target/release/ni-ota-verify
               # 🔴 THE SUITES RUN UNPRIVILEGED. The cosign test seam refuses a
               # root process (review 2026-09-02, P1), exactly as it must on an
               # appliance, so the container root that installed the toolchain
@@ -126,6 +127,7 @@ jobs:
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
               ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_AUTH_STATUS_V2_ROOT /tmp/target/release/ni-ota-verify
               # 🔴 THE SUITES RUN UNPRIVILEGED: the cosign test seam refuses a
               # root process (review 2026-09-02, P1). Build directories live
               # inside the container, so nothing the test user writes reaches
@@ -174,6 +176,7 @@ jobs:
               cargo build --release --locked
               ! grep -a -q NI_OTA_HARDWARE_TARGET_FILE /tmp/target/release/ni-ota-verify
               ! grep -a -q NI_OTA_COSIGN /tmp/target/release/ni-ota-verify
+              ! grep -a -q NI_OTA_AUTH_STATUS_V2_ROOT /tmp/target/release/ni-ota-verify
               # 🔴 THE SUITES RUN UNPRIVILEGED: the cosign test seam refuses a
               # root process (review 2026-09-02, P1). Build directories live
               # inside the container, so nothing the test user writes reaches

@@ -986,6 +986,19 @@ pub(crate) fn snapshot(
     label: &str,
     maximum: u64,
 ) -> Result<Result<SecureTempFile, String>, InternalError> {
+    match read_source(source, label, maximum)? {
+        Ok(bytes) => store.secure_temp_bytes(label, &bytes).map(Ok),
+        Err(reason) => Ok(Err(reason)),
+    }
+}
+
+/// One bounded, stable read of a regular non-symlink file into memory. It needs
+/// no state directory, so a caller can judge the bytes before it needs one.
+pub(crate) fn read_source(
+    source: &Path,
+    label: &str,
+    maximum: u64,
+) -> Result<Result<Vec<u8>, String>, InternalError> {
     let named = match std::fs::symlink_metadata(source) {
         Ok(metadata)
             if metadata.file_type().is_file()
@@ -1034,7 +1047,7 @@ pub(crate) fn snapshot(
             "{label} exceeds its {maximum}-byte read bound"
         )));
     }
-    store.secure_temp_bytes(label, &bytes).map(Ok)
+    Ok(Ok(bytes))
 }
 
 fn parse_canonical_no_lf<T>(bytes: &[u8], what: &str) -> Result<T, String>

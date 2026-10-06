@@ -229,6 +229,11 @@ impl Receipt {
             self.seal.min_bundle_seq,
         ) {
             ("manifest-digest", Some(sealed), None) if hex64(sealed) => {}
+            ("floor", ..) if !FLOOR_SHIPPABLE => {
+                return Err(
+                    "seal mode floor is not shippable: its freshness object does not exist".into(),
+                )
+            }
             ("floor", None, Some(minimum)) if safe_seq(minimum) => {}
             _ => return Err("seal is not exactly one well-formed mode".into()),
         }
@@ -385,6 +390,13 @@ struct InitialInputs<'a> {
     receipt: &'a Path,
 }
 
+/// Mode floor authenticates a release by a minimum `bundle_seq` alone. Without
+/// the freshness object (T7 / OS-0044) that lets an older signed release replay
+/// on a generic installer, so the shipped binary refuses it. The test build
+/// keeps the path alive so that its rules (min-bundle-seq, receipt bytes) stay
+/// covered by the golden vectors until the object exists.
+const FLOOR_SHIPPABLE: bool = cfg!(feature = "test-path-overrides");
+
 enum SealMode<'a> {
     ManifestDigest {
         manifest: &'a str,
@@ -412,51 +424,55 @@ fn verify_initial(inputs: &InitialInputs<'_>) -> Check<(String, u64, bool)> {
             )
         }
     };
-    // 2. freshness is reserved: its schema is T7 / OS-0044 work.
+    // 2. freshness is reserved: its schema is T7 / OS-0044 work. Mode floor is
+    // the mode that needs it (a floor without a freshness object cannot tell a
+    // replay of an older signed release from the current one), so it is refused
+    // here too until that object exists.
     if inputs.freshness {
         return refuse(
             "freshness-unsupported",
             "--freshness and --freshness-sig are reserved in this contract version",
         );
     }
+    if matches!(mode, SealMode::Floor { .. }) && !FLOOR_SHIPPABLE {
+        return refuse(
+            "freshness-unsupported",
+            "mode floor needs the freshness object, which does not exist in this contract version: it is not shippable",
+        );
+    }
 
     let receipt_store = FileStateStore {
         path: inputs.receipt.to_path_buf(),
     };
-    if let Err(reason) = receipt_store.validate_bootstrap_parent() {
-        return refuse("receipt-conflict", reason);
-    }
-
+    // 3-4. Every input is read once, in memory, before the receipt directory is
+    // consulted: the digest rules precede `receipt-conflict` in the contract and
+    // need no state directory. The very bytes judged here are the ones later
+    // staged for the signature check.
+    let read = |source: &Path, label: &str, maximum: u64, class: &'static str| {
+        match crate::preseal::read_source(source, label, maximum)? {
+            Ok(bytes) => Ok(bytes),
+            Err(reason) => refuse(class, reason),
+        }
+    };
     // 3. key-digest
-    let key = snapshot(
-        &receipt_store,
-        inputs.release_key,
-        "release key",
-        MAX_KEY,
-        "key-digest",
-    )?;
-    let key_bytes = key.read()?;
+    let key_bytes: Vec<u8> = read(inputs.release_key, "release key", MAX_KEY, "key-digest")?;
     let key_sha256 = sha256_hex(&key_bytes);
     if !hex64(inputs.sealed_key_sha256) || key_sha256 != inputs.sealed_key_sha256 {
         return refuse("key-digest", "the release key is not the sealed one");
     }
     // 4. manifest-digest / sig-digest
-    let manifest = snapshot(
-        &receipt_store,
+    let manifest_bytes: Vec<u8> = read(
         inputs.manifest,
         "manifest",
         MAX_MANIFEST + 1,
         "manifest-digest",
     )?;
-    let signature = snapshot(
-        &receipt_store,
+    let signature_bytes: Vec<u8> = read(
         inputs.manifest_sig,
         "manifest signature",
         MAX_SIGNATURE,
         "sig-digest",
     )?;
-    let manifest_bytes = manifest.read()?;
-    let signature_bytes = signature.read()?;
     let manifest_sha256 = sha256_hex(&manifest_bytes);
     let manifest_sig_sha256 = sha256_hex(&signature_bytes);
     if let SealMode::ManifestDigest {
@@ -477,6 +493,15 @@ fn verify_initial(inputs: &InitialInputs<'_>) -> Check<(String, u64, bool)> {
             );
         }
     }
+    // The signature check needs private staged copies, and the receipt
+    // directory is where they live: it must be the trust boundary it claims to
+    // be before anything is staged there.
+    if let Err(reason) = receipt_store.validate_bootstrap_parent() {
+        return refuse("receipt-conflict", reason);
+    }
+    let key = receipt_store.secure_temp_bytes("release key", &key_bytes)?;
+    let manifest = receipt_store.secure_temp_bytes("manifest", &manifest_bytes)?;
+    let signature = receipt_store.secure_temp_bytes("manifest signature", &signature_bytes)?;
     // 5. signature, over the exact bytes of the manifest we hashed.
     verify_signature(&key, &signature, &manifest)?;
     // 6-8. strict JSON, schema, bundle_seq

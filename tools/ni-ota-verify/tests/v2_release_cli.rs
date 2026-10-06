@@ -790,6 +790,46 @@ fn the_receipt_directory_must_be_private() {
     assert!(!case.receipt().exists());
 }
 
+/// Contract §2 orders the digest rules before `receipt-conflict`: a sealed key
+/// or manifest that does not match is the refusal even when the receipt
+/// directory is also unusable.
+#[test]
+fn the_digest_rules_precede_receipt_conflict() {
+    let mut key = Case::golden("manifest-digest");
+    fs::set_permissions(key.path("out"), fs::Permissions::from_mode(0o755)).unwrap();
+    key.set("sealed-key-sha256", &"0".repeat(64));
+    let output = key.verify();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("v2 release REFUSED: key-digest:"),
+        "{}",
+        stderr(&output)
+    );
+
+    let mut manifest = Case::golden("manifest-digest");
+    fs::set_permissions(manifest.path("out"), fs::Permissions::from_mode(0o755)).unwrap();
+    manifest.set("sealed-manifest-sha256", &"1".repeat(64));
+    let output = manifest.verify();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("v2 release REFUSED: manifest-digest:"),
+        "{}",
+        stderr(&output)
+    );
+
+    // With every digest right, the unusable directory is the refusal.
+    let good = Case::golden("manifest-digest");
+    fs::set_permissions(good.path("out"), fs::Permissions::from_mode(0o755)).unwrap();
+    let output = good.verify();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("v2 release REFUSED: receipt-conflict:"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!good.receipt().exists());
+}
+
 // ---------------------------------------------------------------------------
 // verify-retained-v2-release
 // ---------------------------------------------------------------------------

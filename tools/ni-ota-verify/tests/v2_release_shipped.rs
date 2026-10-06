@@ -52,3 +52,50 @@ fn the_shipped_binary_names_no_v2_test_seam() {
         );
     }
 }
+
+/// Mode floor needs the freshness object (T7 / OS-0044), which does not exist:
+/// the shipped binary refuses it before it reads any input.
+#[test]
+fn the_shipped_binary_refuses_mode_floor_until_the_freshness_object_exists() {
+    let output = Command::new(BINARY)
+        .args(["verify-v2-release"])
+        .args([
+            "--manifest",
+            "/nonexistent/m",
+            "--manifest-sig",
+            "/nonexistent/s",
+            "--release-key",
+            "/nonexistent/k",
+            "--sealed-key-sha256",
+            &"0".repeat(64),
+            "--sealed-min-bundle-seq",
+            "1",
+            "--hardware-target",
+            "t",
+            "--access-profile",
+            "p",
+            "--trust-policy-id",
+            "i",
+            "--variant",
+            "sealed-lab",
+            "--release-authority",
+            "a",
+            "--candidate-root",
+            "/nonexistent/r",
+            "--host-index-digest",
+            &format!("sha256:{}", "0".repeat(64)),
+            "--host-manifest-digest",
+            &format!("sha256:{}", "0".repeat(64)),
+            "--receipt",
+            "/nonexistent/receipt",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(
+        stderr.contains("v2 release REFUSED: freshness-unsupported:"),
+        "{stderr}"
+    );
+}

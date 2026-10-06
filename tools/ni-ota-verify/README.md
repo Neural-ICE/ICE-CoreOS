@@ -636,6 +636,11 @@ ni-ota-verify verify-retained-v2-release --manifest F --manifest-sig F --release
 
 * Exit **0** pass, **1** refusal (`ni-ota-verify: v2 release REFUSED: <class>: <detail>`),
   **2** usage or tooling failure. No clock is read.
+* **Mode floor is not shippable yet.** Without the freshness object (T7 / OS-0044) a
+  floor lets an older signed release replay on a generic installer, so the shipped
+  binary refuses `--sealed-min-bundle-seq` with `freshness-unsupported`, and refuses a
+  floor receipt as well. The `test-path-overrides` build keeps the path so the golden
+  vectors still cover it.
 * The signature is the pinned `cosign verify-blob` over the exact manifest bytes
   (no envelope, no domain prefix, no canonicalisation, **no low-S pre-filter**: a
   KMS signature need not be low-S, and the golden one is not). Digests are in-process.
