@@ -359,5 +359,168 @@ class CommandLine(unittest.TestCase):
             self.assertIn("data_hex", r.stderr)
 
 
+def first_pcr7_event_offset(blob):
+    return 32 + struct.unpack_from("<I", blob, 28)[0]
+
+
+class ReplayBindsEventData(unittest.TestCase):
+    """`replay --expect` must not accept a log whose event DATA was altered:
+    the logged digest is only trusted once it is H(data)."""
+
+    def flipped_data(self, host):
+        # The last byte of the log is the last byte of the last event's data.
+        blob = bytearray(log_bytes(host))
+        blob[-1] ^= 0x01
+        return bytes(blob)
+
+    def test_replay_refuses_data_that_is_not_the_logged_digest_preimage(self):
+        for host in HOSTS:
+            with self.subTest(host=host):
+                with self.assertRaises(pcr7.Pcr7Error):
+                    pcr7.replay_log(self.flipped_data(host))
+
+    def test_replay_expect_exits_1_on_altered_event_data(self):
+        for host in HOSTS:
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "log.bin"
+                path.write_bytes(self.flipped_data(host))
+                r = cli("replay", str(path), "--expect", live(host).hex())
+                self.assertEqual(r.returncode, 1)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_every_data_byte_of_every_event_is_bound(self):
+        blob = log_bytes("ni67")
+        events = pcr7.policy.parse_eventlog(blob)
+        # Walk the log to find each event's data span, flip one bit in each.
+        off, spans = first_pcr7_event_offset(blob), []
+        for ev in events:
+            off += 12 + len(ev["digests"]) * 34 + 4
+            spans.append((off, off + len(ev["data"])))
+            off += len(ev["data"])
+        self.assertEqual(off, len(blob))
+        for start, end in spans:
+            for position in (start, (start + end) // 2, end - 1):
+                mutated = bytearray(blob)
+                mutated[position] ^= 0x80
+                with self.subTest(position=position), self.assertRaises(pcr7.Pcr7Error):
+                    pcr7.replay_log(bytes(mutated))
+
+    def test_the_event_type_is_not_bound_by_replay_but_verify_refuses_it(self):
+        # Documented limit: a digest hashes the event data only, so the event
+        # TYPE (and the PCR index) of a PCR 7 event is not bound by replay.
+        blob = bytearray(log_bytes("ni67"))
+        blob[first_pcr7_event_offset(blob) + 4] ^= 0x01  # type 0x80000001 -> 0x80000000
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "log.bin"
+            path.write_bytes(bytes(blob))
+            self.assertEqual(cli("replay", str(path), "--expect", live("ni67").hex()).returncode, 0)
+            self.assertEqual(cli("verify", str(path), "--expect", live("ni67").hex()).returncode, 1)
+
+
+class HeaderIsValidated(unittest.TestCase):
+    def mutated(self, offset, bit=0x01):
+        blob = bytearray(log_bytes("ni67"))
+        blob[offset] ^= bit
+        return bytes(blob)
+
+    def test_the_spec_id_header_fields_that_matter_are_checked(self):
+        blob = log_bytes("ni67")
+        header_len = first_pcr7_event_offset(blob)
+        # legacy record pcr, type, the 20-byte digest, then the spec-id signature,
+        # spec major version, algorithm count and the listed algorithm id/size.
+        offsets = [0, 4, 8, 27, 32, 47, 32 + 21, 32 + 24, 32 + 28, 32 + 30, header_len - 1]
+        for offset in offsets:
+            with self.subTest(offset=offset):
+                with self.assertRaises((pcr7.Pcr7Error, pcr7.policy.EventLogError)):
+                    pcr7.replay_log(self.mutated(offset))
+
+    def test_a_clean_header_still_replays(self):
+        for host in HOSTS:
+            self.assertEqual(pcr7.replay_log(log_bytes(host)), live(host))
+
+
+class Limits(unittest.TestCase):
+    def test_the_signature_owner_of_an_authority_is_an_input_of_pcr7(self):
+        # It is logged, not derivable from the certificate: a prediction must be
+        # given it (it comes from the log of a machine that did the boot).
+        ref = pcr7.extract_reference(log_bytes("ni67"))
+        base = pcr7.compute(ref).pcr7
+        ref["authorities"][0]["signature_owner"] = str(uuid.uuid4())
+        self.assertNotEqual(pcr7.compute(ref).pcr7, base)
+
+    def test_names_only_logs_are_flagged_by_replay_verify_and_compute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "ref.json"
+            log = str(FIX / "ni67.pcr7-only.eventlog.bin")
+            cli("extract", log, "--out", str(out))
+            runs = (cli("replay", log, "--expect", live("ni67").hex()),
+                    cli("verify", log, "--expect", live("ni67").hex()),
+                    cli("compute", str(out)))
+            for r in runs:
+                with self.subTest(argv=r.args[3]):
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn("NOT evidence", r.stderr)
+                    self.assertIn("SecureBoot", r.stderr)
+                    self.assertIn("dbx", r.stderr)
+
+    def test_replay_without_expect_says_that_nothing_was_compared(self):
+        r = cli("replay", str(FIX / "ni67.pcr7-only.eventlog.bin"))
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("nothing was compared", r.stderr)
+
+
+class RobustInputs(unittest.TestCase):
+    def test_filter_log_of_a_too_short_log_is_refused_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for size in (0, 2, 31):
+                with self.subTest(size=size):
+                    src = pathlib.Path(tmp) / "short.bin"
+                    src.write_bytes(b"\x00" * size)
+                    r = cli("filter-log", str(src), "--out", str(pathlib.Path(tmp) / "o.bin"))
+                    self.assertEqual(r.returncode, 1)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_deeply_nested_json_is_refused_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "deep.json"
+            bad.write_text("[" * 200000)
+            r = cli("compute", str(bad))
+            self.assertEqual(r.returncode, 1)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_duplicate_json_keys_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "ref.json"
+            cli("extract", str(FIX / "ni67.pcr7-only.eventlog.bin"), "--out", str(out))
+            text = out.read_text().replace('"boot_path"', '"boot_path": "custom", "boot_path"', 1)
+            dup = pathlib.Path(tmp) / "dup.json"
+            dup.write_text(text)
+            r = cli("compute", str(dup))
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("duplicate", r.stderr)
+
+    def test_a_misspelt_key_is_refused_not_defaulted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "ref.json"
+            cli("extract", str(FIX / "ni67.pcr7-only.eventlog.bin"), "--out", str(out))
+            ref = json.loads(out.read_text())
+            typo = dict(ref, separator_hexx=ref["separator_hex"])
+            del typo["separator_hex"]
+            for label, bad in (
+                    ("top-level", typo),
+                    ("authority", dict(ref, authorities=[dict(ref["authorities"][0],
+                                                              signature_ower="x")]
+                                       + ref["authorities"][1:])),
+                    ("variable", dict(ref, variables={**ref["variables"],
+                                                      "PK": {"guid": ref["variables"]["PK"]["guid"],
+                                                             "data_hexx": ""}}))):
+                with self.subTest(where=label):
+                    path = pathlib.Path(tmp) / f"{label}.json"
+                    path.write_text(json.dumps(bad))
+                    r = cli("compute", str(path))
+                    self.assertEqual(r.returncode, 1)
+                    self.assertIn("unknown key", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
