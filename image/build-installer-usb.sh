@@ -1323,8 +1323,14 @@ sealed_store_manifest_digest="$(sed -n 's/^store_image_manifest_digest=//p' "$SE
   || { echo "ERROR: the sealed installer root was built from image '${sealed_image_id:-nothing}', not ${INSTALLER_IMAGE_ID}" >&2; exit 1; }
 [[ "$sealed_store_image_id" == "$BASE_IMAGE_ID" ]] \
   || { echo "ERROR: the sealed image store holds image '${sealed_store_image_id:-nothing}', not original host ${BASE_IMAGE_ID}" >&2; exit 1; }
-[[ "$sealed_store_manifest_digest" == "$BASE_MANIFEST_DIGEST" ]] \
-  || { echo "ERROR: the sealed image store records manifest '${sealed_store_manifest_digest:-nothing}', not original host ${BASE_MANIFEST_DIGEST}" >&2; exit 1; }
+# An index BASE_IMAGE (podman reports the index digest) is staged as its one child of the store image; the sealed
+# manifest then names that index as the source the child was proved against (build-installer-root.sh).
+sealed_store_source_index="$(sed -n 's/^store_source_index_digest=//p' "$SEALED_ROOT_MANIFEST")"
+if [[ "$sealed_store_manifest_digest" != "$BASE_MANIFEST_DIGEST" ]]; then
+  [[ "$sealed_store_source_index" == "$BASE_MANIFEST_DIGEST" && "$sealed_store_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { echo "ERROR: the sealed image store records manifest '${sealed_store_manifest_digest:-nothing}', not original host ${BASE_MANIFEST_DIGEST}" >&2; exit 1; }
+  echo "    sealed store: child ${sealed_store_manifest_digest} of host index ${BASE_MANIFEST_DIGEST}"
+fi
 assert_installer_tag_unmoved "the sealed root and store build"
 assert_store_tag_unmoved "the sealed root and store build"
 SEALED_STORE_SHA256="$(sed -n 's/^store_image_sha256=//p' "$SEALED_ROOT_MANIFEST")"
