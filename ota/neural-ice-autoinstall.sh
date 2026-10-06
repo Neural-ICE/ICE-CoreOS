@@ -510,6 +510,35 @@ readonly PRESEAL_SET_SHA256
 if [[ -n "$PRESEAL_SET_SHA256" && ! "$PRESEAL_SET_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   die "this install medium carries a malformed signed preseal-set digest"
 fi
+
+# --------------------------------------------------------------------------- #
+# MISSION B (T3b): THE v2 RELEASE SEAL. An owner-sealed v2 host cannot ship the
+# v1 OTA authority a preseal set needs (docs/ota/V2-RELEASE-ATTESTATION.md). Its
+# medium instead seals the sha256 of the v2 release manifest and of its detached
+# signature -- the same pattern as neuralice.relauth_sha256/relauth_sig_sha256 --
+# and the files travel on the ESP. Both digests or neither; never together with a
+# preseal set (which already binds the authorisation pair) or the registry pair.
+# The grammar (image/installer) enforces the same rules; they are restated here
+# because this script is what destroys the disk.
+# --------------------------------------------------------------------------- #
+read_v2_release_seal() { # sets V2REL_SHA256, V2REL_SIG_SHA256, V2_SEAL_ACTIVE (0|1)
+  V2REL_SHA256="$(karg_once neuralice.v2rel_sha256)"
+  V2REL_SIG_SHA256="$(karg_once neuralice.v2rel_sig_sha256)"
+  V2_SEAL_ACTIVE=0
+  [[ -n "$V2REL_SHA256" || -n "$V2REL_SIG_SHA256" || "$(karg_count neuralice.v2rel_sha256)" != 0 \
+      || "$(karg_count neuralice.v2rel_sig_sha256)" != 0 ]] || return 0
+  [[ "$V2REL_SHA256" =~ ^[0-9a-f]{64}$ && "$V2REL_SIG_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "this install medium seals a malformed or incomplete v2 release attestation; both neuralice.v2rel_sha256 and neuralice.v2rel_sig_sha256 must be a lowercase sha256"
+  [[ "$V2REL_SHA256" != "$V2REL_SIG_SHA256" ]] \
+    || die "this medium seals one digest for both the v2 release manifest and its detached signature; that pins neither"
+  [[ -z "$PRESEAL_SET_SHA256" ]] \
+    || die "this medium seals both a preseal set and a v2 release attestation; a v2 host forbids the v1 preseal authority"
+  [[ "$(karg_count neuralice.relauth_sha256)" == 0 && "$(karg_count neuralice.relauth_sig_sha256)" == 0 ]] \
+    || die "this medium seals a v2 release attestation and also a registry release-authorization pair; the two lanes are exclusive"
+  V2_SEAL_ACTIVE=1
+}
+read_v2_release_seal
+readonly V2REL_SHA256 V2REL_SIG_SHA256 V2_SEAL_ACTIVE
 NEURALICE_BAKED_IMGREF="$(ni_path NEURALICE_BAKED_IMGREF /usr/lib/neural-ice/ota-imgref)"
 readonly NEURALICE_BAKED_IMGREF
 
@@ -783,6 +812,10 @@ PRESEAL_HANDOFF="$(ni_path PRESEAL_HANDOFF /usr/libexec/neural-ice-preseal-hando
 readonly PRESEAL_HANDOFF
 OTA_VERIFY="$(ni_path OTA_VERIFY /usr/bin/ni-ota-verify)"
 readonly OTA_VERIFY
+# Sourced only when the medium seals a v2 release (read_v2_release_seal): a v1
+# or registry medium never loads it, so its behaviour cannot depend on it.
+NEURALICE_V2_OWNER_SEAL="$(ni_path NEURALICE_V2_OWNER_SEAL /usr/libexec/neural-ice-v2-owner-seal.sh)"
+readonly NEURALICE_V2_OWNER_SEAL
 
 # The ONE signature-policy reader, and the file it reads. Both are fixed
 # production paths: the reader lives in the dm-verity-protected /usr the UKI
@@ -1009,6 +1042,109 @@ mounted_at() { # $1=device -> first mountpoint, or nothing
     | awk 'NR == 1 { first=$0 } END { if (first != "") print first }'
 }
 
+# 🔴 THE HOST-SIDE CANDIDATE PROBE, SHARED BY THE v1 BLOCK AND THE v2 LANE (mission
+# B, T3b). It used to live inline in the `registry || preseal` block below, so a
+# lane that is neither could not read its candidate without copying it. Moved
+# verbatim: a CREATED, NEVER STARTED container, not `image mount`. With the sealed
+# image store attached as an additional (read-only) store, the candidate's layers
+# are deduplicated into that store and `podman image mount` refuses with "layer
+# not known" (containers/storage looks the top layer up in the writable store
+# only; measured on the bench, podman 6.0.2, 2026-09-06). A container mount
+# resolves layers across every store, exactly like the pre-wipe medium probe
+# above, and executes nothing: no start, an entrypoint that does not exist, the
+# merged tree read by US.
+readonly _candidate_probe=neural-ice-candidate-probe
+candidate_probe_release() {
+  local rc=0
+  podman --cgroup-manager=cgroupfs --events-backend=file unmount "$_candidate_probe" >/dev/null 2>&1 || rc=1
+  podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || rc=1
+  return "$rc"
+}
+candidate_probe_open() { # reads $_candidate_image_ref -> sets _img_root, the merged tree (mounted until candidate_probe_release)
+  podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || true
+  podman --cgroup-manager=cgroupfs --events-backend=file create --pull=never --network=none --name "$_candidate_probe" \
+      --entrypoint /nonexistent "$_candidate_image_ref" >/dev/null 2>&1 \
+    || die "cannot stage the selected image for host-side inspection without executing it"
+  _img_root="$(podman --cgroup-manager=cgroupfs --events-backend=file mount "$_candidate_probe" 2>/dev/null)" \
+    || { candidate_probe_release || true; die "cannot inspect the selected image without executing it"; }
+  [[ -n "$_img_root" && -d "$_img_root" ]] \
+    || die "the selected image did not mount to a directory for host-side inspection"
+}
+_img_read() { # $1=path relative to the image root — a plain regular file, read by US
+  local path="$_img_root/$1"
+  [[ -f "$path" && ! -L "$path" ]] || return 0
+  # Bounded: a hostile image must not be able to hand the installer a gigabyte
+  # where a one-word marker belongs.
+  (( "$(wc -c < "$path")" <= 128 )) || return 0
+  tr -d '[:space:]' < "$path"
+}
+
+# MISSION B (T3b), PRE-WIPE. Reads the sealed v2 release pair off the ESP (each
+# file hashed against the digest the signed UKI seals, AFTER the copy), mounts the
+# candidate without executing it, and hands the whole question to
+# v2seal_preflight (ota/neural-ice-v2-owner-seal.sh), which runs
+# `ni-ota-verify verify-v2-release`. Nothing on the target disk has been touched
+# when this returns or refuses. The library has NO relaxed branch: a refusal is
+# final, and v2seal_on_refusal only routes it through this script's failure
+# surface (the evidence word, the recovery line) before the library exits 1.
+V2_WORK=/run/neural-ice-installer/v2-release
+v2seal_on_refusal() { # $1=message: called by the library just before it exits
+  candidate_probe_release >/dev/null 2>&1 || true
+  write_failure_evidence "$1" 2>/dev/null || true
+  log "FAILED in phase ${PHASE_ID}/${PHASE_TOTAL} (${PHASE_LABEL}) [${PHASE_CODE}]: v2 release attestation: $1"
+  log "RECOVERY: power off, clear the TPM at the firmware setup screen, then boot this same medium again"
+}
+v2_assert_candidate_lane() { # $1=the candidate's marker word (read by _img_read)
+  [[ "$1" == owner-sealed-ota-state-v2 ]] \
+    || { candidate_probe_release || true; die "this medium seals a v2 release attestation but the selected appliance declares the OTA-state profile '${1:-none}', not owner-sealed-ota-state-v2"; }
+  (( V2_SEAL_ACTIVE == 1 && PRESEAL_ACTIVE == 0 )) \
+    || { candidate_probe_release || true; die "the owner-sealed v2 appliance needs the sealed v2 release attestation and forbids a preseal transport"; }
+}
+v2_owner_seal_preflight() {
+  local relauth_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub" keyid
+  [[ "$INSTALL_SOURCE" == medium ]] \
+    || die "the v2 release attestation is a medium lane; this install source is '$INSTALL_SOURCE'"
+  [[ -r "$NEURALICE_V2_OWNER_SEAL" && -x "$OTA_VERIFY" && -x "$OTA_TPM_STATE" && -x "$TPM_STATE" ]] \
+    || die "this medium lacks the v2 owner-seal library, the release verifier, or the owner OTA-state helper"
+  [[ -f "$relauth_key" && ! -L "$relauth_key" ]] \
+    || die "the verified installer root carries no release-authorization public key"
+  keyid="$(sed -n 's/^neuralice\.relauth_keyid=//p' <<<"$SEALED_ANCHOR")"
+  [[ "$keyid" =~ ^[0-9a-f]{64}$ ]] \
+    || die "the sealed trust anchor carries no release-authorization key identity"
+  # shellcheck source=ota/neural-ice-v2-owner-seal.sh
+  source "$NEURALICE_V2_OWNER_SEAL"
+  rm -rf -- "$V2_WORK"; install -d -m 0700 "$V2_WORK"
+  esp_staged_file v2-release-manifest.json "$V2REL_SHA256" "$V2_WORK/release-manifest.json"
+  esp_staged_file v2-release-manifest.json.sig "$V2REL_SIG_SHA256" "$V2_WORK/release-manifest.json.sig"
+  _candidate_image_ref="$STORE_IMAGE_NAME"
+  candidate_probe_open
+  v2_assert_candidate_lane "$(_img_read usr/lib/neural-ice/ota-state-profile)"
+  V2SEAL_OTA_VERIFY="$OTA_VERIFY"
+  V2SEAL_MODE="manifest-digest"
+  V2SEAL_MANIFEST="$V2_WORK/release-manifest.json"
+  V2SEAL_MANIFEST_SIG="$V2_WORK/release-manifest.json.sig"
+  V2SEAL_RELEASE_KEY="$relauth_key"
+  V2SEAL_KEY_SHA256="$keyid"
+  V2SEAL_MANIFEST_SHA256="$V2REL_SHA256"
+  V2SEAL_MANIFEST_SIG_SHA256="$V2REL_SIG_SHA256"
+  V2SEAL_HARDWARE_TARGET="$SEALED_HARDWARE_TARGET"
+  V2SEAL_ACCESS_PROFILE="$SEALED_ACCESS_PROFILE"
+  V2SEAL_TRUST_POLICY_ID="$SEALED_TRUST_POLICY_ID"
+  V2SEAL_VARIANT="sealed-lab"
+  V2SEAL_RELEASE_AUTHORITY="$NEURALICE_RELEASE_AUTHORITY"
+  V2SEAL_CANDIDATE_ROOT="$_img_root"
+  V2SEAL_HOST_INDEX_DIGEST="${IMGREF##*@}"
+  V2SEAL_HOST_MANIFEST_DIGEST="$MEDIUM_IMAGE_DIGEST"
+  V2SEAL_WORK="$V2_WORK"
+  V2SEAL_RECEIPT="$V2_WORK/receipt.json"
+  v2seal_preflight
+  candidate_probe_release \
+    || die "cannot release the authenticated candidate image mount before disk mutation"
+  V2_BUNDLE_SEQ="$V2SEAL_BUNDLE_SEQ"
+  V2_PREFLIGHT_RECEIPT_SHA256="$V2SEAL_RECEIPT_SHA256"
+  log "v2 release attested before the wipe: bundle_seq=$V2_BUNDLE_SEQ receipt=$V2_PREFLIGHT_RECEIPT_SHA256 (manifest and signature sealed by the UKI, candidate markers and key verified, nothing written to the target disk)"
+}
+
 candidate_ota_state_profile() { # $1=mounted candidate root -> closed profile token
   local marker="$1/usr/lib/neural-ice/ota-state-profile"
   if [[ ! -e "$marker" && ! -L "$marker" ]]; then
@@ -1020,15 +1156,37 @@ candidate_ota_state_profile() { # $1=mounted candidate root -> closed profile to
     printf '%s\n' owner-sealed-ota-state-v1
     return 0
   fi
+  if cmp -s "$marker" <(printf '%s\n' owner-sealed-ota-state-v2); then
+    printf '%s\n' owner-sealed-ota-state-v2
+    return 0
+  fi
   return 1
 }
 
+# The marker names the ATTESTATION LANE (docs/ota/V2-RELEASE-ATTESTATION.md §1):
+# v1 = the preseal set, v2 = the sealed v2 release manifest. The two are
+# exclusive in both directions, and an unmarked image can take neither lane's
+# seal as a downgrade. `${V2_SEAL_ACTIVE:-0}`: absent means NOT sealed, so the
+# v1 and legacy arms behave exactly as before and the v2 arm fails closed.
 require_medium_source_profile() { # $1=closed candidate profile token
   case "$1" in
-    legacy-unmarked) return 0 ;;
+    legacy-unmarked)
+      [[ "${V2_SEAL_ACTIVE:-0}" == 0 ]] \
+        || die "the sealed medium seals a v2 release attestation but its appliance is an unmarked legacy image; refusing a silent downgrade"
+      return 0
+      ;;
     owner-sealed-ota-state-v1)
+      [[ "${V2_SEAL_ACTIVE:-0}" == 0 ]] \
+        || die "the sealed medium seals a v2 release attestation but its appliance is an owner-sealed v1 image; the lanes are exclusive"
       [[ -n "$PRESEAL_SET_SHA256" ]] \
         || die "the sealed medium contains an owner-sealed appliance but carries no authenticated preseal transport"
+      return 0
+      ;;
+    owner-sealed-ota-state-v2)
+      [[ "${V2_SEAL_ACTIVE:-0}" == 1 ]] \
+        || die "the sealed medium contains an owner-sealed v2 appliance but carries no sealed v2 release attestation"
+      [[ -z "${PRESEAL_SET_SHA256:-}" ]] \
+        || die "the owner-sealed v2 appliance forbids a preseal transport; the medium must seal only its v2 release attestation"
       return 0
       ;;
     *)
@@ -3153,8 +3311,15 @@ readonly PRESEAL_PREFLIGHT_CONFIG=/run/neural-ice-installer/preseal-verifier.con
 readonly PRESEAL_PREFLIGHT_RECEIPT="$PRESEAL_PREFLIGHT_STATE/preseal/receipt.json"
 PRESEAL_ACTIVE=0
 PRESEAL_BUNDLE_SEQ=""
+V2_BUNDLE_SEQ=""
+V2_PREFLIGHT_RECEIPT_SHA256=""
 AUTH_TARGET_REF=""
 AUTH_MANIFEST_DIGEST=""
+# The v2 seal is a MEDIUM lane: a registry install authenticates through the
+# release authorization instead, and a registry pull of a v2 candidate through
+# the block below is refused by its profile case.
+[[ "$V2_SEAL_ACTIVE" == 0 || "$INSTALL_SOURCE" == medium ]] \
+  || die "this medium seals a v2 release attestation but installs from a registry; the v2 lane installs the medium's own sealed image"
 if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
   _relauth_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
   [[ -f "$_relauth_key" && ! -L "$_relauth_key" ]] \
@@ -3367,38 +3532,9 @@ if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
   # likes for the rest, and every comparison below would then agree about a lie.
   # `podman image mount` exposes the merged filesystem to the HOST; the files are
   # read with the installer's own tools and not one byte of the candidate is
-  # executed.
-  # 🔴 A CREATED, NEVER STARTED container, not `image mount`. With the sealed
-  # image store attached as an additional (read-only) store, the candidate's
-  # layers are deduplicated into that store and `podman image mount` refuses
-  # with "layer not known" (containers/storage looks the top layer up in the
-  # writable store only; measured on the bench, podman 6.0.2, 2026-09-06). A
-  # container mount resolves layers across every store, exactly like the
-  # pre-wipe medium probe above, and executes nothing: no start, an entrypoint
-  # that does not exist, the merged tree read by US.
-  readonly _candidate_probe=neural-ice-candidate-probe
-  candidate_probe_release() {
-    local rc=0
-    podman --cgroup-manager=cgroupfs --events-backend=file unmount "$_candidate_probe" >/dev/null 2>&1 || rc=1
-    podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || rc=1
-    return "$rc"
-  }
-  podman --cgroup-manager=cgroupfs --events-backend=file rm -f "$_candidate_probe" >/dev/null 2>&1 || true
-  podman --cgroup-manager=cgroupfs --events-backend=file create --pull=never --network=none --name "$_candidate_probe" \
-      --entrypoint /nonexistent "$_candidate_image_ref" >/dev/null 2>&1 \
-    || die "cannot stage the selected image for host-side inspection without executing it"
-  _img_root="$(podman --cgroup-manager=cgroupfs --events-backend=file mount "$_candidate_probe" 2>/dev/null)" \
-    || { candidate_probe_release || true; die "cannot inspect the selected image without executing it"; }
-  [[ -n "$_img_root" && -d "$_img_root" ]] \
-    || die "the selected image did not mount to a directory for host-side inspection"
-  _img_read() { # $1=path relative to the image root — a plain regular file, read by US
-    local path="$_img_root/$1"
-    [[ -f "$path" && ! -L "$path" ]] || return 0
-    # Bounded: a hostile image must not be able to hand the installer a gigabyte
-    # where a one-word marker belongs.
-    (( "$(wc -c < "$path")" <= 128 )) || return 0
-    tr -d '[:space:]' < "$path"
-  }
+  # executed. (candidate_probe_open, defined above, is that mount: a CREATED,
+  # NEVER STARTED container, shared with the v2 lane.)
+  candidate_probe_open
   img_profile="$(_img_read usr/lib/neural-ice/access-policy)"
   img_variant="$(_img_read usr/lib/neural-ice/appliance-variant)"
   img_target="$(_img_read usr/lib/neural-ice/hardware-target)"
@@ -3430,6 +3566,14 @@ if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
     "")
       (( PRESEAL_ACTIVE == 0 )) \
         || { candidate_probe_release || true; die "the selected legacy appliance cannot consume this medium's owner-profile preseal inputs"; }
+      ;;
+    owner-sealed-ota-state-v2)
+      # A v2 appliance is installed only by the v2 lane (read from the medium,
+      # never through a registry pull or a preseal set). This block is entered
+      # for registry and preseal installs only, so reaching this arm means the
+      # lanes were mixed: refuse, naming the lane.
+      candidate_probe_release || true
+      die "the selected owner-sealed v2 appliance cannot be installed through the registry or preseal lane; it needs this medium's own sealed v2 release attestation"
       ;;
     *)
       candidate_probe_release || true
@@ -3467,10 +3611,16 @@ else
   # standing on and whose verity hash the UKI sealed. The proof is the anchor
   # itself, established above before anything was read out of that root.
   RELEASE_AUTH_VERIFIED_REF="$source_imgref"
+  # MISSION B (T3b): a v2 medium additionally authenticates its image against
+  # the sealed v2 release manifest, BEFORE the first destructive write.
+  if (( V2_SEAL_ACTIVE == 1 )); then
+    v2_owner_seal_preflight
+  fi
 fi
 readonly RELEASE_AUTH_VERIFIED_REF
 readonly AUTH_TARGET_REF AUTH_MANIFEST_DIGEST
 readonly PRESEAL_ACTIVE PRESEAL_BUNDLE_SEQ
+readonly V2_BUNDLE_SEQ V2_PREFLIGHT_RECEIPT_SHA256
 
 # The exact target is now fixed in local containers-storage. On registry
 # installs this point follows signed request authorization, pulled index/child
@@ -4958,6 +5108,24 @@ OWNER_OTA_INSPECTION_PY
   log "Owner-sealed OTA baseline authenticated before the wipe, reverified after deployment, and prepared for first boot."
 fi
 
+# MISSION B (T3b), POST-DEPLOYMENT. The v2 lane's twin of the block above: the
+# sealed manifest pair and its receipt are persisted into the stateroot, the
+# pair is re-authenticated against the DEPLOYED candidate, the receipt is
+# byte-compared with the pre-wipe one, and only then is the TPM floor prepared
+# (bundle_seq of the signed manifest) and inspected. Every TPM object, attribute
+# and the provisioning checkpoint are those of the v1 lane.
+if (( V2_SEAL_ACTIVE == 1 )); then
+  V2SEAL_TARGET_ROOT="$dep"
+  V2SEAL_TARGET_OTA_DIR="$ota_state"
+  V2SEAL_OTA_TPM_STATE="$OTA_TPM_STATE"
+  V2SEAL_TPM_STATE="$TPM_STATE"
+  v2seal_commit
+  [[ "$V2SEAL_BUNDLE_SEQ" == "$V2_BUNDLE_SEQ" && "$V2SEAL_RECEIPT_SHA256" == "$V2_PREFLIGHT_RECEIPT_SHA256" ]] \
+    || die "the v2 owner-seal commit changed the attested bundle_seq or receipt"
+  sync -f "$ota_state" || die "cannot fsync the complete installed v2 release state"
+  log "v2 release attested before the wipe, persisted and reverified after deployment, and the TPM floor prepared for first boot (bundle_seq=$V2_BUNDLE_SEQ)."
+fi
+
 # Publish each installer-created ceremony input atomically.  A power loss may
 # leave the temporary file, but can never leave a partial final input that the
 # first installed boot could mistake for a complete prerequisite set.
@@ -4991,6 +5159,13 @@ rm -f -- "$_intent_tmp"
 _sealed_identity_sha256="$(printf '%s' "$SEALED_ANCHOR" | sha256sum | awk '{print tolower($1)}')"
 if (( PRESEAL_ACTIVE == 1 )) || [[ "$INSTALL_SOURCE" == registry ]]; then
   _release_identity_sha256="$(sha256sum "$_auth_scratch/release-authorization.json" | awk '{print tolower($1)}')"
+elif (( V2_SEAL_ACTIVE == 1 )); then
+  # The sealed v2 manifest IS the release identity (contract §6: install_identity
+  # .release_identity_sha256 == v2_release.manifest_sha256), as the signed
+  # authorization document is on the lanes above.
+  _release_identity_sha256="$V2SEAL_RELEASE_IDENTITY_SHA256"
+  [[ "$_release_identity_sha256" == "$V2REL_SHA256" ]] \
+    || die "the v2 release identity is not the manifest this medium seals"
 else
   _release_identity_sha256="$(printf '%s\0%s' "$SEALED_ANCHOR" "$SEALED_PAYLOAD_DIGEST" | sha256sum | awk '{print tolower($1)}')"
 fi

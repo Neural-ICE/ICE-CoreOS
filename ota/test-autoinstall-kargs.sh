@@ -29,6 +29,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
   awk '/^karg_once\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^candidate_ota_state_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^require_medium_source_profile\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^read_v2_release_seal\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^verify_installed_preseal_candidate\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^encode_snapshotted_ssh_key\(\) \{/,/^}$/' "$AUTOINSTALL"
 } > "$TMP/reader.sh"
@@ -111,6 +112,109 @@ unset PRESEAL_SET_SHA256
 printf '%s\n' owner-sealed-ota-state-v1 malformed > "$medium_root/usr/lib/neural-ice/ota-state-profile"
 medium_attempt >/dev/null 2>&1 && fail "a malformed medium OTA-state profile was admitted"
 [[ ! -e "$destructive" ]] || fail "a malformed medium profile reached the destructive boundary"
+
+# --------------------------------------------------------------------------- #
+# MISSION B / T3b: THE v2 LANE (docs/ota/V2-RELEASE-ATTESTATION.md §1).
+#
+# An owner-sealed v2 host is built FROM this OS and therefore carries the image
+# marker owner-sealed-ota-state-v1 until its build overwrites it. Two real facts
+# are pinned here, each on the production helpers and each by its EXACT refusal
+# text (a bare "attempt failed" is how the case above passes for the wrong
+# reason: PRESEAL_SET_SHA256 is not even assigned there, so `set -u` ends it):
+#   RED 1  the v1 marker with no preseal is refused -- that refusal STAYS;
+#   RED 2  the v2 marker with a sealed v2 release must pass stage 1 -- today the
+#          closed profile set has no such token ("unsupported OTA-state profile").
+# --------------------------------------------------------------------------- #
+v2_root="$TMP/v2-medium-root"
+mkdir -p "$v2_root/usr/lib/neural-ice"
+# <marker content|ABSENT> <preseal sha or empty> <v2 seal 0|1> -> exit 0 only if
+# the synthetic destructive boundary is reached; refusal text goes to stderr.
+# The two assignments are consumed by the extracted production helpers inside this subshell.
+# shellcheck disable=SC2030
+v2_stage1() (
+  local marker=$1
+  PRESEAL_SET_SHA256=$2
+  V2_SEAL_ACTIVE=$3
+  rm -f "$destructive" "$v2_root/usr/lib/neural-ice/ota-state-profile"
+  if [[ "$marker" != ABSENT ]]; then
+    printf '%s\n' "$marker" > "$v2_root/usr/lib/neural-ice/ota-state-profile"
+  fi
+  profile="$(candidate_ota_state_profile "$v2_root")" || die "malformed OTA-state profile marker"
+  require_medium_source_profile "$profile"
+  : > "$destructive"
+)
+expect_refusal() { # <needle> <description> <args of v2_stage1>
+  local needle=$1 what=$2 err
+  shift 2
+  if err="$(v2_stage1 "$@" 2>&1)"; then fail "$what was admitted to the destructive boundary"; fi
+  [[ ! -e "$destructive" ]] || fail "$what reached the destructive boundary"
+  grep -Fq -- "$needle" <<<"$err" \
+    || fail "$what was refused for the wrong reason (wanted '$needle', got: $err)"
+}
+_preseal_set="$(printf '%064d' 8)"
+# RED 1 (kept): the host's inherited v1 marker without any preseal transport.
+expect_refusal 'carries no authenticated preseal transport' \
+  "an owner-sealed v1 medium without preseal" owner-sealed-ota-state-v1 "" 0
+# RED 2: the v2 marker with the sealed v2 release passes stage 1, with no preseal.
+v2_stage1 owner-sealed-ota-state-v2 "" 1 \
+  || fail "an owner-sealed v2 medium sealing its v2 release was refused at stage 1: $(v2_stage1 owner-sealed-ota-state-v2 "" 1 2>&1 || true)"
+[[ -e "$destructive" ]] || fail "the admitted v2 medium did not reach the synthetic destructive boundary"
+# Negatives, each for its own named reason.
+expect_refusal 'carries no sealed v2 release attestation' \
+  "a v2 marker without the v2 seal" owner-sealed-ota-state-v2 "" 0
+expect_refusal 'forbids a preseal transport' \
+  "a v2 marker with the v2 seal AND a preseal set" owner-sealed-ota-state-v2 "$_preseal_set" 1
+expect_refusal 'seals a v2 release attestation' \
+  "a v1 marker with the v2 seal" owner-sealed-ota-state-v1 "$_preseal_set" 1
+expect_refusal 'seals a v2 release attestation' \
+  "a v1 marker with the v2 seal and no preseal" owner-sealed-ota-state-v1 "" 1
+expect_refusal 'seals a v2 release attestation' \
+  "a legacy-unmarked image with the v2 seal (no silent downgrade)" ABSENT "" 1
+expect_refusal 'malformed OTA-state profile marker' \
+  "a marker with a trailing extra word" 'owner-sealed-ota-state-v2 x' "" 1
+expect_refusal 'malformed OTA-state profile marker' \
+  "an unknown v3 marker" owner-sealed-ota-state-v3 "" 1
+# The legacy and v1 paths are unchanged by the v2 words (no v2 seal): admitted
+# exactly as before.
+v2_stage1 ABSENT "" 0 || fail "the legacy-unmarked medium is no longer admitted"
+v2_stage1 owner-sealed-ota-state-v1 "$_preseal_set" 0 || fail "the v1 medium with its preseal transport is no longer admitted"
+rm -f "$destructive"
+# A symlinked or non-regular marker is never a profile.
+rm -f "$v2_root/usr/lib/neural-ice/ota-state-profile"
+ln -s /nonexistent "$v2_root/usr/lib/neural-ice/ota-state-profile"
+( candidate_ota_state_profile "$v2_root" ) >/dev/null 2>&1 \
+  && fail "a dangling symlink was read as an OTA-state profile"
+rm -f "$v2_root/usr/lib/neural-ice/ota-state-profile"
+
+# The v2 karg reader: both digests or neither, exact hex, once each, never with
+# a preseal set or the registry authorisation pair, and the seal flag is derived
+# from nothing else.
+v2_kargs() ( # <cmdline> <preseal sha or empty>
+  set_cmdline "$1"
+  PRESEAL_SET_SHA256=$2
+  read_v2_release_seal
+  # shellcheck disable=SC2031 # read_v2_release_seal sets it in this same subshell
+  printf 'active=%s sha=%s sig=%s\n' "$V2_SEAL_ACTIVE" "$V2REL_SHA256" "$V2REL_SIG_SHA256"
+)
+_h1="$(printf '%064d' 1)"; _h2="$(printf '%064d' 2)"; _hu="A$(printf '%063d' 1)"
+[[ "$(v2_kargs "quiet" "")" == "active=0 sha= sig=" ]] \
+  || fail "a command line without the v2 seal activated the v2 lane"
+[[ "$(v2_kargs "quiet neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sig_sha256=$_h2" "")" == "active=1 sha=$_h1 sig=$_h2" ]] \
+  || fail "the sealed v2 release digests were not read"
+for bad in "neuralice.v2rel_sha256=$_h1" "neuralice.v2rel_sig_sha256=$_h2" \
+  "neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sig_sha256=$_h1" \
+  "neuralice.v2rel_sha256=$_hu neuralice.v2rel_sig_sha256=$_h2" \
+  "neuralice.v2rel_sha256=abc neuralice.v2rel_sig_sha256=$_h2" \
+  "neuralice.v2rel_sha256= neuralice.v2rel_sig_sha256=$_h2" \
+  "neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sig_sha256=$_h2" \
+  "neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sig_sha256=$_h2 neuralice.relauth_sha256=$_h1" \
+  "neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sig_sha256=$_h2 neuralice.relauth_sig_sha256=$_h1"; do
+  v2_kargs "quiet $bad" "" >/dev/null 2>&1 \
+    && fail "a malformed or conflicting v2 seal was accepted: $bad"
+done
+v2_kargs "quiet neuralice.v2rel_sha256=$_h1 neuralice.v2rel_sig_sha256=$_h2" "$_preseal_set" >/dev/null 2>&1 \
+  && fail "a medium sealing both a preseal set and a v2 release was accepted"
+set_cmdline "quiet"
 
 # Execute the production sealed-store preflight with a fake Podman that refuses
 # every create lacking --pull=never. An absent local object must fail here,
@@ -348,6 +452,181 @@ status_line="$(line_of '"$TPM_STATE" provisioning-status)" == preseal-prepared')
    && "$installed_config_publish_line" -lt "$prepare_line" \
    && "$prepare_line" -lt "$inspect_line" && "$inspect_line" -lt "$status_line" ]] \
   || fail "the authenticated eight-input preseal handoff is not ordered around the wipe and bootc install"
+
+# --------------------------------------------------------------------------- #
+# MISSION B / T3b ORDER: the v2 verification precedes EVERY destructive marker;
+# the v2 commit follows the deployment and precedes the persisted ceremony
+# inputs. The v1 call sites above are asserted unchanged by their own lines.
+# --------------------------------------------------------------------------- #
+pass() { printf 'ok: %s\n' "$*"; }
+exact_line() { grep -nx -- "$1" "$AUTOINSTALL" | head -1 | cut -d: -f1 || true; }
+v2_preflight_line="$(exact_line '    v2_owner_seal_preflight')"
+v2_commit_line="$(exact_line '  v2seal_commit')"
+v2_pre_def="$(exact_line 'v2_owner_seal_preflight() {')"
+ceremony_inputs_line="$(line_of 'persist_ceremony_input "$INTENDED_SRK_PUBLIC" srk-v1.tpm2b_public')"
+release_identity_line="$(line_of '_release_identity_sha256="$V2SEAL_RELEASE_IDENTITY_SHA256"')"
+[[ -n "$v2_preflight_line" && -n "$v2_commit_line" && -n "$v2_pre_def" && -n "$ceremony_inputs_line" && -n "$release_identity_line" ]] \
+  || fail "cannot locate the v2 preflight/commit call sites in the installer"
+[[ "$v2_pre_def" -lt "$v2_preflight_line" && "$medium_profile_gate_line" -lt "$v2_preflight_line" ]] \
+  || fail "the v2 preflight is called before it is defined or before the stage-1 profile gate"
+# every destructive marker, by first occurrence: the v2 verification precedes all of them
+for marker_pattern in '^[[:space:]]*wipefs -a "\$target"' '^[[:space:]]*sfdisk .*"\$target"' \
+  '^mkfs\.fat ' '^mkfs\.ext4 ' 'cryptsetup luksFormat' '"\$TPM_STATE" pcr-policy-activate' \
+  '"\$OTA_TPM_STATE" prepare' '^  bootc install to-filesystem' '^phase 4 '; do
+  marker_line="$(grep -nE -- "$marker_pattern" "$AUTOINSTALL" | head -1 | cut -d: -f1 || true)"
+  [[ -n "$marker_line" ]] || fail "cannot locate the destructive marker /$marker_pattern/"
+  [[ "$v2_preflight_line" -lt "$marker_line" ]] \
+    || fail "the v2 verification (line $v2_preflight_line) does not precede the destructive marker /$marker_pattern/ (line $marker_line)"
+done
+[[ "$bootc_line" -lt "$v2_commit_line" && "$v2_commit_line" -lt "$ceremony_inputs_line" \
+   && "$v2_commit_line" -lt "$release_identity_line" ]] \
+  || fail "the v2 commit (line $v2_commit_line) is not between bootc install (line $bootc_line) and the persisted ceremony inputs (line $ceremony_inputs_line)"
+# neither lane's commit may run on the other's seal
+grep -Fq 'if (( V2_SEAL_ACTIVE == 1 )); then' "$AUTOINSTALL" || fail "the v2 call sites are not guarded by V2_SEAL_ACTIVE"
+[[ "$(grep -c '^    v2_owner_seal_preflight$' "$AUTOINSTALL")" == 1 && "$(grep -c '^  v2seal_commit$' "$AUTOINSTALL")" == 1 ]] \
+  || fail "the v2 preflight/commit are not called exactly once"
+# the v2 lane's TPM calls live in the library, never inline in the installer
+[[ "$(grep -c '"\$OTA_TPM_STATE" prepare' "$AUTOINSTALL")" == 1 ]] \
+  || fail "the installer prepares the OTA floor from more than the one v1 call site"
+# THE v1 BLOCK IS NOT RESTRUCTURED: the hoisted probe is the only candidate probe, called once by
+# the registry||preseal block, and no inline container creation remains in it.
+[[ "$(grep -c '^  candidate_probe_open$' "$AUTOINSTALL")" == 2 ]] \
+  || fail "the hoisted candidate probe is not called exactly once by the v1 block and once by the v2 lane"
+[[ "$(grep -c '^  _candidate_image_ref="\$STORE_IMAGE_NAME"$' "$AUTOINSTALL")" == 1 ]] \
+  || fail "the v2 lane does not name the sealed store image as its candidate"
+v2_posture_hits="$(grep -vE '^[[:space:]]*#' "$ROOT/ota/neural-ice-v2-owner-seal.sh" | grep -cE 'NEURALICE_SEALED_OTA_STATE|relaxed' || true)"
+[[ "$v2_posture_hits" == 0 ]] || fail "the v2 library reads the relaxed/strict posture"
+v2_autoinstall_posture="$(awk '/^v2_owner_seal_preflight\(\) \{/,/^}$/' "$AUTOINSTALL" | grep -cE 'NEURALICE_SEALED_OTA_STATE|relaxed' || true)"
+[[ "$v2_autoinstall_posture" == 0 ]] || fail "the v2 preflight adapter reads the relaxed/strict posture"
+
+# --------------------------------------------------------------------------- #
+# MISSION B / T3b ADAPTER: the REAL v2_owner_seal_preflight and the REAL library,
+# against a fake Podman (the merged candidate is the T0 golden candidate root), a
+# fake ESP stage that applies the installer's hash-after-copy rule, and a mock
+# verifier that follows the contract CLI. Before any destructive step by
+# construction: the synthetic boundary below is reached only on a pass.
+# --------------------------------------------------------------------------- #
+V2FIX="$ROOT/tools/ni-ota-verify/tests/fixtures/v2-release"
+[[ -f "$V2FIX/golden.json" ]] || fail "missing the T0 golden vectors"
+v2g() { python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): d=d[k]
+print(d)' "$V2FIX/golden.json" "$1"; }
+{
+  grep -E '^readonly _candidate_probe=' "$AUTOINSTALL"
+  awk '/^candidate_probe_release\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^candidate_probe_open\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^_img_read\(\) \{/,/^}$/' "$AUTOINSTALL"
+  grep -E '^V2_WORK=' "$AUTOINSTALL"
+  awk '/^v2seal_on_refusal\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^v2_assert_candidate_lane\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^v2_owner_seal_preflight\(\) \{/,/^}$/' "$AUTOINSTALL"
+} > "$TMP/v2-adapter.sh"
+for fn in candidate_probe_release candidate_probe_open _img_read v2seal_on_refusal v2_assert_candidate_lane v2_owner_seal_preflight; do
+  grep -q "^${fn}() {" "$TMP/v2-adapter.sh" || fail "cannot extract $fn from the installer"
+done
+cat > "$TMP/v2-mock-verifier" <<'V2_MOCK'
+#!/usr/bin/env bash
+# Contract-shaped enough for the adapter: records argv, honours MOCK_REFUSE, prints the golden stdout.
+printf '%s\n' "$*" >> "$V2_MOCK_LOG"
+[[ -z "${MOCK_REFUSE:-}" ]] || { echo "ni-ota-verify: v2 release REFUSED: ${MOCK_REFUSE}: mock" >&2; exit 1; }
+[[ "$1" == verify-v2-release ]] || exit 2
+while (($#)); do [[ "$1" == --receipt ]] && receipt="$2"; shift; done
+install -m 0600 "$V2_FIXTURE/expected-receipt-manifest-digest.json" "$receipt"
+printf '{"bundle_seq":%s,"idempotent":false,"receipt_sha256":"%s","verdict":"pass"}\n' \
+  "$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["bundle_seq"])' "$receipt")" \
+  "$(sha256sum < "$receipt" | cut -d' ' -f1)"
+V2_MOCK
+chmod 0755 "$TMP/v2-mock-verifier"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/v2-exec-stub"; chmod 0755 "$TMP/v2-exec-stub"
+# The variables and stubs are consumed by the sourced production functions;
+# ShellCheck does not connect that generated file to this lexical scope.
+# shellcheck disable=SC2034,SC2317,SC2329
+v2_adapter_attempt() ( # <candidate profile marker|keep> <esp manifest override|keep> <MOCK_REFUSE|''> <source>
+  local marker=$1 manifest_override=$2 refuse=$3
+  INSTALL_SOURCE=${4:-medium}
+  rm -rf -- "$TMP/v2a"; mkdir -p "$TMP/v2a/verity/usr/lib/neural-ice/keys" "$TMP/v2a/cand"
+  cp -a "$V2FIX/candidate-root/." "$TMP/v2a/cand/"
+  cp "$V2FIX/release-authorization.pub" "$TMP/v2a/verity/usr/lib/neural-ice/keys/"
+  [[ "$marker" == keep ]] || printf '%s\n' "$marker" > "$TMP/v2a/cand/usr/lib/neural-ice/ota-state-profile"
+  : > "$TMP/v2a/podman.log"; : > "$TMP/v2a/verifier.log"; : > "$TMP/v2a/evidence.log"
+  export V2_MOCK_LOG="$TMP/v2a/verifier.log" V2_FIXTURE="$V2FIX" MOCK_REFUSE="$refuse"
+  _img_root=""
+  VERITY_ROOT_MOUNT="$TMP/v2a/verity"
+  NEURALICE_V2_OWNER_SEAL="$ROOT/ota/neural-ice-v2-owner-seal.sh"
+  OTA_VERIFY="$TMP/v2-mock-verifier"; OTA_TPM_STATE="$TMP/v2-exec-stub"; TPM_STATE="$TMP/v2-exec-stub"
+  SEALED_ANCHOR="$(printf 'neuralice.access_profile=%s\nneuralice.relauth_keyid=%s\n' "$(v2g inputs.access_profile)" "$(v2g inputs.sealed_key_sha256)")"
+  SEALED_HARDWARE_TARGET="$(v2g inputs.hardware_target)"; SEALED_ACCESS_PROFILE="$(v2g inputs.access_profile)"
+  SEALED_TRUST_POLICY_ID="$(v2g inputs.trust_policy_id)"; NEURALICE_RELEASE_AUTHORITY="$(v2g inputs.release_authority)"
+  V2REL_SHA256="$(v2g inputs.sealed_manifest_sha256)"; V2REL_SIG_SHA256="$(v2g inputs.sealed_manifest_sig_sha256)"
+  V2_SEAL_ACTIVE=1; PRESEAL_ACTIVE=0
+  IMGREF="registry.example.test/neural-ice-test/host-appliance@$(v2g inputs.host_index_digest)"
+  MEDIUM_IMAGE_DIGEST="$(v2g inputs.host_manifest_digest)"
+  STORE_IMAGE_NAME=localhost/bootc
+  PHASE_ID=1; PHASE_TOTAL=8; PHASE_LABEL="test"; PHASE_CODE="test"
+  V2_BUNDLE_SEQ=""; V2_PREFLIGHT_RECEIPT_SHA256=""
+  log() { printf '%s\n' "$*" >> "$TMP/v2a/log.txt"; }
+  write_failure_evidence() { printf '%s\n' "$1" >> "$TMP/v2a/evidence.log"; }
+  podman() {
+    printf '%s\n' "$*" >> "$TMP/v2a/podman.log"
+    case " $* " in
+      *" mount "*) printf '%s\n' "$TMP/v2a/cand" ;;
+      *) return 0 ;;
+    esac
+  }
+  esp_staged_file() { # the installer's rule: copy, THEN hash the copy against the sealed value
+    local source="$V2FIX/${1#v2-}" observed
+    [[ "$manifest_override" == keep || "$1" != v2-release-manifest.json ]] || source="$manifest_override"
+    install -m 0600 "$source" "$3"
+    observed="$(sha256sum "$3" | cut -d' ' -f1)"
+    [[ "$observed" == "$2" ]] || die "the ESP's $1 hashes to ${observed}, not the ${2} this medium's signature seals"
+  }
+  # shellcheck source=/dev/null
+  source "$TMP/v2-adapter.sh"
+  V2_WORK="$TMP/v2a/work"
+  v2_owner_seal_preflight
+  : > "$destructive"
+  printf '%s %s\n' "$V2_BUNDLE_SEQ" "$V2_PREFLIGHT_RECEIPT_SHA256" > "$TMP/v2a/outputs"
+)
+rm -f "$destructive"
+v2_adapter_attempt keep keep "" || fail "the v2 adapter refused the golden medium: $(v2_adapter_attempt keep keep "" 2>&1 | tail -3)"
+[[ -e "$destructive" ]] || fail "the admitted v2 adapter did not reach the synthetic destructive boundary"
+[[ "$(cat "$TMP/v2a/outputs")" == "$(v2g expected.bundle_seq) $(v2g expected.receipt_sha256.manifest-digest)" ]] \
+  || fail "the adapter's outputs are not the golden bundle_seq and receipt"
+for pair in "--candidate-root $TMP/v2a/cand" "--release-authority registry.example.test" \
+  "--sealed-key-sha256 $(v2g inputs.sealed_key_sha256)" "--sealed-manifest-sha256 $(v2g inputs.sealed_manifest_sha256)" \
+  "--sealed-manifest-sig-sha256 $(v2g inputs.sealed_manifest_sig_sha256)" "--variant sealed-lab" \
+  "--host-index-digest $(v2g inputs.host_index_digest)" "--host-manifest-digest $(v2g inputs.host_manifest_digest)" \
+  "--release-key $TMP/v2a/verity/usr/lib/neural-ice/keys/release-authorization.pub" \
+  "--manifest $TMP/v2a/work/release-manifest.json" "--manifest-sig $TMP/v2a/work/release-manifest.json.sig"; do
+  grep -Fq -- " $pair" <<<" $(cat "$TMP/v2a/verifier.log")" || fail "the adapter did not hand the verifier '$pair'"
+done
+grep -q 'create --pull=never' "$TMP/v2a/podman.log" || fail "the candidate was not staged without a pull"
+grep -q 'unmount neural-ice-candidate-probe' "$TMP/v2a/podman.log" || fail "the candidate mount was not released after the preflight"
+pass "the v2 adapter passes the golden medium and hands the verifier exactly the sealed values"
+
+adapter_refusal() { # <description> <needle> <args of v2_adapter_attempt>
+  local what=$1 needle=$2 err
+  shift 2
+  rm -f "$destructive"
+  if err="$(v2_adapter_attempt "$@" 2>&1)"; then fail "$what was admitted"; fi
+  [[ ! -e "$destructive" ]] || fail "$what reached the destructive boundary"
+  grep -Fq -- "$needle" <<<"$err" || fail "$what was refused for the wrong reason (wanted '$needle', got: $err)"
+}
+altered="$TMP/altered-manifest.json"; { cat "$V2FIX/release-manifest.json"; printf '\n'; } > "$altered"
+adapter_refusal "a manifest on the ESP altered by one byte" "this medium's signature seals" keep "$altered" ""
+[[ ! -s "$TMP/v2a/verifier.log" ]] || fail "the verifier ran over an ESP manifest that fails its sealed hash"
+adapter_refusal "a v1-marked candidate under the v2 seal" "not owner-sealed-ota-state-v2" owner-sealed-ota-state-v1 keep ""
+[[ ! -s "$TMP/v2a/verifier.log" ]] || fail "the verifier ran over a v1-marked candidate"
+grep -q 'unmount neural-ice-candidate-probe' "$TMP/v2a/podman.log" || fail "a refused lane mismatch left the candidate mounted"
+adapter_refusal "a legacy (unmarked-equivalent) wrong marker" "not owner-sealed-ota-state-v2" legacy-word keep ""
+adapter_refusal "a verifier refusal (candidate key != sealed)" "v2seal: refused:" keep keep candidate-key
+grep -q 'unmount neural-ice-candidate-probe' "$TMP/v2a/podman.log" \
+  || fail "a verifier refusal left the candidate mounted (the failure hook must release it)"
+grep -q 'the release verifier refused' "$TMP/v2a/evidence.log" || fail "a verifier refusal bypassed the installer's failure evidence"
+adapter_refusal "a verifier refusal (ota-root.pub in the candidate)" "REFUSED: candidate-anchor" keep keep candidate-anchor
+adapter_refusal "a registry source" "medium lane" keep keep "" registry
+pass "the v2 adapter refuses: altered ESP manifest, v1/odd marker, verifier refusals (probe released, evidence written), registry source -- never reaching the boundary"
 
 for required in \
   'the selected owner-sealed appliance has no UKI-bound preseal inputs' \
