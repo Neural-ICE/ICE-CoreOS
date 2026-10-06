@@ -480,9 +480,10 @@ done
 # immutable identity selected for it.
 grep -Fq '[[ "$sealed_store_image_id" == "$BASE_IMAGE_ID" ]]' "$USB" \
   || fail "the media producer does not compare the staged store with the original host"
-grep -Fq 'if [[ "$sealed_store_manifest_digest" != "$BASE_MANIFEST_DIGEST" ]]; then' "$USB" \
-  && grep -Fq '[[ "$sealed_store_source_index" == "$BASE_MANIFEST_DIGEST" && "$sealed_store_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]' "$USB" \
-  || fail "the media producer does not compare the staged store child digest with the original host (or its proved index)"
+if ! grep -Fq 'if [[ "$sealed_store_manifest_digest" != "$BASE_MANIFEST_DIGEST" ]]; then' "$USB" \
+   || ! grep -Fq '[[ "$sealed_store_source_index" == "$BASE_MANIFEST_DIGEST" && "$sealed_store_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]' "$USB"; then
+  fail "the media producer does not compare the staged store child digest with the original host (or its proved index)"
+fi
 
 # Pinned BIB rejects filesystem customization for raw builds. The selected
 # config therefore makes no sizing claim; the producer's measured fit refusal
@@ -1074,8 +1075,9 @@ build "$TMP/registry-source-index" STORE_MANIFEST_DIGEST="$IDX_DIGEST" MOCK_NAME
 grep -Fq "copy --preserve-digests --src-cert-dir $TMP/certs --src-no-creds docker://mirror.test:5055/neural-ice/appliance@$SRC_DIGEST containers-storage:[overlay@" "$TMP/registry-source-index/skopeo.args" \
   || fail "the store was not staged from the index's child of the store image"
 m="$(find "$TMP/registry-source-index" -name '*.manifest' | head -1)"
-grep -qx "store_image_manifest_digest=$SRC_DIGEST" "$m" && grep -qx "store_source_index_digest=$IDX_DIGEST" "$m" \
-  || fail "the sealed manifest must record the staged child and the index it was proved against: $(cat "$m" 2>/dev/null)"
+if ! grep -qx "store_image_manifest_digest=$SRC_DIGEST" "$m" || ! grep -qx "store_source_index_digest=$IDX_DIGEST" "$m"; then
+  fail "the sealed manifest must record the staged child and the index it was proved against: $(cat "$m" 2>/dev/null)"
+fi
 printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s"}]}' \
   "$OTHER_SRC_DIGEST" > "$TMP/index-none.json"
 IDX2="sha256:$(sha256sum "$TMP/index-none.json" | cut -d' ' -f1)"; cp "$TMP/index-none.json" "$TMP/index-src/${IDX2#sha256:}"
