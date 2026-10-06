@@ -1461,6 +1461,10 @@ if [[ -n "$MEDIUM_CACHE_STORE_HIT" ]]; then
   medium_cache_assert_reused_verity "$STORE_VERITY_HASH" "$MEDIUM_CACHE_STORE_VERITY_HASH" \
     || exit 1
   echo "    cached store verity     : $STORE_VERITY_HASH (recomputed from the reused bytes, equals the entry)"
+elif [[ -n "$MEDIUM_BUILD_CACHE_DIR" && -n "$sealed_store_source_index" ]]; then
+  # An index host's store carries a child, not BASE_MANIFEST_DIGEST: no cache entry is recorded for it (a reuse
+  # would seal another identity for the same bytes); the next build stages it again.
+  echo "    store cache: not recorded for the child of host index ${BASE_MANIFEST_DIGEST}"
 elif [[ -n "$MEDIUM_BUILD_CACHE_DIR" ]]; then
   medium_cache_finalize_store "$MEDIUM_CACHE_STORE_KEY" "$MEDIUM_CACHE_STORE_KEY_DOCUMENT" \
     "$SEALED_STORE_SHA256" "$SEALED_STORE_BYTES" "$BASE_IMAGE_ID" \
@@ -1621,7 +1625,7 @@ case "$MEDIA_MODE" in
         [[ -z "$MIRROR_CA_FILE" && -z "$MIRROR_READY_SHA256" ]] \
           || { echo "ERROR: MIRROR_CA_FILE/MIRROR_READY_SHA256 require INSTALL_SOURCE=registry and INSTALL_MIRROR" >&2; exit 1; }
         if [[ -n "$PRESEAL_STAGE_ROOT" ]]; then
-          seal_install_authorization "$TARGET_IMGREF" "$BASE_MANIFEST_DIGEST"
+          seal_install_authorization "$TARGET_IMGREF" "$sealed_store_manifest_digest"
         else
           [[ -z "$RELEASE_AUTHORIZATION_FILE" && -z "$RELEASE_AUTHORIZATION_SIGNATURE_FILE" ]] \
             || { echo "ERROR: a medium release authorization requires PRESEAL_SET_DIR/PRESEAL_SET_SHA256" >&2; exit 1; }
