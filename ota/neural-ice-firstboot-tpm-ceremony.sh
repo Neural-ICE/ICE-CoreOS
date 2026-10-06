@@ -30,6 +30,11 @@ if [[ -n "${NI_FIRSTBOOT_TPM_TESTING:-}" ]]; then
   readonly OTA_PROFILE_PATH="${NI_FIRSTBOOT_TPM_TEST_OTA_PROFILE:-}"
   readonly CANDIDATE_ROOT="${NI_FIRSTBOOT_TPM_TEST_CANDIDATE_ROOT:-}"
   readonly BOOTC="${NI_FIRSTBOOT_TPM_TEST_BOOTC:-}"
+  readonly RELEASE_KEY="${NI_FIRSTBOOT_TPM_TEST_RELEASE_KEY:-}"
+  # The v2-lane verifier reads the live root `/`; its `--root` seam exists only
+  # in a test-path-overrides build (docs/ota/V2-RELEASE-ATTESTATION.md 3.2), so
+  # it is handed over by the unprivileged test seam alone.
+  if [[ -n "$CANDIDATE_ROOT" ]]; then readonly -a V2_ROOT_ARGS=(--root "$CANDIDATE_ROOT"); else readonly -a V2_ROOT_ARGS=(); fi
   readonly REQUIRED_OWNER_UID="$EUID"
   readonly VALIDATE_FILE_METADATA="${NI_FIRSTBOOT_TPM_TEST_VALIDATE_FILE_METADATA:-0}"
   [[ "$VALIDATE_FILE_METADATA" == 0 || "$VALIDATE_FILE_METADATA" == 1 ]] \
@@ -56,6 +61,8 @@ else
   readonly OTA_PROFILE_PATH=/usr/lib/neural-ice/ota-state-profile
   readonly CANDIDATE_ROOT=/
   readonly BOOTC=/usr/bin/bootc
+  readonly RELEASE_KEY=/usr/lib/neural-ice/keys/release-authorization.pub
+  readonly -a V2_ROOT_ARGS=()
   readonly REQUIRED_OWNER_UID=0
   readonly VALIDATE_FILE_METADATA=1
 fi
@@ -79,18 +86,31 @@ readonly EVIDENCE_V1="$STATE_DIR/owner-ceremony-evidence-v1.json"
 readonly EVIDENCE_V2="$STATE_DIR/owner-ceremony-evidence-v2.json"
 readonly PRESEAL_INPUT="$STATE_DIR/preseal-input-v1"
 readonly PRESEAL_RECEIPT="$STATE_DIR/preseal/receipt.json"
+# Persisted by the installer for the owner-sealed v2 lane (contract section 5).
+readonly V2_INPUT="$STATE_DIR/v2-release-input-v1"
+readonly V2_MANIFEST="$V2_INPUT/release-manifest.json"
+readonly V2_MANIFEST_SIG="$V2_INPUT/release-manifest.json.sig"
+readonly V2_RECEIPT="$STATE_DIR/v2-release/receipt.json"
 
 for executable in "$TPM_STATE" "$DEVICE_ROOT_TOOL" "$PROFILE_ANCHOR" \
   "$SYSTEMD_ANALYZE" "$CRYPTSETUP" "$TPM2_READPUBLIC" "$LUKS_EVIDENCE"; do
   [[ -x "$executable" ]] || die "required immutable helper is unavailable: $executable"
 done
 
+# The immutable image marker names the attestation LANE (closed set): v1 is
+# authenticated by the preseal set, v2 by the v2 release manifest and receipt.
+# Both tokens are 26 bytes with their LF; OWNER_LANE is read by the callers.
+OWNER_LANE=""
 owner_profile_supported() {
   [[ -n "$OTA_PROFILE_PATH" && -e "$OTA_PROFILE_PATH" ]] || return 1
   immutable_marker "$OTA_PROFILE_PATH"
-  [[ "$(wc -c < "$OTA_PROFILE_PATH" | tr -d '[:space:]')" == 26 \
-    && "$(<"$OTA_PROFILE_PATH")" == owner-sealed-ota-state-v1 ]] \
+  [[ "$(wc -c < "$OTA_PROFILE_PATH" | tr -d '[:space:]')" == 26 ]] \
     || die "immutable OTA state profile is unsupported"
+  case "$(<"$OTA_PROFILE_PATH")" in
+    owner-sealed-ota-state-v1) OWNER_LANE=preseal ;;
+    owner-sealed-ota-state-v2) OWNER_LANE=v2release ;;
+    *) die "immutable OTA state profile is unsupported" ;;
+  esac
 }
 
 secure_file() {
@@ -235,7 +255,34 @@ preseal_refusal() { # <message>
   printf 'neural-ice-firstboot-tpm-ceremony: preseal attestation RELAXED (ADR-0050 lab-trust), continuing: %s\n' "$*" >&2
 }
 
+# The installer identity is judged by ONE closed validator, called both before
+# the one-time TPM mutation and by build_evidence, so a malformed or
+# non-canonical identity refuses while the boot can still be retried from the
+# same preseal-prepared state instead of after ceremony-prepare.
+validate_install_identity() { # $1=identity path
+  python3 - "$1" <<'PY'
+import json,re,sys
+def pairs(items):
+    out={}
+    for k,v in items:
+        if k in out: raise ValueError("duplicate JSON key")
+        out[k]=v
+    return out
+with open(sys.argv[1],encoding="utf-8") as f: identity=json.load(f,object_pairs_hook=pairs)
+identity_keys={"install_source","installed_at","installer_sealed_identity_sha256","release_identity_sha256","schema"}
+if not isinstance(identity,dict) or set(identity) != identity_keys: raise SystemExit("installer identity is not a closed document")
+if identity.get("schema") != "neural-ice-owner-ceremony-install-identity-v1": raise SystemExit("wrong installer identity schema")
+if identity["install_source"] not in ("medium","registry"): raise SystemExit("wrong install source")
+if not re.fullmatch(r"[0-9a-f]{64}",identity["installer_sealed_identity_sha256"]): raise SystemExit("bad sealed identity digest")
+if not re.fullmatch(r"[0-9a-f]{64}",identity["release_identity_sha256"]): raise SystemExit("bad release identity digest")
+if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",identity["installed_at"]): raise SystemExit("bad install timestamp")
+canonical=(json.dumps(identity,sort_keys=True,separators=(",",":"))+"\n").encode()
+if open(sys.argv[1],"rb").read() != canonical: raise SystemExit("installer identity is not canonical")
+PY
+}
+
 build_evidence() { # $1=TPM state snapshot
+  validate_install_identity "$INSTALL_IDENTITY" || return
   python3 - "$1" "$INSTALL_IDENTITY" "$WORK/system-luks-evidence.json" \
     "$WORK/data-luks-evidence.json" "$WORK/srk.name" "$WORK/device-root.name" \
     "$STATE_DIR/access-profile-v1.json" "$STATE_DIR/access-profile-v1.sig" \
@@ -251,15 +298,6 @@ def load(path):
     with open(path,encoding="utf-8") as f: return json.load(f,object_pairs_hook=pairs)
 snapshot=json.loads(sys.argv[1],object_pairs_hook=pairs)
 identity=load(sys.argv[2]); system=load(sys.argv[3]); data=load(sys.argv[4])
-identity_keys={"install_source","installed_at","installer_sealed_identity_sha256","release_identity_sha256","schema"}
-if set(identity) != identity_keys: raise SystemExit("installer identity is not a closed document")
-if identity.get("schema") != "neural-ice-owner-ceremony-install-identity-v1": raise SystemExit("wrong installer identity schema")
-if identity["install_source"] not in ("medium","registry"): raise SystemExit("wrong install source")
-if not re.fullmatch(r"[0-9a-f]{64}",identity["installer_sealed_identity_sha256"]): raise SystemExit("bad sealed identity digest")
-if not re.fullmatch(r"[0-9a-f]{64}",identity["release_identity_sha256"]): raise SystemExit("bad release identity digest")
-if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",identity["installed_at"]): raise SystemExit("bad install timestamp")
-canonical=(json.dumps(identity,sort_keys=True,separators=(",",":"))+"\n").encode()
-if open(sys.argv[2],"rb").read() != canonical: raise SystemExit("installer identity is not canonical")
 if snapshot.get("schema") != "neural-ice-tpm-state-snapshot-v1": raise SystemExit("wrong TPM snapshot schema")
 def digest(path): return hashlib.sha256(open(path,"rb").read()).hexdigest()
 obj={"access_profile_anchor":{"json_sha256":digest(sys.argv[7]),"signature_sha256":digest(sys.argv[8]),"spki_sha256":digest(sys.argv[9])},
@@ -432,17 +470,51 @@ verify_preseal_retained() { # expected receipt hash, set hash
     || preseal_refusal "retained preseal baseline does not match authenticated completion evidence"
 }
 
-build_evidence_v2() { # snapshot, receipt hash, set hash, floor, completion ota_state JSON
-  local base; base="$(build_evidence "$1")" || return
-  python3 - "$base" "$2" "$3" "$4" "$5" <<'PY'
-import json,sys
-base=json.loads(sys.argv[1]); inspection=json.loads(sys.argv[5])
+# Evidence of the owner-profile completion. `lane` selects the attestation
+# object: `preseal` -> ota_preseal (schema ...-evidence-v2), `v2release` ->
+# v2_release (schema ...-evidence-v2-lane2). The ota_state object is the same on
+# both lanes (the TPM objects are identical); the two schemas are disjoint.
+build_evidence_owner() { # lane, snapshot, floor, completion ota_state JSON, receipt hash, set hash | receipt path
+  local base; base="$(build_evidence "$2")" || return
+  python3 - "$base" "$1" "$3" "$4" "$5" "$6" <<'PY'
+import hashlib,json,re,sys
+def pairs(items):
+    out={}
+    for key,value in items:
+        if key in out: raise SystemExit("duplicate receipt field")
+        out[key]=value
+    return out
+base=json.loads(sys.argv[1]); lane=sys.argv[2]; floor=int(sys.argv[3]); inspection=json.loads(sys.argv[4])
+receipt_hash=sys.argv[5]
 if inspection.get("anchor_state") != "pristine" or inspection.get("anchor_sha256") is not None:
     raise SystemExit("completion anchor must be pristine")
-if inspection.get("baseline_floor") != int(sys.argv[4]) or not inspection.get("clear_protected") or inspection.get("owner_sealed"):
+if inspection.get("baseline_floor") != floor or not inspection.get("clear_protected") or inspection.get("owner_sealed"):
     raise SystemExit("completion owner state is not protected at the signed floor")
-base["schema"]="neural-ice-owner-ceremony-evidence-v2"
-base["ota_preseal"]={"receipt_schema":"neural-ice-ota-preseal-receipt-v1","receipt_sha256":sys.argv[2],"set_sha256":sys.argv[3]}
+if lane == "preseal":
+    base["schema"]="neural-ice-owner-ceremony-evidence-v2"
+    base["ota_preseal"]={"receipt_schema":"neural-ice-ota-preseal-receipt-v1","receipt_sha256":receipt_hash,"set_sha256":sys.argv[6]}
+elif lane == "v2release":
+    raw=open(sys.argv[6],"rb").read()
+    if not 0 < len(raw) <= 4096 or hashlib.sha256(raw).hexdigest() != receipt_hash:
+        raise SystemExit("v2 release receipt is not the authenticated one")
+    r=json.loads(raw,object_pairs_hook=pairs)
+    seq=r.get("bundle_seq")
+    hexes=("manifest_sha256","manifest_sig_sha256","release_key_sha256")
+    if (r.get("schema") != "neural-ice-v2-release-receipt-v1" or type(seq) is not int
+        or not 0 < seq <= 9007199254740991 or seq != floor
+        or not isinstance(r.get("release_id"),str) or re.fullmatch(r"[A-Za-z0-9._-]+",r["release_id"]) is None
+        or any(not isinstance(r.get(k),str) or re.fullmatch(r"[0-9a-f]{64}",r[k]) is None for k in hexes)):
+        raise SystemExit("v2 release receipt does not bind the completion floor")
+    if base["install_identity"]["release_identity_sha256"] != r["manifest_sha256"]:
+        raise SystemExit("installer release identity is not the v2 release manifest")
+    if base["install_identity"]["install_source"] != "medium" or base["install_identity"]["installed_at"] != "1970-01-01T00:00:00Z":
+        raise SystemExit("installer identity is not the v2 medium identity")
+    base["schema"]="neural-ice-owner-ceremony-evidence-v2-lane2"
+    base["v2_release"]={"bundle_seq":seq,"manifest_sha256":r["manifest_sha256"],
+     "manifest_sig_sha256":r["manifest_sig_sha256"],"receipt_schema":r["schema"],
+     "receipt_sha256":receipt_hash,"release_id":r["release_id"],"release_key_sha256":r["release_key_sha256"]}
+else:
+    raise SystemExit("unknown owner attestation lane")
 base["ota_state"]={
  "anchor_attributes":inspection["anchor_attributes"],"anchor_index":inspection["anchor_index"],
  "anchor_name_at_completion":inspection["anchor_name"],"anchor_policy_sha256":inspection["anchor_policy_sha256"],
@@ -457,12 +529,89 @@ print(json.dumps(base,sort_keys=True,separators=(",",":")))
 PY
 }
 
+build_evidence_v2() { # snapshot, receipt hash, set hash, floor, completion ota_state JSON
+  build_evidence_owner preseal "$1" "$4" "$5" "$2" "$3"
+}
+
+build_evidence_v2lane() { # snapshot, receipt hash, floor, completion ota_state JSON
+  build_evidence_owner v2release "$1" "$3" "$4" "$2" "$V2_RECEIPT"
+}
+
+# The owner-sealed v2 lane (docs/ota/V2-RELEASE-ATTESTATION.md). Its checks have
+# NO relaxed branch: they never call preseal_refusal and never read
+# NEURALICE_SEALED_OTA_STATE, so a forced `relaxed` changes nothing here. An
+# unreadable v2 attestation must stop the boot, not start the licensed target.
+v2_refusal() { die "v2 release attestation: $*"; }
+
+require_v2_release_inputs() {
+  [[ -n "$OTA_STATE" && -x "$OTA_STATE" && -n "$OTA_VERIFY" && -x "$OTA_VERIFY" ]] \
+    || v2_refusal "the verifier or the owner TPM helper is unavailable"
+  [[ -n "$RELEASE_KEY" && -f "$RELEASE_KEY" && ! -L "$RELEASE_KEY" ]] \
+    || v2_refusal "the immutable release authorization key is absent"
+  [[ -d "$V2_INPUT" && ! -L "$V2_INPUT" && -d "${V2_RECEIPT%/*}" && ! -L "${V2_RECEIPT%/*}" ]] \
+    || v2_refusal "the persisted release directories are unsafe or absent"
+  if [[ "$VALIDATE_FILE_METADATA" == 1 ]]; then
+    [[ "$(stat -c '%u:%a' -- "$V2_INPUT")" == "$REQUIRED_OWNER_UID:700" \
+      && "$(stat -c '%u:%a' -- "${V2_RECEIPT%/*}")" == "$REQUIRED_OWNER_UID:700" ]] \
+      || v2_refusal "the persisted release directories have unsafe metadata"
+  fi
+  local input
+  for input in "$V2_MANIFEST" "$V2_MANIFEST_SIG" "$V2_RECEIPT"; do
+    [[ -f "$input" && ! -L "$input" ]] || v2_refusal "a persisted release input is absent or unsafe"
+    secure_file "$input"
+  done
+}
+
+# The one-time TPM mutation is irreversible (the floor is write-locked), so what
+# can be judged before it is: the receipt's own binding to the floor and to the
+# installer identity. build_evidence_owner repeats it on the canonical bytes.
+v2_receipt_binds_install() { # floor
+  python3 - "$V2_RECEIPT" "$INSTALL_IDENTITY" "$1" <<'PY'
+import json,sys
+def pairs(items):
+    out={}
+    for key,value in items:
+        if key in out: raise SystemExit("duplicate receipt field")
+        out[key]=value
+    return out
+r=json.load(open(sys.argv[1]),object_pairs_hook=pairs); i=json.load(open(sys.argv[2]))
+if type(r.get("bundle_seq")) is not int or r["bundle_seq"] != int(sys.argv[3]):
+    raise SystemExit("receipt bundle_seq is not the floor")
+if i.get("release_identity_sha256") != r.get("manifest_sha256"):
+    raise SystemExit("installer release identity is not the v2 release manifest")
+# The v2 lane installs from the medium only, with the fixed installer stamp
+# (docs/ota/V2-RELEASE-ATTESTATION.md, install_identity).
+if i.get("install_source") != "medium" or i.get("installed_at") != "1970-01-01T00:00:00Z":
+    raise SystemExit("installer identity is not the v2 medium identity")
+PY
+}
+
+# Re-verify the persisted pair and receipt against the live root. Prints the
+# verified bundle_seq, which is also the NV floor. The verifier's one-line
+# verdict is never trusted beyond the closed shape checked here.
+v2_release_retained() { # expected receipt sha256
+  local verdict
+  verdict="$("$OTA_VERIFY" verify-retained-v2-release \
+    --manifest "$V2_MANIFEST" --manifest-sig "$V2_MANIFEST_SIG" --release-key "$RELEASE_KEY" \
+    --expected-receipt-sha256 "$1" --receipt "$V2_RECEIPT" --scratch-dir "$WORK" \
+    ${V2_ROOT_ARGS[@]+"${V2_ROOT_ARGS[@]}"})" \
+    || v2_refusal "the persisted manifest, signature and receipt do not authenticate the installed root"
+  python3 - "$verdict" "$1" <<'PY' || v2_refusal "the verifier verdict is malformed"
+import json,sys
+v=json.loads(sys.argv[1]); seq=v.get("bundle_seq")
+if (set(v) != {"bundle_seq","receipt_sha256","verdict"} or v["verdict"] != "pass"
+    or v["receipt_sha256"] != sys.argv[2] or type(seq) is not int or not 0 < seq <= 9007199254740991):
+    raise SystemExit(1)
+print(seq)
+PY
+}
+
 validate_complete() {
   local validation_mode="${1:-retained}"
   [[ "$validation_mode" == initial || "$validation_mode" == retained ]] \
     || die "internal completion validation mode is invalid"
   local completion version evidence_digest evidence evidence_source install_at freshness_at snapshot rebuilt
-  local receipt_hash set_hash floor owner_inspection initial_metadata
+  local receipt_hash set_hash floor owner_inspection initial_metadata evidence_lane verified_seq
   completion="$($TPM_STATE completion-inspect)" \
     || die "authenticated TPM completion evidence is absent"
   read -r version evidence_digest < <(python3 - "$completion" <<'PY'
@@ -476,6 +625,7 @@ PY
   if [[ "$version" == 2 ]]; then
     owner_profile_supported \
       || die "authenticated owner-profile completion lacks immutable reader support"
+    if [[ "$OWNER_LANE" == v2release ]]; then require_v2_release_inputs; fi
   fi
   secure_file "$evidence_source"
   evidence="$WORK/completion-evidence.json"
@@ -505,10 +655,22 @@ PY
   if [[ "$version" == 1 ]]; then
     rebuilt="$(build_evidence "$snapshot")" || die "cannot reconstruct canonical completion evidence"
   else
-    read -r receipt_hash set_hash floor owner_inspection < <(python3 - "$evidence" <<'PY'
+    # The lane is named twice, independently: by the immutable image marker
+    # (OWNER_LANE) and by the TPM-authenticated evidence schema. They must agree;
+    # neither lane can be read through the other's object.
+    evidence_lane="$(python3 - "$evidence" <<'PY'
 import json,sys
-d=json.load(open(sys.argv[1])); p=d["ota_preseal"]; o=d["ota_state"]
-print(p["receipt_sha256"],p["set_sha256"],o["baseline_floor"],json.dumps({
+schema=json.load(open(sys.argv[1])).get("schema")
+print({"neural-ice-owner-ceremony-evidence-v2":"preseal","neural-ice-owner-ceremony-evidence-v2-lane2":"v2release"}[schema])
+PY
+    )" || die "authenticated v2 completion evidence has an unknown schema"
+    [[ "$evidence_lane" == "$OWNER_LANE" ]] \
+      || die "completion evidence lane differs from the immutable OTA state profile"
+    read -r receipt_hash set_hash floor owner_inspection < <(python3 - "$evidence" "$OWNER_LANE" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); o=d["ota_state"]
+p=d["ota_preseal"] if sys.argv[2] == "preseal" else d["v2_release"]
+print(p["receipt_sha256"],p.get("set_sha256","-"),o["baseline_floor"],json.dumps({
  "anchor_attributes":o["anchor_attributes"],"anchor_index":o["anchor_index"],"anchor_name":o["anchor_name_at_completion"],
  "anchor_policy_sha256":o["anchor_policy_sha256"],"anchor_sha256":None,"anchor_size":o["anchor_size"],"anchor_state":o["anchor_state_at_completion"],
  "baseline_floor":o["baseline_floor"],"clear_protected":o["clear_protected_at_completion"],
@@ -517,16 +679,26 @@ print(p["receipt_sha256"],p["set_sha256"],o["baseline_floor"],json.dumps({
  "profile":o["profile"],"schema":"neural-ice-owner-ota-state-inspection-v2"},sort_keys=True,separators=(",",":")))
 PY
     ) || die "authenticated v2 completion evidence is malformed"
-    if [[ "$validation_mode" == initial ]]; then
-      initial_metadata="$(verify_preseal_initial)" \
-        || die "cannot reauthenticate the installed candidate after owner finalization"
-      [[ "$initial_metadata" == "$receipt_hash $set_hash $floor" ]] \
-        || die "post-finalization candidate evidence differs from authenticated completion"
+    if [[ "$OWNER_LANE" == v2release ]]; then
+      # Same re-verification at the initial check and at every boot: the live
+      # root is the installed deployment. No relaxed branch (v2_refusal dies).
+      verified_seq="$(v2_release_retained "$receipt_hash")" || exit 1
+      [[ "$verified_seq" == "$floor" ]] \
+        || v2_refusal "the receipt bundle_seq differs from the authenticated completion floor"
+      rebuilt="$(build_evidence_v2lane "$snapshot" "$receipt_hash" "$floor" "$owner_inspection")" \
+        || die "cannot reconstruct canonical v2 lane-2 completion evidence"
     else
-      verify_preseal_retained "$receipt_hash" "$set_hash"
+      if [[ "$validation_mode" == initial ]]; then
+        initial_metadata="$(verify_preseal_initial)" \
+          || die "cannot reauthenticate the installed candidate after owner finalization"
+        [[ "$initial_metadata" == "$receipt_hash $set_hash $floor" ]] \
+          || die "post-finalization candidate evidence differs from authenticated completion"
+      else
+        verify_preseal_retained "$receipt_hash" "$set_hash"
+      fi
+      rebuilt="$(build_evidence_v2 "$snapshot" "$receipt_hash" "$set_hash" "$floor" "$owner_inspection")" \
+        || die "cannot reconstruct canonical v2 completion evidence"
     fi
-    rebuilt="$(build_evidence_v2 "$snapshot" "$receipt_hash" "$set_hash" "$floor" "$owner_inspection")" \
-      || die "cannot reconstruct canonical v2 completion evidence"
   fi
   [[ "$rebuilt"$'\n' == "$(cat "$evidence")"$'\n' ]] \
     || die "mutable lifecycle evidence no longer matches its authenticated canonical inputs"
@@ -554,15 +726,33 @@ fi
 # particular ownerAuthSet=1, or any single surviving index, refuses here.
 provisioning="$($TPM_STATE provisioning-status)" \
   || die "TPM is neither authenticated-complete nor an exact supported pre-ceremony state; signed physical recovery is required"
+# The installer identity is judged before any lane-specific check and before
+# ceremony-prepare: the TPM mutation is one-time, and a refusal after it turns a
+# retryable boot into a signed physical recovery.
+validate_install_identity "$INSTALL_IDENTITY" \
+  || die "the installer identity is not canonical; refusing before the one-time TPM mutation"
+
 owner_profile=0
 if owner_profile_supported; then
   [[ "$provisioning" == preseal-prepared ]] \
     || die "owner-profile first boot requires the exact preseal-prepared TPM state"
   owner_profile=1
-  initial_metadata="$(verify_preseal_initial)" \
-    || die "cannot authenticate the installed candidate before owner ceremony"
-  read -r receipt_hash set_hash baseline_floor <<<"$initial_metadata"
-  seed_applied_baseline "$receipt_hash" "$set_hash"
+  if [[ "$OWNER_LANE" == v2release ]]; then
+    # Lane 2: the v2 release receipt authenticates the floor. No preseal set, no
+    # v1 applied baseline (it would write OTA-controller state a v2 host forbids),
+    # and no relaxed branch: every refusal below `die`s before the one-time TPM
+    # mutation, so the next boot retries from the same preseal-prepared state.
+    require_v2_release_inputs
+    receipt_hash="$(sha256sum "$V2_RECEIPT" | awk '{print tolower($1)}')"
+    baseline_floor="$(v2_release_retained "$receipt_hash")" || exit 1
+    v2_receipt_binds_install "$baseline_floor" \
+      || v2_refusal "the receipt does not bind the installer release identity"
+  else
+    initial_metadata="$(verify_preseal_initial)" \
+      || die "cannot authenticate the installed candidate before owner ceremony"
+    read -r receipt_hash set_hash baseline_floor <<<"$initial_metadata"
+    seed_applied_baseline "$receipt_hash" "$set_hash"
+  fi
 else
   [[ "$provisioning" == virgin || "$provisioning" == pcr-policy-activated ]] \
     || die "historical first boot requires an exact legacy provisioning state"
@@ -594,8 +784,13 @@ snapshot="$($TPM_STATE state-snapshot "$ACCESS_PROFILE" "$HARDWARE_TARGET" "$SIG
 if (( owner_profile )); then
   "$OTA_STATE" clear-protection >/dev/null || die "cannot protect the TPM against runtime Clear"
   owner_inspection="$($OTA_STATE inspect-v2)" || die "cannot attest protected owner OTA state"
-  build_evidence_v2 "$snapshot" "$receipt_hash" "$set_hash" "$baseline_floor" "$owner_inspection" > "$WORK/evidence.json" \
-    || die "cannot construct canonical v2 lifecycle evidence"
+  if [[ "$OWNER_LANE" == v2release ]]; then
+    build_evidence_v2lane "$snapshot" "$receipt_hash" "$baseline_floor" "$owner_inspection" > "$WORK/evidence.json" \
+      || die "cannot construct canonical v2 lane-2 lifecycle evidence"
+  else
+    build_evidence_v2 "$snapshot" "$receipt_hash" "$set_hash" "$baseline_floor" "$owner_inspection" > "$WORK/evidence.json" \
+      || die "cannot construct canonical v2 lifecycle evidence"
+  fi
   evidence="$EVIDENCE_V2"
 else
   build_evidence "$snapshot" > "$WORK/evidence.json" \

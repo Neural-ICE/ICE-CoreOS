@@ -33,7 +33,7 @@ grep -qx 'RequiredBy=multi-user.target' "$UNIT" || fail "multi-user readiness do
 # SWTPM; this holds the call site and its ordering in the script text.
 grep -q 'bootstrap-from-preseal' "$CEREMONY" \
   || fail "ceremony never seeds the applied baseline from the preseal receipt"
-grep -Fqx "  seed_applied_baseline \"\$receipt_hash\" \"\$set_hash\"" "$CEREMONY" \
+grep -Fqx "    seed_applied_baseline \"\$receipt_hash\" \"\$set_hash\"" "$CEREMONY" \
   || fail "ceremony does not seed the applied baseline from the authenticated receipt and set hashes"
 python3 - "$CEREMONY" <<'PY' || fail "applied-baseline seeding is not ordered after verify_preseal_initial and before ceremony-prepare-v2"
 import sys
@@ -42,6 +42,32 @@ initial = text.index('initial_metadata="$(verify_preseal_initial)"')
 seed = text.index('seed_applied_baseline "$receipt_hash" "$set_hash"')
 prepare = text.index('ceremony-prepare-v2 "$ACCESS_PROFILE"')
 raise SystemExit(0 if initial < seed < prepare else 1)
+PY
+# Mission B, lane 2 (owner-sealed v2 host, docs/ota/V2-RELEASE-ATTESTATION.md
+# section 9): the v2 checks have NO relaxed branch. Hold it in the script text:
+# the v2 functions never name the relaxed posture or its helper, the first boot
+# authenticates through the v2 verifier before the one-time TPM mutation, and
+# the v1 applied-baseline seeding stays on the preseal branch only.
+python3 - "$CEREMONY" <<'PY' || fail "the owner-sealed v2 lane is not wired fail-closed and ordered before the TPM mutation"
+import re, sys
+text = open(sys.argv[1]).read()
+def body(name):
+    m = re.search(r'^%s\(\) \{.*?^\}$' % re.escape(name), text, re.S | re.M)
+    if not m: raise SystemExit("missing function " + name)
+    return m.group(0)
+for name in ("v2_refusal", "require_v2_release_inputs", "v2_receipt_binds_install",
+             "v2_release_retained", "build_evidence_v2lane"):
+    if re.search(r'preseal_refusal|SEALED_OTA_STATE|RELAXED|relaxed', body(name)):
+        raise SystemExit(name + " has a relaxed branch")
+for token in ("owner-sealed-ota-state-v1) OWNER_LANE=preseal", "owner-sealed-ota-state-v2) OWNER_LANE=v2release"):
+    if token not in text: raise SystemExit("marker case missing: " + token)
+branch = text.index('if [[ "$OWNER_LANE" == v2release ]]; then\n    # Lane 2')
+verify = text.index('baseline_floor="$(v2_release_retained "$receipt_hash")"', branch)
+prepare = text.index('ceremony-prepare-v2 "$ACCESS_PROFILE"')
+seed = text.index('seed_applied_baseline "$receipt_hash" "$set_hash"')
+if not (branch < verify < prepare): raise SystemExit("v2 verification is not before ceremony-prepare-v2")
+if not (verify < seed): raise SystemExit("the preseal seeding is not on the other branch")
+if "bootstrap-from-preseal" in text[branch:seed]: raise SystemExit("the v2 branch seeds a v1 baseline")
 PY
 grep -qx 'DefaultDependencies=no' "$UNIT" \
   || fail "ceremony default dependencies would After=basic and cycle with sshd.socket"
@@ -284,7 +310,7 @@ case "$1" in
       "$(cat "$NI_TEST_TPM_COMPLETION")" ;;
   provisioning-status)
     (( $# == 1 )) && [[ ! -e "$NI_TEST_TPM_COMPLETION" ]] || exit 1
-    printf 'virgin\n' ;;
+    printf '%s\n' "${NI_TEST_PROVISIONING:-virgin}" ;;
   ceremony-prepare)
     (( $# == 5 )) && closed_identity "$@" && [[ "$5" == 1 ]] || exit 1
     printf '1 1 0d980453cfc2147ba50e02b979a2a5c70797d8bf305550949accffabf130324b\n' ;;
@@ -423,6 +449,56 @@ expect_pre_tpm_refusal missing-marker 'required immutable marker is not a regula
 prepare_fixture
 chmod 0644 "$STATE/owner-ceremony-intent-v1"
 expect_pre_tpm_refusal writable-evidence 'required mutable evidence is not mode 0600'
+
+# Lane 2 with the production metadata validators ON: exact modes (0700 private
+# directories, 0600 files, 0444 marker) reach the v2 verifier; a deviation
+# refuses before it. The verifier is a stub that records the call and refuses,
+# so this proves WHERE the lane stops, not the attestation itself.
+cat > "$TOOLS/ota-state" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$TOOLS/ota-verify" <<'EOF'
+#!/usr/bin/env bash
+: > "$NI_TEST_VERIFIER_CALLED"
+[[ "$1" == verify-retained-v2-release ]] || exit 2
+exit 1
+EOF
+chmod 0755 "$TOOLS"/*
+prepare_v2_fixture() {
+  prepare_fixture
+  mkdir -m 0700 "$STATE/v2-release-input-v1" "$STATE/v2-release"
+  printf 'manifest' > "$STATE/v2-release-input-v1/release-manifest.json"
+  printf 'sig' > "$STATE/v2-release-input-v1/release-manifest.json.sig"
+  printf '{}\n' > "$STATE/v2-release/receipt.json"
+  chmod 0600 "$STATE/v2-release-input-v1"/* "$STATE/v2-release/receipt.json"
+  rm -f "$TMP/ota-state-profile"
+  printf 'owner-sealed-ota-state-v2\n' > "$TMP/ota-state-profile"; chmod 0444 "$TMP/ota-state-profile"
+  printf 'key' > "$TMP/release-authorization.pub"
+  rm -f "$TMP/verifier-called"
+}
+V2_POSTURE=strict
+v2_ceremony() { NI_CEREMONY_POSTURE="$V2_POSTURE" NI_TEST_PROVISIONING=preseal-prepared \
+  NI_TEST_VERIFIER_CALLED="$TMP/verifier-called" \
+  NI_FIRSTBOOT_TPM_TEST_OTA_STATE="$TOOLS/ota-state" NI_FIRSTBOOT_TPM_TEST_OTA_VERIFY="$TOOLS/ota-verify" \
+  NI_FIRSTBOOT_TPM_TEST_OTA_PROFILE="$TMP/ota-state-profile" \
+  NI_FIRSTBOOT_TPM_TEST_RELEASE_KEY="$TMP/release-authorization.pub" \
+  NI_FIRSTBOOT_TPM_TEST_CANDIDATE_ROOT="$TMP" run_ceremony "$CEREMONY"; }
+for V2_POSTURE in strict relaxed; do
+  prepare_v2_fixture
+  if out="$(v2_ceremony 2>&1)"; then fail "the v2 lane accepted a rejecting verifier ($V2_POSTURE)"; fi
+  [[ -e "$TMP/verifier-called" ]] || fail "exact v2 metadata did not reach the v2 verifier ($V2_POSTURE): $out"
+  grep -Fq 'v2 release attestation' <<<"$out" || fail "the v2 lane refused for the wrong reason ($V2_POSTURE): $out"
+  if grep -Fq RELAXED <<<"$out"; then fail "the v2 lane fell open under $V2_POSTURE: $out"; fi
+  prepare_v2_fixture; chmod 0755 "$STATE/v2-release"
+  if out="$(v2_ceremony 2>&1)"; then fail "a world-readable receipt directory was accepted ($V2_POSTURE)"; fi
+  grep -Fq 'persisted release directories have unsafe metadata' <<<"$out" || fail "receipt directory mode refused for the wrong reason ($V2_POSTURE): $out"
+  [[ ! -e "$TMP/verifier-called" ]] || fail "the verifier ran on unsafe v2 metadata ($V2_POSTURE)"
+  prepare_v2_fixture; chmod 0644 "$STATE/v2-release-input-v1/release-manifest.json"
+  if out="$(v2_ceremony 2>&1)"; then fail "a 0644 persisted manifest was accepted ($V2_POSTURE)"; fi
+  grep -Fq 'required mutable evidence is not mode 0600' <<<"$out" || fail "manifest mode refused for the wrong reason ($V2_POSTURE): $out"
+  [[ ! -e "$TMP/verifier-called" ]] || fail "the verifier ran on a 0644 manifest ($V2_POSTURE)"
+done
 
 # Mutation oracle: restoring the old single all-0600 helper must make the exact
 # legitimate image modes fail before TPM. This prevents a future refactor from
