@@ -7,11 +7,11 @@
 
 ## Tooling state at the time of writing
 
-Written 2026-10-06 against `origin/main` at `c507a8b`. The bench tooling is the one listed in
+Written 2026-10-06 against `origin/main` at `ea12cca`. The bench tooling is the one listed in
 [RUNBOOK-OEM-BENCH](RUNBOOK-OEM-BENCH.md). What matters here: **there is no re-enrolment mode.**
 Today the only way to put a new TPM under a unit is to reinstall, which wipes the disk. A mode that
-re-enrols from the recovery key without erasing (`installer re-enrolment`, OS-0045 task T10) is
-PLANNED. The rules engine (`ni-pcr-rules`) is IN REVIEW (#247) and is not installed on any unit.
+re-enrols from the recovery key without erasing (`installer re-enrolment`, OS-0045 consequences, P1) is
+PLANNED. The rules engine (`ni-pcr-rules`, MERGED #247) exists but is installed on no unit and no installer gate calls it.
 
 ## Cases
 
@@ -39,18 +39,19 @@ the data is lost and the owner must be told so before the board is replaced. The
 administrator password (Q4) is retrieved from escrow only to open the firmware menus on the bench.
 
 ### R3 · Replacement board: the pinned firmware, nothing else
-**Tooling status:** `ni-bench-snapshot` — MERGED (#246); `ni-pcr7-calc` — MERGED (#245)
+**Tooling status:** `ni-bench-snapshot` — MERGED (#246); `ni-pcr7-calc` — MERGED (#245); `pinned firmware channel` — PLANNED (OS-0045 D4 and Q3, no mechanism defined)
 
 On the replacement board, redo the bench steps B1–B4 of the [OEM bench runbook](RUNBOOK-OEM-BENCH.md):
-record the firmware set and bring it to the **pinned** set of the family (flashing only through the
-Neural ICE channel; no autonomous `fwupd`, Q3), TPM clear with physical presence, **a new UEFI
+record the firmware set; it must already be the **pinned** set of the family. The channel that would
+bring a board to it (Q3) is not defined and no tool exists: a board at another set is set aside, and
+nothing is flashed with a vendor tool or `fwupd`. TPM clear with physical presence, **a new UEFI
 administrator password** escrowed under the unit's serial (the old board's password is retired,
 not reused), Secure Boot enabled, production certificate enrolled directly in `db`.
 A board that arrives at another firmware set than the pinned one is a case of the firmware runbook,
 not of this one.
 
 ### R4 · Compare the new board with the family reference
-**Tooling status:** `ni-pcr7-calc` — MERGED (#245); `NI-P7-COVERAGE` — MERGED (#129); `per-configuration signing` — IN REVIEW (ICE-Fabric-v2 #120); `per-device bench record` — PLANNED (T11)
+**Tooling status:** `ni-pcr7-calc` — MERGED (#245); `NI-P7-COVERAGE` — MERGED (#129); `per-configuration signing` — IN REVIEW (ICE-Fabric-v2 #120); `per-device bench record` — PLANNED (OS-0045 D5)
 
 Capture the PCR 7 of the new board booted from the installer medium and replay it:
 
@@ -75,7 +76,7 @@ this runbook is relied on. **Data on the old disk is gone after this step**: cop
 (R6) or accept the loss.
 
 ### R6 · Keep the owner's data (only if the old disk is kept)
-**Tooling status:** `installer re-enrolment` — PLANNED (T10)
+**Tooling status:** `installer re-enrolment` — PLANNED (OS-0045 consequences, RMA, P1)
 
 Planned: an installer mode that takes the recovery key, creates the new tokens and does not touch the
 data. It does not exist. Today, to keep data, unlock the old data volume by hand with its recovery key
@@ -84,7 +85,7 @@ recorded as rehearsed here; rehearse it on a bench unit with disposable data bef
 customer's.
 
 ### R7 · Prove, record, ship
-**Tooling status:** `per-device bench record` — PLANNED (T11); `uefi password escrow` — PLANNED (T11)
+**Tooling status:** `per-device bench record` — PLANNED (OS-0045 D5); `uefi password escrow` — PLANNED (OS-0045 D5 and Q4)
 
 After the first boot, check that both LUKS tokens are bound to the Owner public key (a token with
 literal PCR values is not compliant) and that unlock without prompt works after a reboot. Update the

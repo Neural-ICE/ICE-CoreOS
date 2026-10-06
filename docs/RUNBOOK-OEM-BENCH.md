@@ -14,7 +14,7 @@ code block is MERGED tooling only. This is checked by `ci/test-docs-tpm-scale-ru
 
 ## Tooling state at the time of writing
 
-Written 2026-10-06 against `origin/main` at `c507a8b`.
+Written 2026-10-06 against `origin/main` at `ea12cca`.
 
 | Tool | State | Reference |
 |---|---|---|
@@ -22,9 +22,10 @@ Written 2026-10-06 against `origin/main` at `c507a8b`.
 | `ni-pcr7-calc` (offline PCR 7 replay / prediction) | MERGED | #245 |
 | `NI-P7-COVERAGE` (installer refuses an uncovered live PCR 7 before any write) | MERGED | #129 |
 | signed installer and owner first-boot ceremony | MERGED | on main (`ota/`), no single PR |
-| `ni-pcr-rules` (Owner-signed rules engine) | IN REVIEW | #247 |
+| `ni-pcr-rules` (Owner-signed rules engine; evaluates rules, installed nowhere) | MERGED | #247 |
 | `per-configuration signing` (one Owner signature per reference configuration, CI check) | IN REVIEW | ICE-Fabric-v2 #120 |
-| `NI-P7-RULES` installer gate, `ni-pcr-rekey` agent, NV policy shard, installer re-enrolment, per-device bench record, UEFI password escrow | PLANNED | OS-0045 tasks T5, T7, T8, T10, T11 |
+| `NI-P7-RULES` installer gate (calls the engine), `ni-pcr-rekey` agent, `NV policy shard`, installer re-enrolment, per-device bench record, UEFI password escrow | PLANNED | OS-0045 D2, D3, D4, D5, P1 |
+| `pinned firmware channel` (how a unit is brought to the pinned set) | PLANNED | OS-0045 D4 and Q3; no mechanism defined |
 
 Until `NI-P7-RULES` and the NV policy exist, the admission of a PCR 7 value at install time is
 still the signed-entry mechanism (P0 of OS-0045): a unit whose live PCR 7 is not covered is
@@ -51,12 +52,13 @@ more, and nothing here has been shown on a family other than those two.
 - The bench station holds no PCR policy key (OS-0045 D5).
 
 ### B1 · Record the unit and pin its firmware
-**Tooling status:** none (manual; read-only commands of the OS)
+**Tooling status:** `pinned firmware channel` — PLANNED (OS-0045 D4 and Q3, no mechanism defined)
 
 Record, outside this repository, the unit's serial and the version of every firmware component
 (`fwupdmgr get-devices` is read-only; do not run `refresh` or `update`). Compare with the
-pinned set. Any difference is fixed through the Neural ICE channel only (Q3), on the bench,
-before going on. Serials and hardware identifiers are kept in the bench record, never in the
+pinned set. Any difference: **set the unit aside**. The channel that would bring a unit to the
+pinned set (Q3) is not defined and no tool exists, so this runbook cannot fix a mismatch; do not
+flash with a vendor tool or `fwupd`. Only a unit already at the pinned set goes on. Serials and hardware identifiers are kept in the bench record, never in the
 open-core tree.
 
 ### B2 · Put the unit in factory state
@@ -68,7 +70,7 @@ for the firmware (no LVFS mirror, no network path for `fwupd`); the exact comman
 the remote is **not validated yet** — verify it on the reference unit and record it.
 
 ### B3 · Set the per-device UEFI administrator password and escrow it (Q4)
-**Tooling status:** `uefi password escrow` — PLANNED (T11)
+**Tooling status:** `uefi password escrow` — PLANNED (OS-0045 D5 and Q4)
 
 1. Generate a password **per device**, from a CSPRNG, at the bench. Never reuse one across units.
 2. Set it in the firmware setup.
@@ -83,7 +85,7 @@ the remote is **not validated yet** — verify it on the reference unit and reco
 No tooling exists to generate, store or retrieve this secret. Which of the two recovery keys it
 travels with (system escrow held by Neural ICE, or the data key handed to the owner) is not
 stated by Q4; this runbook assumes the **Neural ICE system escrow**, since the owner must not
-hold a secret that changes the firmware trust. Confirm with the Owner.
+hold a secret that changes the firmware trust. **Open: the Owner has not decided it** (Q4 does not name the key); confirm before this runbook is given to a partner.
 
 ### B4 · Enrol the production certificate directly in the authorised signature database
 **Tooling status:** none (manual, firmware menus)
@@ -99,6 +101,7 @@ On the reference unit, once from the installer medium and once from the installe
 
 ```sh
 T=tools/ni-bench-snapshot/ni-bench-snapshot.py
+# LOG: the TCG2 event log of the boot just captured (the binary firmware log, e.g. /sys/kernel/security/tpm0/binary_bios_measurements)
 python3 -I $T capture --path installer --out installer.json </dev/null   # on the unit, read-only
 python3 -I $T capture --path installed --out installed.json </dev/null   # after the install boot
 python3 -I $T build-record --installer installer.json --installed installed.json --out record.json
@@ -114,6 +117,7 @@ exists yet; the store refuses a synthetic one.
 **Tooling status:** `ni-bench-snapshot` — MERGED (#246); `per-configuration signing` — IN REVIEW (ICE-Fabric-v2 #120)
 
 ```sh
+T=tools/ni-bench-snapshot/ni-bench-snapshot.py   # repeat in a new shell
 python3 -I $T make-sheet --record record.json --seq <n> --issued-at <date> --pubkey owner.pub.pem --out sheet.json
 python3 -I $T sheet-payload sheet.json --out payload.bin       # the Owner signs THIS, offline
 python3 -I $T store --record record.json --sheet sheet.json --signature sheet.sig \
@@ -129,7 +133,7 @@ signature per reference configuration and a CI check that every configuration of
 one — is in review and not usable from `main`.
 
 ### B7 · Production unit — install and compare with the family reference
-**Tooling status:** `signed installer` — MERGED (on main, ota/neural-ice-autoinstall.sh); `ni-pcr7-calc` — MERGED (#245); `NI-P7-COVERAGE` — MERGED (#129); `NI-P7-RULES` — PLANNED (T5); `per-device bench record` — PLANNED (T11)
+**Tooling status:** `signed installer` — MERGED (on main, ota/neural-ice-autoinstall.sh); `ni-pcr7-calc` — MERGED (#245); `NI-P7-COVERAGE` — MERGED (#129); `NI-P7-RULES` — PLANNED (OS-0045 D2, P1); `per-device bench record` — PLANNED (OS-0045 D5)
 
 Boot the signed installer medium and install. Today the installer refuses before any write when
 the live PCR 7 is not covered by a signed entry (`NI-P7-COVERAGE`). A refusal means the unit is
@@ -157,5 +161,5 @@ install proof. This file is what the RMA starts from; it lives outside the open-
 ## What this runbook does not give you
 
 No revocation, no per-machine update path, no tooling for B3 and for the per-unit parts of B7,
-and the rules (`ni-pcr-rules`, IN REVIEW #247) are not installed anywhere. Do not describe the
+and the rules engine (`ni-pcr-rules`, MERGED #247) is installed nowhere and no installer gate calls it (`NI-P7-RULES` is PLANNED). Do not describe the
 bench to a partner as policy-at-scale before P1 is merged and proven on hardware.
