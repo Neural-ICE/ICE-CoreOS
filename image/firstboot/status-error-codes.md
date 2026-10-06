@@ -26,8 +26,9 @@ asserts the script cannot read those paths).
 | NI-E01 | storage unlock | `systemd-cryptsetup@data.service` or `var-lib-neural\x2dice-data.mount`            |
 | NI-E02 | TPM ceremony   | `neural-ice-firstboot-tpm-ceremony.service` failed, **or** still `activating` after `NI_STATUS_CEREMONY_TIMEOUT` s |
 | NI-E03 | network        | `NetworkManager.service`                                                            |
-| NI-E04 | image pull     | v1: `neural-ice-seed-import.service` or `neural-ice-payload-apply.service`; v2: `ni-v2-seed-import.service` or `ni-v2-first-pull.service` |
+| NI-E04 | image pull     | v1: `neural-ice-seed-import.service` or `neural-ice-payload-apply.service`; with a product declaration: a unit of its `images_units=` |
 | NI-E05 | core service   | any unit of the core-services list (below); the failed unit names are shown         |
+| NI-E06 | status declaration | a product declaration under `status-screen.d` was refused (grammar below); the reason and the file name are shown. Not a boot phase: it ranks after E01–E05 and withholds READY |
 
 When several phases fail at once, the **earliest phase wins** (E01 before E02
 before …): the first thing that broke is the one to report.
@@ -43,36 +44,75 @@ before …): the first thing that broke is the one to report.
 | Core services | fixed list below; `active`, or `inactive` with a failed `Condition*=`, counts as done   |
 | READY         | ceremony active, network up with address, N = M, every core service done               |
 
-On a **v2 host** the Images line and READY differ, see "v2 hosts" below.
+On a host whose image ships a **product declaration** the Images line and READY differ, see "Product declarations" below.
 
 ## Core-services list
 
 The OS ships `neural-ice-hostname-init.service`, `neural-ice-device-root.service`,
 `neural-ice-payload-apply.service`, `avahi-daemon.service`. The branded
-derivation (ICE-Fabric) appends its product units by shipping
-`/usr/lib/neural-ice/status-screen/core-services` — one unit name per line, `#`
-comments allowed. The OS itself carries no product knowledge (ADR-0032).
+derivation (ICE-Fabric) adds its product units with a declaration (`core_units=`,
+below) or, older, by shipping `/usr/lib/neural-ice/status-screen/core-services` —
+one unit name per line, `#` comments allowed. A unit the image does not ship
+(`LoadState=not-found`) is skipped. The OS itself carries no product knowledge
+(ADR-0032): every product unit name, path and manifest key comes from the image's
+declarations, and `image/test-status-screen.sh` fails if the script names one.
 
-## v2 hosts
+## Product declarations
 
-A host whose image carries `/usr/lib/neural-ice/ota-state-profile` =
-`owner-sealed-ota-state-v2` is a v2 appliance (matched exactly; any other value
-or no file keeps the v1 screen, byte for byte). Its components are not the
-`Image=` references of the OS image but the components of the signed release
-manifest the first boot imported, so:
+A branded derivation tells the screen what its product needs with files
+`/usr/lib/neural-ice/status-screen.d/*.conf`. **No directory = the v1 screen,
+byte for byte.** An empty directory, or files whose name does not end in `.conf`,
+change nothing.
 
-| Line / state  | v2 source                                                                               |
-|---------------|-----------------------------------------------------------------------------------------|
-| Header        | `release <release_id>` from `/var/lib/neural-ice-v2/current-release/release-manifest.json` (`[A-Za-z0-9._-]`, else `unset`). The v2 manifest carries **no ring**, and no ring is stored on a v2 host, so the screen does not invent a `channel`. |
-| Images        | N/M: M = components of that manifest, N = those whose alias `localhost/neural-ice-applied/<id>:v1` **and** manifest digest are both in `overlay-images/images.json` (graphroot, bootc store or seed store; the alias is what the first pull and the preload import both tag). `[ .. ]` until `ni-v2-seed-import.service` **and** `ni-v2-first-pull.service` are themselves done: `active`, skipped by their `Condition*=` (a full preload never starts the first pull) or not shipped. Having pulled the last image is not done: the unit still commits the aliases and its DONE marker. |
-| Images, no manifest | `[    ] waiting for the attested release manifest` (import not finished) or `release manifest names no readable component`; never the v1 "no product image inventory" skip, and never READY. |
-| NI-E04        | `ni-v2-seed-import.service` or `ni-v2-first-pull.service` in `failed` (a permanent refusal: signature, access profile, signed mirror endpoint/CA, digest, disk). A mirror outage keeps the first pull `activating` (it retries inside the unit), so the screen stays on `N/M present`. The v1 units are not watched. |
-| Core services | `neural-ice-hostname-init`, `neural-ice-device-root`, `avahi-daemon`, `neural-ice-product-payload-apply` (ordered after the first pull, starts the product), `icecore-api` (the product core API, a Quadlet unit), plus the optional extension file. Units the image does not ship are skipped. |
-| READY         | the v1 conditions, with Images and Core services as above: so not before the first pull is done, the product payload applied and the core API active. |
+Grammar (closed; the parser is `decl_parse` in the script):
 
-The screen only **displays** the manifest. Its signature is verified by the
-first pull before it pulls anything, and the release receipt by the owner
-ceremony; this screen reads no key and does not re-verify.
+- The directory and every `*.conf` file: owned by root, regular file (a symlink is
+  refused), not group- or world-writable; at most 16 `*.conf` files, each at most
+  4096 bytes of printable ASCII (no tab, CR, NUL or non-ASCII); the file name
+  matches `[a-z0-9][a-z0-9._-]{0,63}\.conf`.
+- Lines: empty, `# comment` (whole line only), or `key=value`: lower-case key, no
+  space around `=`, no space starting the value, no key twice in a file, a
+  non-empty value. A list is single-space separated.
+- `version=1` is required. The `images_*` keys come **together** in one file
+  (`images_release_key` optional) and only one file may declare them;
+  `core_units` may be given by several files. A file declaring none of them is
+  refused.
+
+| Key                      | Value                                                                                       |
+|--------------------------|---------------------------------------------------------------------------------------------|
+| `version=`               | `1`                                                                                          |
+| `images_units=`          | 1–8 `*.service` names, in the order they run: the image phase. `failed` = NI-E04; READY waits until each is `active`, skipped by its `Condition*=`, or not shipped. Replaces the OS's own v1 image units and its v1 payload apply (they are no longer watched) |
+| `images_manifest=`       | absolute path of the manifest listing the components, under `/var/lib/`, `/usr/lib/` or `/usr/share/` (plain components: no `.`, `..`, empty, space; at most 200 characters). Read as a regular file, never through a symlink, at most 1 MiB, as text only |
+| `images_component_key=`  | JSON key (`[a-z][a-z0-9_]{0,31}`) whose string value is a component id (`[a-z0-9][a-z0-9._-]{0,127}`); each flat `{...}` object carrying it is one component |
+| `images_digest_key=`     | JSON key whose string value is the component's `sha256:<64 hex>` digest                       |
+| `images_alias=`          | alias of a component in containers-storage, `[a-z0-9._/:-]` with exactly one `{id}` replaced by the component id |
+| `images_release_key=`    | optional JSON key whose string value (`[A-Za-z0-9._-]`, else `unset`) is shown as `release <value>` in the header instead of the v1 channel |
+| `core_units=`            | 1–16 `*.service`/`*.target`/`*.mount`/`*.socket` names appended to the core services         |
+
+With `images_*` declared:
+
+| Line / state  | Behaviour                                                                                |
+|---------------|------------------------------------------------------------------------------------------|
+| Images        | N/M: M = components of the manifest, N = those whose alias **and** manifest digest are both in `overlay-images/images.json` (graphroot, bootc store or seed store). `[ .. ]` until every `images_units` unit is itself done: having fetched the last image is not done, the unit still commits. |
+| Images, no manifest | `[    ] waiting for the release manifest` or `release manifest names no readable component`; never the v1 "no product image inventory" skip, and never READY. |
+| Header        | `release <value>` when `images_release_key` is declared, else the v1 channel. A header never invents a value. |
+| READY         | the v1 conditions, with Images and Core services as declared.                            |
+
+The screen only **displays** the manifest: it never verifies a signature and
+reads no key; verifying is the job of the product's own import/pull units.
+
+**NI-E06.** A file that breaks any rule above contributes **nothing** (never
+half-applied, never guessed) and is reported: `FAILURE NI-E06 (status declaration:
+<reason>)` with `unit: <file name>` (the directory name for a directory-level
+refusal) and on the serial mirror. Valid files keep applying. Reasons:
+`unknown key <k>`, `key <k> given twice`, `line <n> is not key=value`,
+`version=1 missing or unsupported`, `declares nothing`, `bad <key>`,
+`missing key <key>`, `images declared by another file`,
+`not printable ASCII`, `larger than 4096 bytes`, `unsafe owner or mode`,
+`not a regular file`, `bad file name`, `more than 16 declarations`,
+`not a plain directory`. The declaration is image content, trusted like the
+image; what it can make the screen print is bounded (a release id of 40 safe
+characters, counters, unit names that passed the unit grammar).
 
 ## Header
 
@@ -80,7 +120,7 @@ Product name (`/usr/lib/os-release`), OS version (`/usr/lib/neural-ice/version`)
 booted image short digest (12 hex, `bootc status`; fallback: the `ostree=`
 deployment checksum from the kernel command line, prefixed `deploy`), device
 channel (v1: `/var/lib/neural-ice/data/release/CHANNEL`, fallback `device_channel=`
-in `/etc/neural-ice/ota.conf`; v2: the release id instead, see above), DMI vendor + model + serial
+in `/etc/neural-ice/ota.conf`; with `images_release_key=`: the release id instead, see above), DMI vendor + model + serial
 (`/sys/class/dmi/id`), hostname.
 
 **Identity policy.** The only device-identifying data on screen is what the
