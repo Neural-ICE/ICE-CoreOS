@@ -1099,6 +1099,181 @@ v2_refused "no sealed release key to verify under" "carries no release key"
 cp "$V2P/test.pub" "$V2P/sealed/release-authorization.pub"
 echo "  v2 release pair (producer): sealed after the source, joint, exclusive, signature verified under the sealed key, bound to the target and hardware"
 
+# --------------------------------------------------------------------------- #
+# 🔴 THE SIGNED PCR7 RULES PAIR, PRODUCER SIDE (mission "TPM policy at scale",
+# ADR-0045, T5). The producer takes the Owner-signed rules document and its
+# detached signature (`--pcr-rules FILE` / `--pcr-rules-signature FILE`, or
+# PCR_RULES_FILE / PCR_RULES_SIGNATURE_FILE), reads each ONCE without following
+# a link into a private copy, seals the SHA-256 of rules.json and the rules'
+# own `sequence` (never asked for as an argument) in the signed UKI line
+# (neuralice.pcr_rules / neuralice.pcr_rules_seq, beside the pcr_policy terms)
+# and stages both files on the ESP under ice-coreos/pcr-rules/. Both or
+# neither; Install only; absent / empty / link / over 1 MiB are refusals.
+#
+# Lifted verbatim, like the v2 pair above, so it runs on a host without
+# veritysetup.
+# --------------------------------------------------------------------------- #
+PRP="$TMP/pcr-rules-producer"; mkdir -p "$PRP/tmp"
+awk '/^sha256_of\(\) \{/,/^}$/' "$BUILDER" > "$PRP/lifted.sh"
+for pr_function in pcr_rules_acquire assert_pcr_rules_inputs seal_pcr_rules_kargs; do
+  awk "/^${pr_function}\\(\\) \\{/,/^}\$/" "$BUILDER" >> "$PRP/lifted.sh"
+done
+for pr_function in sha256_of pcr_rules_acquire assert_pcr_rules_inputs seal_pcr_rules_kargs; do
+  grep -q "^${pr_function}()" "$PRP/lifted.sh" \
+    || fail "the producer no longer defines ${pr_function}; the PCR rules pair would be unsealed"
+done
+bash -n "$PRP/lifted.sh" || fail "the lifted PCR rules functions do not parse"
+
+pr_write_rules() { # $1=dir $2=rules.json body -> dir/rules.json and a distinct dir/rules.json.sig
+  mkdir -p "$1"
+  printf '%s' "$2" > "$1/rules.json"
+  printf 'b3duZXItc2lnbmF0dXJlLW92ZXItdGhlLWRvbWFpbi1zZXBhcmF0ZWQtcnVsZXM=' > "$1/rules.json.sig"
+}
+PR_RULES_BODY='{"approved_certs":[],"approved_pk":[],"schema":"ni-pcr-rules/1","sequence":12,"unbound_variables":"allow"}'
+pr_write_rules "$PRP/good" "$PR_RULES_BODY"
+pr_good_sha="$(sha256sum "$PRP/good/rules.json" | awk '{print $1}')"
+
+# shellcheck disable=SC2034
+pr_seal() { # [VAR=value ...] -> runs the LIFTED producer functions; prints the kargs it sealed
+  (
+    set -uo pipefail
+    MEDIA_MODE=install
+    PCR_RULES_FILE="$PRP/good/rules.json" PCR_RULES_SIGNATURE_FILE="$PRP/good/rules.json.sig"
+    PCR_RULES_PRIVATE_DIR="" PCR_RULES_STAGE_ROOT=""
+    local_assignment=""
+    for local_assignment in "$@"; do printf -v "${local_assignment%%=*}" '%s' "${local_assignment#*=}"; done
+    UKI_KARGS=(sentinel)
+    # shellcheck disable=SC1091
+    source "$PRP/lifted.sh"
+    TMPDIR="$PRP/tmp"
+    trap 'rm -rf -- "$PCR_RULES_PRIVATE_DIR"' EXIT
+    assert_pcr_rules_inputs || exit $?
+    seal_pcr_rules_kargs || exit $?
+    printf '%s\n' "${UKI_KARGS[*]}"
+    printf 'STAGE=%s SHA=%s SEQ=%s\n' "${PCR_RULES_STAGE_ROOT:-unset}" "${PCR_RULES_SHA256:-unset}" "${PCR_RULES_SEQ:-unset}"
+  )
+}
+pr_refused() { # $1=label $2=text the refusal must carry, rest as pr_seal
+  local label=$1 reason=$2 rc=0; shift 2
+  pr_seal "$@" >"$PRP/out" 2>"$PRP/err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "[pcr rules producer] $label: the producer accepted it ($(cat "$PRP/out"))"
+  grep -q "^ERROR:.*${reason}" "$PRP/err" \
+    || fail "[pcr rules producer] $label: refused, but not for '${reason}': $(cat "$PRP/err")"
+}
+
+pr_out="$(pr_seal)" || fail "[pcr rules producer] a well-formed signed rules pair was refused: $(pr_seal 2>&1 | head -3)"
+[ "$(sed -n 1p <<<"$pr_out")" = "sentinel neuralice.pcr_rules=${pr_good_sha} neuralice.pcr_rules_seq=12" ] \
+  || fail "[pcr rules producer] the sealed kargs are not the rules digest then the sequence READ FROM THE RULES: $pr_out"
+grep -q "^STAGE=staged SHA=${pr_good_sha} SEQ=12\$" <<<"$pr_out" \
+  || fail "[pcr rules producer] the producer does not hand the staged hash and sequence to the ESP step: $pr_out"
+# The produced pair, on a produced Install line, is one the closed grammar accepts.
+# shellcheck source=/dev/null
+. "$ROOT/image/installer/neural-ice-sealed-cmdline-grammar.sh"
+pr_pair="$(sed -n 1p <<<"$pr_out")"; pr_pair="${pr_pair#sentinel }"
+ni_sealed_cmdline_classify "quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 neuralice.trust=neural-ice-installer-trust-v1 neuralice.access_profile=lab-managed neuralice.hardware_target=nvidia-gb10-arm64 neuralice.payload=$(printf '1%.0s' {1..64}) neuralice.relauth_keyid=$(printf '2%.0s' {1..64}) neuralice.relauth_schema=neural-ice-installer-release-authorization-v2 neuralice.rootverity=$(printf '3%.0s' {1..64}) neuralice.trust_policy_id=neural-ice-secureboot-lab-v1 neuralice.pcr_policy=$(printf '4%.0s' {1..64}) neuralice.pcr_policy_key=$(printf '5%.0s' {1..64}) neuralice.pcr_policy_signature=$(printf '6%.0s' {1..64}) neuralice.pcr_policy_seq=7 $pr_pair" >/dev/null 2>&1 \
+  || fail "[pcr rules producer] the closed grammar refused the pair the producer seals: $pr_pair"
+
+# Neither input: not a trace of it, and nothing staged.
+pr_none="$(pr_seal PCR_RULES_FILE= PCR_RULES_SIGNATURE_FILE=)" || fail "[pcr rules producer] a medium with no rules was refused"
+[ "$(sed -n 1p <<<"$pr_none")" = sentinel ] \
+  || fail "[pcr rules producer] a medium with no rules sealed something: $pr_none"
+grep -q '^STAGE=unset ' <<<"$pr_none" || fail "[pcr rules producer] a medium with no rules staged something: $pr_none"
+# A sequence read from the rules, whatever it is: 1 and the largest safe integer.
+pr_write_rules "$PRP/seq1" '{"schema":"ni-pcr-rules/1","sequence":1}'
+pr_seq1="$(pr_seal PCR_RULES_FILE="$PRP/seq1/rules.json" PCR_RULES_SIGNATURE_FILE="$PRP/seq1/rules.json.sig" 2>/dev/null)" \
+  || fail "[pcr rules producer] sequence 1 was refused"
+[[ "$(sed -n 1p <<<"$pr_seq1")" == *' neuralice.pcr_rules_seq=1' ]] \
+  || fail "[pcr rules producer] sequence 1 was not sealed as read: $pr_seq1"
+pr_write_rules "$PRP/seqmax" '{"schema":"ni-pcr-rules/1","sequence":9007199254740991}'
+pr_seqmax="$(pr_seal PCR_RULES_FILE="$PRP/seqmax/rules.json" PCR_RULES_SIGNATURE_FILE="$PRP/seqmax/rules.json.sig" 2>/dev/null)" \
+  || fail "[pcr rules producer] the largest safe sequence was refused"
+[[ "$(sed -n 1p <<<"$pr_seqmax")" == *' neuralice.pcr_rules_seq=9007199254740991' ]] \
+  || fail "[pcr rules producer] the largest safe sequence was not sealed as read: $pr_seqmax"
+
+# Joint, or nothing: one file pins nothing.
+pr_refused "rules without signature" "supplied together" PCR_RULES_SIGNATURE_FILE=
+pr_refused "signature without rules" "supplied together" PCR_RULES_FILE=
+# Install only: a Live medium enrols and unlocks nothing.
+pr_refused "Live medium" "Install media" MEDIA_MODE=live
+# Absent / empty / link / too large, on each of the two files.
+: > "$PRP/empty"
+ln -sf "$PRP/good/rules.json" "$PRP/link"
+truncate -s 1048577 "$PRP/huge"
+pr_refused "missing rules" "non-empty regular files" PCR_RULES_FILE="$PRP/none"
+pr_refused "missing signature" "non-empty regular files" PCR_RULES_SIGNATURE_FILE="$PRP/none"
+pr_refused "empty rules" "non-empty regular files" PCR_RULES_FILE="$PRP/empty"
+pr_refused "empty signature" "non-empty regular files" PCR_RULES_SIGNATURE_FILE="$PRP/empty"
+pr_refused "symlinked rules" "non-empty regular files" PCR_RULES_FILE="$PRP/link"
+pr_refused "symlinked signature" "non-empty regular files" PCR_RULES_SIGNATURE_FILE="$PRP/link"
+pr_refused "a directory as rules" "non-empty regular files" PCR_RULES_FILE="$PRP"
+pr_refused "rules over 1 MiB" "larger than the 1048576-byte bound" PCR_RULES_FILE="$PRP/huge"
+pr_refused "signature over 1 MiB" "larger than the 1048576-byte bound" PCR_RULES_SIGNATURE_FILE="$PRP/huge"
+# The rules the engine will read: a JSON object whose `sequence` is an integer in 1..2^53-1.
+pr_bad_rules() { # $1=label $2=body $3=text the refusal must carry
+  pr_write_rules "$PRP/bad" "$2"
+  pr_refused "$1" "$3" PCR_RULES_FILE="$PRP/bad/rules.json" PCR_RULES_SIGNATURE_FILE="$PRP/bad/rules.json.sig"
+}
+pr_bad_rules "rules that are not JSON" 'not json at all' "not valid JSON"
+pr_bad_rules "rules that are an array" '[1,2]' "JSON object"
+pr_bad_rules "rules with no sequence" '{"schema":"ni-pcr-rules/1"}' "sequence"
+pr_bad_rules "a string sequence" '{"sequence":"12"}' "sequence"
+pr_bad_rules "a boolean sequence" '{"sequence":true}' "sequence"
+pr_bad_rules "a fractional sequence" '{"sequence":12.5}' "sequence"
+pr_bad_rules "a float spelling of an integer" '{"sequence":12.0}' "sequence"
+pr_bad_rules "sequence zero" '{"sequence":0}' "sequence"
+pr_bad_rules "a negative sequence" '{"sequence":-3}' "sequence"
+pr_bad_rules "a sequence beyond 2^53-1" '{"sequence":9007199254740992}' "sequence"
+pr_bad_rules "a duplicated sequence key (the engine's parser and ours would disagree)" '{"sequence":1,"sequence":99}' "duplicated JSON key"
+# A signature that is the rules' own bytes pins neither.
+cp "$PRP/good/rules.json" "$PRP/same-sig"
+pr_refused "signature identical to the rules" "same bytes" PCR_RULES_SIGNATURE_FILE="$PRP/same-sig"
+# No private copy survives a producer that exits.
+[ -z "$(find "$PRP/tmp" -mindepth 1 -print -quit)" ] \
+  || fail "[pcr rules producer] a refused or sealed rules pair left its private copy behind: $(ls "$PRP/tmp")"
+
+# The producer's own wiring, asserted on the real file: the two options, the
+# environment inputs they feed, the ordering beside the pcr_policy terms, the ESP
+# staging, and the early (pre-build) call of the cheap half of the refusals.
+for wiring in 'PCR_RULES_FILE="${PCR_RULES_FILE:-}"' 'PCR_RULES_SIGNATURE_FILE="${PCR_RULES_SIGNATURE_FILE:-}"' \
+  '--pcr-rules)' '--pcr-rules-signature)' \
+  'ice-coreos/pcr-rules/rules.json' 'ice-coreos/pcr-rules/rules.json.sig'; do
+  grep -Fq -- "$wiring" "$BUILDER" || fail "[pcr rules producer] the producer lost its wiring: $wiring"
+done
+pr_policy_line="$(grep -nF '"neuralice.pcr_policy_seq=${PCR_POLICY_SEQ}")' "$BUILDER" | head -1 | cut -d: -f1)"
+pr_seal_line="$(grep -n '^    seal_pcr_rules_kargs$' "$BUILDER" | head -1 | cut -d: -f1)"
+pr_source_line="$(grep -nF 'UKI_KARGS+=("neuralice.source=medium")' "$BUILDER" | head -1 | cut -d: -f1)"
+{ [ -n "$pr_policy_line" ] && [ -n "$pr_seal_line" ] && [ -n "$pr_source_line" ]; } \
+  || fail "[pcr rules producer] cannot locate the sealing call, the pcr_policy terms or the medium source"
+{ [ "$pr_policy_line" -lt "$pr_seal_line" ] && [ "$pr_seal_line" -lt "$pr_source_line" ]; } \
+  || fail "[pcr rules producer] the rules pair is not sealed right after the pcr_policy terms and before neuralice.source"
+grep -q '^assert_pcr_rules_inputs$' "$BUILDER" \
+  || fail "[pcr rules producer] the cheap half of the rules refusals does not run before the image build"
+
+# The two options, on the REAL producer (no toolchain is needed: the options are
+# judged before anything else is).
+pr_run() { env -i PATH="$PATH" HOME="$HOME" TMPDIR="$PRP/tmp" bash "$BUILDER" "$@" </dev/null 2>"$PRP/run.err" >"$PRP/run.out"; }
+pr_run --pcr-rules "$PRP/good/rules.json" \
+  && fail "[pcr rules producer] --pcr-rules alone was accepted"
+grep -q '^ERROR:.*supplied together' "$PRP/run.err" \
+  || fail "[pcr rules producer] --pcr-rules alone was refused, but not for being unpaired: $(cat "$PRP/run.err")"
+pr_run --pcr-rules-signature "$PRP/good/rules.json.sig" \
+  && fail "[pcr rules producer] --pcr-rules-signature alone was accepted"
+grep -q '^ERROR:.*supplied together' "$PRP/run.err" \
+  || fail "[pcr rules producer] --pcr-rules-signature alone was refused, but not for being unpaired: $(cat "$PRP/run.err")"
+pr_run --pcr-rules \
+  && fail "[pcr rules producer] --pcr-rules with no value was accepted"
+grep -q '^ERROR:.*requires a file' "$PRP/run.err" \
+  || fail "[pcr rules producer] --pcr-rules with no value was refused, but not for that: $(cat "$PRP/run.err")"
+pr_run --pcr-rules "$PRP/good/rules.json" --pcr-rules "$PRP/good/rules.json" --pcr-rules-signature "$PRP/good/rules.json.sig" \
+  && fail "[pcr rules producer] a repeated --pcr-rules was accepted"
+grep -q '^ERROR:.*more than once' "$PRP/run.err" \
+  || fail "[pcr rules producer] a repeated --pcr-rules was refused, but not for that: $(cat "$PRP/run.err")"
+pr_run --pcr-rule "$PRP/good/rules.json" \
+  && fail "[pcr rules producer] an unknown option was accepted"
+grep -q '^ERROR:.*unknown option' "$PRP/run.err" \
+  || fail "[pcr rules producer] an unknown option was refused, but not as one: $(cat "$PRP/run.err")"
+echo "  PCR rules pair (producer): read once, sequence taken from the rules, sealed beside the policy terms, joint, Install only, bounded"
+
 # shellcheck source=image/test-lib/sealed-medium-fixture.sh
 source "$ROOT/image/test-lib/sealed-medium-fixture.sh"
 
@@ -1595,6 +1770,94 @@ make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manife
   installer-install.efi.manifest "${registry_esp_files[@]}"
 assemble "$ESP" "$SEALED/payload.img"
 echo "  v2 release pair: accepted sealed, refused swapped / unpinned / unsealed / misplaced / beside the authorization pair"
+
+# --------------------------------------------------------------------------- #
+# THE SIGNED PCR7 RULES PAIR ON A REAL MEDIUM (ADR-0045, T5). `rules.json` is
+# hash-bound by the signed UKI (`neuralice.pcr_rules`, with the sequence floor
+# `neuralice.pcr_rules_seq`); `rules.json.sig` is not pinned by hash -- it is
+# verified under the Owner key `neuralice.pcr_policy_key` pins -- but it exists
+# on the ESP if and only if the pair is sealed. Every one of the refusals below
+# is a medium the installer would refuse after the wipe was authorised, or an
+# artefact on the mutable ESP that nothing the signature covers accounts for.
+# --------------------------------------------------------------------------- #
+pcr_rules_doc="$TMP/pcr-rules.json"
+printf '%s' '{"schema":"ni-pcr-rules/1","sequence":12,"unbound_variables":"allow"}' > "$pcr_rules_doc"
+printf 'b3duZXItc2ln' > "$TMP/pcr-rules.json.sig"
+pcr_rules_sha="$(sha256sum "$pcr_rules_doc" | awk '{print $1}')"
+pcr_rules_head="quiet systemd.unit=neural-ice-installer.target neuralice.autoinstall=1 enforcing=0 $PCR_POLICY_FIELDS"
+pcr_rules_pair="neuralice.pcr_rules=${pcr_rules_sha} neuralice.pcr_rules_seq=12"
+pcr_rules_esp_files=(
+  "::/ice-coreos/pcr-rules/rules.json=$pcr_rules_doc"
+  "::/ice-coreos/pcr-rules/rules.json.sig=$TMP/pcr-rules.json.sig"
+)
+build_uki installer-rules "$pcr_rules_head $pcr_rules_pair" >/dev/null \
+  || fail "the PCR rules medium UKI failed to build"
+make_esp "$SEALED/installer-rules.efi" "$SEALED/installer-rules.efi.manifest" \
+  installer-install.efi.manifest "${pcr_rules_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >"$TMP/inspect-rules.out" \
+  || { cat "$TMP/inspect-rules.out"; fail "a correctly sealed PCR rules medium was refused"; }
+grep -q "neuralice.pcr_rules=${pcr_rules_sha}" "$TMP/inspect-rules.out" \
+  || fail "the inspector did not surface the sealed rules pin"
+# The pin is a real comparison: swap rules.json on the ESP, the UKI untouched.
+printf '%s' '{"schema":"ni-pcr-rules/1","sequence":99,"unbound_variables":"allow"}' > "$TMP/pcr-rules-swapped.json"
+make_esp "$SEALED/installer-rules.efi" "$SEALED/installer-rules.efi.manifest" \
+  installer-install.efi.manifest \
+  "::/ice-coreos/pcr-rules/rules.json=$TMP/pcr-rules-swapped.json" \
+  "::/ice-coreos/pcr-rules/rules.json.sig=$TMP/pcr-rules.json.sig"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium whose rules.json was swapped after the cut was accepted"
+# A pin with no file, in each direction.
+make_esp "$SEALED/installer-rules.efi" "$SEALED/installer-rules.efi.manifest" \
+  installer-install.efi.manifest "::/ice-coreos/pcr-rules/rules.json=$pcr_rules_doc"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium sealing a rules pair but carrying no rules signature was accepted"
+make_esp "$SEALED/installer-rules.efi" "$SEALED/installer-rules.efi.manifest" \
+  installer-install.efi.manifest "::/ice-coreos/pcr-rules/rules.json.sig=$TMP/pcr-rules.json.sig"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium sealing a rules pair but carrying no rules.json was accepted"
+make_esp "$SEALED/installer-rules.efi" "$SEALED/installer-rules.efi.manifest" \
+  installer-install.efi.manifest
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium sealing a rules pair but carrying no rules file at all was accepted"
+# A file with no pin is an artefact anybody can replace.
+make_esp "$SEALED/installer-install.efi" "$SEALED/installer-install.efi.manifest" \
+  installer-install.efi.manifest "${pcr_rules_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "unpinned rules files on the ESP were accepted"
+# The kargs are a pair, at the reader of the finished medium too.
+build_uki installer-rules-digest-only "$pcr_rules_head neuralice.pcr_rules=${pcr_rules_sha}" >/dev/null \
+  || fail "the PCR rules digest-only UKI failed to build"
+make_esp "$SEALED/installer-rules-digest-only.efi" "$SEALED/installer-rules-digest-only.efi.manifest" \
+  installer-install.efi.manifest "${pcr_rules_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium sealing the rules digest without its sequence floor was accepted"
+build_uki installer-rules-seq-only "$pcr_rules_head neuralice.pcr_rules_seq=12" >/dev/null \
+  || fail "the PCR rules sequence-only UKI failed to build"
+make_esp "$SEALED/installer-rules-seq-only.efi" "$SEALED/installer-rules-seq-only.efi.manifest" \
+  installer-install.efi.manifest "${pcr_rules_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium sealing a sequence floor without its rules digest was accepted"
+# Rules older than the sealed floor would refuse themselves after the wipe.
+build_uki installer-rules-floor-above "$pcr_rules_head neuralice.pcr_rules=${pcr_rules_sha} neuralice.pcr_rules_seq=13" >/dev/null \
+  || fail "the PCR rules above-the-rules floor UKI failed to build"
+make_esp "$SEALED/installer-rules-floor-above.efi" "$SEALED/installer-rules-floor-above.efi.manifest" \
+  installer-install.efi.manifest "${pcr_rules_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+inspect >/dev/null 2>&1 \
+  && fail "a medium whose sealed sequence floor exceeds the rules' own sequence was accepted"
+# Restore the good registry medium for the assertions that follow.
+make_esp "$SEALED/installer-registry.efi" "$SEALED/installer-registry.efi.manifest" \
+  installer-install.efi.manifest "${registry_esp_files[@]}"
+assemble "$ESP" "$SEALED/payload.img"
+echo "  PCR rules pair: accepted sealed, refused swapped / unpinned / unsealed / half-sealed / below the floor"
 
 # FINAL MEASUREMENTS ARE FROM THE ACCEPTED BYTES, NOT THE BUILD INPUTS. Ask the
 # real inspector to publish them, then independently parse the PE section table
