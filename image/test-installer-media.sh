@@ -911,6 +911,7 @@ v2_seal() { # [VAR=value …] -> runs the LIFTED producer function; prints the k
     # EARLY=0 skips the two early steps to exercise the seal on its own.
     TMPDIR="$V2P/tmp"; mkdir -p "$TMPDIR"
     trap 'rm -rf -- "$V2_RELEASE_PRIVATE_DIR"' EXIT
+    # shellcheck disable=SC2030 # subshell-local on purpose: the fake podman is for this case only
     PATH="$V2P/bin:$PATH"
     BASE_IMAGE="registry.example.test/neural-ice-test/base@sha256:$(printf 'e%.0s' {1..64})"
     export BASE_IMAGE V2_BASE_KEY
@@ -1251,6 +1252,10 @@ grep -q '^assert_pcr_rules_inputs$' "$BUILDER" \
 
 # The two options, on the REAL producer (no toolchain is needed: the options are
 # judged before anything else is).
+# The PATH read here is the script's own: the earlier PATH prepend lives in a
+# subshell on purpose (it stands in a fake podman for one case only), so it must
+# NOT reach this runner.
+# shellcheck disable=SC2031
 pr_run() { env -i PATH="$PATH" HOME="$HOME" TMPDIR="$PRP/tmp" bash "$BUILDER" "$@" </dev/null 2>"$PRP/run.err" >"$PRP/run.out"; }
 pr_run --pcr-rules "$PRP/good/rules.json" \
   && fail "[pcr rules producer] --pcr-rules alone was accepted"
