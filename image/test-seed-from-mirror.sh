@@ -53,6 +53,8 @@ done
 LIFTED="$TMP/lifted.sh"
 {
   awk '/^karg_count\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_die\(\) \{/,/^}$/' "$AUTOINSTALL"
+  awk '/^esp_snapshot_file\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^esp_staged_file\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^seed_mirror_helper\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^seed_from_mirror_fetch_documents\(\) \{/,/^}$/' "$AUTOINSTALL"
@@ -64,7 +66,7 @@ LIFTED="$TMP/lifted.sh"
   awk '/^release_authorization_pins_from_preseal\(\) \{/,/^}$/' "$AUTOINSTALL"
   awk '/^assert_seed_is_the_preseal_release\(\) \{/,/^}$/' "$AUTOINSTALL"
 } > "$LIFTED"
-for function in karg_count esp_staged_file seed_mirror_helper seed_from_mirror_fetch_documents \
+for function in karg_count esp_die esp_snapshot_file esp_staged_file seed_mirror_helper seed_from_mirror_fetch_documents \
   seed_from_mirror_preflight seed_from_mirror_materialize assert_sealed_document_digest \
   seed_manifest_hash_from_closure preseal_installer_authorization_pins \
   release_authorization_pins_from_preseal assert_seed_is_the_preseal_release; do

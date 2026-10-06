@@ -1903,8 +1903,10 @@ def check_pcr_rules_material(paths: set[str], read_file, cmdline: str) -> None:
         document = json.loads(
             rules.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constant
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise InspectionError(f"{PCR_RULES_JSON_PATH} is not valid JSON: {error}") from error
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise InspectionError(
+            f"{PCR_RULES_JSON_PATH} is not valid JSON: {type(error).__name__}"
+        ) from error
     sequence = document.get("sequence") if isinstance(document, dict) else None
     if (isinstance(sequence, bool) or not isinstance(sequence, int)
             or not 1 <= sequence <= PCR_RULES_SAFE_INTEGER):

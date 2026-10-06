@@ -166,17 +166,18 @@ SEED_SOURCE="${SEED_SOURCE:-}"
 # document the installer's PCR7 engine evaluates and `rules.json.sig` its
 # detached, domain-separated Owner signature. The producer reads each ONCE
 # (no link followed, at most 1 MiB, never empty) into a private copy, seals the
-# SHA-256 of rules.json and the rules' OWN `sequence` -- a sequence floor -- a self-consistency check between the sealed value and the
-# signed document, NOT rollback protection: a signed medium cut earlier, without the
-# pair, installs under NI-P7-COVERAGE alone (logged, state=absent on the installed
-# ESP), and the cross-media guard is the NV generation counter (T9, not built),
-# read from the JSON and never asked for as a second input that could disagree
-# with it -- as neuralice.pcr_rules / neuralice.pcr_rules_seq, and stages both
+# SHA-256 of rules.json and the rules' OWN `sequence` (read from the JSON, never
+# asked for as a second input that could disagree with it) as neuralice.pcr_rules /
+# neuralice.pcr_rules_seq, and stages both
 # files on the ESP at ice-coreos/pcr-rules/. The signature file's hash is NOT
 # sealed: the engine verifies it under the Owner key neuralice.pcr_policy_key
 # already pins. Supplied as the options below or as the same-named environment
 # variables the rest of this producer takes; both spellings at once is two
 # sources for one input and a refusal. Parsed FIRST, before any counter moves.
+# The sealed sequence is a floor the signed document is held to -- a self-consistency
+# check, NOT rollback protection: a signed medium cut earlier, without the pair,
+# installs under NI-P7-COVERAGE alone (logged, state=absent on the installed ESP);
+# the cross-media guard is the NV generation counter (T9, not built).
 PCR_RULES_FILE="${PCR_RULES_FILE:-}"
 PCR_RULES_SIGNATURE_FILE="${PCR_RULES_SIGNATURE_FILE:-}"
 PCR_RULES_STAGE_ROOT=""
@@ -614,8 +615,8 @@ with open(sys.argv[1], "rb") as handle:
     raw = handle.read()
 try:
     document = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constant)
-except (UnicodeDecodeError, json.JSONDecodeError) as error:
-    refuse(f"the PCR rules are not valid JSON: {error}")
+except (UnicodeDecodeError, ValueError, RecursionError) as error:
+    refuse(f"the PCR rules are not valid JSON: {type(error).__name__}")
 if not isinstance(document, dict):
     refuse("the PCR rules must be a JSON object")
 sequence = document.get("sequence")
