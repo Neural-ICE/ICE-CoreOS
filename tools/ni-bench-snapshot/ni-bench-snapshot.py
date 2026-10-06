@@ -96,6 +96,13 @@ EV_NAMES = {policy.EV_EFI_VARIABLE_DRIVER_CONFIG: "config",
             policy.EV_EFI_VARIABLE_AUTHORITY: "authority"}
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+FAMILY_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+CALENDAR_DATE = re.compile(r"^\d{4}-\d\d-\d\d$")
+# On the wire (mixed-endian, as efivarfs and the event log carry them).
+ESL_X509 = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072").bytes_le
+# Variables that are EFI_SIGNATURE_LISTs: checked for shape, never trusted as opaque bytes.
+SIGNATURE_LISTS = ("PK", "KEK", "db", "dbx", "dbt", "dbr")
+INSTALLER_BOOT_PATH = "uki-direct"
 TOKEN = re.compile(r"^[0-9A-Za-z._+-]{1,64}$")
 
 
@@ -179,6 +186,8 @@ def _guid(value, where):
 
 def _date(value, where):
     try:
+        if not isinstance(value, str) or not CALENDAR_DATE.match(value):
+            raise ValueError(value)
         return datetime.date.fromisoformat(value).isoformat()
     except (TypeError, ValueError) as error:
         raise BenchError(f"{where}: not an ISO date (YYYY-MM-DD)") from error
@@ -219,6 +228,8 @@ def read_efivars_b64(path):
         if not line.strip():
             continue
         key, _, b64 = line.partition(" ")
+        if len(key) >= 38 and key[-37] == "-":
+            key = key[:-36] + key[-36:].lower()    # a GUID is one name in any case
         if key in found:
             raise BenchError(f"{path}:{number}: variable {key} listed twice")
         found[key] = _b64(b64.strip(), f"{path}:{number}")
@@ -373,6 +384,27 @@ def _secure_boot_state(chosen):
 
 # --- snapshot validation -----------------------------------------------------
 
+def signature_list_entries(data, where):
+    """Every (type, owner, data) of a variable that is a run of EFI_SIGNATURE_LISTs.
+    Strict: the lists must tile the variable exactly, with consistent sizes."""
+    entries, offset = [], 0
+    while offset < len(data):
+        if len(data) - offset < 28:
+            raise BenchError(f"{where}: not an EFI_SIGNATURE_LIST (truncated header at byte {offset})")
+        list_type = data[offset:offset + 16]
+        list_size, header_size, sig_size = struct.unpack_from("<III", data, offset + 16)
+        if list_size < 28 + header_size or offset + list_size > len(data):
+            raise BenchError(f"{where}: not an EFI_SIGNATURE_LIST (declared size does not fit)")
+        body = list_size - 28 - header_size
+        if sig_size < 16 or body % sig_size:
+            raise BenchError(f"{where}: not an EFI_SIGNATURE_LIST (signature size {sig_size})")
+        start = offset + 28 + header_size
+        for at in range(start, start + body, sig_size):
+            entries.append((list_type, data[at:at + 16], data[at + 16:at + sig_size]))
+        offset += list_size
+    return entries
+
+
 def _validate_variables(variables, where, core_present=True):
     if not isinstance(variables, dict):
         raise BenchError(f"{where}: must be an object")
@@ -390,6 +422,8 @@ def _validate_variables(variables, where, core_present=True):
         data = _b64(entry["data_b64"], f"{where}.{name}.data_b64")
         if entry["size"] != len(data) or entry["sha256"] != _sha(data):
             raise BenchError(f"{where}.{name}: size or sha256 does not match the data")
+        if name in SIGNATURE_LISTS:
+            signature_list_entries(data, f"{where}.{name}")
 
 
 def validate_snapshot(snapshot):
@@ -419,6 +453,27 @@ def validate_snapshot(snapshot):
     for field in ("kernel", "state_marker"):
         _str(prov[field], f"snapshot.provenance.{field}", TOKEN, allow_none=True)
     _validate_pcr7(snapshot["pcr7"])
+    try:
+        _, _, authorities = _decode_events(snapshot)
+    except (ValueError, struct.error, policy.EventLogError) as error:
+        raise BenchError(f"snapshot.pcr7 log is not decodable: {error}") from error
+    _check_db_authority(snapshot["variables"], authorities)
+
+
+def _check_db_authority(variables, authorities):
+    """The certificate the firmware logged as the db authority must be one the stored
+    db holds: otherwise the variables and the log describe two different boots."""
+    held = {(owner, data) for kind, owner, data in
+            signature_list_entries(base64.b64decode(variables["db"]["data_b64"]), "snapshot.variables.db")
+            if kind == ESL_X509}
+    for authority in authorities:
+        entry = authority["entry"]
+        if entry["name"] != "db":
+            continue
+        key = (uuid.UUID(entry["signature_owner"]).bytes_le, bytes.fromhex(entry["cert_der_hex"]))
+        if entry["guid"] != GUID_SECURITY_DB or key not in held:
+            raise BenchError("snapshot: the certificate of the db authority event is not in the "
+                             "stored db variable; the variables and the event log are not one boot")
 
 
 def _validate_pcr7(pcr7):
@@ -644,6 +699,7 @@ def validate_record(record, allow_synthetic=False, calc=None):
     _date(fw["bios_date"], "record.firmware.bios_date")
     if fw["variable_measurement"] not in MEASUREMENTS:
         raise BenchError(f"record.firmware.variable_measurement must be one of {MEASUREMENTS}")
+    _str(record["family_id"], "record.family_id", FAMILY_ID)
     if record["family_id"] != family_id_of(fw["bios_version"]):
         raise BenchError("record.family_id must be derived from firmware.bios_version "
                          f"({family_id_of(fw['bios_version'])!r})")
@@ -716,6 +772,10 @@ def _validate_path(label, path, measurement, allow_synthetic, calc):
     shape = next((k for k, v in BOOT_SHAPES.items() if names == v), "custom")
     if path["boot_path"] != shape or ref.get("boot_path") != shape:
         raise BenchError(f"{where}.boot_path {path['boot_path']!r} does not match its authority events {list(names)}")
+    if label == "installer" and shape != INSTALLER_BOOT_PATH:
+        raise BenchError(f"{where}.boot_path is {shape!r}: the installer medium is a UKI the firmware "
+                         f"boots directly, so its path must be {INSTALLER_BOOT_PATH!r}; the installed "
+                         "boot was probably captured twice")
     authority = path["authority_events"]
     if not isinstance(authority, list) or [a.get("name") for a in authority] != list(names):
         raise BenchError(f"{where}.authority_events do not match the reference authorities")
@@ -724,6 +784,7 @@ def _validate_path(label, path, measurement, allow_synthetic, calc):
               optional=("signature_owner", "cert_sha256"))
         _hex64(a["digest"], f"{where}.authority_events[{i}].digest")
         _hex64(a["payload_sha256"], f"{where}.authority_events[{i}].payload_sha256")
+        _check_authority_event(a, ref["authorities"][i], f"{where}.authority_events[{i}]")
     if authority and [a["digest"] for a in authority] != [e["digest"] for e in events[-len(authority):]]:
         raise BenchError(f"{where}.authority_events are not the last PCR 7 events")
     calc = calc if calc is not None else load_calc()
@@ -734,6 +795,24 @@ def _validate_path(label, path, measurement, allow_synthetic, calc):
             raise BenchError(f"{where}: ni-pcr7-calc refuses this reference: {error}") from error
         if value != path["pcr7"]:
             raise BenchError(f"{where}: ni-pcr7-calc computes {value}, the record says {path['pcr7']}")
+
+
+def _check_authority_event(event, authority, where):
+    """A record's authority event must be what its own reference description says."""
+    if event["guid"] != _guid(authority["guid"], where):
+        raise BenchError(f"{where}.guid differs from the reference authority")
+    if "text" in authority:
+        payload = authority["text"].encode("utf-8")
+        if "signature_owner" in event or "cert_sha256" in event:
+            raise BenchError(f"{where}: a text authority carries no certificate")
+    else:
+        owner = _guid(authority["signature_owner"], where)
+        cert = bytes.fromhex(authority["cert_der_hex"])
+        payload = uuid.UUID(owner).bytes_le + cert
+        if event.get("signature_owner") != owner or event.get("cert_sha256") != _sha(cert):
+            raise BenchError(f"{where}: signature_owner or cert_sha256 differs from the reference authority")
+    if event["payload_sha256"] != _sha(payload):
+        raise BenchError(f"{where}.payload_sha256 differs from the reference authority")
 
 
 def load_calc():
@@ -841,6 +920,16 @@ def _check_snapshots(record, snapshots, allow_synthetic):
             raise BenchError(f"the {label} snapshot is {snap['origin']}, not measured")
         if _digest(snap) != record["provenance"]["snapshot_sha256"][label]:
             raise BenchError(f"the {label} snapshot is not the one the record was built from")
+    # The digest above is written by the record itself, so it binds nothing on its own.
+    # build_record is deterministic: the record must BE what these snapshots build, field
+    # for field (canonical bytes, so 1 / true / 1.0 are three different values).
+    try:
+        rebuilt = build_record(snapshots["installer"], snapshots["installed"])
+    except BenchError as error:
+        raise BenchError(f"the stored snapshots do not build a record: {error}") from error
+    if canonical(rebuilt) != canonical(record):
+        raise BenchError("the record is not what its snapshots build: it claims evidence it was "
+                         "not built from")
 
 
 def _dump(obj):
@@ -904,22 +993,43 @@ def _read_member(directory, name):
         raise BenchError(f"{path}: {error}") from error
 
 
-def validate_store(root, pubkey_pem, allow_synthetic=False):
-    """Re-validate a whole pcr-reference/ tree; returns the family ids it holds."""
+def validate_store(root, pubkey_pem, allow_synthetic=False, min_seq=None, expected_pkfp=None):
+    """Re-validate a whole pcr-reference/ tree; returns the family ids it holds.
+
+    The tree alone cannot tell a rollback to an older, still validly signed state,
+    nor which key it should answer to. The caller anchors both: `expected_pkfp` pins
+    the trusted key by value, and `min_seq` ({family_id: floor}) refuses a family
+    whose stored sheet is older than the last one the caller accepted, or that has
+    vanished. CI supplies them from the previously accepted state."""
+    if os.path.islink(root):
+        raise BenchError(f"{root}: a symlink is not allowed as the store root")
     if not os.path.isdir(root):
         raise BenchError(f"{root} is not a directory")
+    if expected_pkfp is not None and pubkey_fingerprint(pubkey_pem) != expected_pkfp:
+        raise BenchError("the trusted public key does not have the expected pkfp "
+                         f"({pubkey_fingerprint(pubkey_pem)[:16]}…)")
+    for family, floor in (min_seq or {}).items():
+        if type(floor) is not int or floor < 1:
+            raise BenchError(f"min_seq for {family}: must be a positive integer")
     families, strays = [], []
     for entry in sorted(os.listdir(root)):
         full = os.path.join(root, entry)
         if os.path.islink(full):
             raise BenchError(f"{full}: a symlink is not allowed in the store")
         (families if os.path.isdir(full) else strays).append(entry)
+    seqs = {}
     for entry in families:
-        _validate_family(os.path.join(root, entry), entry, pubkey_pem, allow_synthetic)
+        seqs[entry] = _validate_family(os.path.join(root, entry), entry, pubkey_pem, allow_synthetic)
     if strays:
         raise BenchError(f"unexpected file at the store root: {strays}")
     if not families:
         raise BenchError(f"{root}: the store is empty")
+    for family, floor in (min_seq or {}).items():
+        if family not in seqs:
+            raise BenchError(f"family {family} has a sequence floor ({floor}) but is not in the store")
+        if seqs[family] < floor:
+            raise BenchError(f"family {family}: stored sheet seq {seqs[family]} is below the "
+                             f"accepted floor {floor} (rollback)")
     return families
 
 
@@ -930,6 +1040,10 @@ def _validate_family(directory, name, pubkey_pem, allow_synthetic):
             full = os.path.join(current, entry)
             if os.path.islink(full):
                 raise BenchError(f"{full}: a symlink is not allowed in the store")
+        for entry in dirs:
+            relative = os.path.relpath(os.path.join(current, entry), directory).replace(os.sep, "/")
+            if relative != "snapshots":
+                raise BenchError(f"{name}: unexpected directory {relative!r}")
         for entry in files:
             present.add(os.path.relpath(os.path.join(current, entry), directory).replace(os.sep, "/"))
     unexpected = sorted(present - set(MEMBERS))
@@ -948,6 +1062,7 @@ def _validate_family(directory, name, pubkey_pem, allow_synthetic):
     verify_sheet(sheet, _read_member(directory, "bench-sheet.sig"), pubkey_pem, record,
                  allow_synthetic=allow_synthetic)
     _check_snapshots(record, snapshots, allow_synthetic)
+    return sheet["seq"]
 
 
 # --- command line ------------------------------------------------------------
@@ -957,10 +1072,19 @@ def _load(path):
 
 
 def _write(path, data):
+    """Write through an unpredictable temporary file in the target's directory, so a
+    planted `.name.tmp` link cannot redirect the write; the result is mode 0644."""
     target = pathlib.Path(path)
-    tmp = target.with_name(f".{target.name}.tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, target)
+    descriptor, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _dmi(name):
@@ -982,6 +1106,13 @@ def _pcr7_text(args):
     if done.returncode != 0:
         raise BenchError(f"tpm2_pcrread failed: {done.stderr.strip()}")
     return done.stdout
+
+
+def _family_floor(text):
+    family, _, number = text.rpartition("=")
+    if not family or not number.isdigit() or int(number) < 1:
+        raise argparse.ArgumentTypeError(f"{text!r}: expected FAMILY=N with N a positive integer")
+    return family, int(number)
 
 
 def cmd_capture(args):
@@ -1035,7 +1166,8 @@ def cmd_store(args):
 
 
 def cmd_validate_store(args):
-    families = validate_store(args.root, args.pubkey, allow_synthetic=args.allow_synthetic)
+    families = validate_store(args.root, args.pubkey, allow_synthetic=args.allow_synthetic,
+                              min_seq=dict(args.min_seq or ()), expected_pkfp=args.expected_pkfp)
     for family in families:
         print(f"ok {family}")
     print("ni-pcr7-calc cross-check: " + ("active" if load_calc() else "absent (fold + reference rebuild only)"))
@@ -1116,6 +1248,10 @@ def main(argv=None):
     vs.add_argument("root")
     vs.add_argument("--pubkey", required=True)
     vs.add_argument("--allow-synthetic", action="store_true", help="test fixtures only")
+    vs.add_argument("--expected-pkfp", metavar="HEX", help="pin the trusted key by its pkfp")
+    vs.add_argument("--min-seq", action="append", type=_family_floor, metavar="FAMILY=N",
+                    help="refuse a family whose stored sheet seq is below N, or that is absent "
+                         "(repeatable; the floor is the last state the caller accepted)")
     vs.set_defaults(fn=cmd_validate_store)
 
     vr = sub.add_parser("validate-record")
@@ -1130,7 +1266,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         args.fn(args)
-    except (BenchError, policy.EventLogError, OSError) as error:
+    except (BenchError, policy.EventLogError, OSError, UnicodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     return 0

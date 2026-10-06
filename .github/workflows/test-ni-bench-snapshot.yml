@@ -4,6 +4,7 @@ name: test-ni-bench-snapshot
 # stdlib-only Python plus the openssl binary, no TPM and no secret. Keys are
 # generated per run by the tests. It reuses the event-log parser and the signature
 # check of ota/neural-ice-tpm-policy.py, so a change to that file re-runs this suite.
+# tools/ni-pcr7-calc (T1) is a path too: its format contract is tested here when present.
 # The fixture is the PCR-7-only derivative of the event log of one physical GB10.
 
 on:
@@ -12,11 +13,13 @@ on:
       - main
     paths:
       - 'tools/ni-bench-snapshot/**'
+      - 'tools/ni-pcr7-calc/**'
       - 'ota/neural-ice-tpm-policy.py'
       - '.github/workflows/test-ni-bench-snapshot.yml'
   pull_request:
     paths:
       - 'tools/ni-bench-snapshot/**'
+      - 'tools/ni-pcr7-calc/**'
       - 'ota/neural-ice-tpm-policy.py'
       - '.github/workflows/test-ni-bench-snapshot.yml'
   workflow_dispatch:

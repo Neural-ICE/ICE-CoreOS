@@ -19,8 +19,14 @@ openssl dgst -sha256 -sign owner.key -out sheet.sig payload.bin      # on the Ow
 python3 -I $T store --record record.json --sheet sheet.json --signature sheet.sig \
                     --installer-snapshot installer.json --installed-snapshot installed.json \
                     --root <repo>/trust/<env>/pcr-reference --pubkey owner.pub.pem
-python3 -I $T validate-store <repo>/trust/<env>/pcr-reference --pubkey owner.pub.pem
+python3 -I $T validate-store <repo>/trust/<env>/pcr-reference --pubkey owner.pub.pem \
+                    --expected-pkfp <pkfp> --min-seq <family_id>=<last accepted seq>
 ```
+
+`--expected-pkfp` pins the trusted key by value and `--min-seq` (repeatable) is the anti-rollback
+floor: a family whose stored sheet is older than the last state the caller accepted, or that has
+disappeared, is refused. The tree alone cannot know either; the caller (the T3 CI) supplies them
+from the previously accepted state.
 
 `capture` reads `/sys/firmware/efi/efivars`, `/sys/kernel/security/tpm0/binary_bios_measurements`,
 `tpm2_pcrread sha256:7` and `/sys/class/dmi/id/bios_*` unless told otherwise.
@@ -29,15 +35,24 @@ python3 -I $T validate-store <repo>/trust/<env>/pcr-reference --pubkey owner.pub
 
 * **Incomplete snapshot**: any of `SecureBoot PK KEK db dbx` missing; Secure Boot off; empty
   `PK` or `SetupMode=1` (setup mode); no PCR 7 event; a PCR 7 value the event log does not
-  replay to; no BIOS version/date; a variable filed under the wrong GUID; unknown fields.
+  replay to; no BIOS version/date; a variable filed under the wrong GUID (or the same variable
+  listed twice, whatever the case of its GUID); unknown fields; a `PK/KEK/db/dbx/dbt/dbr` that is not
+  a well-formed `EFI_SIGNATURE_LIST` run; a `db` authority certificate in the log that the stored
+  `db` does not hold (variables and log would be two different boots).
 * **Incomplete record**: a missing installer **or** installed path; paths captured on different
   firmware or with different `PK/KEK/db/dbx`; two snapshots of the same path; event digests
-  that do not fold to the stated PCR 7; a `pcr7_reference` that does not rebuild them.
+  that do not fold to the stated PCR 7; a `pcr7_reference` that does not rebuild them; an
+  installer path that is not `uki-direct` (the installer medium is a UKI the firmware boots
+  directly: a `shim-grub` installer path means the installed boot was captured twice); a
+  `family_id` that is not a slug; authority events that disagree with their own reference.
 * **Wrong key**: a sheet whose pinned `signer.pkfp` is not the trusted key, a signature that
   does not verify, a signature made over the bare JSON (the payload is domain-separated:
   `"ni-bench-sheet/1\n" + canonical JSON`), or a signed sheet that contradicts its record
   (firmware pin, expected PCR 7, record digest).
-* **Store**: a `synthetic-test` path, snapshots that are not those the record was built from,
+* **Store**: a `synthetic-test` path, a record that is **not what its stored snapshots build**
+  (`build_record` is deterministic: `store` and `validate-store` rebuild it from the two snapshots
+  and compare it byte for byte, so the Owner's signature over the record digest covers evidence
+  that is actually there; `snapshot_sha256` alone bound nothing, the record wrote it itself),
   a replacement whose `seq` does not exceed the stored one, stray files, symlinks, a directory
   not named after the record's `family_id`.
 
@@ -66,6 +81,25 @@ record's path instead of a live machine. Without T1's tool on the tree, this too
 re-folds the events and rebuilds the reference with its own small fold, and says so.
 
 ## Honest limits
+
+* **`origin: measured` is the bench operator's attestation, not a proof.** `capture` labels
+  whatever files it is given (`--efivars-b64`, `--eventlog`, `--pcr7`) as measured; no TPM quote
+  binds them to a live boot. The `synthetic-test` gate stops a flagged fixture, not a relabelled
+  one. What the tool does enforce is shape (installer path `uki-direct`, log replay, variables
+  consistent with the log's db authority). The station-level attestation is the bench sheet of a
+  later task (T11).
+* `validate-record` checks structure and self-consistency only. The binding between a record and
+  its evidence is made by `store` / `validate-store`, which hold the snapshots.
+* `validate-store` is only as strong as the anchors it is given: without `--min-seq` it cannot
+  see a rollback of a whole family directory to an older validly signed state, and without
+  `--expected-pkfp` it trusts whichever key the caller hands it.
+* The sheet is signed with the Owner key that also signs PCR policy digests. Domain separation
+  (`ni-bench-sheet/1\n` prefix) keeps the two apart, but the design (§7, step 8) wants a key with
+  no power over PCR 7; a dedicated key needs no change in this tool.
+* A firmware that measures some variables with data and some without (an empty `dbx`, say) is
+  refused as a whole; on the GB10 all five are zero-length, so this does not occur there.
+* When the firmware measures variable **contents**, this tool does not yet compare each logged
+  config event with the stored variable (only the `db` authority certificate is cross-checked).
 
 * GB10 firmware measures `SecureBoot/PK/KEK/db/dbx` as **names only** (zero-length data); the record
   stores `variable_measurement: names-only` and the blob digests as provenance. A dbx/db

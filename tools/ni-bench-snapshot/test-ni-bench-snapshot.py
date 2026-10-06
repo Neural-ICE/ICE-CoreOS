@@ -759,7 +759,7 @@ class RecordIsBoundToItsSnapshots(Base):
     def test_a_record_whose_installer_path_is_a_copy_of_the_installed_one_is_refused(self):
         installer, installed, rec = self.stage()
         rec["paths"]["installer"] = json.loads(json.dumps(rec["paths"]["installed"]))
-        self.assertIn("built from", self.try_store(rec, installer, installed) or "")
+        self.assertIn("uki-direct", self.try_store(rec, installer, installed) or "")
 
     def test_a_record_with_a_wrong_pk_digest_or_bios_date_is_refused(self):
         installer, installed, rec = self.stage()
