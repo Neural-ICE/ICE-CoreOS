@@ -392,7 +392,7 @@ make_target() {
   rm -f "$TMP/tpm-floor"
 }
 v2_commit_env() {
-  v2_env "${1:-manifest-digest}"
+  v2_env
   make_target
   export V2SEAL_TARGET_ROOT="$TMP/target" V2SEAL_TARGET_OTA_DIR="$TMP/ota"
   export V2SEAL_OTA_TPM_STATE="$TMP/ota-tpm-state" V2SEAL_TPM_STATE="$TMP/tpm-state"
