@@ -7,7 +7,7 @@
 
 BUNDLE is what the user hands over (design: DESIGN-support-bundle-20261006, sections 2 and 4):
 
-    ni-support-<id8>.zip  ->  one  *.tar.gz.age  member  ->  (age X25519)  ->  tar.gz
+    ni-support-<id8>.zip  ->  LISEZ-MOI.txt + diagnostic.tar.gz.age  ->  (age X25519)  ->  tar.gz
 
 or the bare `.tar.gz.age`, or an already decrypted `.tar.gz`. The tar holds `manifest.json`,
 `manifest.sig`, `device-root.spki.der`, the sections the manifest lists, and optionally the
@@ -17,7 +17,8 @@ against a PIN the Owner took at the device's ceremony, never against the key the
 
 What is checked, in this order, stopping at the first refusal (exit 1):
 
-    input        the outer file is a zip with exactly one `.age` member, an age file or a gzip
+    input        the outer file is the client's zip (exactly LISEZ-MOI.txt and diagnostic.tar.gz.age),
+                 an age file or a gzip
     decrypt      `age -d -i KEY` succeeds (the key file is only ever passed by path)
     archive_size compressed archive <= 8 MiB
     decompress   one gzip stream, no trailing bytes, <= 24 MiB (+ tar framing) once expanded
@@ -31,7 +32,9 @@ What is checked, in this order, stopping at the first refusal (exit 1):
     manifest     only after the signature: UTF-8 JSON, no duplicate key, closed schema
     spki_binding the manifest's device_root_spki_sha256 is the pinned SPKI's hash
     files        every entry but the envelope and the unsigned client.json is listed with its exact
-                 size and sha256
+                 size and sha256; the opt-in excerpts follow the per-line rules instead: every line
+                 hashes to an entry of the signed `lines`, in strictly increasing order, and a signed
+                 line that is absent is accepted and reported as removed by the user
 
 Then, without changing the verdict of the checks above, the content is scanned (exit 3 if
 anything is found): a built-in deny-list from design section 2.3 (e-mail, IP, MAC, PEM, tokens,
@@ -53,6 +56,7 @@ import datetime
 import hashlib
 import io
 import ipaddress
+import itertools
 import json
 import os
 import pathlib
@@ -100,8 +104,10 @@ BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 CASE_ID = re.compile(r"[A-Za-z0-9-]{0,32}")
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")
 STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d{1,6})?Z")
-ZIP_MEMBER = re.compile(r"[A-Za-z0-9._-]{1,128}\.age")
-ZIP_ID8 = re.compile(r"ni-support-([0-9a-f]{8})")
+# The client's envelope (ICE-Fabric-v2 `config/support-bundle/README.md`, « Client envelope »): exactly these two members.
+README_MEMBER = "LISEZ-MOI.txt"
+AGE_MEMBER = "diagnostic.tar.gz.age"
+MAX_README = 64 << 10
 # Every pattern above is applied with fullmatch: `$` would also accept a trailing newline.
 # Key syntax of the manifest tables, as the closed manifest schema of the collector (PR-1) states it.
 TABLE_KEYS = {"dropped": (re.compile(r"[a-z][a-z0-9_-]{0,47}"), 64),
@@ -114,6 +120,10 @@ MAX_LISTED = 61                # 64 entries minus the three envelope members
 MANIFEST_KEYS = {"schema", "bundle_id", "case_id", "generated_at", "time_source", "boot_id", "files", "sections",
                  "dropped", "truncated", "redaction", "device_root_spki_sha256", "collector_version"}
 FILE_KEYS = {"path", "size", "sha256"}
+# The one file the user may edit after the preview, by deleting whole lines: its manifest entry carries `lines`,
+# the sha256 of each line in file order (collector contract, « Excerpts »).
+EXCERPTS = "journal-app-excerpts.jsonl"
+MAX_LINES = 1000
 TIME_SOURCES = {"attested", "host_clock"}
 
 # Fixed locations first, so a PATH an attacker controls cannot swap the verifier or the decryptor.
@@ -201,41 +211,58 @@ def read_outer(path):
     return data
 
 
-def unzip_single(data):
+def unzip_envelope(data):
+    """The client's .zip: LISEZ-MOI.txt (read by a person, never parsed) and diagnostic.tar.gz.age. -> age bytes."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
         raise Refusal("input", f"not a readable zip: {one_line(str(exc))}")
     with zf:
         infos = zf.infolist()
-        if len(infos) != 1:
-            raise Refusal("input", f"the zip must hold exactly one .age member, it holds {len(infos)}")
-        info = infos[0]
+        names = sorted(info.filename for info in infos)
+        if names != sorted((README_MEMBER, AGE_MEMBER)):
+            raise Refusal("input", f"the zip must hold exactly {README_MEMBER} and {AGE_MEMBER}, it holds "
+                          f"{len(infos)} member(s): {one_line(', '.join(names), 120)}")
         if zf.comment:
             raise Refusal("input", "the zip carries a comment")
-        if not ZIP_MEMBER.fullmatch(info.filename):
-            raise Refusal("input", "the zip member name is not a plain *.age name")
-        if info.flag_bits & 0x1:
-            raise Refusal("input", "the zip member is encrypted")
-        if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
-            raise Refusal("input", "the zip member uses an unsupported compression")
-        if info.file_size > MAX_OUTER:
-            raise Refusal("input", "the zip member expands beyond the size limit")
-        local_extra = int.from_bytes(data[info.header_offset + 28:info.header_offset + 30], "little")
-        member_end = info.header_offset + 30 + len(info.filename) + local_extra + info.compress_size
-        central = 46 + len(info.filename) + len(info.extra) + len(info.comment)
-        trailer = (0, 12, 16) if info.flag_bits & 0x08 else (0,)
-        if info.header_offset != 0 or not any(zf.start_dir == member_end + t and
-                                              len(data) == zf.start_dir + central + 22 for t in trailer):
-            raise Refusal("input", "the zip holds bytes outside its single member and directory")
-        try:
-            with zf.open(info) as member:
-                content = member.read(MAX_OUTER + 1)
-        except (zipfile.BadZipFile, OSError, ValueError, NotImplementedError, zlib.error) as exc:
-            raise Refusal("input", f"the zip member is unreadable: {one_line(str(exc))}")
-        if len(content) > MAX_OUTER or len(content) != info.file_size:
-            raise Refusal("input", "the zip member does not match its declared size")
-        return info.filename, content
+        for info in infos:
+            if info.flag_bits & 0x1:
+                raise Refusal("input", "a zip member is encrypted")
+            if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise Refusal("input", "a zip member uses an unsupported compression")
+            if info.file_size > (MAX_README if info.filename == README_MEMBER else MAX_OUTER):
+                raise Refusal("input", f"{info.filename} is larger than its size limit")
+        check_zip_layout(data, zf, infos)
+        contents = {}
+        for info in infos:
+            limit = MAX_README if info.filename == README_MEMBER else MAX_OUTER
+            try:
+                with zf.open(info) as member:
+                    content = member.read(limit + 1)
+            except (zipfile.BadZipFile, OSError, ValueError, NotImplementedError, zlib.error) as exc:
+                raise Refusal("input", f"a zip member is unreadable: {one_line(str(exc))}")
+            if len(content) > limit or len(content) != info.file_size:
+                raise Refusal("input", f"{info.filename} does not match its declared size")
+            contents[info.filename] = content
+        return contents[AGE_MEMBER]
+
+
+def check_zip_layout(data, zf, infos):
+    """No byte outside the local entries, the central directory and the end record (nowhere to hide text)."""
+    descriptor = [info for info in infos if info.flag_bits & 0x08]
+    for sizes in itertools.product((12, 16), repeat=len(descriptor)):
+        trailer = dict(zip((id(i) for i in descriptor), sizes))
+        cursor = 0
+        for info in sorted(infos, key=lambda i: i.header_offset):
+            if info.header_offset != cursor:
+                break
+            local_extra = int.from_bytes(data[cursor + 28:cursor + 30], "little")
+            cursor += 30 + len(info.filename.encode("utf-8")) + local_extra + info.compress_size + trailer.get(id(info), 0)
+        else:
+            central = sum(46 + len(i.filename.encode("utf-8")) + len(i.extra) + len(i.comment) for i in infos)
+            if zf.start_dir == cursor and len(data) == zf.start_dir + central + 22:
+                return
+    raise Refusal("input", "the zip holds bytes outside its members and directory")
 
 
 def age_decrypt(data, key_path, age_bin, warnings):
@@ -260,11 +287,11 @@ def age_decrypt(data, key_path, age_bin, warnings):
 
 
 def load_archive(path, key_path, age_bin_override, warnings):
-    """-> (input kind, gzip bytes, outer member name or None)."""
+    """-> (input kind, gzip bytes)."""
     data = read_outer(path)
-    name, kind = None, None
+    kind = None
     if data[:4] == b"PK\x03\x04" or data[:4] == b"PK\x05\x06":
-        name, data = unzip_single(data)
+        data = unzip_envelope(data)
         kind = "zip+age"
     if data.startswith(b"age-encryption.org/"):
         if key_path is None:
@@ -275,7 +302,7 @@ def load_archive(path, key_path, age_bin_override, warnings):
         raise Refusal("input", "the zip member is not an age file")
     if data[:2] != b"\x1f\x8b":
         raise Refusal("input", "not a zip, an age file or a gzip")
-    return kind or "tar.gz", data, name
+    return kind or "tar.gz", data
 
 
 # --- gzip + tar ----------------------------------------------------------------------------------
@@ -500,7 +527,7 @@ def validate_manifest(m):
     for entry in files:
         if not isinstance(entry, dict):
             refuse("a files entry is not an object")
-        if [k for k in entry if k not in FILE_KEYS and not k.startswith("x-")]:
+        if [k for k in entry if k not in FILE_KEYS and k != "lines" and not k.startswith("x-")]:
             refuse("a files entry has an unknown field")
         path, size, digest = entry.get("path"), entry.get("size"), entry.get("sha256")
         if not isinstance(path, str) or not NAME.fullmatch(path):
@@ -514,15 +541,52 @@ def validate_manifest(m):
         if not isinstance(digest, str) or not HEX64.fullmatch(digest):
             refuse("a files entry has a malformed sha256")
         listed[path] = {"path": path, "size": size, "sha256": digest}
+        if "lines" in entry:
+            lines = entry["lines"]
+            if path != EXCERPTS:
+                refuse(f"{path} cannot carry per-line digests, only {EXCERPTS} can")
+            if not isinstance(lines, list) or len(lines) > MAX_LINES or \
+                    not all(isinstance(x, str) and HEX64.fullmatch(x) for x in lines):
+                refuse(f"the line digests of {EXCERPTS} are not a list of at most {MAX_LINES} sha256 values")
+            listed[path]["lines"] = lines
     return stamp, listed
 
 
+def check_excerpt_lines(body, entry):
+    """The collector's rules for the excerpts (README « Excerpts »). -> positions of the lines the user removed."""
+    signed = entry["lines"]
+    if body and not body.endswith(b"\n"):
+        raise Refusal("files", f"{EXCERPTS} does not end with a line feed")
+    index = {}
+    for position, digest in enumerate(signed):
+        index.setdefault(digest, []).append(position)
+    matched, last = [], -1
+    for line in (body.split(b"\n")[:-1] if body else []):
+        digest = sha256_hex(line)
+        if digest not in index:
+            raise Refusal("files", f"{EXCERPTS} holds a line the manifest does not list (modified or added)")
+        later = [p for p in index[digest] if p > last]
+        if not later:
+            raise Refusal("files", f"{EXCERPTS} holds a line out of the manifest's order (reordered or repeated)")
+        last = later[0]
+        matched.append(last)
+    removed = [p for p in range(len(signed)) if p not in set(matched)]
+    if not removed and (len(body) != entry["size"] or sha256_hex(body) != entry["sha256"]):
+        raise Refusal("files", f"{EXCERPTS} keeps every signed line but differs from the manifest's size or sha256")
+    return removed
+
+
 def cross_check_files(members, listed):
-    """Every entry but the envelope and the client block is listed, with its exact size and sha256."""
+    """Every entry but the envelope and the client block is listed, with its exact size and sha256, except the
+    excerpts, which follow the per-line rules when the manifest carries `lines`. -> removed lines [(file, position)]."""
+    removed = []
     for name, entry in listed.items():
         if name not in members:
             raise Refusal("files", f"{name} is listed but missing from the archive")
         body = members[name][0]
+        if "lines" in entry:
+            removed += [(name, p) for p in check_excerpt_lines(body, entry)]
+            continue
         if len(body) != entry["size"]:
             raise Refusal("files", f"{name} has a different size than the manifest says")
         if sha256_hex(body) != entry["sha256"]:
@@ -530,6 +594,7 @@ def cross_check_files(members, listed):
     extra = sorted(set(members) - set(ENVELOPE) - set(UNSIGNED) - set(listed))
     if extra:
         raise Refusal("files", f"entries not listed in the manifest: {', '.join(extra[:5])}")
+    return removed
 
 
 def load_pins(values, pins_file):
@@ -774,10 +839,11 @@ def analyse(args):
     canaries = load_canaries(args.canaries) if args.canaries else []
     openssl_bin = find_tool("openssl", OPENSSL_PATHS, args.openssl_bin)
     checks, warnings = [], []
-    result = {"checks": checks, "warnings": warnings, "findings": [], "files": [], "unsigned": [], "bundle": {}}
+    result = {"checks": checks, "warnings": warnings, "findings": [], "files": [], "unsigned": [], "bundle": {},
+              "removed_by_user": []}
 
     try:
-        kind, gz, outer_name = load_archive(args.bundle, args.key, args.age_bin, warnings)
+        kind, gz = load_archive(args.bundle, args.key, args.age_bin, warnings)
         if args.require_encrypted and kind == "tar.gz":
             raise Refusal("input", "an encrypted bundle is required (--require-encrypted), this one is a plain tar.gz")
         ok(checks, "input", kind)
@@ -810,8 +876,9 @@ def analyse(args):
         if manifest["device_root_spki_sha256"] != spki_hash:
             raise Refusal("spki_binding", "the manifest names another device key than the one that signed it")
         ok(checks, "spki_binding", "manifest key == signing key")
-        cross_check_files(members, listed)
-        ok(checks, "files", "sizes and sha256 match, nothing unlisted")
+        removed = cross_check_files(members, listed)
+        ok(checks, "files", "sizes and sha256 match, nothing unlisted"
+           + (f", {len(removed)} excerpt line(s) removed by the user" if removed else ""))
     except Refusal as refusal:
         checks.append({"name": refusal.check, "ok": False, "detail": refusal.detail})
         result["verdict"] = "refused"
@@ -823,9 +890,6 @@ def analyse(args):
         warnings.append("manifest files are not sorted by path")
     if any(mtime != epoch for _, mtime in members.values()):
         warnings.append("tar mtime of an entry differs from generated_at")
-    match = ZIP_ID8.match(outer_name or "")
-    if match and match.group(1) != manifest["bundle_id"][:8]:
-        warnings.append("the zip member name carries another bundle id than the manifest")
 
     result["bundle"].update({k: manifest[k] for k in (
         "bundle_id", "case_id", "generated_at", "time_source", "boot_id", "collector_version",
@@ -834,6 +898,7 @@ def analyse(args):
     result["files"] = [
         {"path": e["path"], "size": e["size"], "sha256": e["sha256"]} for e in listed.values()]
     result["unsigned"] = [n for n in UNSIGNED if n in members]
+    result["removed_by_user"] = [{"file": name, "position": position} for name, position in removed]
 
     documents = {n: members[n][0] for n in sorted(members) if n not in ("manifest.sig", "device-root.spki.der")}
     findings = scan_content(documents, canaries)
@@ -859,6 +924,8 @@ def render_text(result):
         lines.append(f"  file {entry['path']} ({entry['size']} B)")
     for name in result["unsigned"]:
         lines.append(f"  file {name} (UNSIGNED, produced by the client)")
+    for removal in result["removed_by_user"]:
+        lines.append(f"  {removal['file']}: line {removal['position']} of the signed list: retirée par l'utilisateur")
     for name, section in sorted(bundle.get("sections", {}).items()):
         if not section["included"]:
             lines.append(f"  section {name}: not included ({section['status']})")

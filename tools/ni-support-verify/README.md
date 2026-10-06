@@ -47,8 +47,10 @@ nothing after it, ≤ 24 MiB + framing) · `tar` · `envelope` · `spki` · `pin
   or padding, where neither a hash nor a scan would look), and nothing but zeros follows the
   end-of-archive marker. The gzip header carries no name, comment, extra or CRC field. Members are
   read in memory; nothing is extracted by `tarfile`.
-* **`input`**: a zip holds exactly one `*.age` member and nothing else: no comment, no bytes outside
-  the member and the directory. `--require-encrypted` refuses a plain `.tar.gz`.
+* **`input`**: the client's zip holds exactly `LISEZ-MOI.txt` and `diagnostic.tar.gz.age` (either order),
+  once each, no path, no comment, no bytes outside the two members and the directory, each within its bound
+  (README 64 KiB; the decrypted archive is capped at 8 MiB). `LISEZ-MOI.txt` is read by a person: it is never
+  parsed, scanned or trusted, and it changes no verdict. `--require-encrypted` refuses a plain `.tar.gz`.
 * **`signature`**: ECDSA P-256 / SHA-256, DER, over `"neural-ice-support-bundle-v1" ‖ 0x00 ‖
   manifest.json` (the stored bytes). A signature made for another domain, for example the
   access-profile anchor's (`neural-ice:ota:access-profile-anchor:v1`), does not verify.
@@ -59,11 +61,18 @@ nothing after it, ≤ 24 MiB + framing) · `tar` · `envelope` · `spki` · `pin
 * **`files`**: every entry of the archive except the three envelope members and the client's
   unsigned `client.json` (reported under `unsigned`, scanned like the rest) is listed with its exact
   size and sha256. `sections` says what the user declined or what was unavailable; those files are
-  simply absent.
+  simply absent. **One exception, `journal-app-excerpts.jsonl`** (the opt-in text excerpts the user may thin
+  out after the preview): its manifest entry carries `lines`, the sha256 of each line in file order (at most
+  1000, closed schema; `lines` on any other file is a `manifest` refusal). The file must be present (empty when
+  every line was removed) and end with LF when not empty; every line must hash to an entry of `lines`, in
+  strictly increasing order. A modified, added, duplicated or reordered line is refused. A signed line
+  that is absent is **accepted** and reported, in `removed_by_user` and in the text output, as
+  « retirée par l'utilisateur » with its position in `lines` (a hash does not give the id back). Nothing is
+  signed again: manifest and signature stay as the host produced them. When no line is removed the file must
+  equal the signed size and sha256. Without `lines` in the entry, the whole-file rule applies as to any file.
 
 Deviations that carry no trust decision (tar uid/gid/mode/mtime, a gzip timestamp, a manifest not in
-canonical form or `files` not sorted, a signature that is not low-S, a zip member name with another
-bundle id, a key file readable by others) are `warnings`, not refusals.
+canonical form or `files` not sorted, a signature that is not low-S, a key file readable by others) are `warnings`, not refusals.
 
 ## The content scan (exit 3)
 
@@ -96,10 +105,10 @@ file where a hit is expected to be possible; the collector's README pins that li
 
 The inner archive is the collector's (ICE-Fabric-v2 PR #125, `config/support-bundle/README.md` and its
 closed `support-bundle-manifest.schema.json`, which supersede the design where they differ). The outer
-layers are the client's (PR-4, to be aligned on this page).
+layers are the client's (ICE-Client PR-4): the `.zip` holds `LISEZ-MOI.txt` and `diagnostic.tar.gz.age`.
 
 ```
-ni-support-<id8>.zip            ONE member: ni-support-<id8>.tar.gz.age     (age X25519, support key)
+ni-support-<id8>.zip            LISEZ-MOI.txt (for a person) + diagnostic.tar.gz.age   (age X25519, support key)
   └─ tar.gz  (gzip -n, ustar, sorted, uid=gid=0, mode 0644, mtime = generated_at, flat names)
        manifest.json            canonical JSON: sorted keys, no whitespace, ASCII-escaped, no trailing LF
        manifest.sig             DER ECDSA P-256 (low-S), over "neural-ice-support-bundle-v1" ‖ 0x00 ‖ manifest.json
@@ -111,8 +120,9 @@ ni-support-<id8>.zip            ONE member: ni-support-<id8>.tar.gz.age     (age
 `manifest.json` fields: `schema`, `bundle_id` (32 hex), `case_id` (`[A-Za-z0-9-]{0,32}`),
 `generated_at` (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`), `time_source` (`attested`|`host_clock`), `boot_id`
 (UUID), `collector_version`, `device_root_spki_sha256`, `files[{path,size,sha256}]`,
-`sections{name: {included, status}}`, `dropped`, `truncated`, `redaction`. The outer zip holds exactly
-one `*.age` member; a bare `.tar.gz.age` and an already decrypted `.tar.gz` are also accepted.
+`sections{name: {included, status}}`, `dropped`, `truncated`, `redaction`; each `files` entry is
+`{path, size, sha256}` plus `lines` for the excerpts file. The outer zip holds exactly the two members above;
+a bare `.tar.gz.age` and an already decrypted `.tar.gz` are also accepted.
 
 ## Handling the decrypted bundle
 
@@ -148,5 +158,5 @@ generated per run, nothing secret is committed, every planted « customer » str
   `tpm2_sign` is a stub speaking the real `-f tss` format over a software key and whose
   TPMT_SIGNATURE → DER conversion runs for real. The first bundle from a real appliance is the last
   integration test.
-* Whether a user-removed preview line can reach the signed bundle is a design point for the
-  client PR: a signed section cannot be edited without breaking its sha256 (see the PR report).
+* The length of a line the user removed stays visible (signed `size` minus the bytes kept), and so does how
+  many lines went and where: that is the collector's contract, not something the reader can hide.
