@@ -638,6 +638,11 @@ if [[ -n "$_source_karg" ]]; then
     *) die "neuralice.source must be medium or registry, got: $INSTALL_SOURCE" ;;
   esac
 fi
+# The v2 seal is a MEDIUM lane: a registry install authenticates through the
+# release authorization instead. Refused here, before any mirror or storage
+# work, as the closed grammar refuses the same pair.
+[[ "$V2_SEAL_ACTIVE" == 0 || "$INSTALL_SOURCE" == medium ]] \
+  || die "this medium seals a v2 release attestation but installs from a registry; the v2 lane installs the medium's own sealed image"
 
 # The appliance image to install when INSTALL_SOURCE=registry. It MUST be
 # digest-pinned: the digest is what makes a LAN mirror safe to use, so accepting
@@ -3315,11 +3320,6 @@ V2_BUNDLE_SEQ=""
 V2_PREFLIGHT_RECEIPT_SHA256=""
 AUTH_TARGET_REF=""
 AUTH_MANIFEST_DIGEST=""
-# The v2 seal is a MEDIUM lane: a registry install authenticates through the
-# release authorization instead, and a registry pull of a v2 candidate through
-# the block below is refused by its profile case.
-[[ "$V2_SEAL_ACTIVE" == 0 || "$INSTALL_SOURCE" == medium ]] \
-  || die "this medium seals a v2 release attestation but installs from a registry; the v2 lane installs the medium's own sealed image"
 if [ "$INSTALL_SOURCE" = registry ] || [[ -n "$PRESEAL_SET_SHA256" ]]; then
   _relauth_key="$VERITY_ROOT_MOUNT/usr/lib/neural-ice/keys/release-authorization.pub"
   [[ -f "$_relauth_key" && ! -L "$_relauth_key" ]] \
