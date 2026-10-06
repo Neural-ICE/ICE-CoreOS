@@ -264,7 +264,7 @@ jobs:
             image/lib/preloaded-sizing.sh image/lib/release-authorization.sh image/lib/signing-trust.sh \
             image/policy/render-container-policy.sh image/test-access-policy.sh image/test-build-installer-root.sh \
             image/test-hardware-identity.sh image/test-installer-failure-surface.sh image/test-installer-live-diagnostics.sh \
-            image/test-installer-media.sh image/test-installer-payload.sh image/test-installer-selector-grammar.sh \
+            image/test-installer-media.sh image/test-installer-partlabel-race.sh image/test-installer-payload.sh image/test-installer-selector-grammar.sh \
             image/test-seed-from-mirror.sh \
             image/test-installer-ssh-key.sh image/test-installer-systemd-lifecycle.sh image/test-installer-trust.sh \
             image/test-installer-uki.sh image/test-lib/sealed-medium-fixture.sh image/test-preloaded-output-set.sh \
@@ -469,6 +469,11 @@ jobs:
           ./image/test-registry-authorisation.sh
           ./image/test-installer-ssh-key.sh
           sudo ./image/test-installer-ssh-key.sh --root-seam-negative-only
+          # The producer renames partitions on a loop device and looks the next one up
+          # by label; the kernel re-reads the table after each rename (run
+          # 37522252563). Source contract always; the loop-device rounds run where
+          # sudo -n and the filesystem tools exist, and may not skip here.
+          NI_PARTLABEL_REQUIRE_TOOLS=1 ./image/test-installer-partlabel-race.sh
           ./image/test-tpm-policy-initramfs.sh
           sudo ./image/test-tpm-policy-initramfs.sh
           # The QEMU qualification harness grammar (arguments, refusals, expect/

@@ -2116,7 +2116,38 @@ cleanup(){
 }
 trap cleanup EXIT
 
-part_label() { sudo blkid -s LABEL -o value "$1" 2>/dev/null || true; }
+# 🔴 A partition label is only readable once the kernel's view of the loop's
+# partition table has settled. `sfdisk --part-label` on the loop device makes the
+# kernel re-read the table ("Calling ioctl() to re-read partition table"); the
+# ${LOOP}pN nodes are then removed and re-created, and a blkid that runs in
+# between reads an absent node as "no label" -- which is how "installer ESP not
+# found" killed a build that had just passed with the very same code.
+#   - partitions_settle makes the wait DETERMINISTIC, with no sleep: it re-syncs
+#     the kernel from the on-disk table, waits for udev to drain, then requires
+#     every partition of that table to exist as a block node.
+#   - part_label probes the node itself (-p: no blkid cache, no udev database)
+#     and treats a node that is not a block device as an ERROR, never as an
+#     empty label. Callers read it as `x="$(part_label "$p")"` so that the error
+#     stops the build under `set -e`.
+partitions_settle() {
+  local loop="$1" nr
+  sudo partx -u "$loop" \
+    || { echo "ERROR: cannot re-sync the kernel's partition table of ${loop}" >&2; exit 1; }
+  sudo udevadm settle
+  local numbers
+  numbers="$(sudo partx -g -o NR "$loop")" \
+    || { echo "ERROR: cannot read the partition table of ${loop}" >&2; exit 1; }
+  [[ -n "$numbers" ]] || { echo "ERROR: ${loop} carries no partition" >&2; exit 1; }
+  for nr in $numbers; do
+    [[ -b "${loop}p${nr// /}" ]] \
+      || { echo "ERROR: partition node ${loop}p${nr// /} is missing after the partition table settled" >&2; exit 1; }
+  done
+}
+part_label() {
+  [[ -b "$1" ]] \
+    || { echo "ERROR: partition node $1 is not a block device; refusing to read it as an empty label" >&2; return 1; }
+  sudo blkid -p -s LABEL -o value "$1" 2>/dev/null || true
+}
 part_bytes() { sudo blockdev --getsize64 "$1"; }
 # Overwrite a whole partition with zeros. dd stops at ENOSPC on the last block,
 # which is a successful full overwrite reported as a failure; the property is
@@ -2127,8 +2158,10 @@ zero_partition() { sudo dd if=/dev/zero of="$1" bs=4M conv=fsync status=none 2>/
 # The PAYLOAD partition = the big one bib wrote the ostree onto. It is the only
 # one with room for the sealed payload, and after this step it holds nothing else.
 PAYLOADPART=""; PAYLOADPART_NUM=""
+partitions_settle "$LOOP"
 for p in "${LOOP}"p*; do
-  case "$(part_label "$p")" in
+  label="$(part_label "$p")"
+  case "$label" in
     ni-seed)
       # A medium whose seed arrives from the mirror carries no seed partition: a
       # stick with both is two unreconciled sources of one closure, and the
@@ -2166,34 +2199,37 @@ sudo dd if="$SEALED_DIR/payload.img" of="$PAYLOADPART" bs=4M conv=fsync status=n
 # input: a wrong candidate simply fails the sealed header digest.
 sudo sfdisk --part-label "$LOOP" "$PAYLOADPART_NUM" ni-installer-payload \
   || { echo "ERROR: cannot name the installer payload partition" >&2; exit 1; }
+partitions_settle "$LOOP"
 
 # The BOOT partition loses everything. Nothing on this medium reads it: the root
 # is the verified squashfs inside the payload, and there is no boot manager left
 # to look for a kernel here.
 BOOTPART=""; BOOTPART_NUM=""
 for p in "${LOOP}"p*; do
-  if [[ "$(part_label "$p")" == "boot" ]]; then BOOTPART="$p"; BOOTPART_NUM="${p##*p}"; break; fi
+  label="$(part_label "$p")"
+  if [[ "$label" == "boot" ]]; then BOOTPART="$p"; BOOTPART_NUM="${p##*p}"; break; fi
 done
 [[ -n "$BOOTPART" ]] || { echo "ERROR: boot partition not found" >&2; exit 1; }
 echo "    zeroing the boot partition (${BOOTPART}) — no kernel, no initramfs, no BLS entry"
 zero_partition "$BOOTPART"
 sudo sfdisk --part-label "$LOOP" "$BOOTPART_NUM" ni-installer-void \
   || { echo "ERROR: cannot rename the emptied boot partition" >&2; exit 1; }
+partitions_settle "$LOOP"
 
 # The ESP is REMADE. Zeroing first and then mkfs is what makes "there is no shim,
 # no GRUB and no fallback binary on this medium" a statement about bytes rather
 # than about directory entries.
 ESPPART=""
 for p in "${LOOP}"p*; do
-  [[ "$(part_label "$p")" == "EFI-SYSTEM" ]] && { ESPPART="$p"; break; }
+  label="$(part_label "$p")"
+  [[ "$label" == "EFI-SYSTEM" ]] && { ESPPART="$p"; break; }
 done
 [[ -n "$ESPPART" ]] || { echo "ERROR: installer ESP not found" >&2; exit 1; }
 echo "    remaking the ESP (${ESPPART}) with a single signed EFI authority"
 zero_partition "$ESPPART"
 sudo mkfs.fat -F32 -n NI-INSTALL "$ESPPART" >/dev/null \
   || { echo "ERROR: cannot remake the installer ESP" >&2; exit 1; }
-sudo partx -u "$LOOP" 2>/dev/null || true
-sudo udevadm settle
+partitions_settle "$LOOP"
 sudo mkdir -p "$MNT"
 sudo mount "$ESPPART" "$MNT"
 sudo install -d -m 0755 "$MNT/EFI" "$MNT/EFI/BOOT" "$MNT/EFI/neural-ice"
