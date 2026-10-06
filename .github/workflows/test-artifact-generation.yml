@@ -86,6 +86,7 @@ on:
       - "ota/test-neural-ice-v2-owner-seal.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
+      - "ci/test-docs-tpm-policy-adr.sh"
       - "ci/test-oci-signature-policy.sh"
       - "ci/test-seed-import-policy.sh"
       - "ci/test-no-shim-chained-updater.sh"
@@ -185,6 +186,7 @@ on:
       - "ci/build-image.sh"
       - "ci/test-build-image-dispatch-contract.sh"
       - "ci/test-open-core-boundary.sh"
+      - "ci/test-docs-tpm-policy-adr.sh"
       - "ci/test-oci-signature-policy.sh"
       - "ci/test-seed-import-policy.sh"
       - "ci/test-no-shim-chained-updater.sh"
@@ -250,7 +252,7 @@ jobs:
             ci/stage-artifacts.sh ci/stage-nvidia-userspace.sh ci/test-artifact-generation.sh \
             ci/test-build-image-dispatch-contract.sh ci/test-fabric-coreos-differential.sh ci/test-gb10-console-boot.sh ci/test-install-registry-mirror.sh \
             ci/test-kernel-packaging-patch.sh ci/test-linklocal-fallback.sh ci/test-no-ipv6-on-profiles.sh ci/test-no-shim-chained-updater.sh \
-            ci/test-oci-signature-policy.sh ci/test-seed-import-policy.sh ci/test-open-core-boundary.sh ci/test-open-core-workflow.sh \
+            ci/test-oci-signature-policy.sh ci/test-seed-import-policy.sh ci/test-open-core-boundary.sh ci/test-docs-tpm-policy-adr.sh ci/test-open-core-workflow.sh \
             ci/run-media-validation.sh \
             ci/test-stage-nvidia-userspace.sh ci/test-suite-collection.sh ci/test-swtpm-monotonic-state.sh ci/test-swtpm-owner-ota-state.sh \
             ci/verify-build-context.sh image/build-installer-payload.sh image/build-installer-root.sh \
@@ -414,6 +416,7 @@ jobs:
           ./ci/test-stage-nvidia-userspace.sh
           ./ci/test-build-image-dispatch-contract.sh
           ./ci/test-open-core-boundary.sh
+          ./ci/test-docs-tpm-policy-adr.sh
           ./ci/test-oci-signature-policy.sh
           ./ci/test-seed-import-policy.sh
           ./ci/test-kernel-packaging-patch.sh

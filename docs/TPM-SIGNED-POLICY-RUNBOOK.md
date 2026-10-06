@@ -1,36 +1,46 @@
-# TPM signed policy — replacing the literal PCR 7 seal
+# TPM signed policy — the `PolicyAuthorize` mechanism
 
-> **Status**: mechanism PROVEN on GB10 hardware 2026-08-19 (§9). What remains is
-> proving it at boot on an installed machine, and wiring it into the installer.
+> **Status**: mechanism PROVEN on GB10 hardware 2026-08-19 (§9), on systemd 255 (§5quater).
 >
-> Previously: established by reading
-> the shipped image (see §1); the tooling is under construction. Nothing here is
-> deployed yet.
+> 🔴 **Scope of this document.** It records how the `PolicyAuthorize` mechanism works and what
+> was measured, and it is the mechanism in force today. A different target — PCR7 computed
+> off-machine, signed rules, a local NV policy, revocation — is **accepted** in
+> [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (Accepted by the Owner,
+> 2026-10-06, Q1–Q5; nothing of its implementation is merged). This mechanism remains as the
+> Owner break-glass shard and for migration (Q2), and the signature file stops being the
+> nominal way a new state is admitted (Q1), once P1 is implemented and proven.
 >
 > **Owner-reserved**: signing a policy. No automation holds the private key.
 
 ## Why this exists
 
-Today both LUKS volumes are sealed to the **literal value** of PCR 7, the digest
-of the UEFI Secure Boot state (PK, KEK, `db`, `dbx`, and the certificates that
-validated what was loaded).
+Before this mechanism, both LUKS volumes were sealed to the **literal value** of PCR 7, the digest
+of the UEFI Secure Boot measurements. 🔴 On the GB10 firmwares measured (PNY `.63`, ASUS `.67`) the
+firmware measures the *names* of `SecureBoot`, `PK`, `KEK`, `db` and `dbx` with a zero-length data,
+not their contents: PCR 7 there is driven by the `db` certificate that validates shim, the
+`SbatLevel`, the vendor certificate and the boot path (finding of PR #245, see
+[OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md)). The table and wording below
+were written before that finding and are corrected where it matters.
 
 ```
-seal today :  "release the key only if PCR 7 == A"
+seal then  :  "release the key only if PCR 7 == A"
 ```
 
 The TPM compares and refuses. It has no notion of a *legitimate* change. So every
-one of these bricks automatic unlock, fleet-wide, at the same instant:
+one of these that moves PCR 7 bricks automatic unlock, fleet-wide, at the same instant:
 
 | event | frequency |
 | --- | --- |
-| enrolling or removing a Secure Boot key (PK/KEK/db) | at the lab → prod anchor switch |
-| **a `dbx` revocation update** | **published by Microsoft periodically** |
-| a firmware capsule touching the Secure Boot variables | whenever a firmware path exists |
+| enrolling or removing the `db` certificate that validates shim | at the lab → prod anchor switch |
+| a change of the `SbatLevel` or of the boot path (`shim-grub` / `uki-direct`) | with a shim or boot-chain update |
+| a firmware capsule that changes the `db` authority, the `SbatLevel` or the boot path | whenever a firmware path exists |
 | switching the signing certificate (lab key → Microsoft-signed shim) | once, for MVP 1.0 |
 
-🔴 The `dbx` row is the one that does not wait for our schedule. Under the literal
-seal, applying one revocation locks every appliance that applies it.
+🔴 On the measured GB10 firmwares, **a `dbx`, `KEK` or `PK` update does not move PCR 7**: the
+contents of those variables are not measured, so it does not brick the unlock under the literal
+seal, and PCR 7 does not revoke `dbx` either (an old `dbx` still unlocks). The "`dbx` revocation
+locks every appliance" claim, and the "enrol a key (PK/KEK/db) → PCR 7 moves" claim, are **not
+true on GB10**; they may hold for firmware that measures the data (AAVMF/EDK2: not verified).
 
 This is also why there is **no firmware update path at all** today: opening one
 without this policy guarantees the first capsule stops the fleet.
@@ -88,14 +98,19 @@ D-0   switch the anchor. PCR 7 becomes B.
 
 The private key never moves. What travels is a signature.
 
+> What follows (§3–§4) describes the mechanism as measured with an Owner-signed future state. The
+> OS-0045 (Accepted) holds that it does not scale to one signature per
+> firmware/database combination and cannot revoke, and replaces it.
+
 ⭐ **The signature needs neither confidentiality nor a separate integrity
 channel.** The TPM validates it against K. A forged one simply fails to verify and
 the machine falls back to its recovery key. The worst an attacker achieves by
 tampering with it is **denial of service, never unlock** — so it may be
 distributed over any path.
 
-⚠️ **Keep the old state authorised.** One signature file may cover several states.
-Retire A only once B is proven across the whole fleet: A is the rollback path.
+⚠️ **Keep the old state authorised** during a transition: one signature file may cover
+several states, and A is the rollback path. Note that a signature cannot be revoked, so A
+stays unlocking for as long as the signature is distributed (OS-0045, Context).
 
 ## 4 · 🔴 The ordering rule — never one update
 
@@ -125,8 +140,8 @@ image), `/boot` (1 GiB), the ESP.
 
 **Chosen: inside the OS image.** The image already arrives through bootc, signed
 and verified by `image-ci`, so the signature rides a path that is already trusted
-and needs no new one. A newly authorised state is then a new image, i.e. an OTA —
-the cadence we already operate.
+and needs no new one. Under this mechanism a newly authorised state is a new image, i.e. an OTA;
+OS-0045 (Accepted; not yet implemented) replaces that nominal path by signed rules and a local NV policy.
 
 `/boot` and the ESP remain the out-of-band escape hatch: since the signature is
 self-protecting (§3), dropping one there by hand during recovery is safe.
@@ -278,8 +293,9 @@ demonstration recorded here, **before** any wave is deployed.
 
 ```
 1. take a machine already installed and unlocking automatically
-2. break the policy deliberately — enrol a Secure Boot key so PCR 7 moves
-   without a signature covering the new state
+2. break the policy deliberately — move PCR 7 without a signature covering the new state:
+   enrol a `db` certificate that validates shim, or change the `SbatLevel` (enrolling a `PK`,
+   `KEK` or `dbx` entry may not move PCR 7 on GB10, so it may not make the unlock fail)
 3. reboot. Automatic unlock MUST fail.  ← this is the point: it must fail
 4. unlock with the recovery key, on the console
 5. re-enrol against the correct policy
@@ -374,7 +390,9 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 
 ## Related
 
-- `docs/ADR-0004-disk-encryption-tpm-luks.md` — to amend with the retained policy
-  and its verification clause
+- [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) — the accepted target
+  unlock policy (Accepted) that supersedes the "one signed entry per PCR7 value" model <!-- pcr7-list:history -->
+- `docs/ADR-0004-disk-encryption-tpm-luks.md` — disk encryption; its sealing section now
+  points to OS-0045
 - `docs/ADR-0002-secure-boot-zero-touch.md` — the Microsoft shim submission plan,
   which the retained option must not disturb
