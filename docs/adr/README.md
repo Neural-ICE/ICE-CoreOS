@@ -15,7 +15,7 @@ C'est un rangement historique incohérent, pas une distinction de sens :
 | Emplacement | Contenu |
 |---|---|
 | **`docs/ADR-*.md`** (répertoire parent) | **11 ADR** — `ADR-0002` … `ADR-0013`. Secure Boot, LUKS/TPM, canaux, kernel 4k, licence FSL, multi-arch, enveloppe GB10, identité bootc, état OTA atomique, racine TPM |
-| **`docs/adr/ADR-*.md`** (ici) | **4 ADR** — `ADR-0041` (firmware GSP), `ADR-0042` (pilote R580), `ADR-0043` (console KMS/vconsole), `ADR-0045` (politique de déverrouillage TPM — **Proposed**, décisions Owner Q1–Q5 ouvertes ; `OS-0045`) |
+| **`docs/adr/ADR-*.md`** (ici) | **4 ADR** — `ADR-0041` (firmware GSP), `ADR-0042` (pilote R580), `ADR-0043` (console KMS/vconsole), `ADR-0045` (politique de déverrouillage TPM — **Accepted** le 2026-10-06 par l'Owner (Q1–Q5 tranchées, implémentation non fusionnée) ; `OS-0045`) |
 
 Les deux jeux sont indexés sous le préfixe `OS-` dans le vault.
 
@@ -63,7 +63,7 @@ décision **propre à l'OS** (boot, kernel, chiffrement, bootc, initramfs, firmw
 
 ⚠️ **Vérifiez le numéro contre les DEUX** : le plus haut sur `origin/main` **et** les numéros
 **réservés** par un brouillon ou une PR non fusionnée. `origin/main` seul ne suffit pas — c'est
-exactement comme ça que `OS-0043` s'est retrouvé attribué deux fois. `0044` est pris par la PR #234 et `0045` par `ADR-0045` (Proposed) ; le prochain libre est
+exactement comme ça que `OS-0043` s'est retrouvé attribué deux fois. `0044` est pris par la PR #234 et `0045` par `ADR-0045` (Accepted) ; le prochain libre est
 `0046`, sous réserve des brouillons et PR ouverts (vérifiez-les avant de choisir).
 
 Déposez ensuite un rapport dans `raw_mission_report_to_ingest/` pour que le vault l'intègre — une

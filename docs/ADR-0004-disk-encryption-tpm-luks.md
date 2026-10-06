@@ -5,7 +5,7 @@
 - **Decider**: Business/Security Owner (human)
 - **Related to**: [ADR-0003](ADR-0003-base-and-update-model.md) (bootc foundation, native OTA),
   [ADR-0002](ADR-0002-secure-boot-zero-touch.md) (Secure Boot — PCR 7),
-  [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (target unlock policy, Proposed).
+  [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (unlock policy, Accepted 2026-10-06; not yet implemented).
 
 ## Context
 
@@ -40,24 +40,23 @@ is **transparent** to updates.
 |---|---|---|---|
 | `p1` ESP | 1 GiB | signed EFI binaries (public) | — clear |
 | `p2` `/boot` | 1 GiB | signed kernel + initramfs (public) | — clear |
-| `p3` **LUKS "system"** | 300 GiB | `/ostree` + `/var` (logs, containers) | **TPM2 (PCR 7, `PolicyAuthorize`; target policy OS-0045, Proposed)** + recovery (operator escrow) |
-| `p4` **LUKS "data"** | rest (~3.4 TB) | `/var/lib/neural-ice/data` (user data, models) | **TPM2 (PCR 7, `PolicyAuthorize`; target policy OS-0045, Proposed)** + **OWNER recovery** (USB + screen) |
+| `p3` **LUKS "system"** | 300 GiB | `/ostree` + `/var` (logs, containers) | **TPM2 (PCR 7, `PolicyAuthorize`; target policy OS-0045, Accepted)** + recovery (operator escrow) |
+| `p4` **LUKS "data"** | rest (~3.4 TB) | `/var/lib/neural-ice/data` (user data, models) | **TPM2 (PCR 7, `PolicyAuthorize`; target policy OS-0045, Accepted)** + **OWNER recovery** (USB + screen) |
 
 Only the ESP and `/boot` stay in the clear: they contain only **Secure Boot
 signed** binaries (integrity by signature, no need for confidentiality on
 a public kernel). Everything else (OS *and* data) is encrypted at rest.
 
-### TPM unlock policy — to be replaced by OS-0045 (Proposed)
+### TPM unlock policy — to be replaced by OS-0045 (Accepted)
 
 The original decision of this section (seal both volumes to the literal value of PCR 7) is
 **replaced**: as built today (`ota/neural-ice-autoinstall.sh`, `enroll_luks`), both volumes carry a
 `PolicyAuthorize` token under an Owner public key (`--tpm2-pcrs=` empty,
 `--tpm2-public-key-pcrs=7`); the mechanism and its measured flags are in
 [TPM-SIGNED-POLICY-RUNBOOK](TPM-SIGNED-POLICY-RUNBOOK.md). The target policy (computed PCR7, signed
-rules, local NV policy, revocation) is **proposed** in
-[OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (Proposed; Owner questions
-Q1–Q5 open, in particular Q1, the change of trust model): until the Owner decides, it is a target,
-not a decision, and none of its implementation (P1) is merged. PCR 7 measures the Secure Boot
+rules, local NV policy, revocation) is **decided** in
+[OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (Accepted by the Owner,
+2026-10-06, Q1–Q5): the design is accepted, but none of its implementation (P1) is merged. PCR 7 measures the Secure Boot
 state, **not the kernel hash**: the policy binds keys and the authority path, not binaries.
 
 ### Recovery model (escrow)
@@ -93,7 +92,7 @@ Tang/Clevis network-bound variant of the data remains possible (see options not 
 Everything tested on a loop file (never the real nvme) with the **real TPM**:
 
 - `systemd-cryptenroll` with a literal PCR 7 seal (the seal of the time; the installer now
-  enrols `PolicyAuthorize`, see the runbook; target policy: OS-0045, Proposed) → **enroll OK** (token `systemd-tpm2`, PCR 7,
+  enrols `PolicyAuthorize`, see the runbook; target policy: OS-0045, Accepted) → **enroll OK** (token `systemd-tpm2`, PCR 7,
   sha256, SRK).
 - `--recovery-key` → **OK** (token `systemd-recovery`, modhex 8 groups).
 - `systemd-cryptsetup attach … tpm2-device=auto` → **auto-unlock OK** (LUKS2
@@ -116,12 +115,12 @@ Everything tested on a loop file (never the real nvme) with the **real TPM**:
 - **Installer tools**: everything is in the base (`sfdisk`/`partx`/`cryptsetup`/
   `systemd-cryptenroll`/`mkfs.*`) → **zero added package**.
 - **MS-signed shim migration** (ADR-0002): re-signing the shim will change PCR 7 once
-  → the target unlock policy proposed in OS-0045 (Proposed; nothing of its P1 is merged) is meant
-  to absorb it, instead of a first-boot re-enrol service. Not decided, not built.
+  → the unlock policy of OS-0045 (Accepted; nothing of its P1 is merged) is meant
+  to absorb it, instead of a first-boot re-enrol service. Decided, not built.
 
 ## Options not retained
 
-- **Data on TPM (PCR 7; policy under revision, OS-0045 Proposed)** *(retained)* vs **Tang/Clevis network-bound** (off-site
+- **Data on TPM (PCR 7; policy under revision, OS-0045 Accepted)** *(retained)* vs **Tang/Clevis network-bound** (off-site
   theft = dead data, but depends on a server at boot) vs **bound to measured
   application state**. The decider chose **zero-touch TPM** unlock for
   both domains (sufficient for GDPR "data at rest", no human

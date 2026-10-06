@@ -1,6 +1,6 @@
 # OS-0045 — TPM unlock policy: signed rules and a local NV policy, not a list of PCR7 values
 
-- **Status**: Proposed (2026-10-06). Becomes Accepted only when the Owner has decided Q1–Q5 below.
+- **Status**: Accepted (2026-10-06, Owner). Decisions Q1–Q5 are recorded below.
 - **Date**: 2026-10-06
 - **Decider**: Owner (trust model, keys); coding AI (computation, integration, sequencing)
 - **Supersedes**: the decision "unlock is a `PolicyAuthorize` under an Owner key whose signature
@@ -9,7 +9,7 @@
   [OS-0004](../ADR-0004-disk-encryption-tpm-luks.md) ("TPM sealing = PCR 7 only"), and the
   `NI-P7-COVERAGE` gate used as the policy mechanism. It also absorbs the unmerged draft
   "OS-0044 firmware path" (its number is taken by OS-0044, PR #234; its content is D4 and D5 here).
-  The supersession takes effect only when this ADR is Accepted (Q1 open).
+  The supersession takes effect with this acceptance.
 - **Relates to**: [OS-0015](../ADR-0015-installer-trust-anchor-uki-verity.md) (NV generation counter),
   OS-0044 (D3 payload `pcr-policy/`, D4 direct `db` enrolment at the OEM bench; PR #234, not yet on
   `main`; not verified here whether it has since merged), ICE-Fabric FAB-0064 and FAB-0066.
@@ -53,14 +53,16 @@ D2. **Signed rules.** The Owner signs a versioned, sequenced rules file: Secure 
     present, not in setup mode, `db ⊆ C`, `dbx ⊇ F`, authorities ∈ A. Rules are evaluated only on
     data whose replay equals the **live** PCR7, never on raw `efivars`.
 D3. **Sealing.** LUKS is sealed to a local NV policy (`PolicyAuthorizeNV`, `systemd-pcrlock`). An
-    Owner `PolicyAuthorize` shard is kept as break-glass. *(subject to Q2; the two-shard unlock is
+    Owner `PolicyAuthorize` shard is kept as break-glass. *(Q2; the two-shard unlock is
     not proven, see "Not proven")*
 D4. **Updates.** Any firmware or Secure Boot database update follows: qualify → signed transition
     manifest → arm (NV variant, "old ∪ new") → flash → commit (old variant removed = revocation).
-    No firmware flash without "armed". Firmware updates only through the signed channel (subject to
-    Q3).
+    No firmware flash without "armed". Firmware updates only through the Neural ICE OTA channel (Q3);
+    no autonomous client fwupd.
 D5. **OEM bench.** Pinned firmware, direct `db` enrolment (OS-0044 D4), a bench record per device;
-    the bench station holds no PCR policy key. *(pinned firmware is the option of Q3, subject to Q3)*
+    the bench station holds no PCR policy key. Pinned firmware (Q3); a per-device UEFI
+    administrator password generated at the bench and escrowed with the recovery key (Q4); one
+    golden unit per firmware family (Q5).
 D6. **Kernel binding.** The host will move to a UKI with a signed PCR11 policy (`systemd-measure
     sign`). Until then the policy binds the keys and the authority path, **not the binaries**.
 
@@ -68,24 +70,27 @@ Phasing: **P0** = computation (D1) + reference records + one Owner signature per
 configuration (the current mechanism, fewer entries); **P1** = D2 + D3 + D4; **P2** = D6. P0 alone
 has no revocation and no autonomous update path and must not be deployed at scale without P1.
 
-## Open Owner decisions (not decided — this ADR stays Proposed)
+## Recorded Owner decisions
 
-| # | Question | Why it is not decided here |
+Decided by the Owner on 2026-10-06. Acceptance of the design is not proof of implementation: see
+"Not proven".
+
+| # | Question | Decision (Accepted, 2026-10-06, Owner) |
 |---|---|---|
-| Q1 | Accept the change of trust model: nominal policy is no longer "signed by the Owner per value" but "signed rules + signed OS agent". | Trust decision (keys/authority = Owner) |
-| Q2 | Keep an Owner `PolicyAuthorize` shard as break-glass? | Key custody cost vs recovery |
-| Q3 | Pinned firmware and closed channel (no client fwupd), or firmware updates managed by OTA? | Maintenance commitment sold to customers |
-| Q4 | UEFI administrator password at the bench (if the firmware allows it) and who holds it? | Operational / OEM |
-| Q5 | One golden unit per firmware family (purchase / immobilisation)? | Hardware budget |
+| Q1 | Change of trust model: nominal policy is no longer "signed by the Owner per value" but "signed rules + signed OS agent". | Yes. Accepted. |
+| Q2 | Keep an Owner `PolicyAuthorize` shard? | Yes: kept as break-glass and for migration. |
+| Q3 | Pinned firmware, or firmware updates managed by OTA? | Firmware pinned at the bench; firmware updates only through the Neural ICE OTA. No autonomous client fwupd. |
+| Q4 | UEFI administrator password at the bench, and who holds it? | A per-device UEFI administrator password, generated at the bench and escrowed with the recovery key. |
+| Q5 | One golden unit per firmware family? | Yes: one reference (golden) unit per firmware family. Current families: ASUS DGX Spark (`.67`, `.77`, `.72`; BIOS `GX10DGX…`) and PNY-built DGX Spark Founders Edition (`.63`). |
 
 ## Consequences
 
-These are intended effects of the proposal. None is built or proven: nothing of P1 is merged.
+These are intended effects of the accepted design. None is built or proven: nothing of P1 is merged.
 
 - No Owner signature per machine, per batch, or per new rule-conformant PCR7 value (P1, not proven).
 - Revocation becomes possible (variant removed from the NV index); the "armed" window is bounded
   and logged (P1, not proven).
-- Trust moves from per-value signatures to a signed OS agent and signed rules (Q1).
+- Trust moves from per-value signatures to a signed OS agent and signed rules (Q1, accepted).
 - NV counter `0x01500007` would become the rules sequence (P1, not proven).
 - RMA: reinstall + rules, no signature; the recovery key remains the last resort (P1, not proven).
 - Documents that described a list of PCR7 values as the target are rewritten to point here.
@@ -117,7 +122,7 @@ proven on a device whose policy fails on purpose, before any deployment.
 
 ## Migration
 
-Proposed, none of it executed. `.67` / `.72` stay installed: step M0 adds entries under the same key (no change of tokens); M1
+Accepted, none of it executed. `.67` / `.72` stay installed: step M0 adds entries under the same key (no change of tokens); M1
 delivers the agent in observe-only mode; M2 adds the NV shard to the keyslot, subject to proving two
-tokens/shards under systemd 257, with replacement-with-recovery-key as fallback; M3 retires the lab
-shard only after proof and only if the Owner break-glass is kept (Q2).
+tokens/shards under systemd 257 (a technical proof, not an Owner decision), with replacement-with-recovery-key as fallback; M3 retires the lab
+shard only after proof and only if the Owner break-glass is kept (Q2, decided).

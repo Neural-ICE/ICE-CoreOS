@@ -12,10 +12,14 @@ bad() { echo "FAIL: $*" >&2; fail=1; }
 adr=$(ls docs/adr/ADR-0045-*.md 2>/dev/null | head -n1 || true)
 [ -n "$adr" ] || { bad "docs/adr/ADR-0045-*.md is missing"; exit 1; }
 
-grep -qE '^- \*\*Status\*\*: Proposed' "$adr" || bad "$adr must be Status: Proposed"
+grep -qE '^- \*\*Status\*\*: Accepted \(2026-10-06, Owner\)' "$adr" || bad "$adr must be Status: Accepted (2026-10-06, Owner)"
+! grep -qiE 'Proposed|not decided|subject to Q[0-9]|Q1 open' "$adr" || bad "$adr still carries Proposed / conditional wording"
+grep -q '^## Recorded Owner decisions' "$adr" || bad "$adr lacks the 'Recorded Owner decisions' section"
+! grep -q '^## Open Owner decisions' "$adr" || bad "$adr still has an 'Open Owner decisions' section"
 grep -q '^- \*\*Supersedes\*\*' "$adr" || bad "$adr must name what it supersedes"
 for q in Q1 Q2 Q3 Q4 Q5; do
-  grep -qE "^\| $q \|" "$adr" || bad "$adr must list Owner decision $q as open"
+  grep -qE "^\| $q \|" "$adr" || bad "$adr must record Owner decision $q"
+  grep -E "^\| $q \|" "$adr" | grep -q 'Accepted\|Yes\|pinned\|per-device\|Firmware pinned' || bad "$adr: decision $q has no recorded answer"
 done
 
 # ADR numbers are unique across BOTH directories that share the numbering (docs/ and docs/adr/;
@@ -28,6 +32,9 @@ dups=$(ls docs/ADR-*.md docs/adr/ADR-*.md | sed -E 's#.*/(ADR-[0-9]+)-.*#\1#' | 
 for f in docs/TPM-SIGNED-POLICY-RUNBOOK.md docs/ADR-0004-disk-encryption-tpm-luks.md; do
   grep -q 'OS-0045' "$f" || bad "$f does not point to OS-0045"
 done
+! grep -qE 'OS-0045[^.]*Proposed|Proposed[^.]*OS-0045' docs/TPM-SIGNED-POLICY-RUNBOOK.md docs/ADR-0004-disk-encryption-tpm-luks.md \
+  || bad "runbook / ADR-0004 still call OS-0045 Proposed"
+! grep -q 'ADR-0045.*Proposed' docs/adr/README.md || bad "docs/adr/README.md still calls ADR-0045 Proposed"
 grep -q 'ADR-0045' docs/adr/README.md || bad "docs/adr/README.md does not index ADR-0045"
 grep -qE '\*\*4 ADR\*\*' docs/adr/README.md || bad "docs/adr/README.md ADR count is stale"
 

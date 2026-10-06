@@ -4,11 +4,11 @@
 >
 > 🔴 **Scope of this document.** It records how the `PolicyAuthorize` mechanism works and what
 > was measured, and it is the mechanism in force today. A different target — PCR7 computed
-> off-machine, signed rules, a local NV policy, revocation — is **proposed** in
-> [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (Proposed; Owner
-> decisions Q1–Q5 open; nothing of it is merged). If the Owner accepts it, this mechanism
-> could remain as an optional break-glass shard (Q2) and the signature file would stop being
-> the nominal way a new state is admitted (Q1). Neither is decided.
+> off-machine, signed rules, a local NV policy, revocation — is **accepted** in
+> [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (Accepted by the Owner,
+> 2026-10-06, Q1–Q5; nothing of its implementation is merged). This mechanism remains as the
+> Owner break-glass shard and for migration (Q2), and the signature file stops being the
+> nominal way a new state is admitted (Q1), once P1 is implemented and proven.
 >
 > **Owner-reserved**: signing a policy. No automation holds the private key.
 
@@ -92,8 +92,8 @@ D-0   switch the anchor. PCR 7 becomes B.
 The private key never moves. What travels is a signature.
 
 > What follows (§3–§4) describes the mechanism as measured with an Owner-signed future state. The
-> OS-0045 proposal (Proposed) argues that it does not scale to one signature per
-> firmware/database combination and cannot revoke, and proposes a replacement.
+> OS-0045 (Accepted) holds that it does not scale to one signature per
+> firmware/database combination and cannot revoke, and replaces it.
 
 ⭐ **The signature needs neither confidentiality nor a separate integrity
 channel.** The TPM validates it against K. A forged one simply fails to verify and
@@ -134,7 +134,7 @@ image), `/boot` (1 GiB), the ESP.
 **Chosen: inside the OS image.** The image already arrives through bootc, signed
 and verified by `image-ci`, so the signature rides a path that is already trusted
 and needs no new one. Under this mechanism a newly authorised state is a new image, i.e. an OTA;
-OS-0045 (Proposed, not decided) proposes to replace that nominal path by signed rules and a local NV policy.
+OS-0045 (Accepted; not yet implemented) replaces that nominal path by signed rules and a local NV policy.
 
 `/boot` and the ESP remain the out-of-band escape hatch: since the signature is
 self-protecting (§3), dropping one there by hand during recovery is safe.
@@ -382,8 +382,8 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 
 ## Related
 
-- [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) — the proposed target
-  unlock policy (Proposed) that would supersede the "one signed entry per PCR7 value" model <!-- pcr7-list:history -->
+- [OS-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) — the accepted target
+  unlock policy (Accepted) that supersedes the "one signed entry per PCR7 value" model <!-- pcr7-list:history -->
 - `docs/ADR-0004-disk-encryption-tpm-luks.md` — disk encryption; its sealing section now
   points to OS-0045
 - `docs/ADR-0002-secure-boot-zero-touch.md` — the Microsoft shim submission plan,
