@@ -480,8 +480,10 @@ done
 # immutable identity selected for it.
 grep -Fq '[[ "$sealed_store_image_id" == "$BASE_IMAGE_ID" ]]' "$USB" \
   || fail "the media producer does not compare the staged store with the original host"
-grep -Fq '[[ "$sealed_store_manifest_digest" == "$BASE_MANIFEST_DIGEST" ]]' "$USB" \
-  || fail "the media producer does not compare the staged store child digest with the original host"
+if ! grep -Fq 'if [[ "$sealed_store_manifest_digest" != "$BASE_MANIFEST_DIGEST" ]]; then' "$USB" \
+   || ! grep -Fq '[[ "$sealed_store_source_index" == "$BASE_MANIFEST_DIGEST" && "$sealed_store_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]' "$USB"; then
+  fail "the media producer does not compare the staged store child digest with the original host (or its proved index)"
+fi
 
 # Pinned BIB rejects filesystem customization for raw builds. The selected
 # config therefore makes no sizing claim; the producer's measured fit refusal
@@ -1039,6 +1041,7 @@ OTHER_SRC_DIGEST="sha256:$(sha256sum "$OTHER_SRC_MANIFEST" | awk '{print $1}')"
 cat > "$TOOLS/skopeo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_STATE/skopeo.args"
+if [ "$1" = inspect ] && [ -n "${MOCK_SOURCE_DIR:-}" ]; then ref="${*: -1}"; cat "$MOCK_SOURCE_DIR/${ref##*@sha256:}"; exit 0; fi
 if [ "$1" = inspect ]; then cat "${MOCK_SOURCE_MANIFEST_FILE:?}"; exit 0; fi
 dest="${*: -1}"
 name="${dest##*]}"
@@ -1057,6 +1060,31 @@ grep -Fq "inspect --raw --no-creds --cert-dir $TMP/certs $SRC_REF" "$TMP/registr
   || fail "the registry source manifest was not read back with the pinned certificate directory and no credential"
 grep -Fq "copy --preserve-digests --src-cert-dir $TMP/certs --src-no-creds $SRC_REF containers-storage:[overlay@" "$TMP/registry-source/skopeo.args" \
   || fail "the store was not copied from the registry source with digests preserved"
+# a BASE_IMAGE index (buildx: platform image + attestation manifests): podman reports the index digest; the store
+# is staged from the one listed child whose config is the immutable store image
+mkdir -p "$TMP/index-src"
+cp "$SRC_MANIFEST" "$TMP/index-src/${SRC_DIGEST#sha256:}"
+cp "$OTHER_SRC_MANIFEST" "$TMP/index-src/${OTHER_SRC_DIGEST#sha256:}"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","platform":{"architecture":"arm64","os":"linux"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","platform":{"architecture":"unknown","os":"unknown"}}]}' \
+  "$SRC_DIGEST" "$OTHER_SRC_DIGEST" > "$TMP/index.json"
+IDX_DIGEST="sha256:$(sha256sum "$TMP/index.json" | cut -d' ' -f1)"; cp "$TMP/index.json" "$TMP/index-src/${IDX_DIGEST#sha256:}"
+IDX_REF="docker://mirror.test:5055/neural-ice/appliance@$IDX_DIGEST"
+build "$TMP/registry-source-index" STORE_MANIFEST_DIGEST="$IDX_DIGEST" MOCK_NAMED_MANIFEST="$IDX_DIGEST" MOCK_STORE_MANIFEST="$SRC_DIGEST" \
+  STORE_SOURCE_REF="$IDX_REF" STORE_SOURCE_CERT_DIR="$TMP/certs" MOCK_SOURCE_DIR="$TMP/index-src" >/dev/null 2>&1 \
+  || fail "an index store source with exactly one child of the store image was refused"
+grep -Fq "copy --preserve-digests --src-cert-dir $TMP/certs --src-no-creds docker://mirror.test:5055/neural-ice/appliance@$SRC_DIGEST containers-storage:[overlay@" "$TMP/registry-source-index/skopeo.args" \
+  || fail "the store was not staged from the index's child of the store image"
+m="$(find "$TMP/registry-source-index" -name '*.manifest' | head -1)"
+if ! grep -qx "store_image_manifest_digest=$SRC_DIGEST" "$m" || ! grep -qx "store_source_index_digest=$IDX_DIGEST" "$m"; then
+  fail "the sealed manifest must record the staged child and the index it was proved against: $(cat "$m" 2>/dev/null)"
+fi
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s"}]}' \
+  "$OTHER_SRC_DIGEST" > "$TMP/index-none.json"
+IDX2="sha256:$(sha256sum "$TMP/index-none.json" | cut -d' ' -f1)"; cp "$TMP/index-none.json" "$TMP/index-src/${IDX2#sha256:}"
+out="$(build "$TMP/registry-source-index-none" STORE_MANIFEST_DIGEST="$IDX2" MOCK_NAMED_MANIFEST="$IDX2" MOCK_STORE_MANIFEST="$IDX2" \
+  STORE_SOURCE_REF="docker://mirror.test:5055/neural-ice/appliance@$IDX2" MOCK_SOURCE_DIR="$TMP/index-src" 2>&1)" \
+  && fail "an index without a child of the store image was accepted"
+grep -Fq "lists no image manifest of the immutable store image" <<<"$out" || fail "the no-child refusal is not named: $out"
 out="$(build "$TMP/registry-source-other-ref" STORE_MANIFEST_DIGEST="$SRC_DIGEST" MOCK_NAMED_MANIFEST="$SRC_DIGEST" MOCK_STORE_MANIFEST="$SRC_DIGEST" \
   STORE_SOURCE_REF="docker://mirror.test:5055/neural-ice/appliance@$HOST_MANIFEST" MOCK_SOURCE_MANIFEST_FILE="$SRC_MANIFEST" 2>&1)" \
   && fail "a registry source naming another manifest digest was accepted"
