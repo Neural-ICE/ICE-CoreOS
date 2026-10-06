@@ -1,22 +1,24 @@
-# TPM signed policy — replacing the literal PCR 7 seal
+# TPM signed policy — the `PolicyAuthorize` mechanism
 
-> **Status**: mechanism PROVEN on GB10 hardware 2026-08-19 (§9). What remains is
-> proving it at boot on an installed machine, and wiring it into the installer.
+> **Status**: mechanism PROVEN on GB10 hardware 2026-08-19 (§9), on systemd 255 (§5quater).
 >
-> Previously: established by reading
-> the shipped image (see §1); the tooling is under construction. Nothing here is
-> deployed yet.
+> 🔴 **Scope of this document.** It records how the `PolicyAuthorize` mechanism works and what
+> was measured. It is **not** the target policy. The target — PCR7 computed off-machine, signed
+> rules, a local NV policy, revocation — is decided in
+> [ADR-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) (Proposed; Owner
+> decisions Q1–Q5 open). Under ADR-0045 this mechanism is the Owner break-glass shard, and the
+> signature file is no longer the nominal way a new state is admitted.
 >
 > **Owner-reserved**: signing a policy. No automation holds the private key.
 
 ## Why this exists
 
-Today both LUKS volumes are sealed to the **literal value** of PCR 7, the digest
+Before this mechanism, both LUKS volumes were sealed to the **literal value** of PCR 7, the digest
 of the UEFI Secure Boot state (PK, KEK, `db`, `dbx`, and the certificates that
 validated what was loaded).
 
 ```
-seal today :  "release the key only if PCR 7 == A"
+seal then  :  "release the key only if PCR 7 == A"
 ```
 
 The TPM compares and refuses. It has no notion of a *legitimate* change. So every
@@ -88,14 +90,19 @@ D-0   switch the anchor. PCR 7 becomes B.
 
 The private key never moves. What travels is a signature.
 
+> What follows (§3–§4) describes the mechanism as measured with an Owner-signed future state. It
+> does not scale to one signature per firmware/database combination and cannot revoke; see
+> ADR-0045 for why and for what replaces it.
+
 ⭐ **The signature needs neither confidentiality nor a separate integrity
 channel.** The TPM validates it against K. A forged one simply fails to verify and
 the machine falls back to its recovery key. The worst an attacker achieves by
 tampering with it is **denial of service, never unlock** — so it may be
 distributed over any path.
 
-⚠️ **Keep the old state authorised.** One signature file may cover several states.
-Retire A only once B is proven across the whole fleet: A is the rollback path.
+⚠️ **Keep the old state authorised** during a transition: one signature file may cover
+several states, and A is the rollback path. Note that a signature cannot be revoked, so A
+stays unlocking for as long as the signature is distributed (ADR-0045, Context).
 
 ## 4 · 🔴 The ordering rule — never one update
 
@@ -125,8 +132,8 @@ image), `/boot` (1 GiB), the ESP.
 
 **Chosen: inside the OS image.** The image already arrives through bootc, signed
 and verified by `image-ci`, so the signature rides a path that is already trusted
-and needs no new one. A newly authorised state is then a new image, i.e. an OTA —
-the cadence we already operate.
+and needs no new one. Under this mechanism a newly authorised state is a new image, i.e. an OTA;
+ADR-0045 replaces that nominal path by signed rules and a local NV policy.
 
 `/boot` and the ESP remain the out-of-band escape hatch: since the signature is
 self-protecting (§3), dropping one there by hand during recovery is safe.
@@ -374,7 +381,9 @@ All of the below on `spark-63`, real GB10 TPM, via `ota/test-tpm-signed-policy.s
 
 ## Related
 
-- `docs/ADR-0004-disk-encryption-tpm-luks.md` — to amend with the retained policy
-  and its verification clause
+- [ADR-0045](adr/ADR-0045-tpm-unlock-policy-signed-rules-local-nv.md) — the target unlock
+  policy (Proposed) that supersedes the "one signed entry per PCR7 value" model
+- `docs/ADR-0004-disk-encryption-tpm-luks.md` — disk encryption; its sealing section now
+  points to ADR-0045
 - `docs/ADR-0002-secure-boot-zero-touch.md` — the Microsoft shim submission plan,
   which the retained option must not disturb

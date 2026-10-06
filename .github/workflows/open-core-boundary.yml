@@ -21,3 +21,5 @@ jobs:
         run: bash ci/test-open-core-workflow.sh
       - name: Scan every Git-visible input as raw bytes
         run: bash ci/test-open-core-boundary.sh
+      - name: Check the TPM unlock policy documents agree with OS-0045
+        run: bash ci/test-docs-tpm-policy-adr.sh
