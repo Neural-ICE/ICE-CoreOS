@@ -153,7 +153,9 @@ awk '/^PCR_RULES_DIGEST=/,/^readonly PCR_RULES_STATE$/' "$AUTOINSTALL" > "$I/gat
 ex enroll_luks > "$I/enroll.sh"
 # E2E_VERBOSE_ENROLL=1 lets the tools' own diagnostics through (debugging only).
 [[ "${E2E_VERBOSE_ENROLL:-0}" != 1 ]] || sed -i 's#>/dev/null 2>&1##; s#>/dev/null##' "$I/enroll.sh"
-for f in gate.sh gate-block.sh enroll.sh; do [[ -s "$I/$f" ]] || fail "could not extract $f from the installer"; done
+# the installer's own "what the gate decided" record for the installed ESP
+awk '/^install -m 0644 \/dev\/null .*pcr-rules-at-install\.txt"$/{on=1} on{print} on&&/^fi$/{exit}' "$AUTOINSTALL" > "$I/evidence.sh"
+for f in gate.sh gate-block.sh enroll.sh evidence.sh; do [[ -s "$I/$f" ]] || fail "could not extract $f from the installer"; done
 grep -q '^verify_pcr_rules() {' "$I/gate-block.sh" || fail "the gate block does not hold verify_pcr_rules"
 # The image layout of image/Containerfile.installer, byte for byte.
 cp "$ENGINE" "$I/usr/lib/neural-ice/pcr-rules/tools/ni-pcr-rules/ni-pcr-rules.py"
@@ -248,6 +250,9 @@ check "A: binding is contents (the guest firmware measures contents)" log_has co
 check "A: the installer enrolled the scratch disk" log_has conforming "E2E: ENROLLED"
 check "A: a PolicyAuthorize (pubkey-bound) TPM2 token exists" log_has conforming "pubkey-bound 1"
 check "A: the target changed (the install really wrote)" test "$(target_sha conforming)" != "$TARGET_ORIG"
+check "A: the installed ESP record says state=accepted, sequence 7, binding=contents" \
+  bash -c 'tr -d "\r" < "'"$WORK/conforming.log"'" | grep -F "E2E: record " | grep -F "state=accepted" | grep -F "sequence=7" | grep -F "binding=contents"'
+check "A: the installed rules are the sealed bytes" log_has conforming "E2E: installed rules sha256 $RULES_SHA"
 
 refused() { # scenario slug
   check "$1: refused with NI-P7-RULES: $2" log_has "$1" "NI-P7-RULES: $2"

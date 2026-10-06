@@ -112,6 +112,12 @@ sys.exit(0 if tokens else 1)
 PY
 [[ $? -eq 0 ]] || { echo "E2E-FAIL: the enrolled volume carries no systemd-tpm2 token"; exit 95; }
 [[ -n "$SYS_RECOVERY" ]] && echo "E2E: recovery key issued"
+# The record the installer leaves on the installed ESP, written by its own code.
+TGT=/tmp/tgt; install -d "$TGT/boot/efi/EFI/neural-ice"
+# shellcheck source=/dev/null
+. /evidence.sh
+echo "E2E: record $(tr '\n' ' ' < "$TGT/boot/efi/EFI/neural-ice/pcr-rules-at-install.txt")"
+echo "E2E: installed rules sha256 $(sha256sum < "$TGT/boot/efi/EFI/neural-ice/pcr-rules/rules.json" | awk '{print $1}')"
 echo "E2E: ENROLLED"   # printed only after the readback above found its tokens (see run-e2e.sh checks)
 cryptsetup close system 2>/dev/null || true
 exit 0
