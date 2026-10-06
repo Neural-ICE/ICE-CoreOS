@@ -852,11 +852,10 @@ expect "$out" 'READY' "4j baseline: the v2 fixture draws while the compositor is
 set_state "$CMP" loaded active running
 out="$(run_screen 5 0)"
 [[ -z $out ]] || fail "a declared tty1 owner (the console compositor) is active: the screen must leave tty1 alone: $out"
-for st in 'activating start' 'failed failed' 'inactive dead'; do
-  set -- $st
-  set_state "$CMP" loaded "$1" "$2"
+for st in activating:start failed:failed inactive:dead; do
+  set_state "$CMP" loaded "${st%%:*}" "${st##*:}"
   out="$(run_screen 1 0)"
-  expect "$out" 'READY' "a declared owner that is $1 does not own tty1"
+  expect "$out" 'READY' "a declared owner that is ${st%%:*} does not own tty1"
 done
 # the OS's own owners still count on a declared host
 v2_ready_scene; set_state 'getty@tty1.service' loaded active running
