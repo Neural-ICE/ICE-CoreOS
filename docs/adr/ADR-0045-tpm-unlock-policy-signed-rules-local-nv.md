@@ -1,4 +1,4 @@
-# ADR-0045 — TPM unlock policy: signed rules and a local NV policy, not a list of PCR7 values
+# OS-0045 — TPM unlock policy: signed rules and a local NV policy, not a list of PCR7 values
 
 - **Status**: Proposed (2026-10-06). Becomes Accepted only when the Owner has decided Q1–Q5 below.
 - **Date**: 2026-10-06
@@ -6,12 +6,13 @@
 - **Supersedes**: the decision "unlock is a `PolicyAuthorize` under an Owner key whose signature
   file holds one entry per admitted PCR7 value", as written in
   [TPM-SIGNED-POLICY-RUNBOOK](../TPM-SIGNED-POLICY-RUNBOOK.md) (target state), in
-  [ADR-0004](../ADR-0004-disk-encryption-tpm-luks.md) ("TPM sealing = PCR 7 only"), and the
+  [OS-0004](../ADR-0004-disk-encryption-tpm-luks.md) ("TPM sealing = PCR 7 only"), and the
   `NI-P7-COVERAGE` gate used as the policy mechanism. It also absorbs the unmerged draft
-  "OS-0044 firmware path" (its number is taken by ADR-0044, PR #234; its content is D4 and D5 here).
-- **Relates to**: [ADR-0015](../ADR-0015-installer-trust-anchor-uki-verity.md) (NV generation counter),
-  ADR-0044 (D3 payload `pcr-policy/`, D4 direct `db` enrolment at the OEM bench; PR #234, not yet on
-  `main`), ICE-Fabric ADR FAB-0064/FAB-0066.
+  "OS-0044 firmware path" (its number is taken by OS-0044, PR #234; its content is D4 and D5 here).
+  The supersession takes effect only when this ADR is Accepted (Q1 open).
+- **Relates to**: [OS-0015](../ADR-0015-installer-trust-anchor-uki-verity.md) (NV generation counter),
+  OS-0044 (D3 payload `pcr-policy/`, D4 direct `db` enrolment at the OEM bench; PR #234, not yet on
+  `main`; not verified here whether it has since merged), ICE-Fabric FAB-0064 and FAB-0066.
 
 ## Context
 
@@ -30,9 +31,13 @@ Measured on 2026-10-06 on the code at `f7e53d1`:
   2011 certificates expire in 2026 (series 2023 replaces them). PCR7 of the fleet will move, in waves,
   outside our calendar.
 
-On the GB10 `.67`, read-only capture of 2026-10-06 (BIOS `GX10DGX.0104.2026.0326.1657`): SHA-256
-PCR7 = `5E0A2492…68437`, Secure Boot enabled, host state `owner-sealed-ota-state-v1`. The TCG event
-log and EFI variables of that capture are the fixture basis for the PCR7 calculator.
+A read-only capture of the GB10 `.67` was taken on 2026-10-06 (BIOS `GX10DGX.0104.2026.0326.1657`):
+SHA-256 PCR7 = `5E0A2492…68437`, Secure Boot enabled, host state `owner-sealed-ota-state-v1`. The
+capture files (TCG event log, EFI variables, PCR7) are held outside this repository and are not
+committed with this ADR. The design report cites another PCR7 for `.67` (`07bd0bb2…`, §12 point 6,
+attributed to "repository proofs"; not found in this repository at `f7e53d1`); the difference is
+not explained and is **not verified**. No PCR7 calculator exists: it is planned (task T1) and would
+take captures of this kind as fixtures, which is not done.
 
 This model does not scale to OEM production or RMA (Owner decision, 2026-10-06).
 
@@ -54,8 +59,8 @@ D4. **Updates.** Any firmware or Secure Boot database update follows: qualify �
     manifest → arm (NV variant, "old ∪ new") → flash → commit (old variant removed = revocation).
     No firmware flash without "armed". Firmware updates only through the signed channel (subject to
     Q3).
-D5. **OEM bench.** Pinned firmware, direct `db` enrolment (ADR-0044 D4), a bench record per device;
-    the bench station holds no PCR policy key.
+D5. **OEM bench.** Pinned firmware, direct `db` enrolment (OS-0044 D4), a bench record per device;
+    the bench station holds no PCR policy key. *(pinned firmware is the option of Q3, subject to Q3)*
 D6. **Kernel binding.** The host will move to a UKI with a signed PCR11 policy (`systemd-measure
     sign`). Until then the policy binds the keys and the authority path, **not the binaries**.
 
@@ -75,11 +80,14 @@ has no revocation and no autonomous update path and must not be deployed at scal
 
 ## Consequences
 
-- No Owner signature per machine, per batch, or per new rule-conformant PCR7 value (P1).
-- Revocation becomes real (variant removed from the NV index); the "armed" window is bounded and logged.
+These are intended effects of the proposal. None is built or proven: nothing of P1 is merged.
+
+- No Owner signature per machine, per batch, or per new rule-conformant PCR7 value (P1, not proven).
+- Revocation becomes possible (variant removed from the NV index); the "armed" window is bounded
+  and logged (P1, not proven).
 - Trust moves from per-value signatures to a signed OS agent and signed rules (Q1).
-- NV counter `0x01500007` becomes the rules sequence.
-- RMA: reinstall + rules, no signature; the recovery key remains the last resort.
+- NV counter `0x01500007` would become the rules sequence (P1, not proven).
+- RMA: reinstall + rules, no signature; the recovery key remains the last resort (P1, not proven).
 - Documents that described a list of PCR7 values as the target are rewritten to point here.
 
 ## Alternatives rejected
@@ -91,7 +99,7 @@ has no revocation and no autonomous update path and must not be deployed at scal
 
 ## Not proven (must not be claimed to a partner)
 
-Nothing in P1 has been executed. Open points, to be settled on hardware: `PolicyAuthorize` +
+Nothing in P1 has been executed or merged. Open points, to be settled on hardware: `PolicyAuthorize` +
 `PolicyAuthorizeNV` shards on one keyslot under systemd 257; two systemd-tpm2 tokens under 257
 (refused under 255); `--unlock-tpm2-device=` to add a shard; ConnectX-7 option-ROM events in PCR7;
 GB10 TPM type (fTPM or discrete), PCR banks, UEFI password protecting key menus, a way to block
@@ -109,7 +117,7 @@ proven on a device whose policy fails on purpose, before any deployment.
 
 ## Migration
 
-`.67` / `.72` stay installed: step M0 adds entries under the same key (no change of tokens); M1
+Proposed, none of it executed. `.67` / `.72` stay installed: step M0 adds entries under the same key (no change of tokens); M1
 delivers the agent in observe-only mode; M2 adds the NV shard to the keyslot, subject to proving two
 tokens/shards under systemd 257, with replacement-with-recovery-key as fallback; M3 retires the lab
 shard only after proof and only if the Owner break-glass is kept (Q2).
