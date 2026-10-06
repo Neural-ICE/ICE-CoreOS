@@ -17,7 +17,7 @@ import unittest
 import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
-TOOL = HERE / "ni-pcr7.py"
+TOOL = HERE / "ni-pcr7-calc.py"
 FIX = HERE / "fixtures"
 EXPECTED = json.loads((FIX / "expected.json").read_text())["hosts"]
 
@@ -130,6 +130,16 @@ class WhatMovesPcr7(unittest.TestCase):
         self.assertNotEqual(pcr7.compute(ref).pcr7, base)
 
 
+class PredictAnotherMachine(unittest.TestCase):
+    def test_reference_of_one_gb10_plus_the_other_ones_authorities_predicts_its_live_pcr7(self):
+        # Nothing of ni67 but its authority chain goes in: the Secure Boot
+        # variables come from ni63 (a different vendor, a different firmware).
+        ref = pcr7.extract_reference(log_bytes("ni63"))
+        ref["authorities"] = pcr7.extract_reference(log_bytes("ni67"))["authorities"]
+        self.assertEqual(pcr7.compute(ref).pcr7, live("ni67"))
+        self.assertNotEqual(pcr7.compute(ref).pcr7, live("ni63"))
+
+
 class InstallerMediumPath(unittest.TestCase):
     """Firmware -> signed UKI directly. No real GB10 log exists for it yet, so
     this pins the structure the calculator emits, with arithmetic written out
@@ -153,6 +163,21 @@ class InstallerMediumPath(unittest.TestCase):
             acc = hashlib.sha256(acc + hashlib.sha256(event).digest()).digest()
         self.assertEqual(pcr7.compute(ref).pcr7, acc)
 
+    def test_uki_direct_with_the_lab_db_certificate_matches_the_gx10_installer_pcr7_measured_on_2026_09_04(self):
+        # raw_mission_report_to_ingest/REPORT-p0-installer-usb67-seq4-codex-root-20260904-2235.md
+        # (physical GX10, installer USB booted from the firmware): "PCR7 live
+        # 07bd0bb2…eedd1db et PolicyPCR b83b5281…217937" -- only the first 8 and
+        # last 7 hex digits are recorded there, so only those are compared. The
+        # calculator is given nothing but the lab db certificate of the log of
+        # the installed system.
+        ref = pcr7.extract_reference(log_bytes("ni67"))
+        ref["boot_path"] = "uki-direct"
+        ref["authorities"] = ref["authorities"][:1]
+        value = pcr7.compute(ref).pcr7.hex()
+        self.assertTrue(value.startswith("07bd0bb2") and value.endswith("eedd1db"), value)
+        policy = pcr7.policy.pcr_policy_digest(7, bytes.fromhex(value)).hex()
+        self.assertTrue(policy.startswith("b83b5281") and policy.endswith("217937"), policy)
+
     def test_uki_direct_differs_from_shim_grub_on_the_same_firmware(self):
         shim = pcr7.extract_reference(log_bytes("ni67"))
         uki = json.loads(json.dumps(shim))
@@ -165,6 +190,28 @@ class InstallerMediumPath(unittest.TestCase):
         ref["boot_path"] = "uki-direct"  # still carries SbatLevel + MokListRT
         with self.assertRaises(pcr7.Pcr7Error):
             pcr7.compute(ref)
+
+
+class VariableSynthesis(unittest.TestCase):
+    def test_an_empty_database_measured_as_contents_is_the_empty_measurement(self):
+        names_only = pcr7.extract_reference(log_bytes("ni67"))
+        contents = json.loads(json.dumps(names_only))
+        contents["firmware"]["variable_measurement"] = "contents"
+        for entry in contents["variables"].values():
+            entry["data_hex"] = ""
+        self.assertEqual(pcr7.compute(contents).pcr7, pcr7.compute(names_only).pcr7)
+
+    def test_an_unknown_variable_in_append_esl_is_refused(self):
+        ref = pcr7.extract_reference(log_bytes("ni67"))
+        with self.assertRaises(pcr7.Pcr7Error):
+            pcr7.compute(ref, append_esl={"dbX": "00"})
+
+    def test_dbt_and_dbr_are_supported_in_log_order(self):
+        ref = pcr7.extract_reference(log_bytes("ni67"))
+        base = pcr7.compute(ref).pcr7
+        ref["variables"]["dbt"] = {}
+        ref["variables"]["dbr"] = {}
+        self.assertNotEqual(pcr7.compute(ref).pcr7, base)
 
 
 class Refusals(unittest.TestCase):
@@ -210,16 +257,16 @@ class FilterLog(unittest.TestCase):
 
 
 class CommandLine(unittest.TestCase):
-    def test_check_succeeds_when_both_proofs_hold(self):
+    def test_verify_succeeds_when_both_proofs_hold(self):
         for host in HOSTS:
             with self.subTest(host=host):
-                r = cli("check", str(FIX / f"{host}.pcr7-only.eventlog.bin"),
+                r = cli("verify", str(FIX / f"{host}.pcr7-only.eventlog.bin"),
                         "--expect", live(host).hex())
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn(live(host).hex(), r.stdout)
 
-    def test_check_refuses_a_wrong_expected_value(self):
-        r = cli("check", str(FIX / "ni67.pcr7-only.eventlog.bin"),
+    def test_verify_refuses_a_wrong_expected_value(self):
+        r = cli("verify", str(FIX / "ni67.pcr7-only.eventlog.bin"),
                 "--expect", live("ni63").hex())
         self.assertEqual(r.returncode, 1)
         self.assertIn("NOT", r.stderr)
@@ -233,6 +280,17 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.split()[0], live("ni63").hex())
 
+    def test_malformed_reference_is_refused_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "bad.json"
+            bad.write_text(json.dumps({"schema": "ni-pcr7-reference/1",
+                                       "firmware": {"variable_measurement": "names-only"},
+                                       "boot_path": "shim-grub", "variables": {"PK": 3},
+                                       "authorities": [{"name": "db"}]}))
+            r = cli("compute", str(bad))
+            self.assertEqual(r.returncode, 1)
+            self.assertNotIn("Traceback", r.stderr)
+
     def test_compute_append_esl_flag_reports_unchanged_on_names_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp) / "ref.json"
@@ -240,6 +298,7 @@ class CommandLine(unittest.TestCase):
             r = cli("compute", str(out), "--append-esl", "dbx=" + "00" * 16 + "11" * 32)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.split()[0], live("ni67").hex())
+            self.assertIn("NAMES only", r.stderr)
 
     def test_contents_mode_without_the_variable_bytes_is_refused(self):
         # A reference extracted from a names-only log does not carry the ESLs;
