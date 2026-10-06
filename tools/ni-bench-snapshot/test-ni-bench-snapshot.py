@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import struct
 import subprocess
@@ -109,6 +110,57 @@ def synthetic_installer(installed):
     snap["pcr7"].update(value=fold(kept), eventlog_pcr7_b64=base64.b64encode(log).decode(),
                         eventlog_pcr7_sha256=sha256(log))
     return snap
+
+
+GUID_X509 = bytes.fromhex("a159c0a5e494a74a87b5ab155c2bf072")   # EFI_CERT_X509_GUID, on the wire
+GUID_SHA256 = bytes.fromhex("2616c4c14c509240aca941f936934328")  # EFI_CERT_SHA256_GUID, on the wire
+OWNER = bytes.fromhex("11" * 16)
+
+
+def esl(entries, sig_type=GUID_X509):
+    """One EFI_SIGNATURE_LIST holding `entries` (owner GUID + data each), all of one size."""
+    size = len(OWNER) + len(entries[0])
+    body = b"".join(OWNER + e for e in entries)
+    return sig_type + struct.pack("<III", 28 + len(body), 0, size) + body
+
+
+def with_variable(snap, name, data, attributes=7):
+    """A copy of `snap` whose variable `name` holds `data` (stored size and digest kept consistent)."""
+    snap = json.loads(json.dumps(snap))
+    guid = snap["variables"][name]["guid"] if name in snap["variables"] else tool.VARIABLE_GUIDS[name]
+    snap["variables"][name] = {"guid": guid, "attributes": attributes, "size": len(data),
+                               "sha256": sha256(data), "data_b64": base64.b64encode(data).decode()}
+    return snap
+
+
+def leaves(obj, path=()):
+    """The path of every scalar of a JSON document."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from leaves(value, path + (key,))
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            yield from leaves(value, path + (index,))
+    else:
+        yield path
+
+
+def mutated(value):
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if value is None:
+        return "x"
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]+", value):
+        return ("1" if value[0] != "1" else "2") + value[1:]
+    return value + "x"
+
+
+def set_at(obj, path, value):
+    for key in path[:-1]:
+        obj = obj[key]
+    obj[path[-1]] = value
 
 
 class Keys:
@@ -348,12 +400,16 @@ class ReferenceRecord(Base):
         for a in installed["authority_events"]:
             self.assertRegex(a["digest"], r"^[0-9a-f]{64}$")
 
-    def test_the_installer_path_matches_the_digits_recorded_on_the_bench_in_september(self):
-        # 2026-09-04: a GX10 booting the installer USB logged PCR 7 07bd0bb2…eedd1db
-        # (only those digits were kept; mission report P0 installer-USB .67, 2026-09-04).
-        # The UKI-direct shape (config + separator + the db certificate) reproduces them.
+    def test_the_installer_path_reproduces_the_policy_sealed_in_the_september_uki(self):
+        # 2026-09-04: a GX10 booting the installer USB logged PCR 7 07bd0bb2…eedd1db, and the
+        # UKI seals the full PolicyPCR b83b5281…217937 (mission reports P0 installer-USB .67,
+        # pcr7-4pol). The UKI-direct shape (config + separator + the db certificate) folds to a
+        # PCR 7 whose PolicyPCR is EXACTLY that digest: byte-exact, not a prefix/suffix match.
+        # This is still not a measured installer path: the September BIOS is not recorded.
         _, _, rec = self.good_record()
         pcr7 = rec["paths"]["installer"]["pcr7"]
+        self.assertEqual(policy.pcr_policy_digest(7, bytes.fromhex(pcr7)).hex(),
+                         "b83b5281ae799009b3efd8604f7ce4005d88e51018b5bcc2bb8f66a037217937")
         self.assertTrue(pcr7.startswith("07bd0bb2") and pcr7.endswith("eedd1db"), pcr7)
 
     def test_record_carries_blob_digests_of_the_secure_boot_variables(self):
@@ -405,9 +461,7 @@ class ReferenceRecord(Base):
 
     def test_paths_with_different_secure_boot_variables_are_refused(self):
         installer, installed, _ = self.good_record()
-        installer["variables"]["dbx"]["sha256"] = "22" * 32
-        installer["variables"]["dbx"]["data_b64"] = base64.b64encode(b"x").decode()
-        installer["variables"]["dbx"]["size"] = 1
+        installer = with_variable(installer, "dbx", esl([b"\x22" * 32], GUID_SHA256))
         with self.assertRaisesRegex(tool.BenchError, "dbx"):
             tool.build_record(installer, installed)
 
@@ -668,6 +722,287 @@ class Store(Base):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(tool.BenchError, "empty"):
                 tool.validate_store(root, str(self.owner_pub))
+
+
+class RecordIsBoundToItsSnapshots(Base):
+    """The Owner signs the record's digest; the record must therefore be a function of
+    the snapshots stored next to it, or it could claim evidence it was not built from."""
+
+    def forged_sheet(self, rec):
+        pkfp = tool.pubkey_fingerprint(str(self.owner_pub))
+        return {"schema": tool.SHEET_SCHEMA, "family_id": rec.get("family_id"), "seq": 1,
+                "issued_at": "2026-10-06",
+                "firmware_pin": {k: rec["firmware"].get(k) for k in ("bios_version", "bios_date")},
+                "expected_pcr7": {l: rec["paths"].get(l, {}).get("pcr7") for l in tool.PATHS},
+                "reference_record_sha256": tool.record_digest(rec),
+                "signer": {"pkfp": pkfp, "algorithm": "rsa-pkcs1-sha256"}}
+
+    def stage(self):
+        installer, installed, _ = self.good_record()
+        installer["origin"] = "measured"
+        return installer, installed, tool.build_record(installer, installed)
+
+    def try_store(self, rec, installer, installed):
+        sheet = self.forged_sheet(rec)
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                tool.store(root, rec, sheet, self.sign(sheet),
+                           {"installer": installer, "installed": installed}, str(self.owner_pub))
+            except tool.BenchError as error:
+                return str(error)
+            return None
+
+    def test_the_untouched_record_is_stored(self):
+        installer, installed, rec = self.stage()
+        self.assertIsNone(self.try_store(rec, installer, installed))
+
+    def test_a_record_whose_installer_path_is_a_copy_of_the_installed_one_is_refused(self):
+        installer, installed, rec = self.stage()
+        rec["paths"]["installer"] = json.loads(json.dumps(rec["paths"]["installed"]))
+        self.assertIn("built from", self.try_store(rec, installer, installed) or "")
+
+    def test_a_record_with_a_wrong_pk_digest_or_bios_date_is_refused(self):
+        installer, installed, rec = self.stage()
+        rec["variables"]["PK"]["sha256"] = "ab" * 32
+        self.assertIn("built from", self.try_store(rec, installer, installed) or "")
+        installer, installed, rec = self.stage()
+        rec["firmware"]["bios_date"] = "2026-03-27"
+        self.assertIn("built from", self.try_store(rec, installer, installed) or "")
+
+    def test_no_scalar_of_the_record_can_be_changed_without_the_store_refusing_it(self):
+        installer, installed, rec = self.stage()
+        paths = list(leaves(rec))
+        self.assertGreater(len(paths), 150)
+        accepted = []
+        for path in paths:
+            forged = json.loads(json.dumps(rec))
+            node = forged
+            for key in path[:-1]:
+                node = node[key]
+            node[path[-1]] = mutated(node[path[-1]])
+            if self.try_store(forged, installer, installed) is None:
+                accepted.append(".".join(map(str, path)))
+        self.assertEqual(accepted, [], "record fields the store accepts changed")
+
+    def test_validate_store_rederives_the_record_too(self):
+        installer, installed, rec = self.stage()
+        for path in (("variables", "PK", "sha256"), ("provenance", "tool_version"),
+                     ("paths", "installer", "eventlog_pcr7_sha256"),
+                     ("paths", "installed", "authority_events", 0, "cert_sha256")):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as root:
+                forged = json.loads(json.dumps(rec))
+                set_at(forged, path, mutated(forged[path[0]] if len(path) == 1 else
+                                              eval_path(forged, path)))
+                sheet = self.forged_sheet(forged)
+                family = pathlib.Path(root) / forged["family_id"]
+                (family / "snapshots").mkdir(parents=True)
+                (family / "reference-record.json").write_bytes(tool._dump(forged))
+                (family / "bench-sheet.json").write_bytes(tool._dump(sheet))
+                (family / "bench-sheet.sig").write_bytes(self.sign(sheet))
+                (family / "snapshots" / "installer.snapshot.json").write_bytes(tool._dump(installer))
+                (family / "snapshots" / "installed.snapshot.json").write_bytes(tool._dump(installed))
+                with self.assertRaises(tool.BenchError):
+                    tool.validate_store(root, str(self.owner_pub), allow_synthetic=True)
+
+    def test_a_record_digest_and_authority_event_must_agree_with_its_own_reference(self):
+        _, _, rec = self.good_record()
+        for field in ("payload_sha256", "cert_sha256", "signature_owner", "guid"):
+            forged = json.loads(json.dumps(rec))
+            forged["paths"]["installed"]["authority_events"][0][field] = (
+                "11111111-2222-3333-4444-555555555555" if field in ("signature_owner", "guid")
+                else "cd" * 32)
+            with self.subTest(field=field), self.assertRaises(tool.BenchError):
+                tool.validate_record(forged, allow_synthetic=True)
+
+
+def eval_path(obj, path):
+    for key in path:
+        obj = obj[key]
+    return obj
+
+
+class VariableEvidenceIsChecked(Base):
+    def lines(self):
+        return (FIX / "efivars.b64").read_text().splitlines()
+
+    def capture_with(self, extra=(), drop=(), replace=None):
+        replace = replace or {}
+        lines = []
+        for line in self.lines():
+            name = line.partition("-")[0]
+            if name in drop:
+                continue
+            if name in replace:
+                key, _, _b = line.partition(" ")
+                line = key + " " + base64.b64encode(b"\x07\x00\x00\x00" + replace[name]).decode()
+            lines.append(line)
+        lines.extend(extra)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "efivars.b64"
+            path.write_text("\n".join(lines) + "\n")
+            return capture_installed(efivars_b64=path)
+
+    def test_a_duplicate_listed_under_the_upper_case_guid_is_refused(self):
+        pk = next(l for l in self.lines() if l.startswith("PK-"))
+        key, _, _b = pk.partition(" ")
+        upper = key[:-36] + key[-36:].upper()
+        forged = upper + " " + base64.b64encode(b"\x27\x00\x00\x00" + b"\x00" * 16).decode()
+        with self.assertRaisesRegex(tool.BenchError, "twice"):
+            self.capture_with(extra=[forged])
+
+    def test_a_pk_of_sixteen_padding_bytes_is_not_a_signature_list(self):
+        with self.assertRaisesRegex(tool.BenchError, "PK"):
+            self.capture_with(replace={"PK": b"\x00" * 16})
+
+    def test_every_certificate_list_variable_must_be_well_formed(self):
+        for name in ("PK", "KEK", "db", "dbx"):
+            with self.subTest(name=name), self.assertRaisesRegex(tool.BenchError, name):
+                self.capture_with(replace={name: b"\x01\x02\x03"})
+
+    def test_a_signature_list_with_trailing_bytes_is_refused(self):
+        good = esl([b"cert-a"])
+        with self.assertRaisesRegex(tool.BenchError, "KEK"):
+            self.capture_with(replace={"KEK": good + b"\x00"})
+
+    def test_a_signature_list_whose_declared_size_overruns_is_refused(self):
+        good = bytearray(esl([b"cert-a"]))
+        good[16:20] = struct.pack("<I", len(good) + 10)
+        with self.assertRaisesRegex(tool.BenchError, "KEK"):
+            self.capture_with(replace={"KEK": bytes(good)})
+
+    def test_the_certificate_of_the_db_authority_event_must_be_in_the_stored_db(self):
+        # same log, but a db that does not hold the certificate the firmware logged:
+        # the snapshot would describe a boot that this db could not have verified.
+        with self.assertRaisesRegex(tool.BenchError, "db"):
+            self.capture_with(replace={"db": esl([b"some-other-certificate"])})
+
+    def test_the_real_db_holds_the_authority_certificate(self):
+        tool.validate_snapshot(capture_installed())
+
+    def test_a_snapshot_edited_after_capture_is_refused_by_the_same_check(self):
+        snap = with_variable(capture_installed(), "db", esl([b"some-other-certificate"]))
+        with self.assertRaisesRegex(tool.BenchError, "db"):
+            tool.validate_snapshot(snap)
+
+
+class InstallerPathIsConstrained(Base):
+    def test_an_installer_path_that_is_not_uki_direct_is_refused(self):
+        installed = capture_installed()
+        also_installed = capture_installed(path="installer")
+        with self.assertRaisesRegex(tool.BenchError, "uki-direct"):
+            tool.build_record(also_installed, installed)
+
+    def test_the_synthetic_gate_alone_does_not_make_a_label_a_measurement(self):
+        # `origin: measured` is the operator's attestation (no TPM quote binds it), which is
+        # why the shape constraint above exists and why the README says so.
+        installer, installed, _ = self.good_record()
+        installer["origin"] = "measured"
+        rec = tool.build_record(installer, installed)
+        self.assertEqual(rec["paths"]["installer"]["boot_path"], "uki-direct")
+        self.assertNotEqual(rec["paths"]["installer"]["pcr7"], rec["paths"]["installed"]["pcr7"])
+
+
+class StoreAnchors(Base):
+    def stored(self, root, seq=1):
+        installer, installed, _ = self.good_record()
+        installer["origin"] = "measured"
+        rec = tool.build_record(installer, installed)
+        sheet = tool.make_sheet(rec, seq=seq, issued_at="2026-10-06",
+                                pkfp=tool.pubkey_fingerprint(str(self.owner_pub)))
+        return tool.store(root, rec, sheet, self.sign(sheet),
+                          {"installer": installer, "installed": installed}, str(self.owner_pub))
+
+    def test_a_floor_on_the_sequence_refuses_a_store_rolled_back_to_an_older_sheet(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.stored(root, seq=1)
+            self.assertEqual(tool.validate_store(root, str(self.owner_pub), min_seq={FAMILY: 1}), [FAMILY])
+            with self.assertRaisesRegex(tool.BenchError, "seq"):
+                tool.validate_store(root, str(self.owner_pub), min_seq={FAMILY: 2})
+
+    def test_a_family_that_has_a_floor_but_vanished_from_the_store_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.stored(root)
+            with self.assertRaisesRegex(tool.BenchError, "gone-family"):
+                tool.validate_store(root, str(self.owner_pub), min_seq={FAMILY: 1, "gone-family": 1})
+
+    def test_the_trusted_key_can_be_pinned_by_fingerprint(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.stored(root)
+            good = tool.pubkey_fingerprint(str(self.owner_pub))
+            tool.validate_store(root, str(self.owner_pub), expected_pkfp=good)
+            with self.assertRaisesRegex(tool.BenchError, "pkfp"):
+                tool.validate_store(root, str(self.owner_pub), expected_pkfp="00" * 32)
+
+    def test_the_cli_takes_min_seq_and_expected_pkfp(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.stored(root)
+            pkfp = tool.pubkey_fingerprint(str(self.owner_pub))
+            ok = cli("validate-store", root, "--pubkey", str(self.owner_pub),
+                     "--expected-pkfp", pkfp, "--min-seq", f"{FAMILY}=1")
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            bad = cli("validate-store", root, "--pubkey", str(self.owner_pub), "--min-seq", f"{FAMILY}=2")
+            self.assertEqual(bad.returncode, 1)
+            bad = cli("validate-store", root, "--pubkey", str(self.owner_pub), "--min-seq", "nonsense")
+            self.assertNotEqual(bad.returncode, 0)
+
+    def test_validate_store_refuses_an_undeclared_empty_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            dest = pathlib.Path(self.stored(root))
+            (dest / "stray").mkdir()
+            with self.assertRaisesRegex(tool.BenchError, "stray"):
+                tool.validate_store(root, str(self.owner_pub))
+
+    def test_validate_store_refuses_a_root_that_is_a_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = pathlib.Path(tmp) / "real"
+            real.mkdir()
+            self.stored(str(real))
+            link = pathlib.Path(tmp) / "link"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(tool.BenchError, "symlink"):
+                tool.validate_store(str(link), str(self.owner_pub))
+
+    def test_a_synthetic_snapshot_is_refused_at_the_snapshot_gate_even_if_the_record_agrees(self):
+        installer, installed, _ = self.good_record()      # installer is synthetic-test
+        rec = tool.build_record(installer, installed)
+        with self.assertRaisesRegex(tool.BenchError, "synthetic"):
+            tool._check_snapshots(rec, {"installer": installer, "installed": installed}, False)
+
+
+class SmallHardening(Base):
+    def test_family_id_must_be_a_slug_not_empty_or_punctuation(self):
+        for bios in (".", "-", "..-"):
+            with self.subTest(bios=bios):
+                installed = capture_installed(bios_version=bios)
+                installer = synthetic_installer(installed)
+                with self.assertRaisesRegex(tool.BenchError, "family_id"):
+                    tool.build_record(installer, installed)
+
+    def test_issued_at_is_a_calendar_date_in_one_form(self):
+        rec = self.good_record()[2]
+        pkfp = tool.pubkey_fingerprint(str(self.owner_pub))
+        for bad in ("20261006", "2026-W41-1", "2026-10-6", "2026-10-06T00:00:00"):
+            with self.subTest(issued_at=bad), self.assertRaises(tool.BenchError):
+                tool.make_sheet(rec, 1, bad, pkfp)
+
+    def test_a_file_that_is_not_utf8_exits_1_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "snap.json"
+            bad.write_bytes(b"\xff\xfe\x00")
+            r = cli("validate-snapshot", str(bad))
+            self.assertEqual(r.returncode, 1)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_an_output_is_not_written_through_a_planted_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = pathlib.Path(tmp) / "victim"
+            victim.write_text("keep")
+            out = pathlib.Path(tmp) / "snap.json"
+            (pathlib.Path(tmp) / ".snap.json.tmp").symlink_to(victim)
+            tool._write(str(out), b"data")
+            self.assertEqual(victim.read_text(), "keep")
+            self.assertEqual(out.read_bytes(), b"data")
+            self.assertEqual(out.stat().st_mode & 0o777, 0o644)
 
 
 class CommandLine(Base):
