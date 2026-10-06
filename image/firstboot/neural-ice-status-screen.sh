@@ -24,10 +24,25 @@
 # soon as the unit that owns tty1 (getty@tty1 on the debug variant, the product
 # TUI on the branded appliance) is active. Error codes: status-error-codes.md.
 #
+# V2 HOSTS. A host whose image carries the marker `owner-sealed-ota-state-v2` is a
+# v2 appliance: its components are not Quadlet/bound-image references of the OS
+# image but the components of the signed release manifest the first boot imported
+# (ni-v2-seed-import.service) and, on a preload=none medium, pulls from the LAN
+# mirror (ni-v2-first-pull.service). On such a host the Images line is "components
+# of that manifest whose alias is in containers-storage / components of the
+# manifest", it stays running until the first-pull unit itself is done, the header
+# names the release id instead of a v1 channel (the v2 manifest carries no ring),
+# and READY also waits for the product payload apply and the product core API.
+# The screen only DISPLAYS the manifest; its signature is verified by the first
+# pull (before it pulls anything) and by the owner ceremony. v1 hosts (no marker,
+# or the v1 marker) run the unchanged v1 code paths.
+#
 # Paths this script reads (the static test enforces this list):
 #   /usr/lib/os-release                       product name
 #   /usr/lib/neural-ice/version               OS version (CI, run-unique)
 #   /usr/lib/neural-ice/status-screen/        core-services list extension
+#   /usr/lib/neural-ice/ota-state-profile     image marker: v2 host or not
+#   /var/lib/neural-ice-v2/current-release/release-manifest.json   v2 components, release id
 #   /usr/lib/bootc/bound-images.d/            image inventory (bound images)
 #   /usr/share/containers/systemd/            image inventory (Quadlets)
 #   /etc/containers/systemd/                  image inventory (Quadlets)
@@ -68,6 +83,16 @@ if [[ ${NI_STATUS_SCREEN_TESTING:-0} != 0 ]]; then
 fi
 path() { printf '%s%s' "$ROOT_PREFIX" "$1"; }
 
+# v2 host? The image marker, exactly (a closed set; read like every other file
+# here: regular file, no symlink).
+V2_PROFILE_MARKER=owner-sealed-ota-state-v2
+IS_V2=0
+{
+  marker_file=$(path /usr/lib/neural-ice/ota-state-profile); marker=""
+  if [[ -f $marker_file && ! -L $marker_file && -r $marker_file ]]; then IFS= read -r marker < "$marker_file" || true; fi
+  if [[ $marker == "$V2_PROFILE_MARKER" ]]; then IS_V2=1; fi
+}
+
 # Seconds the TPM owner ceremony may stay `activating` before the screen shows
 # NI-E02. The first boot legitimately takes minutes (TPM provisioning, seed
 # import); the unit sets the default, a drop-in may override it.
@@ -88,6 +113,13 @@ UNIT_CEREMONY='neural-ice-firstboot-tpm-ceremony.service'
 UNIT_NETWORK='NetworkManager.service'
 UNIT_SEED_IMPORT='neural-ice-seed-import.service'
 UNIT_PAYLOAD='neural-ice-payload-apply.service'
+# v2: the preload import and the first-boot component pull; they replace the two
+# v1 units above on a v2 host (the v1 units are not watched there).
+UNIT_V2_SEED_IMPORT='ni-v2-seed-import.service'
+UNIT_V2_FIRST_PULL='ni-v2-first-pull.service'
+# The units whose failure is the image phase (NI-E04), in the order they run.
+if (( IS_V2 )); then IMG_UNITS=("$UNIT_V2_SEED_IMPORT" "$UNIT_V2_FIRST_PULL")
+else IMG_UNITS=("$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD"); fi
 # tty1 owners: the login getty (debug variant) or the product console dashboard
 # (branded appliance, ICE-Fabric neural-ice-tui.service). Either one active
 # means the screen is no longer ours.
@@ -101,6 +133,20 @@ CORE_SERVICES=(
   neural-ice-payload-apply.service
   avahi-daemon.service
 )
+# A v2 host has no v1 payload apply (neural-ice-payload-apply.service is
+# condition-skipped there); its product is started by the v2 payload apply, which
+# is ordered after the first pull, and the product core API (the Quadlet unit
+# icecore-api.service) is what the console and the clients talk to. A unit the
+# image does not ship is skipped, so a v2 variant without them is not held back.
+if (( IS_V2 )); then
+  CORE_SERVICES=(
+    neural-ice-hostname-init.service
+    neural-ice-device-root.service
+    avahi-daemon.service
+    neural-ice-product-payload-apply.service
+    icecore-api.service
+  )
+fi
 core_services_dir=$(path /usr/lib/neural-ice/status-screen)
 if [[ -f $core_services_dir/core-services && ! -L $core_services_dir/core-services ]]; then
   while IFS= read -r line; do
@@ -141,6 +187,9 @@ unit_skipped() { # a unit whose Condition*= was evaluated and said no
 }
 unit_failed() { [[ ${U_ACTIVE[$1]} == failed ]]; }
 unit_active() { [[ ${U_ACTIVE[$1]} == active ]]; }
+# A v2 step (import, first pull) is behind us when it ran, was skipped by its
+# Condition (a full preload never starts the first pull) or is not shipped.
+v2_step_done() { unit_active "$1" || unit_skipped "$1" || unit_absent "$1"; }
 
 # ---------------------------------------------------------------------------
 # Identity header. Nothing here is secret: the DMI model and serial are on the
@@ -293,6 +342,41 @@ count_images() { # -> "N M"
 }
 
 # ---------------------------------------------------------------------------
+# v2 components. The signed release manifest (compact canonical JSON) lists the
+# components; a component is present when its alias
+# localhost/neural-ice-applied/<id>:v1 (what the first pull and the preload import
+# both tag) AND its manifest digest are in containers-storage. Objects of the
+# manifest are flat, so each `{...}` carrying a component_id is one component (the
+# host entry and the evidence entries have none). Parsed with bash and grep only,
+# never executed, never trusted beyond the character classes below.
+# ---------------------------------------------------------------------------
+V2_MANIFEST=$(path /var/lib/neural-ice-v2/current-release/release-manifest.json)
+V2_TOTAL=0; V2_PRESENT=0; V2_RELEASE='unset'; V2_MANIFEST_SEEN=0
+v2_read_release() {
+  local id="" doc
+  V2_TOTAL=0; V2_PRESENT=0; V2_RELEASE='unset'; V2_MANIFEST_SEEN=0
+  [[ -f $V2_MANIFEST && ! -L $V2_MANIFEST && -r $V2_MANIFEST ]] || return 0
+  V2_MANIFEST_SEEN=1
+  doc=$(head -c 1048576 "$V2_MANIFEST" 2>/dev/null | tr -d '\n') || return 0
+  if [[ $doc =~ \"release_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._-]{1,128})\" ]]; then id=${BASH_REMATCH[1]}; fi
+  V2_RELEASE=$(sanitize "${id:-unset}" 40)
+  local indexes="" idx obj cid cdigest
+  for idx in "${STORAGE_INDEXES[@]}"; do
+    [[ -r $idx ]] && indexes+=$(<"$idx")
+  done
+  while IFS= read -r obj; do
+    V2_TOTAL=$((V2_TOTAL + 1))
+    cid=""; cdigest=""
+    [[ $obj =~ \"component_id\"[[:space:]]*:[[:space:]]*\"([a-z0-9][a-z0-9._-]{0,127})\" ]] && cid=${BASH_REMATCH[1]}
+    [[ $obj =~ \"digest\"[[:space:]]*:[[:space:]]*\"(sha256:[0-9a-f]{64})\" ]] && cdigest=${BASH_REMATCH[1]}
+    [[ -n $cid && -n $cdigest ]] || continue
+    if [[ $indexes == *"\"localhost/neural-ice-applied/$cid:v1\""* && $indexes == *"\"$cdigest\""* ]]; then
+      V2_PRESENT=$((V2_PRESENT + 1))
+    fi
+  done < <(grep -oE '\{[^{}]*\}' <<<"$doc" | grep -F '"component_id"' || true)
+}
+
+# ---------------------------------------------------------------------------
 # Screen.
 # ---------------------------------------------------------------------------
 ESC=$'\033'
@@ -377,6 +461,7 @@ PRODUCT=$(product_name)
 VERSION=$(os_version)
 IMAGE=$(booted_image_short)
 CHANNEL=$(device_channel)
+ID_LABEL=channel; ID_VALUE=$CHANNEL
 MODEL="$(dmi sys_vendor 24) $(dmi product_name 32)"
 SERIAL=$(dmi product_serial 40)
 [[ -n ${SERIAL// /} ]] || SERIAL="unknown"
@@ -393,7 +478,7 @@ iteration=0
 while :; do
   iteration=$((iteration + 1))
   for u in "$UNIT_STORAGE" "$UNIT_DATA_MOUNT" "$UNIT_CEREMONY" "$UNIT_NETWORK" \
-           "$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD" "${TTY1_OWNERS[@]}" "${CORE_SERVICES[@]}"; do
+           "${IMG_UNITS[@]}" "${TTY1_OWNERS[@]}" "${CORE_SERVICES[@]}"; do
     query_unit "$u"
   done
 
@@ -408,7 +493,7 @@ while :; do
   # Did every probe answer? A systemctl failure is not a state.
   probing=0
   for u in "$UNIT_STORAGE" "$UNIT_DATA_MOUNT" "$UNIT_CEREMONY" "$UNIT_NETWORK" \
-           "$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD" "${CORE_SERVICES[@]}"; do
+           "${IMG_UNITS[@]}" "${CORE_SERVICES[@]}"; do
     unit_unknown "$u" && { probing=1; break; }
   done
 
@@ -490,15 +575,36 @@ while :; do
   fi
 
   # --- images ---------------------------------------------------------------
-  collect_image_refs
-  read -r img_present img_total <<<"$(count_images)"
   images_done=0; img_extra=""
-  if unit_failed "$UNIT_SEED_IMPORT" || unit_failed "$UNIT_PAYLOAD"; then
+  if (( IS_V2 )); then
+    # v2: the components of the release manifest; done only when the import and
+    # the first pull are done themselves (a pull that has pulled every image is
+    # still committing its aliases and its DONE marker until the unit ends).
+    v2_read_release
+    img_present=$V2_PRESENT; img_total=$V2_TOTAL
+    ID_LABEL=release; ID_VALUE=$V2_RELEASE
+  else
+    collect_image_refs
+    read -r img_present img_total <<<"$(count_images)"
+  fi
+  if unit_failed "${IMG_UNITS[0]}" || unit_failed "${IMG_UNITS[1]}"; then
     img_mark=fail; img_text="$img_present/$img_total present -- image import failed"
-    unit_failed "$UNIT_SEED_IMPORT" && set_failure NI-E04 "image pull" "$UNIT_SEED_IMPORT"
-    unit_failed "$UNIT_PAYLOAD" && set_failure NI-E04 "image pull" "$UNIT_PAYLOAD"
-  elif unit_unknown "$UNIT_SEED_IMPORT" || unit_unknown "$UNIT_PAYLOAD"; then
+    unit_failed "${IMG_UNITS[0]}" && set_failure NI-E04 "image pull" "${IMG_UNITS[0]}"
+    unit_failed "${IMG_UNITS[1]}" && set_failure NI-E04 "image pull" "${IMG_UNITS[1]}"
+  elif unit_unknown "${IMG_UNITS[0]}" || unit_unknown "${IMG_UNITS[1]}"; then
     img_mark="wait"; img_text="$img_present/$img_total present -- probing..."
+  elif (( IS_V2 && img_total == 0 )); then
+    # No component to count: the release is not imported yet (or the manifest is
+    # unreadable). Never the v1 "no inventory" skip: a v2 host always has one.
+    img_mark="wait"
+    if (( V2_MANIFEST_SEEN )); then img_text="release manifest names no readable component"
+    else img_text="waiting for the attested release manifest"; fi
+  elif (( IS_V2 )); then
+    if (( img_present >= img_total )) && v2_step_done "$UNIT_V2_SEED_IMPORT" && v2_step_done "$UNIT_V2_FIRST_PULL"; then
+      img_mark=ok; img_text="$img_present/$img_total present"; images_done=1
+    else
+      img_mark=run; img_text="$img_present/$img_total present"; img_extra=$rx_text
+    fi
   elif (( img_total == 0 )); then
     img_mark=skip; img_text="no product image inventory on this image"; images_done=1
   elif (( img_present >= img_total )); then
@@ -541,8 +647,12 @@ while :; do
   fi
 
   # --- serial mirror (stable lines only, on change) ---------------------------
+  # v1: once. v2: the release id appears when the import publishes the manifest,
+  # so the (change-only) mirror is fed on every pass.
+  if (( iteration == 1 || IS_V2 )); then
+    mirror header "$PRODUCT | OS $VERSION | image $IMAGE | $ID_LABEL $ID_VALUE"
+  fi
   if (( iteration == 1 )); then
-    mirror header "$PRODUCT | OS $VERSION | image $IMAGE | channel $CHANNEL"
     mirror identity "model $MODEL | serial $SERIAL"
   fi
   mirror storage "$(mark "$storage_mark") Storage: $storage_text"
@@ -559,7 +669,7 @@ while :; do
   # --- draw -------------------------------------------------------------------
   uptime_s=$(( ($(now_ms) - START_MS) / 1000 ))
   line " NEURAL ICE   $PRODUCT"
-  line " OS $VERSION   image $IMAGE   channel $CHANNEL"
+  line " OS $VERSION   image $IMAGE   $ID_LABEL $ID_VALUE"
   line " Model $MODEL   Serial $SERIAL   Host $(hostname_now)"
   line " ------------------------------------------------------------------------------"
   line " $(mark "$storage_mark")  Storage         $storage_text"

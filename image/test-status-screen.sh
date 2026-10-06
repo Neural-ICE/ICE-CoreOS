@@ -7,7 +7,10 @@
 #      key, no LUKS/TPM material, no licence, no token, no fingerprint path;
 #   3. the script, run through its unprivileged test seam against crafted
 #      fixtures, shows the phases, the counters, the receive rate, the failure
-#      block with the stable NI-Exx code, READY, and the serial mirror lines.
+#      block with the stable NI-Exx code, READY, and the serial mirror lines;
+#   4. the same script on a v2 host (owner-sealed-ota-state-v2 marker): Images from
+#      the attested release manifest, ni-v2-seed-import / ni-v2-first-pull, READY
+#      only once the first pull is done and the product core units are active.
 set -euo pipefail
 
 if (( EUID == 0 )); then
@@ -142,6 +145,7 @@ allowed=(
   /var/lib/containers/storage/overlay-images/images.json /usr/lib/bootc/storage/overlay-images/images.json
   /sys/class/net /sys/class/dmi/id
   /proc/cmdline /proc/sys/kernel/hostname /sys/class/tty/console/active /dev /dev/null
+  /usr/lib/neural-ice/ota-state-profile /var/lib/neural-ice-v2/current-release/release-manifest.json
 )
 while IFS= read -r found; do
   ok=0
@@ -497,4 +501,176 @@ reject "$out" 'FAILURE' "degraded inventory is not a failure"
 ! env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" bash "$SCRIPT" >/dev/null 2>&1 \
   || fail "test seam ran without an explicit systemctl"
 
-echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, 13 behaviour scenes)"
+# --- 4. v2 host (owner-sealed-ota-state-v2) --------------------------------------
+# Field bug, first production-grade v2 appliance (ASUS GX10, lane-2 preload=none
+# medium): the v1 screen showed "Images [--] no product image inventory on this
+# image", "channel unset", and READY while ni-v2-first-pull was still pulling.
+# A v2 host is recognised by its image marker only; v1 behaviour is untouched
+# (sections 3a-3i run without the marker).
+V2_REL=v2-lab-train-3-20261006-b
+v2_digest() { printf 'sha256:%064d' "$1"; }
+make_v2_fixture() { # tonight's screen: first pull activating, 1 of 3 components pulled, nothing else started
+  make_fixture
+  rm -rf "$FX/root/usr/lib/bootc/bound-images.d" "$FX/root/usr/share/containers/systemd" "$FX/root/etc/containers/systemd" \
+    "$FX/root/usr/lib/neural-ice/status-screen" "$FX/root/var/lib/neural-ice/data/release"
+  printf 'owner-sealed-ota-state-v2\n' > "$FX/root/usr/lib/neural-ice/ota-state-profile"
+  mkdir -p "$FX/root/var/lib/neural-ice-v2/current-release"
+  # compact canonical JSON, as signed: 3 components, the host entry and an evidence entry are NOT components
+  printf '{"bundle_seq":3,"compatibility":{"minimum_reader":1},"components":[%s,%s,%s],"content":[],"evidence":[{"digest":"%s","kind":"attestation"}],"hardware_target":"nvidia-gb10-arm64","host":{"contract":"host-bootc-v1","digest":"%s","reboot_required":true,"repository":"rg.fr-par.scw.cloud/neural-ice-v2-lab/host-appliance","restart_scope":["bootc-fetch-apply-updates.service"]},"release_id":"%s","schema":"neural-ice-release-manifest-v1"}\n' \
+    "{\"component_id\":\"agentic-core\",\"contract\":\"oci-component-v1\",\"digest\":\"$(v2_digest 11)\",\"reboot_required\":false,\"repository\":\"rg.fr-par.scw.cloud/neural-ice-v2-lab/agentic-core\",\"restart_scope\":[\"agentic-core.service\"]}" \
+    "{\"component_id\":\"caddy\",\"contract\":\"oci-component-v1\",\"digest\":\"$(v2_digest 12)\",\"reboot_required\":false,\"repository\":\"rg.fr-par.scw.cloud/neural-ice-v2-lab/caddy\",\"restart_scope\":[\"caddy.service\"]}" \
+    "{\"component_id\":\"icecore-api\",\"contract\":\"oci-component-v1\",\"digest\":\"$(v2_digest 13)\",\"reboot_required\":false,\"repository\":\"rg.fr-par.scw.cloud/neural-ice-v2-lab/icecore-api\",\"restart_scope\":[\"icecore-api.service\"]}" \
+    "$(v2_digest 99)" "$(v2_digest 98)" "$V2_REL" > "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+  v2_store 1
+  cat > "$FX/scene" <<'EOF'
+systemd-cryptsetup@data.service loaded active exited 0 yes
+var-lib-neural\x2dice-data.mount loaded active mounted 0 yes
+neural-ice-firstboot-tpm-ceremony.service loaded active exited 0 yes
+NetworkManager.service loaded active running 0 yes
+neural-ice-hostname-init.service loaded active exited 0 yes
+neural-ice-device-root.service loaded inactive dead 4242 no
+neural-ice-payload-apply.service loaded inactive dead 4242 no
+avahi-daemon.service loaded active running 0 yes
+ni-v2-seed-import.service loaded active exited 0 yes
+ni-v2-first-pull.service loaded activating start 0 yes
+neural-ice-product-payload-apply.service loaded inactive dead 0 no
+icecore-api.service loaded inactive dead 0 no
+EOF
+}
+v2_store() { # <n>: containers-storage holds the aliases of the first n components, digest-for-digest
+  local n=$1 i out="" ids=(agentic-core caddy icecore-api)
+  for ((i = 0; i < n; i++)); do
+    out+="${out:+,}{\"id\":\"x$i\",\"digest\":\"$(v2_digest $((11 + i)))\",\"names\":[\"localhost/neural-ice-applied/${ids[i]}:v1\",\"rg.fr-par.scw.cloud/neural-ice-v2-lab/${ids[i]}@$(v2_digest $((11 + i)))\"]}"
+  done
+  printf '[%s]\n' "$out" > "$FX/root/var/lib/containers/storage/overlay-images/images.json"
+}
+v2_ready_scene() { # first pull done, every component present, product core units up
+  v2_store 3
+  set_state ni-v2-first-pull.service loaded active exited 0 yes
+  set_state neural-ice-product-payload-apply.service loaded active exited 0 yes
+  set_state icecore-api.service loaded active running 0 yes
+}
+
+# 4a. tonight's screen, reproduced: first pull at 1/3, product units not started.
+make_v2_fixture
+out="$(run_screen)"
+expect "$out" "release $V2_REL" "v2 header carries the attested release id"
+reject "$out" 'channel unset' "a v2 host has no v1 CHANNEL file; the header must not claim an unset channel"
+reject "$out" 'channel ' "the v2 header names the release, not a v1 channel"
+expect "$out" '[ .. ]  Images          1/3 present  RX ' "v2 Images row: components present / components of the release manifest, first pull running"
+reject "$out" 'no product image inventory' "a v2 host has an inventory: the components of its release manifest"
+reject "$out" 'READY' "no READY while ni-v2-first-pull is still activating"
+reject "$out" 'FAILURE' "a first pull in progress is not a failure"
+expect "$out" '[ .. ]  Core services   3/5 active' "v2 core list: hostname-init, device-root, avahi, product payload apply, core API"
+expect "$out" 'no input is read' "footer still says starting"
+serial="$(serial_out)"
+expect "$serial" "neural-ice-status: Neural ICE CoreOS | OS 0.51.11 | image deploy ab0000000000 | release $V2_REL" "serial header names the release"
+expect "$serial" 'neural-ice-status: [ .. ] Images: 1/3 present' "serial image counter on v2"
+reject "$serial" 'READY' "serial never announces READY during the first pull"
+
+# 4b. READY only after the first pull is done AND the product core units are active.
+make_v2_fixture
+v2_ready_scene
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+expect "$out" '[ OK ]  Images          3/3 present' "v2 images all present, first pull done"
+expect "$out" '[ OK ]  Core services   5/5 active' "v2 core units all active"
+expect "$out" 'READY -- login available.' "v2 READY once everything is done"
+expect "$(serial_out)" 'neural-ice-status: READY -- login available' "serial READY marker on v2"
+# every component present but the unit has not committed yet (aliases, DONE marker): not ready
+set_state ni-v2-first-pull.service loaded activating start 0 yes
+out="$(run_screen 1 0)"
+expect "$out" '[ .. ]  Images          3/3 present' "all components present but the first pull unit still running"
+reject "$out" 'READY' "READY waits for the first-pull unit itself, not for the last alias"
+# queued behind the seed import: not started yet, not done
+set_state ni-v2-first-pull.service loaded inactive dead 0 no
+out="$(run_screen 1 0)"
+reject "$out" 'READY' "a first pull that has not started is not done"
+# a full-preload host: the first pull is skipped by its Condition (no HYDRATE-PENDING) and counts as done
+set_state ni-v2-first-pull.service loaded inactive dead 4242 no
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+expect "$out" 'READY -- login available.' "a condition-skipped first pull (full preload) is done"
+# the product core API is part of READY
+set_state icecore-api.service loaded inactive dead 0 no
+out="$(run_screen 1 0)"
+expect "$out" '[ .. ]  Core services   4/5 active' "core API not started yet"
+reject "$out" 'READY' "READY waits for the product core API"
+set_state icecore-api.service loaded failed failed 0 no
+out="$(run_screen 1 0)"
+expect "$out" 'FAILURE  NI-E05  (core service)' "a failed core API is a core-service failure"
+expect "$out" 'unit:    icecore-api.service' "the core API unit is named"
+
+# 4c. a digest that is not the manifest's is not "present"; an alias without its image neither.
+make_v2_fixture
+printf '[{"digest":"%s","names":["localhost/neural-ice-applied/agentic-core:v1"]},{"digest":"%s","names":["localhost/neural-ice-applied/caddy:v1"]}]\n' \
+  "$(v2_digest 77)" "$(v2_digest 12)" > "$FX/root/var/lib/containers/storage/overlay-images/images.json"
+out="$(run_screen 1 0)"
+expect "$out" 'Images          1/3 present' "a stale alias (other digest) does not count; the matching one does"
+
+# 4d. failures: NI-E04 names the v2 unit; earliest phase wins.
+make_v2_fixture
+set_state ni-v2-first-pull.service loaded failed failed 0 yes
+out="$(run_screen)"
+expect "$out" 'FAILURE  NI-E04  (image pull)' "first pull failure code"
+expect "$out" 'unit:    ni-v2-first-pull.service' "first pull unit named"
+expect "$out" '[FAIL]  Images          1/3 present -- image import failed' "images row fails"
+reject "$out" 'READY' "no READY on a failed first pull"
+expect "$(serial_out)" 'neural-ice-status: FAILURE NI-E04 (image pull) unit=ni-v2-first-pull.service serial=SN-1234-5678' "serial failure marker"
+set_state ni-v2-seed-import.service loaded failed failed 0 yes
+out="$(run_screen)"
+expect "$out" 'unit:    ni-v2-seed-import.service' "the import, which comes first, is the unit named"
+# a v1 unit failing on a v2 host is not this screen's business
+make_v2_fixture
+set_state neural-ice-seed-import.service loaded failed failed 0 yes
+set_state neural-ice-payload-apply.service loaded failed failed 0 yes
+out="$(run_screen)"
+reject "$out" 'NI-E04' "v1 import units are not watched on a v2 host"
+
+# 4e. no release manifest yet: nothing to count, never READY, never a v1 "no inventory" skip.
+make_v2_fixture
+rm -f "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen)"
+expect "$out" 'release unset' "no manifest: the header says so"
+expect "$out" '[    ]  Images          waiting for the attested release manifest' "no manifest: waiting, not skipped"
+reject "$out" 'no product image inventory' "an absent manifest is not an empty inventory"
+reject "$out" 'READY' "no READY without a release manifest"
+# a manifest that names no component cannot be READY either
+printf '{"release_id":"%s","components":[]}\n' "$V2_REL" > "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+reject "$out" 'READY' "a manifest with zero components must not be READY"
+# the manifest is read as a regular file, never through a symlink, and its release id is character-checked
+rm -f "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+printf '{"release_id":"x","components":[]}\n' > "$FX/elsewhere.json"
+ln -s "$FX/elsewhere.json" "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen)"
+reject "$out" 'release x' "a symlinked manifest is not read"
+make_v2_fixture
+sed -i "s/$V2_REL/bad id;\$(touch pwned)/" "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen)"
+expect "$out" 'release unset' "a release id outside [A-Za-z0-9._-] is not shown"
+[[ ! -e pwned && ! -e $FX/pwned ]] || fail "manifest content reached a shell"
+
+# 4f. unknown is not a state on v2 either.
+make_v2_fixture
+out="$(run_screen 1 0 NI_STATUS_TEST_SYSTEMCTL=/bin/false NI_STATUS_READY_LINGER=0)"
+expect "$out" 'Images          1/3 present -- probing...' "v2 unknown import state probes"
+reject "$out" 'READY' "a failing systemctl never yields READY on v2"
+reject "$out" 'FAILURE' "a failing systemctl is not a v2 failure"
+
+# 4g. v2 is recognised by the marker alone: the v1 marker (or none) keeps the v1 screen.
+make_v2_fixture
+mkdir -p "$FX/root/var/lib/neural-ice/data/release"; printf 'beta-debug\n' > "$FX/root/var/lib/neural-ice/data/release/CHANNEL"   # a v1 host has one
+printf 'owner-sealed-ota-state-v1\n' > "$FX/root/usr/lib/neural-ice/ota-state-profile"
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "v1 marker: v1 header"
+expect "$out" 'no product image inventory on this image' "v1 marker: v1 images row"
+reject "$out" 'release ' "v1 marker: no release in the header"
+rm -f "$FX/root/usr/lib/neural-ice/ota-state-profile"
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "no marker: v1 header"
+make_v2_fixture
+mkdir -p "$FX/root/var/lib/neural-ice/data/release"; printf 'beta-debug\n' > "$FX/root/var/lib/neural-ice/data/release/CHANNEL"
+printf 'owner-sealed-ota-state-v2-extra\n' > "$FX/root/usr/lib/neural-ice/ota-state-profile"
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "the marker is matched exactly, not by prefix"
+
+echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, 13 v1 behaviour scenes, 7 v2 scenes)"
