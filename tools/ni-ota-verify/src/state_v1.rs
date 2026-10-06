@@ -2637,18 +2637,56 @@ fn authenticate_status(
                 held_transaction: None,
             })
         }
-        StateProfile::OwnerSealedV1 { written } => {
-            if let Err(reason) = require_owner_profile_marker() {
-                return Ok(Err(reason));
-            }
+        StateProfile::OwnerSealedV1 { written } => 'owner: {
+            let lane = match require_owner_lane() {
+                Ok(lane) => lane,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            // The lanes are disjoint: the marker, the evidence schema and the
+            // persisted attestation directories must all name the same one.
+            let attested = match (&lane, &completion.attestation) {
+                (
+                    OwnerLane::Preseal,
+                    crate::access_profile_anchor::Attestation::Preseal {
+                        receipt_sha256,
+                        set_sha256,
+                    },
+                ) => Some((receipt_sha256.clone(), set_sha256.clone())),
+                (OwnerLane::V2Release, crate::access_profile_anchor::Attestation::V2Release(_)) => {
+                    None
+                }
+                _ => {
+                    return Ok(Err(
+                        "owner TPM backend lacks one exact version-2 completion binding".into(),
+                    ))
+                }
+            };
             if completion.completion_version != 2
                 || completion.baseline_floor.is_none()
-                || completion.preseal_receipt_sha256.is_none()
-                || completion.preseal_set_sha256.is_none()
                 || state_dir.join("owner-ceremony-evidence-v1.json").exists()
             {
                 return Ok(Err(
                     "owner TPM backend lacks one exact version-2 completion binding".into(),
+                ));
+            }
+            let Some((expected_receipt_sha256, expected_set_sha256)) = attested else {
+                // The v2 release lane: its own verifier, its own bindings. The
+                // checks after this arm (NV02 and owner state unchanged) are
+                // shared by both lanes.
+                break 'owner owner_v2_release_status(
+                    state_dir,
+                    operation,
+                    &completion,
+                    &first_public,
+                    written,
+                    &mut initial_owner_inspection,
+                )?;
+            };
+            if state_dir.join("v2-release-input-v1").exists()
+                || state_dir.join("v2-release").exists()
+            {
+                return Ok(Err(
+                    "preseal TPM backend is mixed with v2-release evidence".into()
                 ));
             }
             let inspection = match inspect_owner_state()? {
@@ -2674,11 +2712,8 @@ fn authenticate_status(
                     installer_authorization_signature: &input
                         .join("installer-release-authorization-v2.sig"),
                     receipt: &receipt,
-                    expected_set_sha256: completion.preseal_set_sha256.as_deref().expect("checked"),
-                    expected_receipt_sha256: completion
-                        .preseal_receipt_sha256
-                        .as_deref()
-                        .expect("checked"),
+                    expected_set_sha256: &expected_set_sha256,
+                    expected_receipt_sha256: &expected_receipt_sha256,
                     scratch_dir: operation,
                     config: config_path,
                 })? {
@@ -2931,14 +2966,27 @@ struct RunningSystem {
 }
 
 fn observe_running_system(paths: &RunningSystemPaths) -> Result<RunningSystem, String> {
+    observe_running_system_with(paths, true)
+}
+
+/// The v2 release lane has no payload seed: `with_payload` false leaves the
+/// payload empty and never reads the marker.
+fn observe_running_system_with(
+    paths: &RunningSystemPaths,
+    with_payload: bool,
+) -> Result<RunningSystem, String> {
     let (deployment, deployment_bytes) = inspect_booted_deployment(&paths.ostree)?;
     let origin_name = format!("{}.{}.origin", deployment.checksum, deployment.serial);
     let origin =
         read_deployment_origin(&paths.deployment_root, &deployment.stateroot, &origin_name)?;
     let origin_ref = parse_deployment_origin(&origin.bytes)?;
     let manifest = inspect_booted_manifest(&paths.ostree, &deployment.checksum)?;
-    let payload = read_noatime_regular(&paths.payload, 0o644, 256)
-        .map_err(|error| format!("cannot authenticate running PAYLOAD_ID: {}", error.0))?;
+    let payload = if with_payload {
+        read_noatime_regular(&paths.payload, 0o644, 256)
+            .map_err(|error| format!("cannot authenticate running PAYLOAD_ID: {}", error.0))?
+    } else {
+        Vec::new()
+    };
     Ok(RunningSystem {
         deployment,
         deployment_bytes,
@@ -3199,6 +3247,130 @@ pub(crate) fn verify_running_is_preseal_target(
         return Err(divergence);
     }
     reobserve_running_system(&paths, &running)
+}
+
+/// The status of a completed v2-release-lane appliance. Everything the preseal
+/// lane authenticates is authenticated here by the v2 verifier instead: the
+/// persisted manifest pair and receipt against the LIVE root, the receipt digest
+/// against the TPM-bound evidence, the floor three ways, and the booted
+/// deployment against the host the receipt names. The bytes of the result are
+/// the preseal lane's, so no consumer changes.
+fn owner_v2_release_status(
+    state_dir: &Path,
+    operation: &Path,
+    completion: &crate::access_profile_anchor::VerifiedOwnerCompletion,
+    first_public: &NvPublicArea,
+    written: bool,
+    initial_inspection: &mut Option<OwnerStateInspection>,
+) -> Result<Result<StatusOutcome, String>, InternalError> {
+    let crate::access_profile_anchor::Attestation::V2Release(attested) = &completion.attestation
+    else {
+        return Ok(Err(
+            "owner TPM backend lacks one exact version-2 completion binding".into(),
+        ));
+    };
+    if state_dir.join("preseal-input-v1").exists() || state_dir.join("preseal").exists() {
+        return Ok(Err(
+            "v2-release TPM backend is mixed with preseal evidence".into()
+        ));
+    }
+    let inspection = match inspect_owner_state()? {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if let Err(reason) = validate_owner_inspection(&inspection, first_public, completion) {
+        return Ok(Err(reason));
+    }
+    *initial_inspection = Some(inspection.clone());
+    let input = state_dir.join("v2-release-input-v1");
+    let receipt = state_dir.join("v2-release/receipt.json");
+    let root = v2_release_root();
+    let verified = match crate::v2_release::verify_retained(&crate::v2_release::RetainedPaths {
+        manifest: &input.join("release-manifest.json"),
+        manifest_sig: &input.join("release-manifest.json.sig"),
+        release_key: &root.join("usr/lib/neural-ice/keys/release-authorization.pub"),
+        receipt: &receipt,
+        scratch_dir: operation,
+        expected_receipt_sha256: &attested.receipt_sha256,
+        root: &root,
+    })? {
+        Ok(value) => value,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    // The evidence the TPM binds, the receipt the verifier re-derived from the
+    // signed pair, and the floor the TPM holds must all be the same release.
+    if completion.baseline_floor != Some(verified.bundle_seq)
+        || inspection.baseline_floor != verified.bundle_seq
+        || attested.bundle_seq != verified.bundle_seq
+    {
+        return Ok(Err(
+            "owner baseline floor differs from authenticated v2 release evidence".into(),
+        ));
+    }
+    if attested.receipt_sha256 != verified.receipt_sha256
+        || attested.manifest_sha256 != verified.manifest_sha256
+        || attested.manifest_sig_sha256 != verified.manifest_sig_sha256
+        || attested.release_key_sha256 != verified.release_key_sha256
+        || attested.release_id != verified.release_id
+        || attested.release_identity_sha256 != verified.manifest_sha256
+    {
+        return Ok(Err(
+            "completion evidence differs from the authenticated v2 release".into(),
+        ));
+    }
+    if written {
+        return Ok(Err(
+            "owner-written OTA state requires the pending typed licensing/time R2 verifier".into(),
+        ));
+    }
+    if state_dir.join("state-v1").exists() {
+        return Ok(Err(
+            "pristine owner anchor is mixed with generation state".into()
+        ));
+    }
+    Ok(
+        verify_running_v2_release(&verified, &running_system_paths()).map(|()| StatusOutcome {
+            status: AuthenticatedOtaStatus {
+                committed_generation: None,
+                completion_version: 2,
+                enforce_ready_verified: false,
+                profile: OWNER_STATE_PROFILE.into(),
+                schema: "neural-ice-authenticated-ota-status-v1".into(),
+            },
+            held_transaction: None,
+        }),
+    )
+}
+
+/// Where the live root `/` is read from. Only the test build can move it.
+fn v2_release_root() -> PathBuf {
+    #[cfg(feature = "test-path-overrides")]
+    if let Some(root) = std::env::var_os("NI_OTA_AUTH_STATUS_V2_ROOT") {
+        return PathBuf::from(root);
+    }
+    PathBuf::from("/")
+}
+
+/// Design P4: the booted deployment is the host the receipt names — its image
+/// reference (`repository@index digest`) and the platform manifest it imported.
+/// No OTA transaction window explains a difference here: the successor rule for
+/// an updated host is T9, and until it lands an updated host is refused.
+fn verify_running_v2_release(
+    verified: &crate::v2_release::VerifiedV2Release,
+    paths: &RunningSystemPaths,
+) -> Result<(), String> {
+    let running = observe_running_system_with(paths, false)?;
+    let expected = format!(
+        "{}@{}",
+        verified.host_repository, verified.host_index_digest
+    );
+    if running.origin_ref != expected
+        || running.manifest != verified.host_manifest_digest
+        || !running.manifest.strip_prefix("sha256:").is_some_and(sha256)
+    {
+        return Err("booted deployment differs from authenticated v2 release baseline".into());
+    }
+    reobserve_running_system(paths, &running)
 }
 
 fn verify_running_baseline(
@@ -3669,7 +3841,17 @@ pub(crate) fn owner_anchor_pristine() -> Result<Result<(), String>, InternalErro
     })
 }
 
-fn require_owner_profile_marker() -> Result<(), String> {
+/// Which attestation lane the image marker declares (contract §1). The TPM
+/// objects and the status `profile` are the same on both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerLane {
+    /// `owner-sealed-ota-state-v1`: the preseal set.
+    Preseal,
+    /// `owner-sealed-ota-state-v2`: the v2 release manifest.
+    V2Release,
+}
+
+fn require_owner_lane() -> Result<OwnerLane, String> {
     #[cfg(feature = "test-path-overrides")]
     let marker = std::env::var_os("NI_OTA_AUTH_STATUS_PROFILE_MARKER")
         .map_or_else(|| PathBuf::from(OWNER_PROFILE_MARKER), PathBuf::from);
@@ -3681,10 +3863,24 @@ fn require_owner_profile_marker() -> Result<(), String> {
             error.0
         )
     })?;
-    if bytes != b"owner-sealed-ota-state-v1\n" {
-        return Err("immutable OTA profile marker is not the owner-sealed contract".into());
+    match bytes.as_slice() {
+        b"owner-sealed-ota-state-v1\n" => Ok(OwnerLane::Preseal),
+        marker if marker == format!("{}\n", crate::v2_release::LANE_MARKER).as_bytes() => {
+            Ok(OwnerLane::V2Release)
+        }
+        _ => Err("immutable OTA profile marker is not the owner-sealed contract".into()),
     }
-    Ok(())
+}
+
+/// The v1-only callers (`bootstrap-from-preseal`, the pristine-anchor check) act
+/// on the preseal lane and refuse a v2-lane image: it carries no preseal set.
+fn require_owner_profile_marker() -> Result<(), String> {
+    match require_owner_lane()? {
+        OwnerLane::Preseal => Ok(()),
+        OwnerLane::V2Release => Err(
+            "immutable OTA profile marker names the v2 release lane, not the preseal lane".into(),
+        ),
+    }
 }
 
 fn write_snapshot_config(
@@ -6451,8 +6647,10 @@ mod tests {
         let mut completion = crate::access_profile_anchor::VerifiedOwnerCompletion {
             completion_version: 2,
             evidence_digest_sha256: "a".repeat(64),
-            preseal_receipt_sha256: Some("b".repeat(64)),
-            preseal_set_sha256: Some("c".repeat(64)),
+            attestation: crate::access_profile_anchor::Attestation::Preseal {
+                receipt_sha256: "b".repeat(64),
+                set_sha256: "c".repeat(64),
+            },
             baseline_floor: Some(5),
         };
         let mut inspection = OwnerStateInspection {
