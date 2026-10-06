@@ -12,6 +12,7 @@ require the tool to find them (and never to echo them back).
 """
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -22,6 +23,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import unicodedata
 import unittest
 import zipfile
 
@@ -81,7 +84,7 @@ def sign(key, message):
 
 
 def canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
 def sha(data):
@@ -130,8 +133,11 @@ class Producer:
             "case_id": "BETA-12",
             "generated_at": GENERATED_AT,
             "time_source": "host_clock",
-            "boot_id": "fedcba9876543210fedcba9876543210",
+            "boot_id": "fedcba98-7654-3210-fedc-ba9876543210",
             "files": [{"path": p, "size": len(d), "sha256": sha(d)} for p, d in sorted(self.files.items())],
+            "sections": {"identity": {"included": True, "status": "ok"},
+                         "journals": {"included": True, "status": "ok"},
+                         "app_excerpts": {"included": False, "status": "declined"}},
             "dropped": {"journal-app": 3},
             "truncated": {"journal-host": False},
             "redaction": {"email": 0},
@@ -253,21 +259,34 @@ class ValidBundle(ToolTest):
         self.assertEqual(v["unsigned"], ["client.json"])
         self.assertNotIn("client.json", [f["path"] for f in v["files"]])
 
-    def test_excluded_section_is_listed_and_absent(self):
-        manifest = self.prod.manifest()
-        manifest["files"].append({"path": "journal-app.jsonl", "included": False})
-        manifest["files"].sort(key=lambda f: f["path"])
-        proc = self.verify(self.prod.build(manifest=manifest))
+    def test_declined_section_is_reported_and_its_file_is_absent(self):
+        proc = self.verify(self.prod.build())
         self.assertEqual(proc.returncode, 0, proc.stdout)
-        entry = [f for f in self.verdict(proc)["files"] if f["path"] == "journal-app.jsonl"][0]
-        self.assertFalse(entry["included"])
+        sections = self.verdict(proc)["bundle"]["sections"]
+        self.assertEqual(sections["app_excerpts"], {"included": False, "status": "declined"})
+        path = self.prod.write("b.tar.gz", self.prod.build())
+        text = run("verify", path, "--pin-spki-sha256", self.prod.pin).stdout
+        self.assertIn("section app_excerpts: not included (declined)", text)
 
-    def test_excluded_section_present_in_archive_is_refused(self):
-        self.prod.files["journal-app.jsonl"] = b'{"n":1}\n'
+    def test_a_file_entry_with_a_per_file_included_flag_is_refused(self):
         manifest = self.prod.manifest()
-        manifest["files"] = [f if f["path"] != "journal-app.jsonl" else {"path": "journal-app.jsonl", "included": False}
-                             for f in manifest["files"]]
-        self.assertRefused(self.prod.build(manifest=manifest), "files")
+        manifest["files"][0]["included"] = False
+        self.assertRefused(self.prod.build(manifest=manifest), "manifest")
+
+    def test_sections_table_is_validated(self):
+        for label, bad in {
+            "status": {"x": {"included": True, "status": "fine"}},
+            "extra key": {"x": {"included": True, "status": "ok", "why": "y"}},
+            "not bool": {"x": {"included": 1, "status": "ok"}},
+            "key syntax": {"X-1": {"included": True, "status": "ok"}},
+            "not a table": [],
+        }.items():
+            with self.subTest(label=label):
+                self.assertRefused(self.prod.build(manifest=self.prod.manifest(sections=bad)), "manifest")
+
+    def test_fractional_seconds_in_generated_at_are_accepted(self):
+        proc = self.verify(self.prod.build(manifest=self.prod.manifest(generated_at="2026-10-06T12:00:00.250000Z")))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
 
     def test_listed_section_missing_from_archive_is_refused(self):
         self.assertRefused(self.prod.build(drop=("units.json",)), "files")
@@ -395,6 +414,10 @@ class Refusals(ToolTest):
             "bool count": {"dropped": {"journal-app": True}},
             "truncated not bool": {"truncated": {"journal-host": 1}},
             "files not list": {"files": {}},
+            "trailing newline in case_id": {"case_id": "ABC\n"},
+            "trailing newline in version": {"collector_version": "1.0\n"},
+            "undashed boot_id": {"boot_id": "fedcba9876543210fedcba9876543210"},
+            "bad table key": {"redaction": {"Email": 1}},
         }
         for label, over in cases.items():
             with self.subTest(label=label):
@@ -772,6 +795,222 @@ class GoldenBundle(unittest.TestCase):
         data = (self.FIXTURE / "ni-support-golden.tar.gz").read_bytes()
         self.assertEqual(data[:4], b"\x1f\x8b\x08\x00")
         self.assertEqual(data[4:8], b"\0\0\0\0")
+
+
+class ReviewRegressions(ToolTest):
+    """Defects an independent adversarial review reproduced; each one stays fixed."""
+
+    def finding_rules(self, **files):
+        self.prod.files = {**SECTIONS, **files}
+        proc = self.verify(self.prod.build(), "--format", "json")
+        self.assertIn(proc.returncode, (0, 3), proc.stdout + proc.stderr)
+        return {f["rule"] for f in self.verdict(proc)["findings"]}
+
+    def test_hostile_line_costs_bounded_time_and_never_kills_the_reader(self):
+        hostile = b'{"message":"' + b"-eyJaaaaaaaaa" * 150000 + b'"}\n'
+        self.assertLess(len(hostile), 2 << 20)
+        started = time.monotonic()
+        proc = self.verify(self.prod.build() if self.prod.files.update({"journal-host.jsonl": hostile}) is None else b"")
+        self.assertLess(time.monotonic() - started, 90)
+        self.assertIn(proc.returncode, (0, 3), proc.stderr[-300:])
+        self.assertIn(self.verdict(proc)["verdict"], ("verified", "findings"))
+
+    def test_other_hostile_lines_stay_linear(self):
+        for label, line in {
+            "email": b"a" * 70 + b"@" + b"b" * (1 << 20),
+            "hyphen run": b"a-" * (1 << 19),
+            "colon run": b"a:" * (1 << 19),
+            "dots": b"1." * (1 << 19),
+            "pair": b"token" * (1 << 17) + b"=",
+        }.items():
+            with self.subTest(label=label):
+                self.prod.files = {**SECTIONS, "journal-host.jsonl": b'{"message":"' + line + b'"}\n'}
+                started = time.monotonic()
+                proc = self.verify(self.prod.build())
+                self.assertLess(time.monotonic() - started, 60, label)
+                self.assertIn(proc.returncode, (0, 3), proc.stderr[-300:])
+
+    def test_redaction_counts_named_after_a_rule_are_not_a_leak(self):
+        manifest = self.prod.manifest(redaction={"email": 3, "token": 2, "ip_address": 1}, dropped={"email": 1})
+        proc = self.verify(self.prod.build(manifest=manifest))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+    def test_x_fields_of_the_manifest_are_still_scanned(self):
+        manifest = self.prod.manifest()
+        manifest["x-debug"] = {"token": "s3cr3t-value"}
+        proc = self.verify(self.prod.build(manifest=manifest))
+        self.assertEqual(proc.returncode, 3, proc.stdout)
+
+    def test_surrogates_in_the_signed_manifest_never_crash_the_reader(self):
+        escaped = canonical(self.prod.manifest(**{"x-note": "\ud800"}))
+        proc = self.verify(self.prod.build(manifest_bytes=escaped, signature=sign(self.prod.key, DOMAIN + escaped)))
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        raw = canonical(self.prod.manifest(**{"x-note": "ABC"})).replace(b"ABC", b"\xed\xa0\x80")
+        proc = self.verify(self.prod.build(manifest_bytes=raw, signature=sign(self.prod.key, DOMAIN + raw)))
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.failed_check(proc), "manifest")
+
+    def test_tool_and_destination_errors_are_clean(self):
+        path = self.prod.write("b.tar.gz", self.prod.build())
+        proc = run("verify", path, "--pin-spki-sha256", self.prod.pin, "--openssl-bin", "/usr/bin")
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("Traceback", proc.stderr)
+        proc = run("extract", path, "--out", "/proc/nope/x", "--pin-spki-sha256", self.prod.pin)
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def smuggled(self, mutate):
+        """A bundle whose gzip/tar bytes were edited where no listed file, hash or signature looks."""
+        return self.prod.build(mutate_raw=mutate)
+
+    def test_bytes_hidden_in_tar_padding_or_unused_header_fields_are_refused(self):
+        def padding(raw):
+            with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+                first = tf.getmembers()[0]
+            end = first.offset_data + first.size
+            self.assertLess(end % 512, 511)
+            return raw[:end] + b"alice@cabinet-exemple.example"[:512 - end % 512] + raw[end + min(29, 512 - end % 512):]
+
+        def header_spare(raw):
+            fixed = bytearray(raw)
+            fixed[500:506] = b"HIDDEN"
+            checksum = sum(fixed[0:148]) + 32 * 8 + sum(fixed[156:512])
+            fixed[148:156] = b"%06o\0 " % checksum
+            return bytes(fixed)
+
+        for label, mutate in (("padding", padding), ("header spare bytes", header_spare)):
+            with self.subTest(label=label):
+                self.assertRefused(self.smuggled(mutate), "tar")
+
+    def test_gzip_header_fields_that_can_carry_text_are_refused(self):
+        def with_comment(raw):
+            body = gzip.compress(raw, 9, mtime=0)
+            return body[:3] + bytes([body[3] | 0x10]) + body[4:10] + b"alice@cabinet-exemple.example\0" + body[10:]
+        self.assertRefused(self.prod.build(gz_wrap=with_comment), "decompress")
+
+    def test_every_deny_list_regex_is_linear_on_its_own(self):
+        """Without the line windows: the windows are a second defence, not the first."""
+        spec = importlib.util.spec_from_file_location("ni_support_verify", TOOL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        hostile = ["-eyJaaaaaaaaa" * 20000, "a" * 70 + "@" + "b" * 260000, "a-" * 130000, "a:" * 130000,
+                   "1." * 130000, "token" * 50000 + "=", "ab" * 130000]
+        for pattern in (module.TOKEN, module.EMAIL, module.IPV4, module.IPV6_RUN, module.MAC, module.SECRET_PAIR,
+                        module.FIELD_PAIR, module.RECOVERY_KEY):
+            for text in hostile:
+                started = time.monotonic()
+                for _ in pattern.finditer(text):
+                    pass
+                self.assertLess(time.monotonic() - started, 3, (pattern.pattern[:40], text[:12]))
+
+    def test_new_deny_list_shapes(self):
+        leaks = {
+            "unicode email": b'{"message":"mail jos\xc3\xa9@exemple.fr"}\n',
+            "ipv6 then colon": b'{"message":"peer fe80::1: timeout"}\n',
+            "ipv6 then dot": b'{"message":"connect to 2001:db8::1."}\n',
+            "token pair": b'{"message":"access_token=Zq9XkLm2PvT7wRb4NcY8"}\n',
+            "client secret pair": b'{"message":"client_secret=Zq9XkLm2PvT7wRb4NcY8"}\n',
+            "basic auth": b'{"message":"Authorization: Basic dXNlcjpwYXNzd29yZA=="}\n',
+            "filename pair": b'{"message":"opened filename=Contrat-Dupont.pdf"}\n',
+            "escaped json in a string": b'{"message":"{\\"prompt\\":\\"Resume du contrat\\"}"}\n',
+            "camel case key": b'{"licenseKey":"LIC-ANYTHING"}\n',
+            "hyphen key": b'{"user-email":"x"}\n',
+            "duplicate keys": b'{"prompt":"Resume du contrat Dupont SA","prompt":""}\n',
+            "very deep key": b'{"a":' * 30 + b'{"prompt":"Resume"}' + b"}" * 30 + b"\n",
+        }
+        for label, line in leaks.items():
+            with self.subTest(leak=label):
+                self.assertTrue(self.finding_rules(**{"journal-app.jsonl": line}), label)
+
+    def test_ordinary_journal_text_still_passes_after_the_new_rules(self):
+        ordinary = [
+            "wpa-style 6.8.0.1-generic booted", "Linux version 6.8.0.1 (builder)", "chrony version 4.5.0.1",
+            "package foo-1.2.3.4-1.el9.x86_64 installed", "ostree commit 1.2.3.4 staged",
+            "ab-cd-ef-01-23-45.service started", "time 10:20:30:: elapsed", "NVRM: Xid (PCI:0000:01:00): 79",
+            "token: ok", "password: required", "tokens=3 refreshed", "token_expires=2026-10-06T10:00:00Z",
+            "std::collections::HashMap<K, V>", "src/api/routes/v1.rs:123:45", "user@1000.service: Succeeded",
+            "Bearer authentication is configured", "email delivery disabled", "filename policy loaded",
+            "image sha256:" + "ab" * 32, "serving on 127.0.0.1:8443 and ::1",
+        ]
+        body = "".join(json.dumps({"message": text}) + "\n" for text in ordinary).encode()
+        self.assertEqual(self.finding_rules(**{"journal-host.jsonl": body}), set())
+
+    def test_canary_matching_is_unicode_aware_and_bom_safe(self):
+        canaries = self.tmp / "c.txt"
+        canaries.write_bytes(b"\xef\xbb\xbf" + "Müller & Fils, clause 14\n".encode() + b"  Dossier-Succession-7731  \n")
+        nfd = unicodedata.normalize("NFD", "CLAUSE: MÜLLER & FILS, CLAUSE 14")
+        for label, text in (("upper case + NFD", nfd), ("first canary after the BOM", "Müller & Fils, clause 14"),
+                            ("stripped canary", "x dossier-succession-7731 y")):
+            with self.subTest(label=label):
+                self.prod.files = {**SECTIONS, "journal-app.jsonl": json.dumps({"m": text}, ensure_ascii=False).encode() + b"\n"}
+                proc = self.verify(self.prod.build(), "--canaries", canaries)
+                self.assertEqual(proc.returncode, 3, proc.stdout)
+
+    def test_zip_comment_and_bytes_outside_the_member_are_refused(self):
+        age_like = b"age-encryption.org/v1\n" + b"x" * 40
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("ni-support-01234567.tar.gz.age", age_like)
+            zf.comment = b"alice@cabinet-exemple.example"
+        gap = io.BytesIO()
+        with zipfile.ZipFile(gap, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("ni-support-01234567.tar.gz.age", age_like)
+        gapped = gap.getvalue()
+        start = zipfile.ZipFile(io.BytesIO(gapped)).start_dir
+        gapped = gapped[:start] + b"HIDDEN" + gapped[start:]
+        key = self.tmp / "k"
+        key.write_text("AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n")
+        for label, data in (("comment", out.getvalue()), ("gap", gapped)):
+            with self.subTest(label=label):
+                path = self.prod.write("z.zip", data)
+                proc = run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", key, "--format", "json")
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(self.failed_check(proc), "input")
+
+    def test_require_encrypted_refuses_a_plain_archive(self):
+        self.assertRefused(self.prod.build(), "input", "--require-encrypted")
+
+    def test_unsigned_client_block_is_labelled_when_shown_or_extracted(self):
+        self.prod.files["client.json"] = b'{"client_version":"0.50.37"}'
+        manifest = self.prod.manifest()
+        manifest["files"] = [f for f in manifest["files"] if f["path"] != "client.json"]
+        path = self.prod.write("b.tar.gz", self.prod.build(manifest=manifest))
+        proc = run("show", path, "client.json", "--pin-spki-sha256", self.prod.pin)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("UNSIGNED", proc.stderr)
+
+    def test_run_through_the_shebang_is_isolated_too(self):
+        env = {**os.environ, "PYTHONPATH": str(self.tmp)}
+        (self.tmp / "json.py").write_text("raise SystemExit('planted json module imported')\n")
+        path = self.prod.write("b.tar.gz", self.prod.build())
+        proc = subprocess.run([str(TOOL), "verify", str(path), "--pin-spki-sha256", self.prod.pin],
+                              capture_output=True, text=True, env=env, cwd=self.tmp, check=False)
+        self.assertNotIn("planted", proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_high_s_signature_is_a_warning_not_a_refusal(self):
+        manifest = canonical(self.prod.manifest())
+        order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+        for _ in range(40):
+            der = sign(self.prod.key, DOMAIN + manifest)
+            r_len = der[3]
+            s_at = 4 + r_len + 2
+            s_value = int.from_bytes(der[s_at:], "big")
+            if s_value <= order // 2:
+                high = order - s_value
+                s_bytes = high.to_bytes(33, "big").lstrip(b"\0")
+                if s_bytes[0] & 0x80:
+                    s_bytes = b"\0" + s_bytes
+                body = der[2:4 + r_len] + b"\x02" + bytes([len(s_bytes)]) + s_bytes
+                sig = b"\x30" + bytes([len(body)]) + body
+                break
+        else:
+            self.fail("could not craft a high-S signature")
+        proc = self.verify(self.prod.build(manifest_bytes=manifest, signature=sig))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("low-S", " ".join(self.verdict(proc)["warnings"]))
 
 
 class Hardening(ToolTest):

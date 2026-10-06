@@ -42,20 +42,28 @@ nothing after it, ≤ 24 MiB + framing) · `tar` · `envelope` · `spki` · `pin
 
 * **`tar`**: strict POSIX ustar (GNU and pax extensions refused), regular files only (no link,
   directory, device), flat `^[a-z0-9][a-z0-9._-]{0,63}$` names (no `/`, `..`, upper case),
-  no duplicate, ≤ 64 entries, ≤ 2 MiB each, nothing but zeros after the end-of-archive
-  marker. Members are read in memory; nothing is extracted by `tarfile`.
+  no duplicate, ≤ 64 entries, ≤ 2 MiB each. **Every header must be the canonical ustar header
+  of its own fields and every byte of padding zero** (so no text rides in unused header fields
+  or padding, where neither a hash nor a scan would look), and nothing but zeros follows the
+  end-of-archive marker. The gzip header carries no name, comment, extra or CRC field. Members are
+  read in memory; nothing is extracted by `tarfile`.
+* **`input`**: a zip holds exactly one `*.age` member and nothing else: no comment, no bytes outside
+  the member and the directory. `--require-encrypted` refuses a plain `.tar.gz`.
 * **`signature`**: ECDSA P-256 / SHA-256, DER, over `"neural-ice-support-bundle-v1" ‖ 0x00 ‖
   manifest.json` (the stored bytes). A signature made for another domain, for example the
   access-profile anchor's (`neural-ice:ota:access-profile-anchor:v1`), does not verify.
 * **`manifest`**: parsed only after the signature verified. Strict JSON (no duplicate key, no
-  `NaN`), closed schema (`x-…` fields ignored, any other unknown field refused), sorted `files`,
-  the fields of design section 4.2. A schema other than `neural-ice-support-bundle-v1` is refused.
-* **`files`**: every `included` section is in the archive with the listed size and sha256; an
-  `included: false` one is absent; nothing else is in the archive except the three envelope
-  members and the client's unsigned `client.json` (reported under `unsigned`, scanned like the rest).
+  `NaN`), closed schema (`x-…` fields ignored, any other unknown field refused), key and value
+  syntax as the collector's `support-bundle-manifest.schema.json`. A schema other than
+  `neural-ice-support-bundle-v1` is refused.
+* **`files`**: every entry of the archive except the three envelope members and the client's
+  unsigned `client.json` (reported under `unsigned`, scanned like the rest) is listed with its exact
+  size and sha256. `sections` says what the user declined or what was unavailable; those files are
+  simply absent.
 
-Deviations that carry no trust decision (tar uid/gid/mode/mtime, gzip header fields, manifest
-not in canonical form, a zip member name with another bundle id) are `warnings`, not refusals.
+Deviations that carry no trust decision (tar uid/gid/mode/mtime, a gzip timestamp, a manifest not in
+canonical form or `files` not sorted, a signature that is not low-S, a zip member name with another
+bundle id, a key file readable by others) are `warnings`, not refusals.
 
 ## The content scan (exit 3)
 
@@ -67,30 +75,44 @@ line, ≥ 6 characters; matched case-insensitively, as UTF-8 and as a JSON escap
 section, in `manifest.json` and in `client.json`; also in the raw tar and gzip bytes). The
 Owner can feed it the names, e-mails and licence keys he knows must never leave a customer.
 
+Every rule is bounded (lookbehinds, capped repeats, lines scanned in 16 KiB windows, a 150 s budget
+that ends in a `scan_incomplete` finding): one hostile line cannot stall the reader. The key-name
+rules (`secret_pair`, `forbidden_field`, `deny_key`) do not apply to `manifest.json`, whose keys the
+schema closes and whose `redaction`/`dropped` tables are named after rules (`email`, `token`); only its
+free `x-` fields are scanned. A bare word after `password:` is prose, not a secret.
+
 A finding is `{file, line, rule}`: **the matched text is never printed**, so a leak is not
 re-leaked into a terminal, a ticket or a log. `systemd` unit names such as `user@1000.service`
-are not e-mails. Known limits: a 64-hex digest is not flagged (digests are everywhere in a
+are not e-mails; a four-number version after `version`, `build`, `commit`… or glued to a package name is
+not an IP. Known limits: a 64-hex digest is not flagged (digests are everywhere in a
 bundle, so the hardware fingerprint cannot be told apart by shape: put it in `--canaries`);
 free text cannot be proven free of a name nobody listed; a four-number version such as
-`1.2.3.4` reads as an IPv4.
+`1.2.3.4` with no such word before it reads as an IPv4; `dead::beef` reads as an IPv6; a password made
+only of letters and shorter than 12 characters after `password=` is not seen. **`journal-app-excerpts.jsonl`
+is free text by design (D2-A: opt-in, read by the user line by line): with the Owner's canaries it is the one
+file where a hit is expected to be possible; the collector's README pins that limit.**
 
 ## The bundle as this tool reads it (the contract the producers meet)
+
+The inner archive is the collector's (ICE-Fabric-v2 PR #125, `config/support-bundle/README.md` and its
+closed `support-bundle-manifest.schema.json`, which supersede the design where they differ). The outer
+layers are the client's (PR-4, to be aligned on this page).
 
 ```
 ni-support-<id8>.zip            ONE member: ni-support-<id8>.tar.gz.age     (age X25519, support key)
   └─ tar.gz  (gzip -n, ustar, sorted, uid=gid=0, mode 0644, mtime = generated_at, flat names)
-       manifest.json            canonical JSON: sorted keys, no spaces, UTF-8
-       manifest.sig             DER ECDSA, tpm2_sign -g sha256 -s ecdsa over DOMAIN ‖ manifest.json
+       manifest.json            canonical JSON: sorted keys, no whitespace, ASCII-escaped, no trailing LF
+       manifest.sig             DER ECDSA P-256 (low-S), over "neural-ice-support-bundle-v1" ‖ 0x00 ‖ manifest.json
        device-root.spki.der     the signing key, 91-byte P-256 SubjectPublicKeyInfo
-       <section files>          exactly the manifest's included files
+       <section files>          each listed in manifest.files with its exact size and sha256
        client.json              optional, produced by the client, NOT signed
 ```
 
-`manifest.json` fields: `schema`, `bundle_id` (32 hex), `case_id` (`^[A-Za-z0-9-]{0,32}$`),
-`generated_at` (`YYYY-MM-DDTHH:MM:SSZ`), `time_source` (`attested`|`host_clock`), `boot_id`,
-`files[{path,size,sha256,included?}]`, `dropped`, `truncated`, `redaction`,
-`device_root_spki_sha256`, `collector_version`. The outer zip must hold exactly one `*.age`
-member; a bare `.tar.gz.age` and an already decrypted `.tar.gz` are also accepted.
+`manifest.json` fields: `schema`, `bundle_id` (32 hex), `case_id` (`[A-Za-z0-9-]{0,32}`),
+`generated_at` (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`), `time_source` (`attested`|`host_clock`), `boot_id`
+(UUID), `collector_version`, `device_root_spki_sha256`, `files[{path,size,sha256}]`,
+`sections{name: {included, status}}`, `dropped`, `truncated`, `redaction`. The outer zip holds exactly
+one `*.age` member; a bare `.tar.gz.age` and an already decrypted `.tar.gz` are also accepted.
 
 ## Handling the decrypted bundle
 
@@ -111,6 +133,8 @@ systemd-run --user --pipe --wait --quiet -p PrivateNetwork=yes -p NoNewPrivilege
 
 ```sh
 python3 -I tools/ni-support-verify/test-ni-support-verify.py   # needs openssl, age, age-keygen
+# release differential, against the real collector (needs an ICE-Fabric-v2 checkout; not in CI):
+NEURAL_ICE_FABRIC_V2_ROOT=/path/to/ICE-Fabric-v2 python3 -I tools/ni-support-verify/test-collector-interop.py
 ```
 
 Bundles are built per run by a producer independent of the tool; the signing and age keys are
@@ -119,9 +143,10 @@ generated per run, nothing secret is committed, every planted « customer » str
 
 ## Not covered here
 
-* A signature made by the real TPM (`tpm2_sign` on `0x81010005`) has not been fed to this tool:
-  the sandbox that built it has no `tpm2-tools`. The format is the plain DER ECDSA the
-  access-profile anchor already produces and `openssl` already verifies; the first bundle from a
-  real collector is the integration test.
+* A signature made by the real TPM (`tpm2_sign` on `0x81010005`) has not been fed to this tool: the
+  sandbox has no `tpm2-tools`. The interop test reads bundles from the real collector, whose
+  `tpm2_sign` is a stub speaking the real `-f tss` format over a software key and whose
+  TPMT_SIGNATURE → DER conversion runs for real. The first bundle from a real appliance is the last
+  integration test.
 * Whether a user-removed preview line can reach the signed bundle is a design point for the
   client PR: a signed section cannot be edited without breaking its sha256 (see the PR report).

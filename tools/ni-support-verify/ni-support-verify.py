@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """Owner-side reader of a Neural ICE support bundle: verify, list, show, extract.
 
     verify   BUNDLE  --pin-spki-sha256 HEX ...   integrity, signature, pin, content scan
@@ -22,15 +22,16 @@ What is checked, in this order, stopping at the first refusal (exit 1):
     archive_size compressed archive <= 8 MiB
     decompress   one gzip stream, no trailing bytes, <= 24 MiB (+ tar framing) once expanded
     tar          strict POSIX ustar: regular files only, flat `[a-z0-9._-]` names, no duplicates,
-                 <= 64 entries, <= 2 MiB each, nothing after the end-of-archive marker
+                 <= 64 entries, <= 2 MiB each, canonical headers, zero padding, nothing after the
+                 end-of-archive marker
     envelope     manifest.json, manifest.sig and device-root.spki.der are present
     spki         device-root.spki.der is an ECDSA P-256 SubjectPublicKeyInfo
     pin          sha256(SPKI) is one of the pins the caller gave
     signature    ECDSA/SHA-256 over  "neural-ice-support-bundle-v1" 0x00 manifest.json  verifies
     manifest     only after the signature: UTF-8 JSON, no duplicate key, closed schema
     spki_binding the manifest's device_root_spki_sha256 is the pinned SPKI's hash
-    files        every included section is in the archive with the listed size and sha256, an
-                 excluded one is absent, and nothing else is there (but the unsigned client.json)
+    files        every entry but the envelope and the unsigned client.json is listed with its exact
+                 size and sha256
 
 Then, without changing the verdict of the checks above, the content is scanned (exit 3 if
 anything is found): a built-in deny-list from design section 2.3 (e-mail, IP, MAC, PEM, tokens,
@@ -63,6 +64,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import unicodedata
 import zipfile
 import zlib
 
@@ -82,7 +85,6 @@ MAX_OUTER = MAX_ARCHIVE + AGE_OVERHEAD + (16 << 10)
 MAX_KEY_FILE = 64 << 10
 MAX_CANARIES = 1000
 MIN_CANARY = 6
-JSON_DEPTH = 24
 
 ENVELOPE = ("manifest.json", "manifest.sig", "device-root.spki.der")
 UNSIGNED = ("client.json",)
@@ -91,20 +93,27 @@ UNSIGNED = ("client.json",)
 # BIT STRING (uncompressed point, 65 bytes) }. The whole key is 91 bytes.
 SPKI_P256_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200") + b"\x04"
 
-NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-BUNDLE_ID = re.compile(r"^[0-9a-f]{32}$")
-BOOT_ID = re.compile(r"^[0-9a-f]{32}$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-CASE_ID = re.compile(r"^[A-Za-z0-9-]{0,32}$")
-VERSION = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
-STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-ZIP_MEMBER = re.compile(r"^[A-Za-z0-9._-]{1,128}\.age$")
-ZIP_ID8 = re.compile(r"^ni-support-([0-9a-f]{8})")
-KEY_NAME = re.compile(r"^[a-z0-9._-]{1,64}$")
+NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+BUNDLE_ID = re.compile(r"[0-9a-f]{32}")
+BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+CASE_ID = re.compile(r"[A-Za-z0-9-]{0,32}")
+VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")
+STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d{1,6})?Z")
+ZIP_MEMBER = re.compile(r"[A-Za-z0-9._-]{1,128}\.age")
+ZIP_ID8 = re.compile(r"ni-support-([0-9a-f]{8})")
+# Every pattern above is applied with fullmatch: `$` would also accept a trailing newline.
+# Key syntax of the manifest tables, as the closed manifest schema of the collector (PR-1) states it.
+TABLE_KEYS = {"dropped": (re.compile(r"[a-z][a-z0-9_-]{0,47}"), 64),
+              "truncated": (re.compile(r"[a-z][a-z0-9_-]{0,47}"), 64),
+              "redaction": (re.compile(r"[a-z][a-z0-9_]{0,31}"), 32)}
+SECTION_KEY = re.compile(r"[a-z][a-z_]{0,31}")
+SECTION_STATUS = {"ok", "declined", "unavailable", "timeout", "invalid"}
+MAX_LISTED = 61                # 64 entries minus the three envelope members
 
-MANIFEST_KEYS = {"schema", "bundle_id", "case_id", "generated_at", "time_source", "boot_id", "files",
+MANIFEST_KEYS = {"schema", "bundle_id", "case_id", "generated_at", "time_source", "boot_id", "files", "sections",
                  "dropped", "truncated", "redaction", "device_root_spki_sha256", "collector_version"}
-FILE_KEYS = {"path", "size", "sha256", "included"}
+FILE_KEYS = {"path", "size", "sha256"}
 TIME_SOURCES = {"attested", "host_clock"}
 
 # Fixed locations first, so a PATH an attacker controls cannot swap the verifier or the decryptor.
@@ -132,11 +141,11 @@ def sha256_hex(data):
 
 def find_tool(name, fixed, override):
     if override:
-        if not os.access(override, os.X_OK):
+        if not os.path.isfile(override) or not os.access(override, os.X_OK):
             raise Usage(f"{name} is not executable: {override}")
         return override
     for path in fixed:
-        if os.access(path, os.X_OK):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     found = shutil.which(name)
     if not found:
@@ -202,7 +211,9 @@ def unzip_single(data):
         if len(infos) != 1:
             raise Refusal("input", f"the zip must hold exactly one .age member, it holds {len(infos)}")
         info = infos[0]
-        if not ZIP_MEMBER.match(info.filename):
+        if zf.comment:
+            raise Refusal("input", "the zip carries a comment")
+        if not ZIP_MEMBER.fullmatch(info.filename):
             raise Refusal("input", "the zip member name is not a plain *.age name")
         if info.flag_bits & 0x1:
             raise Refusal("input", "the zip member is encrypted")
@@ -210,6 +221,13 @@ def unzip_single(data):
             raise Refusal("input", "the zip member uses an unsupported compression")
         if info.file_size > MAX_OUTER:
             raise Refusal("input", "the zip member expands beyond the size limit")
+        local_extra = int.from_bytes(data[info.header_offset + 28:info.header_offset + 30], "little")
+        member_end = info.header_offset + 30 + len(info.filename) + local_extra + info.compress_size
+        central = 46 + len(info.filename) + len(info.extra) + len(info.comment)
+        trailer = (0, 12, 16) if info.flag_bits & 0x08 else (0,)
+        if info.header_offset != 0 or not any(zf.start_dir == member_end + t and
+                                              len(data) == zf.start_dir + central + 22 for t in trailer):
+            raise Refusal("input", "the zip holds bytes outside its single member and directory")
         try:
             with zf.open(info) as member:
                 content = member.read(MAX_OUTER + 1)
@@ -271,7 +289,7 @@ def gunzip_bounded(data, warnings):
     if len(data) < 18 or data[2] != 8:
         raise Refusal("decompress", "not a gzip/deflate stream")
     if data[3] & 0x1E:
-        warnings.append("gzip header carries a name, comment or extra field (not written with gzip -n)")
+        raise Refusal("decompress", "the gzip header carries a name, comment, extra or CRC field (gzip -n writes none)")
     if data[4:8] != b"\0\0\0\0":
         warnings.append("gzip header carries a timestamp (not written with gzip -n)")
     limit = MAX_TOTAL + TAR_FRAMING
@@ -314,7 +332,13 @@ def read_tar(raw, warnings):
                     raise Refusal("tar", "an entry is not a POSIX ustar header (GNU or pax extension?)")
                 if header[156:157] != b"0" or member.type != tarfile.REGTYPE or member.pax_headers:
                     raise Refusal("tar", "an entry is not a plain regular file (link, directory, device or extension)")
-                if not NAME.match(name):
+                try:
+                    canonical_header = member.tobuf(tarfile.USTAR_FORMAT, "utf-8", "strict")
+                except (ValueError, UnicodeError):
+                    raise Refusal("tar", "an entry header cannot be written back in ustar form")
+                if canonical_header != header:
+                    raise Refusal("tar", "an entry header is not canonical (bytes the format leaves unused are not zero)")
+                if not NAME.fullmatch(name):
                     raise Refusal("tar", "an entry name is not a flat [a-z0-9._-] name")
                 if name in seen:
                     raise Refusal("tar", "duplicate entry name")
@@ -334,6 +358,9 @@ def read_tar(raw, warnings):
                 body = stream.read(member.size + 1) if stream else b""
                 if len(body) != member.size:
                     raise Refusal("tar", "an entry is shorter than its header says")
+                padded_end = member.offset_data + -(-member.size // 512) * 512
+                if raw[member.offset_data + member.size:padded_end].strip(b"\0"):
+                    raise Refusal("tar", "an entry's data is followed by non-zero padding")
                 members[name] = (body, member.mtime)
             end = tf.offset
         except tarfile.TarError as exc:
@@ -350,12 +377,15 @@ def check_spki(spki):
         raise Refusal("spki", "device-root.spki.der is not an ECDSA P-256 SubjectPublicKeyInfo")
 
 
-def verify_signature(spki, signature, message, openssl_bin):
+def verify_signature(spki, signature, message, openssl_bin, warnings):
     if not 8 <= len(signature) <= MAX_SIGNATURE or signature[0] != 0x30:
         raise Refusal("signature", "manifest.sig is not a DER ECDSA signature")
     env = clean_env()
-    pem = subprocess.run([openssl_bin, "pkey", "-pubin", "-inform", "DER", "-outform", "PEM"], input=spki,
-                         capture_output=True, env=env, check=False)
+    try:
+        pem = subprocess.run([openssl_bin, "pkey", "-pubin", "-inform", "DER", "-outform", "PEM"], input=spki,
+                             capture_output=True, env=env, check=False)
+    except OSError as exc:
+        raise Usage(f"openssl could not run: {one_line(str(exc))}")
     if pem.returncode != 0:
         raise Refusal("spki", "openssl cannot read device-root.spki.der")
     key_file, sig_file = AnonFile(pem.stdout), AnonFile(signature)
@@ -363,11 +393,33 @@ def verify_signature(spki, signature, message, openssl_bin):
         done = subprocess.run([openssl_bin, "dgst", "-sha256", "-verify", key_file.path,
                                "-signature", sig_file.path], input=message, capture_output=True, env=env,
                               check=False, pass_fds=key_file.pass_fds + sig_file.pass_fds)
+    except OSError as exc:
+        raise Usage(f"openssl could not run: {one_line(str(exc))}")
     finally:
         key_file.close()
         sig_file.close()
     if done.returncode != 0 or b"Verified OK" not in done.stdout:
         raise Refusal("signature", "the signature does not verify over the domain-separated manifest")
+    if not low_s(signature):
+        warnings.append("manifest.sig is not low-S (the contract says low-S; the signature still verifies)")
+
+
+P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+
+def low_s(der):
+    """True when the DER ECDSA signature's s is in the lower half of the curve order."""
+    try:
+        if der[0] != 0x30 or der[1] != len(der) - 2 or der[2] != 0x02:
+            return False
+        r_len = der[3]
+        pos = 4 + r_len
+        if der[pos] != 0x02:
+            return False
+        s_value = int.from_bytes(der[pos + 2:pos + 2 + der[pos + 1]], "big")
+    except IndexError:
+        return False
+    return s_value <= P256_ORDER // 2
 
 
 def strict_pairs(pairs):
@@ -391,9 +443,12 @@ def parse_manifest(raw, warnings):
         raise Refusal("manifest", f"manifest.json is not strict JSON: {one_line(str(exc))}")
     if not isinstance(manifest, dict):
         raise Refusal("manifest", "manifest.json is not an object")
-    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    try:
+        canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    except (ValueError, UnicodeError, RecursionError):
+        raise Refusal("manifest", "manifest.json cannot be put in canonical form")
     if canonical != raw:
-        warnings.append("manifest.json is not in canonical form (sorted keys, no spaces)")
+        warnings.append("manifest.json is not in canonical form (sorted keys, no whitespace, ASCII-escaped)")
     return manifest
 
 
@@ -416,67 +471,62 @@ def validate_manifest(m):
     for field, rx in (("bundle_id", BUNDLE_ID), ("boot_id", BOOT_ID), ("case_id", CASE_ID),
                       ("collector_version", VERSION), ("device_root_spki_sha256", HEX64),
                       ("generated_at", STAMP)):
-        if not isinstance(m[field], str) or not rx.match(m[field]):
+        if not isinstance(m[field], str) or not rx.fullmatch(m[field]):
             refuse(f"{field} is malformed")
     try:
-        stamp = datetime.datetime.strptime(m["generated_at"], "%Y-%m-%dT%H:%M:%SZ")
+        stamp = datetime.datetime.strptime(STAMP.fullmatch(m["generated_at"]).group(1), "%Y-%m-%dT%H:%M:%S")
     except ValueError:
         refuse("generated_at is not a calendar time")
     if m["time_source"] not in TIME_SOURCES:
         refuse("time_source is not attested or host_clock")
-    for field, check in (("dropped", is_count), ("redaction", is_count),
-                         ("truncated", lambda v: isinstance(v, bool))):
+    for field, (key_rx, limit) in TABLE_KEYS.items():
         table = m[field]
-        if not isinstance(table, dict) or len(table) > MAX_ENTRIES or \
-                not all(KEY_NAME.match(k) and check(v) for k, v in table.items()):
-            refuse(f"{field} is not a table of section -> {'boolean' if field == 'truncated' else 'count'}")
+        check = (lambda v: isinstance(v, bool)) if field == "truncated" else is_count
+        if not isinstance(table, dict) or len(table) > limit or \
+                not all(key_rx.fullmatch(k) and check(v) for k, v in table.items()):
+            refuse(f"{field} is not a bounded table of section -> {'boolean' if field == 'truncated' else 'count'}")
+    sections = m["sections"]
+    if not isinstance(sections, dict) or len(sections) > 16:
+        refuse("sections is not a bounded table")
+    for key, value in sections.items():
+        if not SECTION_KEY.fullmatch(key) or not isinstance(value, dict) or \
+                set(value) != {"included", "status"} or not isinstance(value["included"], bool) or \
+                value["status"] not in SECTION_STATUS:
+            refuse("a sections entry is not {included: boolean, status: ok|declined|unavailable|timeout|invalid}")
     files = m["files"]
-    if not isinstance(files, list) or len(files) > MAX_ENTRIES:
+    if not isinstance(files, list) or len(files) > MAX_LISTED:
         refuse("files is not a bounded list")
-    paths, listed = [], {}
+    listed = {}
     for entry in files:
         if not isinstance(entry, dict):
             refuse("a files entry is not an object")
-        bad = [k for k in entry if k not in FILE_KEYS and not k.startswith("x-")]
-        if bad:
+        if [k for k in entry if k not in FILE_KEYS and not k.startswith("x-")]:
             refuse("a files entry has an unknown field")
-        path = entry.get("path")
-        if not isinstance(path, str) or not NAME.match(path):
+        path, size, digest = entry.get("path"), entry.get("size"), entry.get("sha256")
+        if not isinstance(path, str) or not NAME.fullmatch(path):
             refuse("a files entry has a malformed path")
         if path in ENVELOPE or path in UNSIGNED:
             refuse(f"{path} cannot be listed as a section")
         if path in listed:
             refuse("a path is listed twice")
-        included = entry.get("included", True)
-        if not isinstance(included, bool):
-            refuse("included is not a boolean")
-        if included:
-            size, digest = entry.get("size"), entry.get("sha256")
-            if not (isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= MAX_SECTION):
-                refuse("a files entry has a size outside 0..2 MiB")
-            if not isinstance(digest, str) or not HEX64.match(digest):
-                refuse("a files entry has a malformed sha256")
-        paths.append(path)
-        listed[path] = {"path": path, "included": included, "size": entry.get("size"),
-                        "sha256": entry.get("sha256")}
-    if paths != sorted(paths):
-        refuse("files is not sorted by path")
+        if not (isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= MAX_SECTION):
+            refuse("a files entry has a size outside 0..2 MiB")
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            refuse("a files entry has a malformed sha256")
+        listed[path] = {"path": path, "size": size, "sha256": digest}
     return stamp, listed
 
 
 def cross_check_files(members, listed):
-    for name in listed:
-        entry = listed[name]
-        if entry["included"]:
-            if name not in members:
-                raise Refusal("files", f"{name} is listed but missing from the archive")
-            body = members[name][0]
-            if len(body) != entry["size"]:
-                raise Refusal("files", f"{name} has a different size than the manifest says")
-            if sha256_hex(body) != entry["sha256"]:
-                raise Refusal("files", f"{name} does not match its sha256 in the manifest")
-        elif name in members:
-            raise Refusal("files", f"{name} is marked excluded but is in the archive")
+    """Every entry but the envelope and the client block is listed, with its exact size and sha256."""
+    for name, entry in listed.items():
+        if name not in members:
+            raise Refusal("files", f"{name} is listed but missing from the archive")
+        body = members[name][0]
+        if len(body) != entry["size"]:
+            raise Refusal("files", f"{name} has a different size than the manifest says")
+        if sha256_hex(body) != entry["sha256"]:
+            raise Refusal("files", f"{name} does not match its sha256 in the manifest")
     extra = sorted(set(members) - set(ENVELOPE) - set(UNSIGNED) - set(listed))
     if extra:
         raise Refusal("files", f"entries not listed in the manifest: {', '.join(extra[:5])}")
@@ -485,7 +535,7 @@ def cross_check_files(members, listed):
 def load_pins(values, pins_file):
     pins = {}
     for value in values or []:
-        if not HEX64.match(value):
+        if not HEX64.fullmatch(value):
             raise Usage("--pin-spki-sha256 must be 64 lowercase hex digits")
         pins.setdefault(value, "")
     if pins_file:
@@ -498,7 +548,7 @@ def load_pins(values, pins_file):
             if not line or line.startswith("#"):
                 continue
             digest, _, label = line.partition(" ")
-            if not HEX64.match(digest):
+            if not HEX64.fullmatch(digest):
                 raise Usage("a pins file line must start with 64 lowercase hex digits")
             pins.setdefault(digest, one_line(label.strip(), 80))
     if not pins:
@@ -509,26 +559,58 @@ def load_pins(values, pins_file):
 
 # --- content scan ------------------------------------------------------------------------------------
 
-DENY_KEYS = frozenset("""license_key licence_key hardware_fingerprint fingerprint recovery_key luks_recovery_key
-passphrase password secret api_key private_key access_token refresh_token token setup_code pairing_code email
-user_email prompt transcript document_name filename file_name paired_device_name""".split())
+# Key names that must never hold a value. Matched after normalisation (camelCase and hyphens to snake_case).
+DENY_NAMES = frozenset("""license_key licence_key hardware_fingerprint fingerprint recovery_key luks_recovery_key
+passphrase password passwd pwd secret client_secret api_key private_key access_token refresh_token token
+authorization setup_code pairing_code email user_email username user_name prompt transcript document_name
+filename file_name paired_device_name ssid bssid""".split())
+# The same idea for `name=value` in free text, limited to content-shaped names: a bare `token: ok` or
+# `password: required` in ordinary journal text is not a leak (secret-shaped pairs are SECRET_PAIR's).
+TEXT_NAMES = ("filename", "file_name", "document_name", "prompt", "transcript", "user_email", "email",
+              "username", "user_name", "paired_device_name", "ssid")
+EMPTY = (None, "", False, 0, [], {})
 
 SYSTEMD_UNIT_SUFFIXES = frozenset("service slice scope socket timer mount path target device automount swap".split())
+VERSION_WORDS = ("version", "ver", "v", "build", "release", "rev", "commit", "tag", "kernel", "firmware",
+                 "package", "pkg")
 
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.([A-Za-z]{2,})")
-IPV4 = re.compile(r"(?<![\w.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\w]|\.\d)")
+# Every regex below is bounded: a lookbehind keeps a match from starting inside a run it cannot use,
+# repeats are capped, and a line is scanned in windows, so one hostile line costs a bounded time.
+EMAIL = re.compile(r"(?<![\w.%+-])[\w.%+-]{1,64}@[\w-]+(?:\.[\w-]+)*\.([^\W\d_]{2,})(?![\w-])")
+IPV4 = re.compile(r"(?<![\w.-])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})"
+                  r"(?![\w-]|\.\d)")
 IPV6_RUN = re.compile(r"(?<![A-Za-z0-9_:.])[0-9A-Fa-f:.]{3,}(?![A-Za-z0-9_:.])")
-MAC = re.compile(r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])")
+MAC = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:])")
 PEM = re.compile(r"-----BEGIN [A-Z0-9 ]{3,40}-----")
-TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
-                   r"|\bnicap1_[A-Za-z0-9_-]{4,}")
+TOKEN = re.compile(
+    r"(?i)(?<![\w-])bearer\s+(?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{8,}"
+    r"|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
+    r"|(?<![\w-])nicap1_[A-Za-z0-9_-]{4,}"
+    r"|(?<![A-Za-z0-9_])(?:ghp|gho|ghs|ghu|github_pat|glpat|xox[abp])[-_][A-Za-z0-9_-]{16,}"
+    r"|(?<![\w-])authorization\\?[\"']?\s*[:=]\s*\\?[\"']?(?:basic|bearer|token|digest)\s+[A-Za-z0-9._~+/=-]{6,}")
 RECOVERY_KEY = re.compile(r"(?<![a-z-])(?:[a-z]{8}-){7}[a-z]{8}(?![a-z-])")
-SECRET_PAIR = re.compile(r"(?i)\b(?:password|passwd|passphrase|secret|api[_-]?key|private[_-]?key|recovery[_-]?key"
-                         r"|licen[cs]e[_-]?key)\b[\"']?\s*[:=]\s*[\"']?(?!(?:null|true|false)\b)([^\s\"'<*]{4,})")
+VALUE_START = r"\\?[\"']?(?!(?:null|true|false|0)\b|<|\*)"
+SECRET_PAIR = re.compile(
+    r"(?i)(?<![\w-])[\w-]{0,40}(?:secret|passw(?:or)?d|pwd|passphrase|token|api[_-]?key|private[_-]?key"
+    r"|recovery[_-]?key|licen[cs]e[_-]?key)\\?[\"']?\s*[:=]\s*" + VALUE_START + r"([^\s\"'\\<*,}\]]{4,})")
+FIELD_PAIR = re.compile(r"(?i)(?<![\w-])(?:" + "|".join(TEXT_NAMES) + r")\\?[\"']?\s*[:=]\s*" + VALUE_START
+                        + r"[^\s\"'\\,}\]]")
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
+WINDOW = 16 << 10
+WINDOW_OVERLAP = 512
+SCAN_BUDGET_SECONDS = 150
 
-def text_rules(line):
+
+def windows(line):
+    if len(line) <= WINDOW:
+        yield line
+        return
+    for start in range(0, len(line), WINDOW - WINDOW_OVERLAP):
+        yield line[start:start + WINDOW]
+
+
+def text_rules(line, key_rules=True):
     """Rule names a decoded line breaks. Never returns, logs or echoes the matched text."""
     hits = set()
     if CONTROL.search(line):
@@ -537,10 +619,12 @@ def text_rules(line):
         if match.group(1).lower() not in SYSTEMD_UNIT_SUFFIXES:
             hits.add("email")
     for match in IPV4.finditer(line):
-        if not match.group(1).startswith(("127.", "0.0.0.0")):
-            hits.add("ip_address")
+        before = line[max(0, match.start() - 16):match.start()].lower().rstrip(" :=")
+        if match.group(1).startswith(("127.", "0.0.0.0")) or before.endswith(VERSION_WORDS):
+            continue
+        hits.add("ip_address")
     for match in IPV6_RUN.finditer(line):
-        token = match.group(0)
+        token = match.group(0).strip(":.")
         if token.count(":") >= 2:
             try:
                 address = ipaddress.IPv6Address(token)
@@ -556,31 +640,42 @@ def text_rules(line):
         hits.add("token")
     if RECOVERY_KEY.search(line):
         hits.add("recovery_key")
-    if SECRET_PAIR.search(line):
-        hits.add("secret_pair")
+    if key_rules:
+        for match in SECRET_PAIR.finditer(line):
+            value = match.group(1)
+            # A bare word (`password: required`, `token: expired`) is journal prose, not a secret.
+            if len(value) >= 12 or not value.isalpha():
+                hits.add("secret_pair")
+        if FIELD_PAIR.search(line):
+            hits.add("forbidden_field")
     return hits
 
 
-def walk_keys(node, depth=0):
-    """Forbidden key names holding a non-empty value, anywhere in a JSON value."""
-    if depth > JSON_DEPTH:
-        return
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key.lower() in DENY_KEYS and value not in (None, "", False, 0, [], {}):
-                yield key
-            yield from walk_keys(value, depth + 1)
-    elif isinstance(node, list):
-        for item in node:
-            yield from walk_keys(item, depth + 1)
+def normalise_key(key):
+    key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key[:128])
+    return key.replace("-", "_").lower()
+
+
+def deny_key_hits(text):
+    """Forbidden key names holding a non-empty value, anywhere in a JSON text, duplicates included."""
+    found = []
+
+    def hook(pairs):
+        for key, value in pairs:
+            if normalise_key(key) in DENY_NAMES and value not in EMPTY:
+                found.append(key)
+        return dict(pairs)
+
+    json.loads(text, object_pairs_hook=hook)
+    return found
 
 
 def load_canaries(path):
     try:
-        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+        lines = pathlib.Path(path).read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         raise Usage(f"cannot read the canary file: {one_line(str(exc))}")
-    canaries = [line for line in (raw.rstrip("\r") for raw in lines) if line.strip()]
+    canaries = [line.strip() for line in lines if line.strip()]
     if not canaries:
         raise Usage("the canary file has no canary")
     if len(canaries) > MAX_CANARIES:
@@ -589,15 +684,20 @@ def load_canaries(path):
         raise Usage(f"every canary must be at least {MIN_CANARY} characters")
     out = []
     for index, canary in enumerate(canaries, 1):
-        variants = {canary.encode("utf-8"), json.dumps(canary).strip('"').encode("ascii"),
-                    json.dumps(canary, ensure_ascii=False).strip('"').encode("utf-8")}
-        out.append((index, {v.lower() for v in variants}))
+        raw_variants = {canary.encode("utf-8"), json.dumps(canary).strip('"').encode("ascii"),
+                        json.dumps(canary, ensure_ascii=False).strip('"').encode("utf-8")}
+        out.append((index, {v.lower() for v in raw_variants}, fold(canary)))
     return out
+
+
+def fold(text):
+    return unicodedata.normalize("NFC", text).casefold()
 
 
 def scan_content(documents, canaries):
     """documents: {name: bytes}. -> findings [{file, line, rule}], never the matched text."""
     findings = []
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
 
     def add(name, line, rule):
         entry = {"file": name, "line": line, "rule": rule}
@@ -606,38 +706,58 @@ def scan_content(documents, canaries):
 
     for name, body in documents.items():
         lowered = body.lower()
-        for index, variants in canaries:
-            for variant in variants:
-                at = lowered.find(variant)
-                if at >= 0:
-                    add(name, body.count(b"\n", 0, at) + 1, "canary")
-                    break
         try:
             text = body.decode("utf-8")
         except UnicodeDecodeError:
             add(name, 0, "non_text")
             text = body.decode("utf-8", "replace")
+        folded = fold(text) if canaries else ""
+        for index, variants, folded_canary in canaries:
+            if time.monotonic() > deadline:
+                break
+            at = next((lowered.find(v) for v in variants if v in lowered), -1)
+            if at >= 0:
+                add(name, body.count(b"\n", 0, at) + 1, "canary")
+                continue
+            at = folded.find(folded_canary)
+            if at >= 0:
+                add(name, folded.count("\n", 0, at) + 1, "canary")
+        is_manifest = name == "manifest.json"
         for number, line in enumerate(text.split("\n"), 1):
-            for rule in sorted(text_rules(line)):
-                add(name, number, rule)
+            if time.monotonic() > deadline:
+                add(name, number, "scan_incomplete")
+                return findings
+            for window in windows(line):
+                for rule in sorted(text_rules(window, key_rules=not is_manifest)):
+                    add(name, number, rule)
         if name.endswith((".json", ".jsonl")):
             chunks = [(0, text)] if name.endswith(".json") else \
                 [(n, row) for n, row in enumerate(text.split("\n"), 1) if row.strip()]
             for number, chunk in chunks:
+                if is_manifest:
+                    # The manifest's own keys are closed by its schema (its tables count what was
+                    # redacted, under rule names such as `email`); only its free `x-` fields are scanned.
+                    try:
+                        chunk = json.dumps({k: v for k, v in json.loads(chunk).items() if k.startswith("x-")})
+                    except (ValueError, RecursionError, AttributeError):
+                        continue
                 try:
-                    value = json.loads(chunk)
-                except (ValueError, RecursionError):
+                    hits = deny_key_hits(chunk)
+                except RecursionError:
+                    add(name, number, "json_too_deep")
                     continue
-                for _ in walk_keys(value):
+                except ValueError:
+                    continue
+                if hits:
                     add(name, number, "deny_key")
     return findings
 
 
 def canary_indexes_in_raw(raw_tar, raw_gz, canaries):
     """A canary in framing, padding or the compressed bytes themselves: the layers a file scan skips."""
-    hits = []
-    for index, variants in canaries:
-        for label, blob in (("tar", raw_tar.lower()), ("gzip", raw_gz.lower())):
+    hits, blobs = [], (("tar", raw_tar.lower()), ("gzip", raw_gz.lower()))
+    for index, variants, _ in canaries:
+        for label, blob in blobs:
             if any(v in blob for v in variants):
                 hits.append((index, label))
     return hits
@@ -658,6 +778,8 @@ def analyse(args):
 
     try:
         kind, gz, outer_name = load_archive(args.bundle, args.key, args.age_bin, warnings)
+        if args.require_encrypted and kind == "tar.gz":
+            raise Refusal("input", "an encrypted bundle is required (--require-encrypted), this one is a plain tar.gz")
         ok(checks, "input", kind)
         if kind != "tar.gz":
             ok(checks, "decrypt", "age")
@@ -680,7 +802,7 @@ def analyse(args):
             raise Refusal("pin", f"the bundle's device key (sha256 {spki_hash}) is not one of the pinned device keys")
         result["bundle"]["pin_label"] = pins[spki_hash]
         ok(checks, "pin", "the device key is pinned")
-        verify_signature(spki, signature, DOMAIN + manifest_raw, openssl_bin)
+        verify_signature(spki, signature, DOMAIN + manifest_raw, openssl_bin, warnings)
         ok(checks, "signature", "ECDSA-SHA256 over the domain-separated manifest")
         manifest = parse_manifest(manifest_raw, warnings)
         stamp, listed = validate_manifest(manifest)
@@ -696,6 +818,9 @@ def analyse(args):
         return result, None
 
     epoch = int(stamp.replace(tzinfo=datetime.timezone.utc).timestamp())
+    paths = [e["path"] for e in listed.values()]
+    if paths != sorted(paths):
+        warnings.append("manifest files are not sorted by path")
     if any(mtime != epoch for _, mtime in members.values()):
         warnings.append("tar mtime of an entry differs from generated_at")
     match = ZIP_ID8.match(outer_name or "")
@@ -704,11 +829,10 @@ def analyse(args):
 
     result["bundle"].update({k: manifest[k] for k in (
         "bundle_id", "case_id", "generated_at", "time_source", "boot_id", "collector_version",
-        "device_root_spki_sha256", "dropped", "truncated", "redaction")})
+        "device_root_spki_sha256", "sections", "dropped", "truncated", "redaction")})
     result["bundle"].update({"archive_bytes": len(gz), "expanded_bytes": len(raw)})
     result["files"] = [
-        {"path": e["path"], "size": e["size"], "sha256": e["sha256"], "included": e["included"]}
-        for e in listed.values()]
+        {"path": e["path"], "size": e["size"], "sha256": e["sha256"]} for e in listed.values()]
     result["unsigned"] = [n for n in UNSIGNED if n in members]
 
     documents = {n: members[n][0] for n in sorted(members) if n not in ("manifest.sig", "device-root.spki.der")}
@@ -732,10 +856,12 @@ def render_text(result):
         if key in bundle:
             lines.append(f"  {key}: {bundle[key]}")
     for entry in result["files"]:
-        size = "excluded" if not entry["included"] else f"{entry['size']} B"
-        lines.append(f"  file {entry['path']} ({size})")
+        lines.append(f"  file {entry['path']} ({entry['size']} B)")
     for name in result["unsigned"]:
         lines.append(f"  file {name} (UNSIGNED, produced by the client)")
+    for name, section in sorted(bundle.get("sections", {}).items()):
+        if not section["included"]:
+            lines.append(f"  section {name}: not included ({section['status']})")
     for key in ("dropped", "truncated", "redaction"):
         if bundle.get(key):
             lines.append(f"  {key}: {json.dumps(bundle[key], sort_keys=True)}")
@@ -760,6 +886,8 @@ def cmd_show(args, result, members):
         if name not in members or name in ("manifest.sig", "device-root.spki.der"):
             raise Refusal("show", f"{one_line(name, 80)} is not a readable member of this bundle")
     for name in args.members:
+        if name in UNSIGNED:
+            sys.stderr.write(f"{name} is UNSIGNED: the client produced it, the device did not sign it\n")
         if len(args.members) > 1:
             sys.stdout.write(f"==> {name} <==\n")
         sys.stdout.write(neutralise(members[name][0]))
@@ -768,6 +896,13 @@ def cmd_show(args, result, members):
 
 
 def cmd_extract(args, members):
+    try:
+        write_members(args, members)
+    except OSError as exc:
+        raise Usage(f"cannot write the destination: {one_line(str(exc))}")
+
+
+def write_members(args, members):
     out = pathlib.Path(args.out)
     if out.is_symlink():
         raise Usage("the destination is a symlink")
@@ -783,6 +918,8 @@ def cmd_extract(args, members):
             handle.write(body)
     sys.stderr.write(f"extracted {len(members)} verified members into {out}; delete this directory "
                      "once the case is read (the runbook requires it)\n")
+    if any(name in members for name in UNSIGNED):
+        sys.stderr.write("client.json is UNSIGNED: the client produced it, the device did not sign it\n")
 
 
 def build_parser():
@@ -796,6 +933,8 @@ def build_parser():
         p.add_argument("--pins-file", metavar="FILE", help="one pin per line: HEX [label]; # comments")
         p.add_argument("--key", metavar="FILE", help="age identity file of the support key (encrypted input)")
         p.add_argument("--canaries", metavar="FILE", help="strings that must never appear, one per line")
+        p.add_argument("--require-encrypted", action="store_true",
+                       help="refuse a bundle that was not age-encrypted (a plain tar.gz)")
         p.add_argument("--format", choices=("text", "json"), default="text")
         p.add_argument("--age-bin", metavar="PATH")
         p.add_argument("--openssl-bin", metavar="PATH")
@@ -849,6 +988,9 @@ def main(argv=None):
     except Refusal as refusal:
         sys.stderr.write(f"refused: {refusal.check}: {refusal.detail}\n")
         return 1
+    except OSError as exc:
+        sys.stderr.write(f"ni-support-verify: {one_line(str(exc))}\n")
+        return 2
 
 
 if __name__ == "__main__":
