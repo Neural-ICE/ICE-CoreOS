@@ -3328,18 +3328,23 @@ fn owner_v2_release_status(
             "pristine owner anchor is mixed with generation state".into()
         ));
     }
-    Ok(
-        verify_running_v2_release(&verified, &running_system_paths()).map(|()| StatusOutcome {
-            status: AuthenticatedOtaStatus {
-                committed_generation: None,
-                completion_version: 2,
-                enforce_ready_verified: false,
-                profile: OWNER_STATE_PROFILE.into(),
-                schema: "neural-ice-authenticated-ota-status-v1".into(),
-            },
-            held_transaction: None,
-        }),
-    )
+    Ok(verify_running_v2_release(
+        &verified,
+        inspection.baseline_floor,
+        &root,
+        operation,
+        &running_system_paths(),
+    )?
+    .map(|()| StatusOutcome {
+        status: AuthenticatedOtaStatus {
+            committed_generation: None,
+            completion_version: 2,
+            enforce_ready_verified: false,
+            profile: OWNER_STATE_PROFILE.into(),
+            schema: "neural-ice-authenticated-ota-status-v1".into(),
+        },
+        held_transaction: None,
+    }))
 }
 
 /// Where the live root `/` is read from. Only the test build can move it.
@@ -3351,26 +3356,71 @@ fn v2_release_root() -> PathBuf {
     PathBuf::from("/")
 }
 
-/// Design P4: the booted deployment is the host the receipt names — its image
-/// reference (`repository@index digest`) and the platform manifest it imported.
-/// No OTA transaction window explains a difference here: the successor rule for
-/// an updated host is T9, and until it lands an updated host is refused.
+/// Where the engine hands the current release over (ICE-Fabric-v2
+/// `ni-v2-seed-import.sh` at the first import; the activation engine at every
+/// host switch): the signed manifest and its detached signature.
+const V2_CURRENT_RELEASE: &str = "var/lib/neural-ice-v2/current-release";
+
+/// Design P4 and the succession rule (mission B, T9): the booted deployment is
+/// the host the receipt names — its image reference (`repository@index digest`)
+/// and the platform manifest it imported — OR the host of the signed current
+/// release: the manifest the engine handed over, verified under the receipt's
+/// own release key, no older than the TPM floor, for the receipt's hardware
+/// target and release authority. The install host stays accepted without reading
+/// the handover, so a rollback to it needs nothing from `/var`.
 fn verify_running_v2_release(
     verified: &crate::v2_release::VerifiedV2Release,
+    floor: u64,
+    root: &Path,
+    scratch: &Path,
     paths: &RunningSystemPaths,
-) -> Result<(), String> {
-    let running = observe_running_system_with(paths, false)?;
-    let expected = format!(
+) -> Result<Result<(), String>, InternalError> {
+    let running = match observe_running_system_with(paths, false) {
+        Ok(running) => running,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let well_formed = running.manifest.strip_prefix("sha256:").is_some_and(sha256);
+    let install_host = format!(
         "{}@{}",
         verified.host_repository, verified.host_index_digest
     );
-    if running.origin_ref != expected
-        || running.manifest != verified.host_manifest_digest
-        || !running.manifest.strip_prefix("sha256:").is_some_and(sha256)
-    {
-        return Err("booted deployment differs from authenticated v2 release baseline".into());
+    let divergence = "booted deployment differs from authenticated v2 release baseline";
+    if !well_formed {
+        return Ok(Err(divergence.into()));
     }
-    reobserve_running_system(paths, &running)
+    // The install host's index digest fixes its platform child: a different
+    // child under that digest is no host the receipt or any release names.
+    if running.origin_ref == install_host {
+        if running.manifest != verified.host_manifest_digest {
+            return Ok(Err(divergence.into()));
+        }
+    } else {
+        let current = root.join(V2_CURRENT_RELEASE);
+        let successor = crate::v2_release::verify_successor(
+            &crate::v2_release::SuccessorPaths {
+                manifest: &current.join("release-manifest.json"),
+                manifest_sig: &current.join("release-manifest.json.sig"),
+                release_key: &root.join("usr/lib/neural-ice/keys/release-authorization.pub"),
+                scratch_dir: scratch,
+            },
+            verified,
+            floor,
+        )?;
+        let host = match successor {
+            Ok(host) => host,
+            Err(reason) => {
+                return Ok(Err(format!(
+                    "{divergence}; not the host of the signed current release: {reason}"
+                )))
+            }
+        };
+        if running.origin_ref != format!("{}@{}", host.repository, host.index_digest) {
+            return Ok(Err(format!(
+                "{divergence}; not the host of the signed current release"
+            )));
+        }
+    }
+    Ok(reobserve_running_system(paths, &running))
 }
 
 fn verify_running_baseline(

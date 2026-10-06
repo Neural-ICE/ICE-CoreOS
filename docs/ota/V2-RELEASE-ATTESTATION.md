@@ -395,6 +395,38 @@ On a completed v2-lane appliance the verb prints **exactly** the bytes of
 fails if the two diverge.) The licence gate and model-fetch compare these bytes and
 need **no code change**.
 
+### 8.1 Succession rule: the booted host is an updated host (mission B, T9)
+
+The booted deployment (`repository@index digest`, plus the platform manifest digest) must be
+**one** of:
+
+1. the **install host**: the receipt's `host_repository@host_index_digest` and
+   `host_manifest_digest`. This path reads nothing from `/var`, so a `bootc rollback` to
+   the install host is always answered;
+2. the host of the **current release**: the pair `release-manifest.json` and
+   `release-manifest.json.sig` under `/var/lib/neural-ice-v2/current-release/`, which the
+   engine hands over (ICE-Fabric-v2 `ni-v2-seed-import.sh` at the first import, the
+   activation engine at every host switch), when, all of them:
+   * the pair is a regular non-symlink file pair within the §2 bounds, and the live
+     `/usr/lib/neural-ice/keys/release-authorization.pub` is the receipt's key (already
+     enforced by `verify-retained-v2-release`);
+   * the signature verifies under that key, exactly as rule 5;
+   * `bundle_seq >= ` the TPM floor (the floor is write-locked at the install's
+     `bundle_seq`; the floor is not a ratchet, see §12);
+   * `hardware_target` is the receipt's, and the host repository is under the receipt's
+     release authority;
+   * the booted `origin` is `<manifest host.repository>@<manifest host.digest>`, and the
+     platform manifest digest is `sha256:<64 lowercase hex>`.
+
+   An origin equal to the install host's keeps its install platform child: the current
+   release cannot re-pick it.
+
+Everything else is unchanged and still a conjunction: receipt, evidence, floor three ways,
+live-root markers, pristine anchor. A successor under a written anchor or a drifted live
+root is refused as before. The status bytes are the golden ones for both hosts. Refusals
+read `booted deployment differs from authenticated v2 release baseline; not the host of
+the signed current release: <class>: <detail>` (classes of §2).
+
 ## 9. The `relaxed` posture on the v2 lane
 
 `NEURALICE_SEALED_OTA_STATE` defaults to `relaxed` everywhere (ADR-0050 lever B), which
@@ -522,8 +554,15 @@ two tokens add ≈ 180 bytes / 2 words. T3a must re-measure on the real render.
   (anchor signature, TPM stubs, booted deployment) was not run on the vector.
 * `host_manifest_digest` provenance (who resolves the platform child, and from which
   source in each installer) is the caller's; only its format is checked.
-* The freshness object (mode floor) and the successor rule for an updated host (T9)
-  are out of this contract version.
+* The freshness object (mode floor) is out of this contract version.
+* **Succession (§8.1) is not a ratchet.** The floor `0x01500001` cannot move after the
+  ceremony, so `bundle_seq >= floor` does not stop a replay of an older signed release
+  between the floor and the latest, nor tell which release is "the" current one if the
+  engine's `/var` is rewritten by a root attacker. That needs the extendable anchor
+  `0x01500002` (DESIGN-root R5) and is not part of T9. The platform manifest digest of an
+  updated host is checked for shape only: the signed index digest fixes it, and the reader
+  does not read the registry index. The engine side (writing `current-release` before the
+  switch reboot, restoring it on rollback) is ICE-Fabric-v2 work, not in this contract.
 * **`--variant` is `{sealed-lab}`** while the image build accepts `debug|sealed-lab|prod`.
   Owner of the extension: the coordinator with Thomas; production exit criterion: a
   contract version that admits `prod` (and its marker/receipt values) before the first
