@@ -1,0 +1,7 @@
+{
+  "default": [{ "type": "reject" }],
+  "transports": {
+    "oci": { "/run/ni-payload/host-oci": [{ "type": "insecureAcceptAnything" }] },
+    "containers-storage": { "": [{ "type": "insecureAcceptAnything" }] }
+  }
+}

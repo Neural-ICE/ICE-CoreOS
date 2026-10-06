@@ -1,6 +1,7 @@
 #!/bin/bash
-# Prototype of the generic installer's first gate (ADR-0044). Nothing on the payload partition is used before
+# The generic installer's first gate (ADR-0044). Nothing on the payload partition is used before
 # the release manifest it carries verifies under the release key whose file sha256 the UKI cmdline seals.
+# On success it writes /run/ni-verified/release.env, the only input the install step trusts.
 # Closed-world: sealed kargs exactly once and well-formed (an external cmdline appended by systemd-stub when
 # Secure Boot is off must not shadow them); exactly one payload partition; one bounded copy of each object,
 # verified and parsed from that copy; the manifest must be canonical JSON (no duplicate keys).
@@ -20,7 +21,11 @@ keyid="$(sealed neuralice.relauth_keyid '^[0-9a-f]{64}$')"
 minseq="$(sealed neuralice.min_bundle_seq '^[1-9][0-9]{0,15}$')"
 target="$(sealed neuralice.hardware_target '^[a-z0-9]+(-[a-z0-9]+)*$')"
 sealed neuralice.installer_version '^[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null
+pcrid="$(sealed neuralice.pcr_policy_key '^[0-9a-f]{64}$')"
+sealed neuralice.access_profile '^[a-z]+(-[a-z]+)*$' >/dev/null
+sealed neuralice.trust_policy_id '^[a-z0-9]+(-[a-z0-9]+)*$' >/dev/null
 [ "$(sha256sum "$KEY" | cut -d' ' -f1)" = "$keyid" ] || die "the embedded release key is not the sealed one"
+[ "$(sha256sum /usr/lib/neural-ice-generic/pcr-policy.pub | cut -d' ' -f1)" = "$pcrid" ] || die "the embedded PCR policy key is not the sealed one"
 devs=""
 for _ in $(seq 1 30); do   # every block device probed first, so a slower second disk cannot be missed
   udevadm settle --timeout=30 || true
@@ -50,4 +55,7 @@ host="$(jq -r '.host.repository + "@" + .host.digest' "$M")"
 [[ "$seq" =~ ^[1-9][0-9]{0,15}$ ]] && [ "$seq" -ge "$minseq" ] || die "bundle_seq $seq below the sealed floor $minseq"
 [ "$mt" = "$target" ] || die "manifest hardware_target $mt is not the sealed $target"
 [[ "$host" =~ ^rg\.fr-par\.scw\.cloud/neural-ice-v2-lab/host-appliance@sha256:[0-9a-f]{64}$ ]] || die "host reference outside the v2 namespace: $host"
+hostdigest="${host#*@}"
+printf 'RELEASE_ID=%s\nBUNDLE_SEQ=%s\nHARDWARE_TARGET=%s\nHOST_REF=%s\nHOST_DIGEST=%s\n' "$rid" "$seq" "$mt" "$host" "$hostdigest" > /run/ni-verified/release.env
+[[ "$rid" =~ ^[A-Za-z0-9._-]+$ ]] || die "release_id has unsafe characters"
 say "NI-GENERIC-PAYLOAD-OK release=$rid seq=$seq target=$mt host=$host"
