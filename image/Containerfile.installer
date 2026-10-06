@@ -227,6 +227,12 @@ COPY ota/neural-ice-tpm-state.sh /usr/libexec/neural-ice-tpm-state
 # caller. The target image carries its own copy for first boot; this one is the
 # signed live installer's bounded prepare/inspect implementation.
 COPY ota/neural-ice-ota-tpm-state.sh /usr/libexec/neural-ice-ota-tpm-state
+# The v2 owner-seal library is SOURCED by the installer (never executed): the v2
+# lane's pre-wipe preflight and post-install commit live in it. Without this copy
+# every v2-sealed medium is refused before any destructive step, by design, and
+# the v2 lane is unusable -- so the image test asserts the copy, its mode and its
+# syntax rather than leaving a permanent refusal to pass unnoticed.
+COPY ota/neural-ice-v2-owner-seal.sh /usr/libexec/neural-ice-v2-owner-seal.sh
 COPY image/bootc-overlay/usr/lib/systemd/system/neural-ice-device-root.service \
      /usr/lib/systemd/system/neural-ice-device-root.service
 RUN install -d -m 0755 /etc/systemd/system/neural-ice-device-root.service.d
@@ -244,7 +250,8 @@ RUN set -euxo pipefail; \
       /usr/libexec/neural-ice-live-diagnostics \
       /usr/libexec/neural-ice-installer-failure \
       /usr/lib/systemd/system-generators/neural-ice-installer-runtime-generator; \
-    chmod 0644 /usr/lib/neural-ice/sealed-cmdline-grammar.sh \
+    chmod 0644 /usr/libexec/neural-ice-v2-owner-seal.sh \
+      /usr/lib/neural-ice/sealed-cmdline-grammar.sh \
       /usr/lib/neural-ice/installer-failure-policy \
       /usr/lib/neural-ice/registry-authorisation.py; \
     chmod 0444 /usr/lib/neural-ice/lib/access-policy.sh \
@@ -261,6 +268,8 @@ RUN set -euxo pipefail; \
       /usr/libexec/neural-ice-luks-token-evidence \
       /usr/libexec/neural-ice-preseal-handoff; \
     bash -n /usr/libexec/neural-ice-ota-tpm-state; \
+    bash -n /usr/libexec/neural-ice-v2-owner-seal.sh; \
+    test "$(stat -c '%u:%g:%a' /usr/libexec/neural-ice-v2-owner-seal.sh)" = 0:0:644; \
     test -r /usr/lib/neural-ice/lib/tpm2-nv-public.sh; \
     test -x /usr/bin/ni-ota-verify; \
     if _ota_usage=$(/usr/bin/ni-ota-verify 2>&1); then \
