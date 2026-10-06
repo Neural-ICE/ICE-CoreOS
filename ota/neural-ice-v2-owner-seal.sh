@@ -303,6 +303,7 @@ V2SEAL_INSPECTION_PY
 
 v2seal_commit() {
   local ota_dir input_dir receipt_dir persisted_manifest persisted_sig persisted_receipt inspection file
+  local persisted_sha256 attested_sha256
   _v2seal_require V2SEAL_MANIFEST V2SEAL_MANIFEST_SIG V2SEAL_RECEIPT V2SEAL_BUNDLE_SEQ \
     V2SEAL_RECEIPT_SHA256 V2SEAL_WORK V2SEAL_TARGET_ROOT V2SEAL_TARGET_OTA_DIR V2SEAL_OTA_TPM_STATE V2SEAL_TPM_STATE
   _v2seal_require_seal_inputs
@@ -343,9 +344,17 @@ v2seal_commit() {
     || v2seal_refusal "the deployed candidate re-authenticates to a different bundle_seq or receipt than the pre-wipe one"
   cmp -- "$V2SEAL_RECEIPT" "$persisted_receipt" \
     || v2seal_refusal "the installed v2 receipt differs from the authenticated pre-wipe receipt"
-  [[ "$(_v2seal_sha256 "$persisted_manifest")" == "$(_v2seal_sha256 "$V2SEAL_MANIFEST")" ]] \
+  # Hash into variables, not into a [[ ]] comparison: the helper exits inside
+  # its command substitution, so a failed sha256sum would otherwise compare
+  # empty with empty and pass. Each digest is validated before it is compared.
+  persisted_sha256="$(_v2seal_sha256 "$persisted_manifest")" \
+    || _v2seal_internal "cannot hash the persisted manifest"
+  attested_sha256="$(_v2seal_sha256 "$V2SEAL_MANIFEST")" \
+    || _v2seal_internal "cannot hash the attested manifest"
+  _v2seal_require_hex64 persisted_sha256 attested_sha256
+  [[ "$persisted_sha256" == "$attested_sha256" ]] \
     || v2seal_refusal "the persisted manifest is not the attested one"
-  V2SEAL_RELEASE_IDENTITY_SHA256="$(_v2seal_sha256 "$persisted_manifest")"
+  V2SEAL_RELEASE_IDENTITY_SHA256="$persisted_sha256"
   if [[ "$V2SEAL_MODE" == manifest-digest && "$V2SEAL_RELEASE_IDENTITY_SHA256" != "$V2SEAL_MANIFEST_SHA256" ]]; then
     v2seal_refusal "the persisted manifest is not the one this medium seals"
   fi
