@@ -166,14 +166,16 @@ uki_build_identity() {
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || return 0
   command -v setpriv >/dev/null 2>&1 \
     || fail "a privileged caller needs setpriv to build the UKI unprivileged"
-  # The throwaway material is root-owned (the signing key is 0600) and the caller's
-  # work directory is root-private: hand the builder's inputs and output to the
-  # unprivileged identity, and refuse loudly if it still cannot reach them.
-  chown -R "$UKI_BUILD_UID:$UKI_BUILD_UID" "$IN" "$TOOLS" "$POLICY_ROOT" "$SEALED" \
-    "$TMP/uki.key" "$TMP/uki.crt" || fail "cannot hand the UKI inputs to the unprivileged builder"
+  # Only what the builder must WRITE or cannot otherwise read changes hands: its
+  # output directory and the 0600 throwaway signing key. The inputs and the pinned
+  # trust policy stay root-owned and world-readable, so the builder cannot rewrite
+  # what it is checked against.
+  chown "$UKI_BUILD_UID:$UKI_BUILD_UID" "$SEALED" "$TMP/uki.key" \
+    || fail "cannot hand the UKI output and key to the unprivileged builder"
   UKI_DROP=(setpriv "--reuid=$UKI_BUILD_UID" "--regid=$UKI_BUILD_UID" --clear-groups --)
   "${UKI_DROP[@]}" test -r "$TMP/uki.key" -a -w "$SEALED" -a -x "$TMP" \
-    || fail "the unprivileged UKI builder cannot reach $TMP (its parent directories must be traversable, mode 0711)"
+    -a -r "$ROOT/image/build-installer-uki.sh" -a -w "${TMPDIR:-/tmp}" \
+    || fail "the unprivileged UKI builder cannot reach its inputs: $TMP and the checkout $ROOT must be traversable and readable, ${TMPDIR:-/tmp} writable (work directory mode 0711)"
 }
 build_uki() { # $1=name  $2=extra kargs  $3...=env overrides
   local name=$1 kargs=$2; shift 2
