@@ -78,6 +78,29 @@ class CollectorInterop(unittest.TestCase):
         self.assertEqual({f["file"] for f in verdict["findings"]}, {"journal-app-excerpts.jsonl"},
                          verdict["findings"])
 
+    def test_lines_the_user_removed_verify_without_a_new_signature(self):
+        """What the client does after the preview: delete whole lines of the excerpts file, nothing else."""
+        import gzip, io, tarfile
+        path, pin, canaries = self.sandbox_bundle(sections={"app_excerpts": True})
+        with tarfile.open(fileobj=io.BytesIO(gzip.decompress(path.read_bytes()))) as tf:
+            infos = {m.name: (m, tf.extractfile(m).read()) for m in tf.getmembers()}
+        name = "journal-app-excerpts.jsonl"
+        lines = infos[name][1].split(b"\n")[:-1]
+        self.assertGreater(len(lines), 2)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as out:
+            for member, data in sorted(infos.values(), key=lambda x: x[0].name):
+                if member.name == name:
+                    data = b"".join(line + b"\n" for i, line in enumerate(lines) if i != 1)
+                member.size = len(data)
+                out.addfile(member, io.BytesIO(data))
+        edited = path.with_name("edited.tar.gz")
+        edited.write_bytes(gzip.compress(buf.getvalue(), 9, mtime=0))
+        proc = run("verify", edited, "--pin-spki-sha256", pin, "--format", "json")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual([c["name"] for c in verdict["checks"] if not c["ok"]], [], verdict["checks"])
+        self.assertEqual(verdict["removed_by_user"], [{"file": name, "position": 1}])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, argv=[sys.argv[0]])

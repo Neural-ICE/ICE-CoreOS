@@ -45,7 +45,7 @@ CANARIES = [CANARY_DOC, CANARY_QUERY, CANARY_LICENCE, CANARY_DEVICE]
 
 SECTIONS = {
     "identity.json": b'{"device_id":"d-0001","hostname":"ni-spark","os_version":"0.50.37"}',
-    "units.json": b'{"neural-ice-license-gate.service":{"ActiveState":"active","NRestarts":0}}',
+    "units.json": b'{"example-gate.service":{"ActiveState":"active","NRestarts":0}}',
     "journal-host.jsonl": (
         b'{"ts":"2026-10-06T10:12:13Z","unit":"neural-ice-ota.service","prio":4,"message":"retry 2/5 after 12:34:56"}\n'
         b'{"ts":"2026-10-06T10:12:14Z","unit":"user@1000.service","prio":3,"message":"nvidia-smi 580.95.05 on 6.17.0-1008-nvidia"}\n'
@@ -93,6 +93,7 @@ def sha(data):
 
 GENERATED_AT = "2026-10-06T12:00:00Z"
 EPOCH = 1791288000  # 2026-10-06T12:00:00Z
+EPOCH_REAL = 1791288000
 
 
 def tar_member(name, data=b"", *, type_=tarfile.REGTYPE, linkname="", mode=0o644, mtime=EPOCH):
@@ -114,6 +115,70 @@ def make_tar(members, fmt=tarfile.USTAR_FORMAT):
 
 def make_gz(raw):
     return gzip.compress(raw, 9, mtime=0)
+
+
+README_NAME, AGE_NAME = "LISEZ-MOI.txt", "diagnostic.tar.gz.age"
+
+
+def envelope_zip(age_bytes, *, members=None, comment=b""):
+    """The client's one .zip: LISEZ-MOI.txt and diagnostic.tar.gz.age, nothing else."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as zf:
+        for name, data in (members if members is not None else
+                           [(README_NAME, b"Fichier chiffre. Rien n'a ete envoye automatiquement.\n"),
+                            (AGE_NAME, age_bytes)]):
+            zf.writestr(name, data)
+        zf.comment = comment
+    return out.getvalue()
+
+
+class _Sink:
+    """A write-only stream: zipfile then writes data descriptors (flag 0x08) after each member."""
+
+    def __init__(self):
+        self.parts = []
+
+    def write(self, data):
+        self.parts.append(bytes(data))
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def value(self):
+        return b"".join(self.parts)
+
+
+def descriptor_zip(age_bytes, readme=b"hello\n"):
+    sink = _Sink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr(README_NAME, readme)
+        zf.writestr(AGE_NAME, age_bytes)
+    return sink.value()
+
+
+def zip_offsets(data):
+    """-> (offset of each central entry's header_offset field, offset of the EOCD)."""
+    eocd = data.rindex(b"PK\x05\x06")
+    start, count = int.from_bytes(data[eocd + 16:eocd + 20], "little"), int.from_bytes(data[eocd + 10:eocd + 12], "little")
+    fields, at = [], start
+    for _ in range(count):
+        fields.append(at + 42)
+        at += 46 + sum(int.from_bytes(data[at + o:at + o + 2], "little") for o in (28, 30, 32))
+    return fields, eocd
+
+
+def splice_zip(data, at, blob):
+    """Insert `blob` at `at` and keep every offset right: the zip stays valid, with bytes nobody accounts for."""
+    fields, eocd = zip_offsets(data)
+    out = bytearray(data[:at] + blob + data[at:])
+    for field in fields:
+        value = int.from_bytes(out[field + len(blob):field + len(blob) + 4], "little")
+        if value >= at:
+            out[field + len(blob):field + len(blob) + 4] = (value + len(blob)).to_bytes(4, "little")
+    cd = eocd + len(blob) + 16
+    out[cd:cd + 4] = (int.from_bytes(out[cd:cd + 4], "little") + len(blob)).to_bytes(4, "little")
+    return bytes(out)
 
 
 class Producer:
@@ -295,7 +360,7 @@ class ValidBundle(ToolTest):
         files = dict(SECTIONS)
         files["journal-host.jsonl"] = (
             b'{"message":"Started getty@tty1.service - Getty on tty1"}\n'
-            b'{"message":"icecore_api::api::health: ready in 12.5 ms (v0.50.37, build 6.17.0-1008-nvidia)"}\n'
+            b'{"message":"example_app::api::health: ready in 12.5 ms (v0.50.37, build 6.17.0-1008-nvidia)"}\n'
             b'{"message":"image sha256:' + b"ab" * 32 + b' pulled; at 10:20:30 and 2026-10-06T10:20:30Z"}\n'
             b'{"message":"std::fmt failed; NI-E03 phase 4/7; nvidia-smi 580.95.05; GB10; unit foo.service failed"}\n'
         )
@@ -509,13 +574,8 @@ class AgeAndZip(ToolTest):
     def encrypt(self, data, recipient=None):
         return subprocess.run(["age", "-r", recipient or self.recipient], input=data, capture_output=True, check=True).stdout
 
-    def zipped(self, age_bytes, name="ni-support-01234567.tar.gz.age", extra=()):
-        out = io.BytesIO()
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as zf:
-            zf.writestr(name, age_bytes)
-            for n, d in extra:
-                zf.writestr(n, d)
-        return out.getvalue()
+    def zipped(self, age_bytes, **kwargs):
+        return envelope_zip(age_bytes, **kwargs)
 
     def test_zip_of_age_decrypts_verifies_and_lists(self):
         data = self.zipped(self.encrypt(self.prod.build()))
@@ -556,10 +616,21 @@ class AgeAndZip(ToolTest):
 
     def test_zip_layout_is_closed(self):
         age_bytes = self.encrypt(self.prod.build())
+        readme = (README_NAME, b"hello\n")
         cases = {
-            "two members": self.zipped(age_bytes, extra=[("notes.txt", b"hi")]),
-            "traversal": self.zipped(age_bytes, name="../x.tar.gz.age"),
-            "wrong extension": self.zipped(age_bytes, name="bundle.tar.gz"),
+            "the age member alone (no LISEZ-MOI.txt)": self.zipped(age_bytes, members=[(AGE_NAME, age_bytes)]),
+            "LISEZ-MOI.txt alone": self.zipped(age_bytes, members=[readme]),
+            "the former single member name": self.zipped(age_bytes, members=[
+                readme, ("ni-support-01234567.tar.gz.age", age_bytes)]),
+            "a third member": self.zipped(age_bytes, members=[readme, (AGE_NAME, age_bytes), ("notes.txt", b"hi")]),
+            "two age members": self.zipped(age_bytes, members=[(AGE_NAME, age_bytes), ("other.tar.gz.age", age_bytes)]),
+            "a duplicated LISEZ-MOI.txt": self.zipped(age_bytes, members=[readme, readme, (AGE_NAME, age_bytes)]),
+            "a duplicated age member": self.zipped(age_bytes, members=[readme, (AGE_NAME, age_bytes), (AGE_NAME, age_bytes)]),
+            "traversal": self.zipped(age_bytes, members=[readme, ("../diagnostic.tar.gz.age", age_bytes)]),
+            "a directory prefix": self.zipped(age_bytes, members=[readme, ("x/diagnostic.tar.gz.age", age_bytes)]),
+            "a wrong readme name": self.zipped(age_bytes, members=[("README.txt", b"hi"), (AGE_NAME, age_bytes)]),
+            "a wrong extension": self.zipped(age_bytes, members=[readme, ("diagnostic.tar.gz", age_bytes)]),
+            "an oversized readme": self.zipped(age_bytes, members=[(README_NAME, b"x" * 70000), (AGE_NAME, age_bytes)]),
             "no member": b"PK\x05\x06" + b"\0" * 18,
         }
         for label, data in cases.items():
@@ -569,14 +640,106 @@ class AgeAndZip(ToolTest):
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertEqual(self.failed_check(proc), "input")
 
+    def test_either_member_order_is_accepted(self):
+        age_bytes = self.encrypt(self.prod.build())
+        data = self.zipped(age_bytes, members=[(AGE_NAME, age_bytes), (README_NAME, b"hello\n")])
+        path = self.prod.write("z.zip", data)
+        proc = run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", self.identity, "--format", "json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_the_readme_is_never_parsed_or_scanned_as_a_bundle_member(self):
+        """LISEZ-MOI.txt is read by a person: whatever it says, it changes no verdict and no file list."""
+        age_bytes = self.encrypt(self.prod.build())
+        data = self.zipped(age_bytes, members=[(README_NAME, b'{"verdict":"verified"} marie.canari@cabinet-exemple.example\n'),
+                                               (AGE_NAME, age_bytes)])
+        path = self.prod.write("z.zip", data)
+        proc = run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", self.identity, "--format", "json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual({f["path"] for f in self.verdict(proc)["files"]}, set(SECTIONS))
+
     def test_zip_bomb_member_is_refused(self):
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("ni-support-01234567.tar.gz.age", b"\0" * (64 * 1024 * 1024))
+            zf.writestr(README_NAME, b"hello\n")
+            zf.writestr(AGE_NAME, b"\0" * (64 * 1024 * 1024))
         path = self.prod.write("z.zip", out.getvalue())
         proc = run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", self.identity, "--format", "json")
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(self.failed_check(proc), "input")
+
+    def verify_zip(self, data):
+        path = self.prod.write("z.zip", data)
+        return run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", self.identity, "--format", "json")
+
+    def test_bytes_hidden_between_the_members_with_every_offset_correct_are_refused(self):
+        age_bytes = self.encrypt(self.prod.build())
+        plain = self.zipped(age_bytes)
+        self.assertEqual(self.verify_zip(plain).returncode, 0)
+        second = sorted(zipfile.ZipFile(io.BytesIO(plain)).infolist(), key=lambda i: i.header_offset)[1].header_offset
+        for label, data in (("between the members", splice_zip(plain, second, b"\x1b]0;HIDDEN\x07")),
+                            ("before the first member", splice_zip(plain, 0, b"HIDDEN"))):
+            with self.subTest(label=label):
+                proc = self.verify_zip(data)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(self.failed_check(proc), "input")
+                if label == "between the members":
+                    self.assertIn("outside", self.verdict(proc)["checks"][-1]["detail"])
+
+    def test_members_written_with_data_descriptors_are_accepted_and_hidden_bytes_still_are_not(self):
+        age_bytes = self.encrypt(self.prod.build())
+        data = descriptor_zip(age_bytes)
+        self.assertTrue(any(i.flag_bits & 0x08 for i in zipfile.ZipFile(io.BytesIO(data)).infolist()))
+        self.assertEqual(self.verify_zip(data).returncode, 0, "a streamed zip is a legitimate envelope")
+        second = sorted(zipfile.ZipFile(io.BytesIO(data)).infolist(), key=lambda i: i.header_offset)[1].header_offset
+        proc = self.verify_zip(splice_zip(data, second, b"HIDDEN"))
+        self.assertEqual((proc.returncode, self.failed_check(proc)), (1, "input"))
+
+    def test_overlapping_members_are_refused(self):
+        age_bytes = self.encrypt(self.prod.build())
+        plain = bytearray(self.zipped(age_bytes))
+        fields, _ = zip_offsets(bytes(plain))
+        plain[fields[1]:fields[1] + 4] = (0).to_bytes(4, "little")  # the second entry claims the first one's bytes
+        proc = self.verify_zip(bytes(plain))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(self.failed_check(proc), "input")
+
+    def test_a_stored_member_whose_compressed_size_exceeds_its_real_size_hides_nothing(self):
+        """Python reads `file_size` bytes and the CRC covers only those: the tail inside the member would be unseen."""
+        age_bytes = self.encrypt(self.prod.build())
+        tail = b"\x1b]0;PWNED\x07 hidden text"
+        for target in (README_NAME, AGE_NAME):
+            with self.subTest(member=target):
+                plain = self.zipped(age_bytes)
+                zf = zipfile.ZipFile(io.BytesIO(plain))
+                info = zf.getinfo(target)
+                end = info.header_offset + 30 + len(info.filename) + int.from_bytes(plain[info.header_offset + 28:info.header_offset + 30], "little") + info.compress_size
+                grown = bytearray(splice_zip(plain, end, tail))
+                # local header and central entry both claim the larger compressed size, the real size stays
+                fields, _ = zip_offsets(bytes(grown))
+                for at in (info.header_offset + 18, [f for f in fields][list(zf.namelist()).index(target)] - 42 + 20):
+                    grown[at:at + 4] = (info.compress_size + len(tail)).to_bytes(4, "little")
+                proc = self.verify_zip(bytes(grown))
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(self.failed_check(proc), "input")
+
+    def test_a_deflated_member_with_bytes_after_its_stream_hides_nothing(self):
+        age_bytes = self.encrypt(self.prod.build())
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(README_NAME, b"hello hello hello hello\n" * 20)
+            zf.writestr(AGE_NAME, age_bytes)
+        plain = out.getvalue()
+        self.assertEqual(self.verify_zip(plain).returncode, 0)
+        zf = zipfile.ZipFile(io.BytesIO(plain))
+        info = zf.getinfo(README_NAME)
+        self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+        end = info.header_offset + 30 + len(info.filename) + int.from_bytes(plain[info.header_offset + 28:info.header_offset + 30], "little") + info.compress_size
+        grown = bytearray(splice_zip(plain, end, b"HIDDEN"))
+        fields, _ = zip_offsets(bytes(grown))
+        for at in (info.header_offset + 18, fields[zf.namelist().index(README_NAME)] - 42 + 20):
+            grown[at:at + 4] = (info.compress_size + 6).to_bytes(4, "little")
+        proc = self.verify_zip(bytes(grown))
+        self.assertEqual((proc.returncode, self.failed_check(proc)), (1, "input"))
 
     def test_nothing_is_written_to_disk_while_verifying(self):
         quiet_tmp, quiet_cwd = self.tmp / "tmpdir", self.tmp / "cwd"
@@ -682,7 +845,7 @@ class CanaryAndDenyList(ToolTest):
         positions = {
             "json value": b'{"detail":"%s"}\n' % CANARY_DOC.encode(),
             "json key": b'{"%s":1}\n' % CANARY_DOC.encode(),
-            "log line": b"Oct 06 12:00:00 icecore-api[1]: opened " + CANARY_DOC.encode() + b" for reading\n",
+            "log line": b"Oct 06 12:00:00 example-app[1]: opened " + CANARY_DOC.encode() + b" for reading\n",
             "argument": b'{"message":"cmd --file=/srv/%s.pdf --verbose"}\n' % CANARY_DOC.encode(),
             "unicode": ('{"message":"%s"}\n' % CANARY_QUERY).encode(),
             "json-escaped": ('{"message":%s}\n' % json.dumps(CANARY_QUERY)).encode(),
@@ -948,21 +1111,18 @@ class ReviewRegressions(ToolTest):
                 proc = self.verify(self.prod.build(), "--canaries", canaries)
                 self.assertEqual(proc.returncode, 3, proc.stdout)
 
-    def test_zip_comment_and_bytes_outside_the_member_are_refused(self):
+    def test_zip_comment_and_bytes_outside_the_members_are_refused(self):
         age_like = b"age-encryption.org/v1\n" + b"x" * 40
-        out = io.BytesIO()
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as zf:
-            zf.writestr("ni-support-01234567.tar.gz.age", age_like)
-            zf.comment = b"alice@cabinet-exemple.example"
-        gap = io.BytesIO()
-        with zipfile.ZipFile(gap, "w", zipfile.ZIP_STORED) as zf:
-            zf.writestr("ni-support-01234567.tar.gz.age", age_like)
-        gapped = gap.getvalue()
-        start = zipfile.ZipFile(io.BytesIO(gapped)).start_dir
-        gapped = gapped[:start] + b"HIDDEN" + gapped[start:]
+        commented = envelope_zip(age_like, comment=b"alice@cabinet-exemple.example")
+        plain = envelope_zip(age_like)
+        start = zipfile.ZipFile(io.BytesIO(plain)).start_dir
+        gapped = plain[:start] + b"HIDDEN" + plain[start:]
+        # bytes between the two members, where no local header or directory entry looks
+        first_end = zipfile.ZipFile(io.BytesIO(plain)).infolist()[1].header_offset
+        between = plain[:first_end] + b"HIDDEN" + plain[first_end:]
         key = self.tmp / "k"
         key.write_text("AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n")
-        for label, data in (("comment", out.getvalue()), ("gap", gapped)):
+        for label, data in (("comment", commented), ("gap", gapped), ("between the members", between)):
             with self.subTest(label=label):
                 path = self.prod.write("z.zip", data)
                 proc = run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", key, "--format", "json")
@@ -1025,6 +1185,319 @@ class Hardening(ToolTest):
         source = TOOL.read_text()
         self.assertIn("/usr/bin/openssl", source)
         self.assertIn("/usr/bin/age", source)
+
+EXCERPTS = "journal-app-excerpts.jsonl"
+REMOVED = "retirée par l'utilisateur"
+
+
+class RealClientExport(ToolTest):
+    """What the REAL client export code (ICE-Client PR #288) makes of the REAL collector's bundle
+    (fixtures/collector-v2). Nothing here is hand-built: see fixtures/client-v2/README.md for the producer."""
+
+    FIXTURE = HERE / "fixtures" / "client-v2"
+    PIN = (HERE / "fixtures" / "collector-v2" / "pin.txt").read_text().split()[0]
+
+    def check(self, name, *extra):
+        return run("verify", self.FIXTURE / name, "--pin-spki-sha256", self.PIN, "--format", "json", *extra)
+
+    def test_the_client_export_without_edits_verifies(self):
+        proc = self.check("client-unedited.tar.gz")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = self.verdict(proc)
+        self.assertEqual(verdict["removed_by_user"], [])
+        self.assertEqual(verdict["unsigned"], ["client.json"])
+        self.assertEqual(verdict["warnings"], [])
+
+    def test_lines_the_user_removed_verify_and_are_reported(self):
+        proc = self.check("client-removed-1-3.tar.gz")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = self.verdict(proc)
+        self.assertEqual(verdict["verdict"], "verified")
+        self.assertEqual(verdict["removed_by_user"], [{"file": EXCERPTS, "position": 1}, {"file": EXCERPTS, "position": 3}])
+        self.assertEqual(verdict["warnings"], [])
+        text = run("verify", self.FIXTURE / "client-removed-1-3.tar.gz", "--pin-spki-sha256", self.PIN)
+        self.assertEqual(text.stdout.count(REMOVED), 2, text.stdout)
+
+    def test_the_report_describes_the_file_as_extracted_and_keeps_the_signed_values_apart(self):
+        verdict = self.verdict(self.check("client-removed-1-3.tar.gz"))
+        entry = {f["path"]: f for f in verdict["files"]}[EXCERPTS]
+        raw = gzip.decompress((self.FIXTURE / "client-removed-1-3.tar.gz").read_bytes())
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            kept = tf.extractfile(EXCERPTS).read()
+        self.assertEqual((entry["size"], entry["sha256"]), (len(kept), sha(kept)))
+        self.assertEqual(entry["removed_lines"], 2)
+        self.assertEqual(entry["signed_size"], 773)
+        self.assertNotEqual(entry["signed_sha256"], entry["sha256"])
+        other = {f["path"]: f for f in verdict["files"]}["identity.json"]
+        self.assertEqual(set(other), {"path", "size", "sha256"}, "files that follow the whole-file rule are reported as before")
+        text = run("verify", self.FIXTURE / "client-removed-1-3.tar.gz", "--pin-spki-sha256", self.PIN).stdout
+        self.assertIn(f"file {EXCERPTS} ({len(kept)} B, 2 of 5 signed lines removed by the user; signed {773} B)", text)
+        # `extract` writes the file the report describes
+        out = self.tmp / "case"
+        proc = run("extract", self.FIXTURE / "client-removed-1-3.tar.gz", "--out", out, "--pin-spki-sha256", self.PIN)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sha((out / EXCERPTS).read_bytes()), entry["sha256"])
+
+    def test_an_unticked_section_is_an_empty_file_that_verifies(self):
+        proc = self.check("client-all-removed.tar.gz")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        verdict = self.verdict(proc)
+        self.assertEqual([r["position"] for r in verdict["removed_by_user"]], [0, 1, 2, 3, 4])
+        shown = run("show", self.FIXTURE / "client-all-removed.tar.gz", EXCERPTS, "--pin-spki-sha256", self.PIN)
+        self.assertEqual((shown.returncode, shown.stdout.strip()), (0, ""), shown.stderr)
+
+    def test_the_client_block_is_unsigned_and_changes_nothing(self):
+        raw = gzip.decompress((self.FIXTURE / "client-removed-1-3.tar.gz").read_bytes())
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            block = json.loads(tf.extractfile("client.json").read())
+        self.assertEqual(block["edits"], {"excerpt_lines_removed": 2, "excerpts_withdrawn": False})
+
+    def test_the_real_envelope_is_accepted_up_to_the_decryption(self):
+        """The real zip holds LISEZ-MOI.txt and the age file: the layer passes, the dropped key cannot open it."""
+        spec = importlib.util.spec_from_file_location("ni_support_verify", TOOL)
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        age_bytes = tool.unzip_envelope((self.FIXTURE / "client-removed-1-3-throwaway-key.zip").read_bytes())
+        self.assertTrue(age_bytes.startswith(b"age-encryption.org/v1\n-> X25519 "))
+        with zipfile.ZipFile(self.FIXTURE / "client-removed-1-3-throwaway-key.zip") as zf:
+            self.assertEqual(sorted(zf.namelist()), ["LISEZ-MOI.txt", "diagnostic.tar.gz.age"])
+            readme = zf.read("LISEZ-MOI.txt").decode("utf-8")
+        self.assertIn("Aucune donnée n'est envoyée automatiquement ; ce fichier chiffré ne contient aucun document, prompt ni transcription.", readme)
+        stranger = self.tmp / "stranger.key"
+        subprocess.run(["age-keygen", "-o", str(stranger)], capture_output=True, check=True)
+        proc = run("verify", self.FIXTURE / "client-removed-1-3-throwaway-key.zip", "--pin-spki-sha256", self.PIN,
+                   "--key", stranger, "--format", "json")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        checks = {c["name"]: c["ok"] for c in self.verdict(proc)["checks"]}
+        self.assertEqual(checks, {"decrypt": False}, "past the zip layer (an envelope refusal would be an `input` failure), stopped at the key")
+
+    def test_what_the_client_may_never_do_is_still_refused_on_real_output(self):
+        """Take the client's real export and do what a hostile or buggy client would: each is refused."""
+        raw = gzip.decompress((self.FIXTURE / "client-removed-1-3.tar.gz").read_bytes())
+        members = {}
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            for info in tf.getmembers():
+                members[info.name] = tf.extractfile(info).read()
+        lines = members[EXCERPTS].split(b"\n")[:-1]
+        cases = {
+            "a kept line reworded": members[EXCERPTS].replace(b"CASE", b"CAse", 1) if b"CASE" in members[EXCERPTS]
+            else members[EXCERPTS].replace(b"ERROR", b"ERRoR", 1),
+            "kept lines reordered": b"".join(line + b"\n" for line in reversed(lines)),
+            "a kept line twice": b"".join(line + b"\n" for line in lines + lines[:1]),
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label):
+                edited = {**members, EXCERPTS: body}
+                gz = make_gz(make_tar([tar_member(n, d, mtime=EPOCH_REAL) for n, d in sorted(edited.items())]))
+                path = self.prod.write("hostile.tar.gz", gz)
+                proc = run("verify", path, "--pin-spki-sha256", self.PIN, "--format", "json")
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertEqual(self.failed_check(proc), "files")
+
+
+class CollectorExcerptLines(ToolTest):
+    """Per-line digests of the opt-in excerpts (collector contract, ICE-Fabric-v2 `config/support-bundle/README.md`,
+    « Excerpts »). The bundle is the REAL host collector's output (fixtures/collector-v2/, made by
+    `config/bin/test-support-bundle.sh`'s own sandbox at ICE-Fabric-v2 5365944, signed by a throwaway key that
+    was destroyed): the editing below is what a client does, deleting whole lines from the file, nothing else."""
+
+    FIXTURE = HERE / "fixtures" / "collector-v2"
+
+    def setUp(self):
+        super().setUp()
+        self.pin = (self.FIXTURE / "pin.txt").read_text().split()[0]
+        raw = gzip.decompress((self.FIXTURE / "collector-excerpts.tar.gz").read_bytes())
+        self.members = {}
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            for info in tf.getmembers():
+                self.members[info.name] = tf.extractfile(info).read()
+        self.lines = self.members[EXCERPTS].split(b"\n")[:-1]
+        self.assertGreaterEqual(len(self.lines), 5)
+
+    def repack(self, excerpts=..., drop=()):
+        members = dict(self.members)
+        if excerpts is not ...:
+            members[EXCERPTS] = excerpts
+        for name in drop:
+            members.pop(name)
+        entries = [tar_member(name, data, mtime=EPOCH_REAL) for name, data in sorted(members.items())]
+        return make_gz(make_tar(entries))
+
+    def keep(self, indexes):
+        return b"".join(self.lines[i] + b"\n" for i in indexes)
+
+    def check(self, gz, *extra):
+        path = self.prod.write("b.tar.gz", gz)
+        return run("verify", path, "--pin-spki-sha256", self.pin, "--format", "json", *extra)
+
+    def assertVerified(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return self.verdict(proc)
+
+    def assertRefusedFiles(self, proc, needle=None):
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        bad = [c for c in self.verdict(proc)["checks"] if not c["ok"]]
+        self.assertEqual([c["name"] for c in bad], ["files"], proc.stdout)
+        if needle:
+            self.assertIn(needle, bad[0]["detail"])
+
+    def test_the_collectors_bundle_as_produced_verifies_and_reports_no_removal(self):
+        verdict = self.assertVerified(self.check(self.repack()))
+        self.assertEqual(verdict["removed_by_user"], [])
+        self.assertEqual(verdict["warnings"], [])
+
+    def test_removed_lines_are_accepted_and_reported_by_position(self):
+        verdict = self.assertVerified(self.check(self.repack(self.keep([0, 2, 3]))))
+        self.assertEqual(verdict["removed_by_user"], [{"file": EXCERPTS, "position": 1}, {"file": EXCERPTS, "position": 4}])
+        self.assertEqual(verdict["verdict"], "verified")
+
+    def test_text_report_says_the_lines_were_removed_by_the_user(self):
+        path = self.prod.write("b.tar.gz", self.repack(self.keep([0, 1, 3, 4])))
+        proc = run("verify", path, "--pin-spki-sha256", self.pin)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(REMOVED, proc.stdout)
+        self.assertEqual(proc.stdout.count(REMOVED), 1)
+
+    def test_every_single_removal_and_the_removal_of_everything_are_accepted(self):
+        for gone in range(len(self.lines)):
+            with self.subTest(removed=gone):
+                kept = [i for i in range(len(self.lines)) if i != gone]
+                verdict = self.assertVerified(self.check(self.repack(self.keep(kept))))
+                self.assertEqual([r["position"] for r in verdict["removed_by_user"]], [gone])
+        verdict = self.assertVerified(self.check(self.repack(b"")))
+        self.assertEqual([r["position"] for r in verdict["removed_by_user"]], list(range(len(self.lines))))
+        self.assertIn(EXCERPTS, [f["path"] for f in verdict["files"]])
+
+    def test_the_signed_manifest_and_signature_are_untouched_by_a_removal(self):
+        edited = gzip.decompress(self.repack(self.keep([1, 2])))
+        with tarfile.open(fileobj=io.BytesIO(edited)) as tf:
+            for name in ("manifest.json", "manifest.sig", "device-root.spki.der"):
+                self.assertEqual(tf.extractfile(name).read(), self.members[name], name)
+
+    def test_the_file_missing_altogether_is_refused(self):
+        self.assertRefusedFiles(self.check(self.repack(drop=(EXCERPTS,))), "missing")
+
+    def test_a_modified_line_is_refused(self):
+        for label, body in (
+                ("one byte", self.keep([0, 1]).replace(b"ERROR", b"ERRoR", 1) + self.keep([2, 3, 4])),
+                ("a rewritten message", self.keep([0, 1, 2, 3, 4]).replace(b"prompt rejected", b"prompt rejecte")),
+                ("a re-serialised line", self.keep([0]).replace(b'"id":0,', b'"id": 0,') + self.keep([1, 2, 3, 4]))):
+            with self.subTest(label=label):
+                self.assertRefusedFiles(self.check(self.repack(body)), "line")
+
+    def test_an_added_line_is_refused(self):
+        forged = b'{"id":9,"level":"ERROR","message":"added","nonce":"' + b"0" * 32 + b'","unit":"example-app.service"}\n'
+        for label, body in (("at the end", self.keep(range(5)) + forged),
+                            ("in the middle", self.keep([0, 1]) + forged + self.keep([2, 3, 4])),
+                            ("an empty line", self.keep([0, 1]) + b"\n" + self.keep([2, 3, 4]))):
+            with self.subTest(label=label):
+                self.assertRefusedFiles(self.check(self.repack(body)), "line")
+
+    def test_a_duplicated_line_is_refused(self):
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 1, 1, 2, 3, 4]))), "order")
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 1, 2, 3, 4, 4]))), "order")
+
+    def test_reordered_lines_are_refused(self):
+        self.assertRefusedFiles(self.check(self.repack(self.keep([1, 0, 2, 3, 4]))), "order")
+        self.assertRefusedFiles(self.check(self.repack(self.keep([4, 3, 2, 1, 0]))), "order")
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 2, 1]))), "order")
+
+    def test_a_missing_final_line_feed_or_a_carriage_return_is_refused(self):
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 1, 2]).rstrip(b"\n"))), "line feed")
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 1, 2]).replace(b"\n", b"\r\n"))), "line")
+
+    def test_a_removal_cannot_be_undone_by_resubstituting_a_removed_line_from_elsewhere(self):
+        """A line copied from another bundle of the same device is not in this bundle's signed list."""
+        other = self.lines[0].replace(b'"id":0', b'"id":0,"x":1')
+        self.assertRefusedFiles(self.check(self.repack(other + b"\n" + self.keep([1, 2]))), "line")
+
+    def test_lines_on_any_other_file_is_refused_as_a_manifest_error(self):
+        self.prod.files = {**SECTIONS}
+        m = self.prod.manifest()
+        m["files"][0]["lines"] = [sha(b"x")]
+        proc = self.verify(self.prod.build(manifest=m))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(self.failed_check(proc), "manifest")
+
+    def producer_with_lines(self, lines=..., body=b"a\nb\nc\n"):
+        self.prod.files = {**SECTIONS, EXCERPTS: body}
+        m = self.prod.manifest()
+        entry = [e for e in m["files"] if e["path"] == EXCERPTS][0]
+        entry["lines"] = [sha(x) for x in body.split(b"\n")[:-1]] if lines is ... else lines
+        return m
+
+    def test_malformed_lines_arrays_are_refused_as_manifest_errors(self):
+        good = [sha(b"a"), sha(b"b"), sha(b"c")]
+        cases = {"not a list": "x", "a string entry that is not hex": ["Z" * 64], "an uppercase digest": [sha(b"a").upper()],
+                 "a short digest": ["ab" * 31], "a number": [1], "a nested list": [good],
+                 "over 1000 entries": [sha(str(i).encode()) for i in range(1001)], "null": None}
+        for label, lines in cases.items():
+            with self.subTest(label=label):
+                m = self.producer_with_lines(lines)
+                self.assertRefusedManifest(self.prod.build(manifest=m))
+
+    def assertRefusedManifest(self, gz):
+        proc = self.verify(gz)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(self.failed_check(proc), "manifest")
+
+    def test_a_repeated_digest_in_the_signed_lines_is_refused_as_ambiguous(self):
+        """The collector's nonce makes every line digest distinct; a repeat would make a removal unattributable."""
+        m = self.producer_with_lines([sha(b"a"), sha(b"a"), sha(b"b")], body=b"a\n")
+        self.assertRefusedManifest(self.prod.build(manifest=m))
+
+    def test_a_producer_made_bundle_follows_the_same_rules(self):
+        m = self.producer_with_lines()
+        self.assertEqual(self.verdict(self.verify(self.prod.build(manifest=m)))["removed_by_user"], [])
+        self.prod.files[EXCERPTS] = b"a\nc\n"
+        proc = self.verify(self.prod.build(manifest=m))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.verdict(proc)["removed_by_user"], [{"file": EXCERPTS, "position": 1}])
+
+    def test_keeping_every_signed_line_requires_the_signed_file_digest_too(self):
+        """Nothing removed: the file is the one the collector produced, so its size and sha256 must agree with `lines`."""
+        m = self.producer_with_lines()
+        entry = [e for e in m["files"] if e["path"] == EXCERPTS][0]
+        entry["sha256"] = sha(b"something else")
+        proc = self.verify(self.prod.build(manifest=m))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(self.failed_check(proc), "files")
+
+    def test_an_excerpts_file_without_lines_in_the_manifest_keeps_the_whole_file_rule(self):
+        """Older producers: no `lines` means size and sha256, as for every other file."""
+        self.prod.files = {**SECTIONS, EXCERPTS: b"a\nb\n"}
+        m = self.prod.manifest()
+        self.assertEqual(self.verify(self.prod.build(manifest=m)).returncode, 0)
+        self.prod.files[EXCERPTS] = b"a\n"
+        proc = self.verify(self.prod.build(manifest=m))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.failed_check(proc), "files")
+
+    def test_the_content_scan_still_reads_the_kept_lines(self):
+        canaries = self.prod.write("canaries.txt", b"Marie Canari\n")
+        proc = self.check(self.repack(self.keep([3])), "--canaries", canaries)
+        self.assertEqual(proc.returncode, 3, proc.stdout)
+        self.assertEqual({f["file"] for f in self.verdict(proc)["findings"]}, {EXCERPTS})
+        proc = self.check(self.repack(self.keep([0, 1, 2, 4])), "--canaries", canaries)
+        self.assertEqual({f["file"] for f in self.verdict(proc)["findings"]} - {EXCERPTS}, set())
+
+    def test_removing_a_line_does_not_hide_the_other_files_from_the_size_and_digest_rule(self):
+        members = dict(self.members)
+        members["identity.json"] = members["identity.json"].replace(b"a", b"b", 1)
+        self.members = members
+        self.assertRefusedFiles(self.check(self.repack(self.keep([1, 2, 3]))), "identity.json")
+
+    def test_a_client_block_never_changes_what_the_manifest_allows(self):
+        """`client.json` may say anything (it is unsigned): a claimed edit of a signed file is not an edit."""
+        claim = json.dumps({"schema": "neural-ice-support-client-v1",
+                            "edits": {"edited_files": [{"path": "identity.json"}], "removed_files": ["units.json"]}}).encode()
+        self.members["client.json"] = claim
+        verdict = self.assertVerified(self.check(self.repack(self.keep([0, 1, 2]))))
+        self.assertEqual(verdict["unsigned"], ["client.json"])
+        self.members["identity.json"] = self.members["identity.json"] + b" "
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 1, 2]))), "identity.json")
+        del self.members["units.json"]
+        self.assertRefusedFiles(self.check(self.repack(self.keep([0, 1, 2]))))
 
 
 if __name__ == "__main__":
