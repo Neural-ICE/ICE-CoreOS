@@ -3804,6 +3804,21 @@ fn read_deployment_origin(
         .map_err(|error| format!("cannot authenticate OSTree deployment origin: {error}"))
 }
 
+/// The `<repository>@<digest>` an origin's `container-image-reference` names,
+/// for the two registry transports a host reaches the appliance by:
+/// `ostree-unverified-registry:` (an installed host, or `bootc switch` without
+/// `--enforce-container-sigpolicy`) and `ostree-image-signed:docker://` (the
+/// engine's `bootc switch --retain --enforce-container-sigpolicy`, as in
+/// ICE-Fabric-v2 `release-engine/src/activation_real.rs`:
+/// ostree-rs-ext's containers-policy source over the registry transport). Any
+/// other source or transport is refused; the caller still compares the returned
+/// reference to the exact `<repository>@<digest>` the authenticated release names.
+fn origin_registry_reference(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("ostree-unverified-registry:")
+        .or_else(|| value.strip_prefix("ostree-image-signed:docker://"))
+}
+
 fn parse_deployment_origin(bytes: &[u8]) -> Result<String, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "OSTree deployment origin is not UTF-8".to_owned())?;
@@ -3838,8 +3853,7 @@ fn parse_deployment_origin(bytes: &[u8]) -> Result<String, String> {
         }
         if section == "origin" && key == "container-image-reference" {
             image = Some(
-                value
-                    .strip_prefix("ostree-unverified-registry:")
+                origin_registry_reference(value)
                     .ok_or_else(|| {
                         "OSTree deployment origin uses an unexpected transport".to_owned()
                     })?
@@ -4752,6 +4766,78 @@ mod tests {
     #[cfg(feature = "test-path-overrides")]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ORIGIN_IMAGE: &str =
+        "registry.example.test/neural-ice/host-appliance@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn origin_with(reference: &str) -> Vec<u8> {
+        format!("[origin]\ncontainer-image-reference={reference}\n").into_bytes()
+    }
+
+    #[test]
+    fn deployment_origin_yields_the_reference_of_either_registry_transport() {
+        // `bootc switch --retain` and an installed host.
+        assert_eq!(
+            parse_deployment_origin(&origin_with(&format!(
+                "ostree-unverified-registry:{ORIGIN_IMAGE}"
+            )))
+            .unwrap(),
+            ORIGIN_IMAGE
+        );
+        // `bootc switch --retain --enforce-container-sigpolicy`: F6 — this was refused
+        // with "uses an unexpected transport".
+        assert_eq!(
+            parse_deployment_origin(&origin_with(&format!(
+                "ostree-image-signed:docker://{ORIGIN_IMAGE}"
+            )))
+            .unwrap(),
+            ORIGIN_IMAGE
+        );
+    }
+
+    #[test]
+    fn deployment_origin_refuses_every_other_source_and_transport() {
+        for reference in [
+            format!("ostree-image-signed:oci:{ORIGIN_IMAGE}"),
+            format!("ostree-image-signed:oci-archive:{ORIGIN_IMAGE}"),
+            format!("ostree-image-signed:containers-storage:{ORIGIN_IMAGE}"),
+            format!("ostree-image-signed:docker:/{ORIGIN_IMAGE}"),
+            format!("ostree-image-signed:docker:{ORIGIN_IMAGE}"),
+            format!("ostree-image-signed:{ORIGIN_IMAGE}"),
+            format!("ostree-image-signed://{ORIGIN_IMAGE}"),
+            format!("ostree-unverified-image:docker://{ORIGIN_IMAGE}"),
+            format!("ostree-remote-image:lab:docker://{ORIGIN_IMAGE}"),
+            format!("ostree-remote-registry:lab:{ORIGIN_IMAGE}"),
+            format!("docker://{ORIGIN_IMAGE}"),
+            ORIGIN_IMAGE.to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(
+                parse_deployment_origin(&origin_with(&reference)).unwrap_err(),
+                "OSTree deployment origin uses an unexpected transport",
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_origin_keeps_its_framing_rules_under_the_signed_transport() {
+        let signed = format!("ostree-image-signed:docker://{ORIGIN_IMAGE}");
+        let doubled = format!(
+            "[origin]\ncontainer-image-reference={signed}\ncontainer-image-reference={signed}\n"
+        );
+        assert!(parse_deployment_origin(doubled.as_bytes())
+            .unwrap_err()
+            .contains("duplicate or malformed key"));
+        let unframed = format!("[origin]\ncontainer-image-reference={signed}");
+        assert!(parse_deployment_origin(unframed.as_bytes())
+            .unwrap_err()
+            .contains("malformed text framing"));
+        // A reference the transport does not carry is no image reference.
+        assert!(parse_deployment_origin(b"[origin]\nrefspec=main\n")
+            .unwrap_err()
+            .contains("lacks its container image reference"));
+    }
 
     fn hex_bytes(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);

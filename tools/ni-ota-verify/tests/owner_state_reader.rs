@@ -3814,11 +3814,15 @@ impl V2Keyed {
     }
 
     fn boot_ref(&self, host: &str, child: &str) {
+        self.boot_origin(&format!("ostree-unverified-registry:{host}"), child);
+    }
+
+    /// Boot with `reference` exactly as `container-image-reference` records it.
+    fn boot_origin(&self, reference: &str, child: &str) {
         fs::remove_file(&self.owner.ostree.origin).unwrap();
         write_mode(
             &self.owner.ostree.origin,
-            format!("[origin]\ncontainer-image-reference=ostree-unverified-registry:{host}\n")
-                .as_bytes(),
+            format!("[origin]\ncontainer-image-reference={reference}\n").as_bytes(),
             0o644,
         );
         fs::write(&self.owner.ostree.metadata, format!("'{child}'\n")).unwrap();
@@ -3873,6 +3877,118 @@ fn v2_lane_accepts_the_host_of_the_signed_current_release() {
     );
     let calls = fs::read_to_string(&keyed.owner.fixture.calls).unwrap();
     assert!(!calls.contains("FORBIDDEN"), "{calls}");
+}
+
+/// The origin `bootc switch --retain --enforce-container-sigpolicy <host@digest>`
+/// writes (the engine's argv in ICE-Fabric-v2 `activation_real.rs`): the containers-policy transport of
+/// ostree-rs-ext, `ostree-image-signed:` + `docker://` + `<repo>@<digest>`.
+fn signed_origin(host: &str) -> String {
+    format!("ostree-image-signed:docker://{host}")
+}
+
+#[test]
+fn v2_lane_accepts_the_host_a_signature_enforcing_switch_booted() {
+    // F6: the engine's switch records the signed transport; the host it booted
+    // is the host of the signed current release all the same.
+    let keyed = install_v2_keyed_owner("v2-t9-signed-transport");
+    keyed.hand_over_successor();
+    keyed.boot_origin(
+        &signed_origin(&format!("{}@{SUCCESSOR_INDEX}", keyed.repository())),
+        SUCCESSOR_CHILD,
+    );
+    let before = observe_tree(&keyed.owner.fixture.state);
+    let output = keyed.owner.run();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, V2_HELD_STATUS);
+    assert!(output.stderr.is_empty());
+    assert_eq!(observe_tree(&keyed.owner.fixture.state), before);
+    assert_eq!(
+        fs::read_dir(&keyed.owner.fixture.scratch).unwrap().count(),
+        0
+    );
+
+    // A rollback to the install host keeps whichever transport it was written with.
+    let install = install_v2_keyed_owner("v2-t9-signed-install-host");
+    let install_host = format!(
+        "{}@{}",
+        install.owner.golden["expected"]["host_repository"]
+            .as_str()
+            .unwrap(),
+        install.owner.golden["inputs"]["host_index_digest"]
+            .as_str()
+            .unwrap()
+    );
+    let child = install.owner.golden["inputs"]["host_manifest_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    install.boot_origin(&signed_origin(&install_host), &child);
+    assert_eq!(install.owner.run().status.code(), Some(0));
+}
+
+#[test]
+fn v2_lane_refuses_a_signed_transport_origin_that_is_not_exactly_the_host() {
+    let transport = "OSTree deployment origin uses an unexpected transport";
+    // `{repo}` is the release's host repository, `{index}` its index digest.
+    let cases = [
+        // Another repository under the signed transport.
+        (
+            "other-repository",
+            "ostree-image-signed:docker://registry.example.invalid/neural-ice-test/host-appliance@{index}",
+            NOT_THE_CURRENT_HOST,
+        ),
+        // A tag where the digest belongs.
+        (
+            "tag",
+            "ostree-image-signed:docker://{repo}:latest",
+            NOT_THE_CURRENT_HOST,
+        ),
+        // The digest of another index.
+        (
+            "other-digest",
+            "ostree-image-signed:docker://{repo}@sha256:9999999999999999999999999999999999999999999999999999999999999999",
+            NOT_THE_CURRENT_HOST,
+        ),
+        // Another image transport behind the signed prefix.
+        ("oci-transport", "ostree-image-signed:oci:{repo}@{index}", transport),
+        (
+            "containers-storage",
+            "ostree-image-signed:containers-storage:{repo}@{index}",
+            transport,
+        ),
+        // The signed prefix without a transport, or with a malformed one.
+        ("no-transport", "ostree-image-signed:{repo}@{index}", transport),
+        (
+            "docker-single-slash",
+            "ostree-image-signed:docker:/{repo}@{index}",
+            transport,
+        ),
+        // The other ostree-rs-ext sources are no source this reader knows.
+        (
+            "unverified-image",
+            "ostree-unverified-image:docker://{repo}@{index}",
+            transport,
+        ),
+        (
+            "remote-image",
+            "ostree-remote-image:lab:docker://{repo}@{index}",
+            transport,
+        ),
+    ];
+    for (name, origin, expected) in cases {
+        let keyed = install_v2_keyed_owner(&format!("v2-t9-signed-{name}"));
+        keyed.hand_over_successor();
+        let origin = origin
+            .replace("{repo}", &keyed.repository())
+            .replace("{index}", SUCCESSOR_INDEX);
+        keyed.boot_origin(&origin, SUCCESSOR_CHILD);
+        keyed.owner.assert_refused(name, expected);
+    }
 }
 
 #[test]
