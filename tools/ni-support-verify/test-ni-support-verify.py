@@ -132,6 +132,55 @@ def envelope_zip(age_bytes, *, members=None, comment=b""):
     return out.getvalue()
 
 
+class _Sink:
+    """A write-only stream: zipfile then writes data descriptors (flag 0x08) after each member."""
+
+    def __init__(self):
+        self.parts = []
+
+    def write(self, data):
+        self.parts.append(bytes(data))
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def value(self):
+        return b"".join(self.parts)
+
+
+def descriptor_zip(age_bytes, readme=b"hello\n"):
+    sink = _Sink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr(README_NAME, readme)
+        zf.writestr(AGE_NAME, age_bytes)
+    return sink.value()
+
+
+def zip_offsets(data):
+    """-> (offset of each central entry's header_offset field, offset of the EOCD)."""
+    eocd = data.rindex(b"PK\x05\x06")
+    start, count = int.from_bytes(data[eocd + 16:eocd + 20], "little"), int.from_bytes(data[eocd + 10:eocd + 12], "little")
+    fields, at = [], start
+    for _ in range(count):
+        fields.append(at + 42)
+        at += 46 + sum(int.from_bytes(data[at + o:at + o + 2], "little") for o in (28, 30, 32))
+    return fields, eocd
+
+
+def splice_zip(data, at, blob):
+    """Insert `blob` at `at` and keep every offset right: the zip stays valid, with bytes nobody accounts for."""
+    fields, eocd = zip_offsets(data)
+    out = bytearray(data[:at] + blob + data[at:])
+    for field in fields:
+        value = int.from_bytes(out[field + len(blob):field + len(blob) + 4], "little")
+        if value >= at:
+            out[field + len(blob):field + len(blob) + 4] = (value + len(blob)).to_bytes(4, "little")
+    cd = eocd + len(blob) + 16
+    out[cd:cd + 4] = (int.from_bytes(out[cd:cd + 4], "little") + len(blob)).to_bytes(4, "little")
+    return bytes(out)
+
+
 class Producer:
     """One bundle, assembled the way the host collector will, with hooks to corrupt it."""
 
@@ -618,6 +667,80 @@ class AgeAndZip(ToolTest):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(self.failed_check(proc), "input")
 
+    def verify_zip(self, data):
+        path = self.prod.write("z.zip", data)
+        return run("verify", path, "--pin-spki-sha256", self.prod.pin, "--key", self.identity, "--format", "json")
+
+    def test_bytes_hidden_between_the_members_with_every_offset_correct_are_refused(self):
+        age_bytes = self.encrypt(self.prod.build())
+        plain = self.zipped(age_bytes)
+        self.assertEqual(self.verify_zip(plain).returncode, 0)
+        second = sorted(zipfile.ZipFile(io.BytesIO(plain)).infolist(), key=lambda i: i.header_offset)[1].header_offset
+        for label, data in (("between the members", splice_zip(plain, second, b"\x1b]0;HIDDEN\x07")),
+                            ("before the first member", splice_zip(plain, 0, b"HIDDEN"))):
+            with self.subTest(label=label):
+                proc = self.verify_zip(data)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(self.failed_check(proc), "input")
+                if label == "between the members":
+                    self.assertIn("outside", self.verdict(proc)["checks"][-1]["detail"])
+
+    def test_members_written_with_data_descriptors_are_accepted_and_hidden_bytes_still_are_not(self):
+        age_bytes = self.encrypt(self.prod.build())
+        data = descriptor_zip(age_bytes)
+        self.assertTrue(any(i.flag_bits & 0x08 for i in zipfile.ZipFile(io.BytesIO(data)).infolist()))
+        self.assertEqual(self.verify_zip(data).returncode, 0, "a streamed zip is a legitimate envelope")
+        second = sorted(zipfile.ZipFile(io.BytesIO(data)).infolist(), key=lambda i: i.header_offset)[1].header_offset
+        proc = self.verify_zip(splice_zip(data, second, b"HIDDEN"))
+        self.assertEqual((proc.returncode, self.failed_check(proc)), (1, "input"))
+
+    def test_overlapping_members_are_refused(self):
+        age_bytes = self.encrypt(self.prod.build())
+        plain = bytearray(self.zipped(age_bytes))
+        fields, _ = zip_offsets(bytes(plain))
+        plain[fields[1]:fields[1] + 4] = (0).to_bytes(4, "little")  # the second entry claims the first one's bytes
+        proc = self.verify_zip(bytes(plain))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(self.failed_check(proc), "input")
+
+    def test_a_stored_member_whose_compressed_size_exceeds_its_real_size_hides_nothing(self):
+        """Python reads `file_size` bytes and the CRC covers only those: the tail inside the member would be unseen."""
+        age_bytes = self.encrypt(self.prod.build())
+        tail = b"\x1b]0;PWNED\x07 hidden text"
+        for target in (README_NAME, AGE_NAME):
+            with self.subTest(member=target):
+                plain = self.zipped(age_bytes)
+                zf = zipfile.ZipFile(io.BytesIO(plain))
+                info = zf.getinfo(target)
+                end = info.header_offset + 30 + len(info.filename) + int.from_bytes(plain[info.header_offset + 28:info.header_offset + 30], "little") + info.compress_size
+                grown = bytearray(splice_zip(plain, end, tail))
+                # local header and central entry both claim the larger compressed size, the real size stays
+                fields, _ = zip_offsets(bytes(grown))
+                for at in (info.header_offset + 18, [f for f in fields][list(zf.namelist()).index(target)] - 42 + 20):
+                    grown[at:at + 4] = (info.compress_size + len(tail)).to_bytes(4, "little")
+                proc = self.verify_zip(bytes(grown))
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(self.failed_check(proc), "input")
+
+    def test_a_deflated_member_with_bytes_after_its_stream_hides_nothing(self):
+        age_bytes = self.encrypt(self.prod.build())
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(README_NAME, b"hello hello hello hello\n" * 20)
+            zf.writestr(AGE_NAME, age_bytes)
+        plain = out.getvalue()
+        self.assertEqual(self.verify_zip(plain).returncode, 0)
+        zf = zipfile.ZipFile(io.BytesIO(plain))
+        info = zf.getinfo(README_NAME)
+        self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+        end = info.header_offset + 30 + len(info.filename) + int.from_bytes(plain[info.header_offset + 28:info.header_offset + 30], "little") + info.compress_size
+        grown = bytearray(splice_zip(plain, end, b"HIDDEN"))
+        fields, _ = zip_offsets(bytes(grown))
+        for at in (info.header_offset + 18, fields[zf.namelist().index(README_NAME)] - 42 + 20):
+            grown[at:at + 4] = (info.compress_size + 6).to_bytes(4, "little")
+        proc = self.verify_zip(bytes(grown))
+        self.assertEqual((proc.returncode, self.failed_check(proc)), (1, "input"))
+
     def test_nothing_is_written_to_disk_while_verifying(self):
         quiet_tmp, quiet_cwd = self.tmp / "tmpdir", self.tmp / "cwd"
         quiet_tmp.mkdir(), quiet_cwd.mkdir()
@@ -1095,6 +1218,26 @@ class RealClientExport(ToolTest):
         text = run("verify", self.FIXTURE / "client-removed-1-3.tar.gz", "--pin-spki-sha256", self.PIN)
         self.assertEqual(text.stdout.count(REMOVED), 2, text.stdout)
 
+    def test_the_report_describes_the_file_as_extracted_and_keeps_the_signed_values_apart(self):
+        verdict = self.verdict(self.check("client-removed-1-3.tar.gz"))
+        entry = {f["path"]: f for f in verdict["files"]}[EXCERPTS]
+        raw = gzip.decompress((self.FIXTURE / "client-removed-1-3.tar.gz").read_bytes())
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            kept = tf.extractfile(EXCERPTS).read()
+        self.assertEqual((entry["size"], entry["sha256"]), (len(kept), sha(kept)))
+        self.assertEqual(entry["removed_lines"], 2)
+        self.assertEqual(entry["signed_size"], 773)
+        self.assertNotEqual(entry["signed_sha256"], entry["sha256"])
+        other = {f["path"]: f for f in verdict["files"]}["identity.json"]
+        self.assertEqual(set(other), {"path", "size", "sha256"}, "files that follow the whole-file rule are reported as before")
+        text = run("verify", self.FIXTURE / "client-removed-1-3.tar.gz", "--pin-spki-sha256", self.PIN).stdout
+        self.assertIn(f"file {EXCERPTS} ({len(kept)} B, 2 of 5 signed lines removed by the user; signed {773} B)", text)
+        # `extract` writes the file the report describes
+        out = self.tmp / "case"
+        proc = run("extract", self.FIXTURE / "client-removed-1-3.tar.gz", "--out", out, "--pin-spki-sha256", self.PIN)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sha((out / EXCERPTS).read_bytes()), entry["sha256"])
+
     def test_an_unticked_section_is_an_empty_file_that_verifies(self):
         proc = self.check("client-all-removed.tar.gz")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -1297,6 +1440,11 @@ class CollectorExcerptLines(ToolTest):
         proc = self.verify(gz)
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertEqual(self.failed_check(proc), "manifest")
+
+    def test_a_repeated_digest_in_the_signed_lines_is_refused_as_ambiguous(self):
+        """The collector's nonce makes every line digest distinct; a repeat would make a removal unattributable."""
+        m = self.producer_with_lines([sha(b"a"), sha(b"a"), sha(b"b")], body=b"a\n")
+        self.assertRefusedManifest(self.prod.build(manifest=m))
 
     def test_a_producer_made_bundle_follows_the_same_rules(self):
         m = self.producer_with_lines()

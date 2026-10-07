@@ -243,8 +243,28 @@ def unzip_envelope(data):
                 raise Refusal("input", f"a zip member is unreadable: {one_line(str(exc))}")
             if len(content) > limit or len(content) != info.file_size:
                 raise Refusal("input", f"{info.filename} does not match its declared size")
+            check_member_stream(data, info, limit)
             contents[info.filename] = content
         return contents[AGE_MEMBER]
+
+
+def check_member_stream(data, info, limit):
+    """The compressed bytes of a member are exactly its content: nothing rides after a stored member's
+    `file_size` bytes or after the end of a deflate stream (the CRC and `zipfile` only look at the content)."""
+    start = info.header_offset + 30 + len(info.filename.encode("utf-8")) \
+        + int.from_bytes(data[info.header_offset + 28:info.header_offset + 30], "little")
+    raw = data[start:start + info.compress_size]
+    if info.compress_type == zipfile.ZIP_STORED:
+        if info.compress_size != info.file_size:
+            raise Refusal("input", f"{info.filename} holds bytes beyond its declared size")
+        return
+    inflater = zlib.decompressobj(-15)
+    try:
+        inflater.decompress(raw, limit + 1)
+    except zlib.error as exc:
+        raise Refusal("input", f"{info.filename} is not a clean deflate stream: {one_line(str(exc))}")
+    if not inflater.eof or inflater.unused_data:
+        raise Refusal("input", f"{info.filename} holds bytes after its deflate stream")
 
 
 def check_zip_layout(data, zf, infos):
@@ -548,6 +568,8 @@ def validate_manifest(m):
             if not isinstance(lines, list) or len(lines) > MAX_LINES or \
                     not all(isinstance(x, str) and HEX64.fullmatch(x) for x in lines):
                 refuse(f"the line digests of {EXCERPTS} are not a list of at most {MAX_LINES} sha256 values")
+            if len(set(lines)) != len(lines):
+                refuse(f"the line digests of {EXCERPTS} repeat one: a removal could not be attributed")
             listed[path]["lines"] = lines
     return stamp, listed
 
@@ -878,7 +900,7 @@ def analyse(args):
         ok(checks, "spki_binding", "manifest key == signing key")
         removed = cross_check_files(members, listed)
         ok(checks, "files", "sizes and sha256 match, nothing unlisted"
-           + (f", {len(removed)} excerpt line(s) removed by the user" if removed else ""))
+           + (f"; the excerpts follow the per-line rules, {len(removed)} line(s) removed by the user" if removed else ""))
     except Refusal as refusal:
         checks.append({"name": refusal.check, "ok": False, "detail": refusal.detail})
         result["verdict"] = "refused"
@@ -895,8 +917,19 @@ def analyse(args):
         "bundle_id", "case_id", "generated_at", "time_source", "boot_id", "collector_version",
         "device_root_spki_sha256", "sections", "dropped", "truncated", "redaction")})
     result["bundle"].update({"archive_bytes": len(gz), "expanded_bytes": len(raw)})
-    result["files"] = [
-        {"path": e["path"], "size": e["size"], "sha256": e["sha256"]} for e in listed.values()]
+    result["files"] = []
+    for e in listed.values():
+        entry = {"path": e["path"], "size": e["size"], "sha256": e["sha256"]}
+        gone = sum(1 for name, _ in removed if name == e["path"])
+        if "lines" in e:
+            entry["removed_lines"] = gone
+            entry["signed_lines"] = len(e["lines"])
+        if gone:
+            # What `show` and `extract` give is the file the user kept, not the one the host signed.
+            kept = members[e["path"]][0]
+            entry.update({"signed_size": e["size"], "signed_sha256": e["sha256"],
+                          "size": len(kept), "sha256": sha256_hex(kept)})
+        result["files"].append(entry)
     result["unsigned"] = [n for n in UNSIGNED if n in members]
     result["removed_by_user"] = [{"file": name, "position": position} for name, position in removed]
 
@@ -921,7 +954,11 @@ def render_text(result):
         if key in bundle:
             lines.append(f"  {key}: {bundle[key]}")
     for entry in result["files"]:
-        lines.append(f"  file {entry['path']} ({entry['size']} B)")
+        if entry.get("removed_lines"):
+            lines.append(f"  file {entry['path']} ({entry['size']} B, {entry['removed_lines']} of {entry['signed_lines']} "
+                         f"signed lines removed by the user; signed {entry['signed_size']} B)")
+        else:
+            lines.append(f"  file {entry['path']} ({entry['size']} B)")
     for name in result["unsigned"]:
         lines.append(f"  file {name} (UNSIGNED, produced by the client)")
     for removal in result["removed_by_user"]:

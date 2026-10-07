@@ -48,7 +48,8 @@ nothing after it, ≤ 24 MiB + framing) · `tar` · `envelope` · `spki` · `pin
   end-of-archive marker. The gzip header carries no name, comment, extra or CRC field. Members are
   read in memory; nothing is extracted by `tarfile`.
 * **`input`**: the client's zip holds exactly `LISEZ-MOI.txt` and `diagnostic.tar.gz.age` (either order),
-  once each, no path, no comment, no bytes outside the two members and the directory, each within its bound
+  once each, no path, no comment, no byte outside the two members and the directory (a stored member holds exactly its
+  content, a deflated one ends with its stream: nothing rides in the slack), each within its bound
   (README 64 KiB; the decrypted archive is capped at 8 MiB). `LISEZ-MOI.txt` is read by a person: it is never
   parsed, scanned or trusted, and it changes no verdict. `--require-encrypted` refuses a plain `.tar.gz`.
 * **`signature`**: ECDSA P-256 / SHA-256, DER, over `"neural-ice-support-bundle-v1" ‖ 0x00 ‖
@@ -68,7 +69,9 @@ nothing after it, ≤ 24 MiB + framing) · `tar` · `envelope` · `spki` · `pin
   strictly increasing order. A modified, added, duplicated or reordered line is refused. A signed line
   that is absent is **accepted** and reported, in `removed_by_user` and in the text output, as
   « retirée par l'utilisateur » with its position in `lines` (a hash does not give the id back). Nothing is
-  signed again: manifest and signature stay as the host produced them. When no line is removed the file must
+  signed again: manifest and signature stay as the host produced them. In the verdict's `files`, such a file is reported as
+  extracted (its real `size` and `sha256`, what `show` and `extract` give) with `removed_lines`, `signed_lines`, `signed_size`
+  and `signed_sha256`; a repeated digest in `lines` is a `manifest` refusal. When no line is removed the file must
   equal the signed size and sha256. Without `lines` in the entry, the whole-file rule applies as to any file.
 
 Deviations that carry no trust decision (tar uid/gid/mode/mtime, a gzip timestamp, a manifest not in
