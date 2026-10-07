@@ -153,9 +153,32 @@ for value in "$ROOT_HASH" "$PAYLOAD_DIGEST"; do
   [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "the payload manifest carries a malformed digest"
 done
 
+# 🔴 THE UKI BUILDER REFUSES A TOOL OVERRIDE IN A PRIVILEGED PROCESS, and this
+# fixture drives it through NI_UKI_TEST_TOOLS. The guard is a security control and
+# stays as it is. A caller that needs root for its own loop-device and mount work
+# (image/test-verify-preloaded-media.sh) therefore builds each UKI as the
+# unprivileged `nobody` identity: the builder only reads $IN, the policy, the
+# throwaway key and the payload manifest, and only writes into $SEALED.
+UKI_BUILD_UID=65534
+UKI_DROP=() # the privilege-drop prefix; empty when the caller is already unprivileged
+uki_build_identity() {
+  UKI_DROP=()
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || return 0
+  command -v setpriv >/dev/null 2>&1 \
+    || fail "a privileged caller needs setpriv to build the UKI unprivileged"
+  # The throwaway material is root-owned (the signing key is 0600) and the caller's
+  # work directory is root-private: hand the builder's inputs and output to the
+  # unprivileged identity, and refuse loudly if it still cannot reach them.
+  chown -R "$UKI_BUILD_UID:$UKI_BUILD_UID" "$IN" "$TOOLS" "$POLICY_ROOT" "$SEALED" \
+    "$TMP/uki.key" "$TMP/uki.crt" || fail "cannot hand the UKI inputs to the unprivileged builder"
+  UKI_DROP=(setpriv "--reuid=$UKI_BUILD_UID" "--regid=$UKI_BUILD_UID" --clear-groups --)
+  "${UKI_DROP[@]}" test -r "$TMP/uki.key" -a -w "$SEALED" -a -x "$TMP" \
+    || fail "the unprivileged UKI builder cannot reach $TMP (its parent directories must be traversable, mode 0711)"
+}
 build_uki() { # $1=name  $2=extra kargs  $3...=env overrides
   local name=$1 kargs=$2; shift 2
-  env KERNEL="$IN/vmlinuz" INITRD="$IN/initrd" STUB="$IN/stub.efi" OSREL="$IN/os-release" \
+  uki_build_identity
+  "${UKI_DROP[@]}" env KERNEL="$IN/vmlinuz" INITRD="$IN/initrd" STUB="$IN/stub.efi" OSREL="$IN/os-release" \
     ROOT_VERITY_HASH="$ROOT_HASH" PAYLOAD_DIGEST="$PAYLOAD_DIGEST" \
     VARIANT=sealed-lab HARDWARE_TARGET=nvidia-gb10-arm64 \
     HARDWARE_IDENTITY_FILE="$IN/gb10.fingerprints" \
