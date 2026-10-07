@@ -15,3 +15,7 @@ PR #288), run by its ignored test `export_for_the_cross_repository_proof`:
 | `client-removed-1-3-throwaway-key.zip` | same as the removed case, in the client's envelope (`LISEZ-MOI.txt` + `diagnostic.tar.gz.age`), sealed to an age key generated and dropped by the producer: it cannot be decrypted, by design; it proves the envelope layer |
 
 The manifest and signature in every file are the collector's, untouched.
+
+These four files were regenerated from the neutral `collector-v2` bundle with the same producer (ICE-Client
+`e2de94b`, PR #288): run on the previous collector bundle, that producer reproduced the previous
+`client-removed-1-3.tar.gz` byte for byte, so only the collector input changed.

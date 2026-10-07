@@ -152,7 +152,8 @@ NEURAL_ICE_FABRIC_V2_ROOT=/path/to/ICE-Fabric-v2 python3 -I tools/ni-support-ver
 
 Bundles are built per run by a producer independent of the tool; the signing and age keys are
 generated per run, nothing secret is committed, every planted « customer » string is synthetic.
-`fixtures/golden-v1/` is one bundle signed once by a throwaway key whose private half was destroyed.
+`fixtures/golden-v1/` is one bundle signed once by a throwaway key whose private half was destroyed;
+it is the test producer's default sections, regenerated with neutral unit names (no product unit is named here).
 
 ## Not covered here
 

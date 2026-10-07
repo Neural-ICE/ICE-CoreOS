@@ -45,7 +45,7 @@ CANARIES = [CANARY_DOC, CANARY_QUERY, CANARY_LICENCE, CANARY_DEVICE]
 
 SECTIONS = {
     "identity.json": b'{"device_id":"d-0001","hostname":"ni-spark","os_version":"0.50.37"}',
-    "units.json": b'{"neural-ice-license-gate.service":{"ActiveState":"active","NRestarts":0}}',
+    "units.json": b'{"example-gate.service":{"ActiveState":"active","NRestarts":0}}',
     "journal-host.jsonl": (
         b'{"ts":"2026-10-06T10:12:13Z","unit":"neural-ice-ota.service","prio":4,"message":"retry 2/5 after 12:34:56"}\n'
         b'{"ts":"2026-10-06T10:12:14Z","unit":"user@1000.service","prio":3,"message":"nvidia-smi 580.95.05 on 6.17.0-1008-nvidia"}\n'
@@ -360,7 +360,7 @@ class ValidBundle(ToolTest):
         files = dict(SECTIONS)
         files["journal-host.jsonl"] = (
             b'{"message":"Started getty@tty1.service - Getty on tty1"}\n'
-            b'{"message":"icecore_api::api::health: ready in 12.5 ms (v0.50.37, build 6.17.0-1008-nvidia)"}\n'
+            b'{"message":"example_app::api::health: ready in 12.5 ms (v0.50.37, build 6.17.0-1008-nvidia)"}\n'
             b'{"message":"image sha256:' + b"ab" * 32 + b' pulled; at 10:20:30 and 2026-10-06T10:20:30Z"}\n'
             b'{"message":"std::fmt failed; NI-E03 phase 4/7; nvidia-smi 580.95.05; GB10; unit foo.service failed"}\n'
         )
@@ -845,7 +845,7 @@ class CanaryAndDenyList(ToolTest):
         positions = {
             "json value": b'{"detail":"%s"}\n' % CANARY_DOC.encode(),
             "json key": b'{"%s":1}\n' % CANARY_DOC.encode(),
-            "log line": b"Oct 06 12:00:00 icecore-api[1]: opened " + CANARY_DOC.encode() + b" for reading\n",
+            "log line": b"Oct 06 12:00:00 example-app[1]: opened " + CANARY_DOC.encode() + b" for reading\n",
             "argument": b'{"message":"cmd --file=/srv/%s.pdf --verbose"}\n' % CANARY_DOC.encode(),
             "unicode": ('{"message":"%s"}\n' % CANARY_QUERY).encode(),
             "json-escaped": ('{"message":%s}\n' % json.dumps(CANARY_QUERY)).encode(),
@@ -1386,7 +1386,7 @@ class CollectorExcerptLines(ToolTest):
                 self.assertRefusedFiles(self.check(self.repack(body)), "line")
 
     def test_an_added_line_is_refused(self):
-        forged = b'{"id":9,"level":"ERROR","message":"added","nonce":"' + b"0" * 32 + b'","unit":"icecore-api.service"}\n'
+        forged = b'{"id":9,"level":"ERROR","message":"added","nonce":"' + b"0" * 32 + b'","unit":"example-app.service"}\n'
         for label, body in (("at the end", self.keep(range(5)) + forged),
                             ("in the middle", self.keep([0, 1]) + forged + self.keep([2, 3, 4])),
                             ("an empty line", self.keep([0, 1]) + b"\n" + self.keep([2, 3, 4]))):
