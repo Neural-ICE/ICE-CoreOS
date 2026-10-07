@@ -935,8 +935,8 @@ done
 # That used to kill the script under `set -e` (seq 5 rehearsal: "printf: write
 # error: Input/output error", unit failed at every boot, even with a working
 # console). A real pty whose master is closed is the same EIO. The screen must
-# survive it: exit 0, reopen tty1 and keep drawing, and stop once the owner is
-# active.
+# survive it: drop the frames, exit 0 without a write error on stderr, and stop
+# once the owner is active.
 command -v python3 >/dev/null 2>&1 || fail "python3 is required to hang up a pty under the screen"
 cat > "$TOOLS/hangup-run.py" <<'PY'
 import os, pty, subprocess, sys
@@ -961,7 +961,7 @@ sys.exit(rc)
 PY
 make_v2_fixture; v2_ready_scene
 set_state "$CMP" loaded activating start
-rm -f "$FX/gate.fifo" "$FX/gate-counter" "$FX/flip-counter" "$FX/root/dev/tty1"; mkfifo "$FX/gate.fifo"
+rm -f "$FX/gate.fifo" "$FX/gate-counter" "$FX/flip-counter"; mkfifo "$FX/gate.fifo"
 set +e
 hangup_err="$(env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" NI_STATUS_TEST_SYSTEMCTL="$TOOLS/systemctl" \
   NI_STATUS_TEST_IP="$TOOLS/ip" NI_STATUS_TEST_ITERATIONS=3 NI_STATUS_TEST_INTERVAL=0 NI_STATUS_READY_LINGER=60 \
@@ -972,10 +972,9 @@ hangup_rc=$?
 set -e
 [[ -s $FX/first-frame ]] || fail "4k: the screen drew nothing on the live tty"
 [[ $hangup_rc -eq 0 ]] || fail "4k: a tty1 hung up under the screen made it exit $hangup_rc instead of surviving: $hangup_err"
-[[ "$(grep -c 'NEURAL ICE   Neural ICE' "$FX/root/dev/tty1" || true)" -ge 1 ]] \
-  || fail "4k: after the hang-up the screen must reopen tty1 and keep drawing"
-# ...and an owner that turns active after the hang-up still ends the screen without drawing again
-rm -f "$FX/root/dev/tty1" "$FX/gate-counter" "$FX/flip-counter"; rm -f "$FX/gate.fifo"; mkfifo "$FX/gate.fifo"
+[[ -z $hangup_err ]] || fail "4k: a dead tty1 must not be reported on stderr (the unit log): $hangup_err"
+# ...and an owner that turns active after the hang-up ends the screen at once
+rm -f "$FX/gate-counter" "$FX/flip-counter" "$FX/gate.fifo"; mkfifo "$FX/gate.fifo"
 set_state "$CMP" loaded activating start
 set +e
 env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" NI_STATUS_TEST_SYSTEMCTL="$TOOLS/systemctl" \
@@ -987,6 +986,5 @@ env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" NI_STATUS_TEST_SYS
 hangup_rc=$?
 set -e
 [[ $hangup_rc -eq 0 ]] || fail "4k: owner active after the hang-up: the screen must exit 0, got $hangup_rc"
-[[ ! -s $FX/root/dev/tty1 ]] || fail "4k: once the owner is active nothing may be drawn on the reopened tty1: $(cat "$FX/root/dev/tty1")"
 
 echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, open-core boundary, 13 v1 behaviour scenes, declared-product scenes, tty1 owners, tty1 hung up under the screen, malformed-declaration refusals)"

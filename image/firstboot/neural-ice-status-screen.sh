@@ -526,17 +526,14 @@ ESC=$'\033'
 # sees it `active`: our descriptor is then dead and writes fail with EIO. Under
 # `set -e` that used to end the script with status 1 and fail the unit at every
 # boot of a v2 host, with a working console (seq 5 rehearsal, 07.10.2026). A
-# dead descriptor is not a failure of the screen: reopen tty1 once and write
-# again; if that fails too, the frame is dropped and the next iteration retries.
-# The reopened tty1 also shows the status again should the compositor crash-loop,
-# instead of a black screen.
-reopen_tty() { { exec 1>>"$(path /dev/tty1)"; } 2>/dev/null; }
+# dead descriptor is not a failure of the screen: the frame is dropped, and the
+# loop ends as before once the declared owner is active (or at READY + linger).
+# The screen is NOT redrawn on a reopened tty1: the compositor's session owns the
+# device node (mode 0620, its uid) and this unit holds no capability, so a reopen
+# would only succeed where it must not draw.
 tty_out() { # <printf format> [args]
   # shellcheck disable=SC2059 # the callers pass the format
-  printf "$@" 2>/dev/null && return 0
-  # shellcheck disable=SC2059
-  reopen_tty && printf "$@" 2>/dev/null
-  return 0
+  printf "$@" 2>/dev/null || true
 }
 cursor_hide() { tty_out '%s[?25l' "$ESC"; }
 cursor_show() { tty_out '%s[?25h' "$ESC"; }
