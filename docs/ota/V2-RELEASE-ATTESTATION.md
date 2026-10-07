@@ -416,7 +416,16 @@ The booted deployment (`repository@index digest`, plus the platform manifest dig
    * `hardware_target` is the receipt's, and the host repository is under the receipt's
      release authority;
    * the booted `origin` is `<manifest host.repository>@<manifest host.digest>`, and the
-     platform manifest digest is `sha256:<64 lowercase hex>`.
+     platform manifest digest is `sha256:<64 lowercase hex>`. The origin's
+     `container-image-reference` carries that reference behind exactly one of two
+     transports: `ostree-unverified-registry:` (an installed host; `bootc switch` without
+     `--enforce-container-sigpolicy`) or `ostree-image-signed:docker://` (the engine's
+     `bootc switch --retain --enforce-container-sigpolicy`, the argv of ICE-Fabric-v2
+     `release-engine/src/activation_real.rs`). Any other
+     source or transport (`ostree-unverified-image:`, `ostree-remote-*`, `oci:`,
+     `containers-storage:`, a bare reference) is refused as `uses an unexpected
+     transport`; a tag, another repository or another digest behind either transport is
+     refused as not the host of the signed current release.
 
    An origin equal to the install host's keeps its install platform child: the current
    release cannot re-pick it.
