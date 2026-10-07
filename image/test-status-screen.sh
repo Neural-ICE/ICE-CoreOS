@@ -228,6 +228,14 @@ if [[ -n ${NI_TEST_FLIP_UNIT:-} && $unit == "$NI_TEST_FLIP_UNIT" ]]; then
     printf 'LoadState=loaded\nActiveState=active\nSubState=running\nConditionTimestampMonotonic=0\nConditionResult=yes\n'; exit 0
   fi
 fi
+# Optional gate: the Nth query of NI_TEST_GATE_UNIT blocks until the test harness
+# opens and closes NI_TEST_GATE_FIFO, so a test can act between two iterations
+# without sleeping to wait for a state.
+if [[ -n ${NI_TEST_GATE_UNIT:-} && $unit == "$NI_TEST_GATE_UNIT" ]]; then
+  n=0; [[ -f $NI_TEST_GATE_COUNTER ]] && n=$(<"$NI_TEST_GATE_COUNTER")
+  n=$((n + 1)); printf '%s' "$n" > "$NI_TEST_GATE_COUNTER"
+  if (( n == NI_TEST_GATE_AT )); then cat "$NI_TEST_GATE_FIFO" > /dev/null; fi
+fi
 state=$(awk -v u="$unit" '$1 == u { $1 = ""; print; exit }' "$NI_TEST_SCENE")
 if [[ -z $state ]]; then
   printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nConditionTimestampMonotonic=0\nConditionResult=no\n'; exit 0
@@ -921,4 +929,64 @@ for k in version images_units images_manifest images_component_key images_digest
   grep -qE "^      $k\)" "$SCRIPT" || fail "declaration key $k is not parsed"
 done
 
-echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, open-core boundary, 13 v1 behaviour scenes, declared-product scenes, tty1 owners, malformed-declaration refusals)"
+# 4k. tty1 hung up under the screen. A compositor that takes tty1 hangs it up
+# (TTYVHangup=yes) while it is still `activating`, before the screen sees it
+# `active`: the screen's descriptor is then dead and every write fails with EIO.
+# That used to kill the script under `set -e` (seq 5 rehearsal: "printf: write
+# error: Input/output error", unit failed at every boot, even with a working
+# console). A real pty whose master is closed is the same EIO. The screen must
+# survive it: exit 0, reopen tty1 and keep drawing, and stop once the owner is
+# active.
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to hang up a pty under the screen"
+cat > "$TOOLS/hangup-run.py" <<'PY'
+import os, pty, subprocess, sys
+script, fifo, shown = sys.argv[1], sys.argv[2], sys.argv[3]
+master, slave = pty.openpty()
+proc = subprocess.Popen(["bash", script], stdout=slave, stderr=subprocess.PIPE, env=os.environ.copy())
+os.close(slave)
+seen = b""
+while b"READY" not in seen:                  # the first frame, drawn on the live tty
+    chunk = os.read(master, 65536)
+    if not chunk:
+        break
+    seen += chunk
+os.close(master)                             # hang up: every later write on the slave is EIO
+with open(fifo, "w"):                        # release the gate: iteration 2 starts now
+    pass
+err = proc.stderr.read().decode()
+rc = proc.wait()
+open(shown, "wb").write(seen)
+sys.stderr.write(err)
+sys.exit(rc)
+PY
+make_v2_fixture; v2_ready_scene
+set_state "$CMP" loaded activating start
+rm -f "$FX/gate.fifo" "$FX/gate-counter" "$FX/flip-counter" "$FX/root/dev/tty1"; mkfifo "$FX/gate.fifo"
+set +e
+hangup_err="$(env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" NI_STATUS_TEST_SYSTEMCTL="$TOOLS/systemctl" \
+  NI_STATUS_TEST_IP="$TOOLS/ip" NI_STATUS_TEST_ITERATIONS=3 NI_STATUS_TEST_INTERVAL=0 NI_STATUS_READY_LINGER=60 \
+  NI_TEST_SCENE="$FX/scene" NI_TEST_IPV4="$FX/ipv4" NI_TEST_FLIP_COUNTER="$FX/flip-counter" \
+  NI_TEST_GATE_UNIT=$CMP NI_TEST_GATE_AT=3 NI_TEST_GATE_COUNTER="$FX/gate-counter" NI_TEST_GATE_FIFO="$FX/gate.fifo" \
+  python3 "$TOOLS/hangup-run.py" "$SCRIPT" "$FX/gate.fifo" "$FX/first-frame" 2>&1 >/dev/null)"
+hangup_rc=$?
+set -e
+[[ -s $FX/first-frame ]] || fail "4k: the screen drew nothing on the live tty"
+[[ $hangup_rc -eq 0 ]] || fail "4k: a tty1 hung up under the screen made it exit $hangup_rc instead of surviving: $hangup_err"
+[[ "$(grep -c 'NEURAL ICE   Neural ICE' "$FX/root/dev/tty1" || true)" -ge 1 ]] \
+  || fail "4k: after the hang-up the screen must reopen tty1 and keep drawing"
+# ...and an owner that turns active after the hang-up still ends the screen without drawing again
+rm -f "$FX/root/dev/tty1" "$FX/gate-counter" "$FX/flip-counter"; rm -f "$FX/gate.fifo"; mkfifo "$FX/gate.fifo"
+set_state "$CMP" loaded activating start
+set +e
+env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" NI_STATUS_TEST_SYSTEMCTL="$TOOLS/systemctl" \
+  NI_STATUS_TEST_IP="$TOOLS/ip" NI_STATUS_TEST_ITERATIONS=3 NI_STATUS_TEST_INTERVAL=0 NI_STATUS_READY_LINGER=60 \
+  NI_TEST_SCENE="$FX/scene" NI_TEST_IPV4="$FX/ipv4" NI_TEST_FLIP_COUNTER="$FX/flip-counter" \
+  NI_TEST_FLIP_UNIT=$CMP NI_TEST_FLIP_AFTER=4 \
+  NI_TEST_GATE_UNIT=$CMP NI_TEST_GATE_AT=3 NI_TEST_GATE_COUNTER="$FX/gate-counter" NI_TEST_GATE_FIFO="$FX/gate.fifo" \
+  python3 "$TOOLS/hangup-run.py" "$SCRIPT" "$FX/gate.fifo" "$FX/first-frame" >/dev/null 2>&1
+hangup_rc=$?
+set -e
+[[ $hangup_rc -eq 0 ]] || fail "4k: owner active after the hang-up: the screen must exit 0, got $hangup_rc"
+[[ ! -s $FX/root/dev/tty1 ]] || fail "4k: once the owner is active nothing may be drawn on the reopened tty1: $(cat "$FX/root/dev/tty1")"
+
+echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, open-core boundary, 13 v1 behaviour scenes, declared-product scenes, tty1 owners, tty1 hung up under the screen, malformed-declaration refusals)"
