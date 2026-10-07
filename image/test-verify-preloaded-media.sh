@@ -56,10 +56,11 @@ python3 "$ROOT/image/seed-tree-manifest.py" \
 
 # The gate binds the medium to the signed release authority (cad2366, #120) and
 # requires both identities. The fixture supplies its own: the closure identity is
-# the seed-tree manifest hash, the manifest identity is that of a release manifest
+# a fixed digest distinct from the seed-tree manifest hash (so a mix-up in the
+# receipt is visible), the manifest identity is that of a release manifest
 # file the fixture writes. The receipt must record exactly these values.
 printf '{"schema":"neural-ice-release-manifest-fixture"}\n' > "$work/release-manifest.json"
-release_closure_sha256="$(sha256sum "$work/expected.json" | cut -d' ' -f1)"
+release_closure_sha256="$(printf 'release-closure-fixture' | sha256sum | cut -d' ' -f1)"
 release_manifest_sha256="$(sha256sum "$work/release-manifest.json" | cut -d' ' -f1)"
 release_args=(
   --release-closure-sha256 "$release_closure_sha256"
@@ -385,6 +386,7 @@ python3 "$ROOT/image/seed-tree-manifest.py" \
 if python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/missing-payload.json" \
+  "${release_args[@]}" \
   --artifact "$work/root-injection.img.zst" \
   --artifact-checksum "$work/root-injection.img.zst.sha256" \
   --compression zstd-fast \
