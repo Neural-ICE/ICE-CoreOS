@@ -54,6 +54,18 @@ python3 "$ROOT/image/seed-tree-manifest.py" \
   --tree "payload=$work/source/payload" \
   --output "$work/expected.json"
 
+# The gate binds the medium to the signed release authority (cad2366, #120) and
+# requires both identities. The fixture supplies its own: the closure identity is
+# the seed-tree manifest hash, the manifest identity is that of a release manifest
+# file the fixture writes. The receipt must record exactly these values.
+printf '{"schema":"neural-ice-release-manifest-fixture"}\n' > "$work/release-manifest.json"
+release_closure_sha256="$(sha256sum "$work/expected.json" | cut -d' ' -f1)"
+release_manifest_sha256="$(sha256sum "$work/release-manifest.json" | cut -d' ' -f1)"
+release_args=(
+  --release-closure-sha256 "$release_closure_sha256"
+  --release-manifest-sha256 "$release_manifest_sha256"
+)
+
 printf '{"schema":"neural-ice-ota-lab-baseline-v1"}\n' > "$work/ota-lab-baseline.json"
 printf '\001detached-signature-fixture\000\377' > "$work/ota-lab-baseline.sig"
 bom_sha256="$(sha256sum "$work/ota-lab-baseline.json" | cut -d' ' -f1)"
@@ -81,6 +93,7 @@ expect_baseline_refusal() {
   if python3 "$ROOT/image/verify-preloaded-media.py" \
     --raw "$raw" \
     --expected-manifest "$work/expected.json" \
+    "${release_args[@]}" \
     --artifact "$raw" \
     --artifact-checksum "$work/$name.img.sha256" \
     --compression none \
@@ -163,6 +176,7 @@ receipt_checksum="$receipt.sha256"
 python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/expected.json" \
+  "${release_args[@]}" \
   --artifact "$artifact" \
   --artifact-checksum "$artifact_checksum" \
   --compression zstd-fast \
@@ -175,7 +189,8 @@ python3 "$ROOT/image/verify-preloaded-media.py" \
   sha256sum -c "$(basename "$receipt_checksum")"
 )
 python3 - "$receipt" "$artifact" "$raw" "$bom_sha256" "$signature_sha256" "$operator_sha256" \
-  "$raw_bytes" "$ROOT_HASH" "$PAYLOAD_DIGEST" "$POLICY_ID" <<'PY'
+  "$raw_bytes" "$ROOT_HASH" "$PAYLOAD_DIGEST" "$POLICY_ID" \
+  "$release_closure_sha256" "$release_manifest_sha256" <<'PY'
 import hashlib
 import json
 import sys
@@ -191,6 +206,8 @@ import sys
     root_hash,
     payload_digest,
     policy_id,
+    release_closure_sha256,
+    release_manifest_sha256,
 ) = sys.argv[1:]
 with open(receipt_path, encoding="ascii") as stream:
     receipt = json.load(stream)
@@ -211,6 +228,8 @@ assert receipt["sealed_core"] == {
     "verity_root_hash": root_hash,
 }
 assert receipt["ni_seed"]["fstype"] == "xfs"
+assert receipt["ni_seed"]["release_closure_sha256"] == release_closure_sha256
+assert receipt["ni_seed"]["release_manifest_sha256"] == release_manifest_sha256
 assert receipt["artifact"]["compression"] == "zstd-fast"
 assert receipt["artifact"]["filename"] == artifact_path.rsplit("/", 1)[-1]
 assert receipt["lab_baseline"]["bom"] == {
@@ -289,6 +308,7 @@ expect_media_refusal() { # <name> <message> [extra args...]
   if python3 "$ROOT/image/verify-preloaded-media.py" \
     --raw "$raw" \
     --expected-manifest "$work/expected.json" \
+    "${release_args[@]}" \
     --artifact "$raw" \
     --artifact-checksum "$work/$name.img.sha256" \
     --compression none \
@@ -345,6 +365,7 @@ printf 'owner-data\n' > "$work/owned-receipt.json"
 if python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/expected.json" \
+  "${release_args[@]}" \
   --artifact "$raw" \
   --artifact-checksum "$work/uncompressed.img.sha256" \
   --compression none \
@@ -378,6 +399,7 @@ loop="$(losetup --find --show "$raw")"
 if python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/expected.json" \
+  "${release_args[@]}" \
   --artifact "$work/existing-loop.img.zst" \
   --artifact-checksum "$work/existing-loop.img.zst.sha256" \
   --compression zstd-fast \
@@ -400,6 +422,7 @@ before_mount_dirs="$(find /run -maxdepth 1 -type d -name 'neural-ice-ni-seed.*' 
 if env PATH="$work/fake-bin:$PATH" python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/expected.json" \
+  "${release_args[@]}" \
   --artifact "$work/bad-mount.img.zst" \
   --artifact-checksum "$work/bad-mount.img.zst.sha256" \
   --compression zstd-fast \
@@ -488,6 +511,7 @@ sealed_core_mutation void-repopulated void \
 python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/expected.json" \
+  "${release_args[@]}" \
   --artifact "$work/restored.img" \
   --artifact-checksum "$work/restored.img.sha256" \
   --compression none \
@@ -504,6 +528,7 @@ loop=''
 if python3 "$ROOT/image/verify-preloaded-media.py" \
   --raw "$raw" \
   --expected-manifest "$work/expected.json" \
+  "${release_args[@]}" \
   --artifact "$work/ambiguous.img.zst" \
   --artifact-checksum "$work/ambiguous.img.zst.sha256" \
   --compression zstd-fast \

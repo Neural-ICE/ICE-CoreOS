@@ -186,6 +186,9 @@ jobs:
             image/test-verify-preloaded-media.sh
       - name: Final raw-media integration
         if: github.event_name == 'push'
+        # A missing tool (mtools) must fail this step, never skip it silently:
+        # the last "green" here was a skip that had never run the medium path.
         run: >-
           sudo --non-interactive unshare --mount --propagation private --
-          env PATH="$PATH" bash image/test-verify-preloaded-media.sh
+          env PATH="$PATH" NI_MEDIA_SUITE_REQUIRE_TOOLS=1
+          bash image/test-verify-preloaded-media.sh
