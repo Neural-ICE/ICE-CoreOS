@@ -29,8 +29,9 @@ IgnoreOnIsolate=yes
 # No Conflicts=getty@tty1.service on purpose: getty@tty1 and this unit are both
 # pulled into the same boot transaction, and a Conflicts= between two jobs of one
 # transaction makes systemd DROP one of them -- possibly the login prompt. The
-# script instead polls the tty1 owners (getty@tty1, neural-ice-tui) and exits
-# the moment one is active; getty and the TUI both clear the screen.
+# script instead polls the tty1 owners (getty@tty1, neural-ice-tui, and the units
+# a product declaration names with tty1_owners=) and exits the moment one is
+# active; getty and the TUI both clear the screen.
 Before=getty@tty1.service neural-ice-tui.service
 
 [Service]

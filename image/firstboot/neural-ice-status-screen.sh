@@ -22,12 +22,30 @@
 # management NIC's receive rate from /sys/class/net/*/statistics/rx_bytes deltas
 # and redraws the whole screen. It exits by itself when the box is READY or as
 # soon as the unit that owns tty1 (getty@tty1 on the debug variant, the product
-# TUI on the branded appliance) is active. Error codes: status-error-codes.md.
+# TUI on the branded appliance, or a unit the image declares: tty1_owners=) is active. Error codes: status-error-codes.md.
+#
+# PRODUCT DECLARATIONS. The OS carries no product knowledge (ADR-0032). A branded
+# derivation tells this screen what its product needs through declaration files
+# /usr/lib/neural-ice/status-screen.d/*.conf (closed key=value grammar, parsed
+# and refused by decl_parse below, documented in status-error-codes.md): the
+# units of its image phase, the signed manifest that lists its components (and
+# how to read it), and extra core units. A declaration that names an image
+# manifest switches the Images line from the v1 inventory (Quadlet/bound-image
+# references of the OS image) to "components of that manifest present in
+# containers-storage / components of the manifest", keeps the screen running
+# until the declared image units are themselves done, shows the manifest's
+# release id instead of the v1 channel (when the declaration names the key) and
+# no longer watches the OS's own v1 image units. The screen only DISPLAYS the
+# manifest: it never verifies it. A refused declaration is a status fault
+# (NI-E06), never silently ignored. No directory = the v1 code paths, unchanged.
 #
 # Paths this script reads (the static test enforces this list):
 #   /usr/lib/os-release                       product name
 #   /usr/lib/neural-ice/version               OS version (CI, run-unique)
 #   /usr/lib/neural-ice/status-screen/        core-services list extension
+#   /usr/lib/neural-ice/status-screen.d/      product declarations (*.conf)
+#   the one file a declaration names as its image manifest (images_manifest=,
+#     regular file, under /var/lib, /usr/lib or /usr/share)
 #   /usr/lib/bootc/bound-images.d/            image inventory (bound images)
 #   /usr/share/containers/systemd/            image inventory (Quadlets)
 #   /etc/containers/systemd/                  image inventory (Quadlets)
@@ -74,13 +92,169 @@ path() { printf '%s%s' "$ROOT_PREFIX" "$1"; }
 CEREMONY_TIMEOUT=${NI_STATUS_CEREMONY_TIMEOUT:-1800}
 [[ $CEREMONY_TIMEOUT =~ ^[0-9]+$ ]] || die "NI_STATUS_CEREMONY_TIMEOUT must be an integer number of seconds"
 # Seconds READY stays on screen before the script exits on its own when no
-# tty1 owner shows up (branded appliance: the TUI replaces us earlier).
+# tty1 owner shows up (branded appliance: the TUI or the declared owner replaces us earlier).
 READY_LINGER=${NI_STATUS_READY_LINGER:-10}
 [[ $READY_LINGER =~ ^[0-9]+$ ]] || die "NI_STATUS_READY_LINGER must be an integer number of seconds"
 
 # ---------------------------------------------------------------------------
-# Watched units. FIXED: the screen never takes unit names from anything that
-# is not part of the image.
+# Small readers, shared by the identity header and the declaration parser.
+# ---------------------------------------------------------------------------
+read_first_line() { # <file> -> first line or ""
+  local f=$1 line=""
+  [[ -f $f && ! -L $f && -r $f ]] || { printf ''; return 0; }
+  IFS= read -r line < "$f" || true
+  printf '%s' "$line"
+}
+sanitize() { # printable ASCII only, one line, bounded length
+  local s=$1
+  s=${s//[^[:print:]]/}
+  printf '%s' "${s:0:${2:-64}}"
+}
+
+# ---------------------------------------------------------------------------
+# Product declarations: /usr/lib/neural-ice/status-screen.d/*.conf. The grammar
+# is closed (status-error-codes.md is its reference):
+#   - the directory and every *.conf in it: root-owned, a regular file (never a
+#     symlink), not group/world-writable; at most DECL_MAX_FILES files of at most
+#     DECL_MAX_BYTES bytes, printable ASCII only. Other names are ignored (as
+#     systemd drop-ins are);
+#   - lines: blank, `# comment`, or `key=value` (no space around `=`, no key
+#     twice, no key outside the list below);
+#   - version=1 is required; images_* keys come all together (images_release_key
+#     optional) in ONE file; core_units= and tty1_owners= may be spread over files.
+# A file that breaks any rule contributes NOTHING and is reported (NI-E06): the
+# screen never half-applies a declaration and never guesses what was meant.
+# Values name units, a path and manifest keys; the screen reads the one manifest
+# file as text (bash and grep only), never executes it, and prints only the
+# release id, character-checked and bounded.
+# ---------------------------------------------------------------------------
+DECL_DIR=$(path /usr/lib/neural-ice/status-screen.d)
+DECL_MAX_FILES=16
+DECL_MAX_BYTES=4096
+DECL_PATH_ROOTS=(var/lib usr/lib usr/share)     # a declared path sits under one of these (relative to /)
+DECL_UID=0; [[ ${NI_STATUS_SCREEN_TESTING:-0} == 0 ]] || DECL_UID=$EUID
+DECL_UNIT_RE='^[A-Za-z0-9@._:\\-]{1,200}\.(service|target|mount|socket)$'
+DECL_IMG_UNIT_RE='^[A-Za-z0-9@._:-]{1,200}\.service$'
+DECL_JSON_KEY_RE='^[a-z][a-z0-9_]{0,31}$'
+DECL_ALIAS_RE='^[a-z0-9._/:-]*\{id\}[a-z0-9._/:-]*$'
+declare -a DECL_FAULTS=() DECL_CORE=() DECL_TTY1=() DECL_IMG_UNITS=()
+DECL_IMG_FILE=""; DECL_MANIFEST=""; DECL_COMP_KEY=""; DECL_DIGEST_KEY=""; DECL_ALIAS=""; DECL_RELEASE_KEY=""
+
+decl_fault() { DECL_FAULTS+=("$(sanitize "$1" 40)|$(sanitize "$2" 40)"); }   # <file> <why>
+decl_owner_ok() { # <path>: owned by the expected uid, not writable by group/others
+  local uid mode
+  read -r uid mode < <(stat -c '%u %a' -- "$1" 2>/dev/null) || return 1
+  [[ $uid == "$DECL_UID" && $mode =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 8#022) == 0 ))
+}
+decl_unit_list() { # <list> <max> <regex>: single-space separated, 1..max names, each matching the regex, no repeat
+  local -a items; local u; local -A dup=()
+  [[ -n $1 && $1 != ' '* && $1 != *' ' && $1 != *'  '* ]] || return 1
+  IFS=' ' read -ra items <<<"$1"
+  (( ${#items[@]} <= $2 )) || return 1
+  for u in "${items[@]}"; do
+    [[ $u =~ $3 && -z ${dup[$u]:-} ]] || return 1
+    dup[$u]=1
+  done
+}
+decl_path_ok() { # <path>: absolute, bounded, plain components, under an allowed root
+  local p=$1 root
+  [[ ${#p} -le 200 && $p =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9_-]$ ]] || return 1
+  [[ $p != *//* && $p != */./* && $p != */../* && $p != */.. && $p != */. ]] || return 1
+  for root in "${DECL_PATH_ROOTS[@]}"; do [[ $p == /"$root"/* ]] && return 0; done
+  return 1
+}
+decl_parse() { # <file> <name>: parse one declaration; its facts are committed only when all of it is valid
+  local f=$1 name=$2 line key value lineno=0 k u
+  local -a core_items tty1_items
+  local -A seen=()
+  local d_version="" d_units="" d_manifest="" d_comp="" d_digest="" d_alias="" d_release="" d_core="" d_tty1=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    [[ -n $line && $line != '#'* ]] || continue
+    if [[ ! $line =~ ^([a-z][a-z0-9_]{0,31})=([^[:space:]].*)$ ]]; then decl_fault "$name" "line $lineno is not key=value"; return 0; fi
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    if [[ -n ${seen[$key]:-} ]]; then decl_fault "$name" "key $key given twice"; return 0; fi
+    seen[$key]=1
+    case $key in
+      version) d_version=$value ;;
+      images_units)
+        decl_unit_list "$value" 8 "$DECL_IMG_UNIT_RE" || { decl_fault "$name" "bad images_units"; return 0; }
+        d_units=$value ;;
+      images_manifest)
+        decl_path_ok "$value" || { decl_fault "$name" "bad images_manifest"; return 0; }
+        d_manifest=$value ;;
+      images_component_key)
+        [[ $value =~ $DECL_JSON_KEY_RE ]] || { decl_fault "$name" "bad images_component_key"; return 0; }
+        d_comp=$value ;;
+      images_digest_key)
+        [[ $value =~ $DECL_JSON_KEY_RE ]] || { decl_fault "$name" "bad images_digest_key"; return 0; }
+        d_digest=$value ;;
+      images_release_key)
+        [[ $value =~ $DECL_JSON_KEY_RE ]] || { decl_fault "$name" "bad images_release_key"; return 0; }
+        d_release=$value ;;
+      images_alias)
+        [[ ${#value} -le 128 && $value =~ $DECL_ALIAS_RE ]] || { decl_fault "$name" "bad images_alias"; return 0; }
+        d_alias=$value ;;
+      core_units)
+        decl_unit_list "$value" 16 "$DECL_UNIT_RE" || { decl_fault "$name" "bad core_units"; return 0; }
+        d_core=$value ;;
+      tty1_owners)
+        decl_unit_list "$value" 4 "$DECL_IMG_UNIT_RE" || { decl_fault "$name" "bad tty1_owners"; return 0; }
+        d_tty1=$value ;;
+      *) decl_fault "$name" "unknown key $key"; return 0 ;;
+    esac
+  done < "$f"
+  [[ $d_version == 1 ]] || { decl_fault "$name" "version=1 missing or unsupported"; return 0; }
+  for k in images_units images_manifest images_component_key images_digest_key images_alias images_release_key; do
+    if [[ -n ${seen[$k]:-} ]]; then seen[images]=1; fi
+  done
+  if [[ -n ${seen[images]:-} ]]; then
+    for k in images_units images_manifest images_component_key images_digest_key images_alias; do
+      [[ -n ${seen[$k]:-} ]] || { decl_fault "$name" "missing key $k"; return 0; }
+    done
+    [[ -z $DECL_IMG_FILE ]] || { decl_fault "$name" "images declared by another file"; return 0; }
+  elif [[ -z $d_core && -z $d_tty1 ]]; then
+    decl_fault "$name" "declares nothing"; return 0
+  fi
+  if [[ -n ${seen[images]:-} ]]; then
+    DECL_IMG_FILE=$name; DECL_MANIFEST=$d_manifest; DECL_COMP_KEY=$d_comp; DECL_DIGEST_KEY=$d_digest
+    DECL_ALIAS=$d_alias; DECL_RELEASE_KEY=$d_release
+    IFS=' ' read -ra DECL_IMG_UNITS <<<"$d_units"
+  fi
+  if [[ -n $d_core ]]; then
+    IFS=' ' read -ra core_items <<<"$d_core"
+    for u in "${core_items[@]}"; do DECL_CORE+=("$u"); done
+  fi
+  if [[ -n $d_tty1 ]]; then
+    IFS=' ' read -ra tty1_items <<<"$d_tty1"
+    for u in "${tty1_items[@]}"; do DECL_TTY1+=("$u"); done
+  fi
+}
+decl_load() {
+  local f name n=0
+  [[ -e $DECL_DIR || -L $DECL_DIR ]] || return 0           # no directory: the v1 screen, nothing to report
+  if [[ -L $DECL_DIR || ! -d $DECL_DIR ]]; then decl_fault status-screen.d "not a plain directory"; return 0; fi
+  decl_owner_ok "$DECL_DIR" || { decl_fault status-screen.d "unsafe owner or mode"; return 0; }
+  for f in "$DECL_DIR"/*.conf; do
+    [[ -e $f || -L $f ]] || continue
+    name=${f##*/}
+    n=$((n + 1))
+    if (( n > DECL_MAX_FILES )); then decl_fault status-screen.d "more than $DECL_MAX_FILES declarations"; return 0; fi
+    if [[ ! $name =~ ^[a-z0-9][a-z0-9._-]{0,63}\.conf$ ]]; then decl_fault "$name" "bad file name"; continue; fi
+    if [[ -L $f || ! -f $f ]]; then decl_fault "$name" "not a regular file"; continue; fi
+    decl_owner_ok "$f" || { decl_fault "$name" "unsafe owner or mode"; continue; }
+    if [[ $(stat -c %s -- "$f" 2>/dev/null) -gt $DECL_MAX_BYTES ]]; then decl_fault "$name" "larger than $DECL_MAX_BYTES bytes"; continue; fi
+    if LC_ALL=C grep -aqv '^[[:print:]]*$' -- "$f" 2>/dev/null; then decl_fault "$name" "not printable ASCII"; continue; fi
+    decl_parse "$f" "$name"
+  done
+}
+decl_load
+
+# ---------------------------------------------------------------------------
+# Watched units. FIXED by the image: the screen never takes a unit name from
+# anything that is not part of the image (the OS list below, plus what the
+# image's own declarations name, validated above).
 # ---------------------------------------------------------------------------
 UNIT_STORAGE='systemd-cryptsetup@data.service'      # the "data" volume of the disk encryption table (nofail)
 UNIT_DATA_MOUNT='var-lib-neural\x2dice-data.mount'
@@ -88,19 +262,38 @@ UNIT_CEREMONY='neural-ice-firstboot-tpm-ceremony.service'
 UNIT_NETWORK='NetworkManager.service'
 UNIT_SEED_IMPORT='neural-ice-seed-import.service'
 UNIT_PAYLOAD='neural-ice-payload-apply.service'
+# The units whose failure is the image phase (NI-E04), in the order they run:
+# the OS's own v1 pair, or what the declaration names (it replaces them).
+if [[ -n $DECL_IMG_FILE ]]; then IMG_UNITS=("${DECL_IMG_UNITS[@]}")
+else IMG_UNITS=("$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD"); fi
 # tty1 owners: the login getty (debug variant) or the product console dashboard
 # (branded appliance, ICE-Fabric neural-ice-tui.service). Either one active
-# means the screen is no longer ours.
+# means the screen is no longer ours. A declaration adds the units its image
+# starts on tty1 instead (tty1_owners=, e.g. a kiosk compositor): the OS does not
+# name them.
 TTY1_OWNERS=('getty@tty1.service' 'neural-ice-tui.service')
-# Core services shipped by this OS. The branded derivation appends its product
-# units through /usr/lib/neural-ice/status-screen/core-services (one unit per
-# line, `#` comments) -- the OS stays free of product knowledge (ADR-0032).
+for u in "${DECL_TTY1[@]}"; do
+  [[ " ${TTY1_OWNERS[*]} " == *" $u "* ]] || TTY1_OWNERS+=("$u")
+done
+# Core services shipped by this OS. The branded derivation adds its product
+# units through its declaration (core_units=) or the older
+# /usr/lib/neural-ice/status-screen/core-services (one unit per line, `#`
+# comments) -- the OS stays free of product knowledge (ADR-0032). A declaration
+# of the image phase replaces the OS's v1 payload apply, which is then not the
+# one that starts the product.
 CORE_SERVICES=(
   neural-ice-hostname-init.service
   neural-ice-device-root.service
   neural-ice-payload-apply.service
   avahi-daemon.service
 )
+if [[ -n $DECL_IMG_FILE ]]; then
+  CORE_SERVICES=(
+    neural-ice-hostname-init.service
+    neural-ice-device-root.service
+    avahi-daemon.service
+  )
+fi
 core_services_dir=$(path /usr/lib/neural-ice/status-screen)
 if [[ -f $core_services_dir/core-services && ! -L $core_services_dir/core-services ]]; then
   while IFS= read -r line; do
@@ -110,6 +303,9 @@ if [[ -f $core_services_dir/core-services && ! -L $core_services_dir/core-servic
     CORE_SERVICES+=("$line")
   done < "$core_services_dir/core-services"
 fi
+for u in "${DECL_CORE[@]}"; do
+  [[ " ${CORE_SERVICES[*]} " == *" $u "* ]] || CORE_SERVICES+=("$u")
+done
 
 # ---------------------------------------------------------------------------
 # systemd state, one query per unit per poll. `systemctl show` answers over the
@@ -141,23 +337,15 @@ unit_skipped() { # a unit whose Condition*= was evaluated and said no
 }
 unit_failed() { [[ ${U_ACTIVE[$1]} == failed ]]; }
 unit_active() { [[ ${U_ACTIVE[$1]} == active ]]; }
+# A declared image step is behind us when it ran, was skipped by its Condition=
+# (a step with nothing to do) or is not shipped.
+step_done() { unit_active "$1" || unit_skipped "$1" || unit_absent "$1"; }
 
 # ---------------------------------------------------------------------------
 # Identity header. Nothing here is secret: the DMI model and serial are on the
 # chassis label, the hostname is broadcast over mDNS, the version and short
 # image digest identify the software for support.
 # ---------------------------------------------------------------------------
-read_first_line() { # <file> -> first line or ""
-  local f=$1 line=""
-  [[ -f $f && ! -L $f && -r $f ]] || { printf ''; return 0; }
-  IFS= read -r line < "$f" || true
-  printf '%s' "$line"
-}
-sanitize() { # printable ASCII only, one line, bounded length
-  local s=$1
-  s=${s//[^[:print:]]/}
-  printf '%s' "${s:0:${2:-64}}"
-}
 product_name() {
   local name
   name=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$(path /usr/lib/os-release)" 2>/dev/null | head -1)
@@ -293,6 +481,43 @@ count_images() { # -> "N M"
 }
 
 # ---------------------------------------------------------------------------
+# Manifest components (only when a declaration names an image manifest). The
+# manifest is compact JSON whose components are flat objects: each `{...}`
+# carrying the declared component key is one component (other entries, such as
+# the host or evidence ones, do not carry it). A component is present when its
+# alias (images_alias with {id} replaced by the component id) AND its digest are
+# in containers-storage. Parsed with bash and grep only, never executed, never
+# trusted beyond the character classes below.
+# ---------------------------------------------------------------------------
+MANIFEST=""; [[ -z $DECL_IMG_FILE ]] || MANIFEST=$(path "$DECL_MANIFEST")
+MANI_TOTAL=0; MANI_PRESENT=0; MANI_RELEASE='unset'; MANI_SEEN=0
+manifest_read() {
+  local id="" doc indexes="" idx obj cid cdigest alias
+  MANI_TOTAL=0; MANI_PRESENT=0; MANI_RELEASE='unset'; MANI_SEEN=0
+  [[ -f $MANIFEST && ! -L $MANIFEST && -r $MANIFEST ]] || return 0
+  MANI_SEEN=1
+  doc=$(head -c 1048576 "$MANIFEST" 2>/dev/null | tr -d '\n') || return 0
+  if [[ -n $DECL_RELEASE_KEY && $doc =~ \"$DECL_RELEASE_KEY\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._-]{1,128})\" ]]; then
+    id=${BASH_REMATCH[1]}
+  fi
+  MANI_RELEASE=$(sanitize "${id:-unset}" 40)
+  for idx in "${STORAGE_INDEXES[@]}"; do
+    [[ -r $idx ]] && indexes+=$(<"$idx")
+  done
+  while IFS= read -r obj; do
+    MANI_TOTAL=$((MANI_TOTAL + 1))
+    cid=""; cdigest=""
+    [[ $obj =~ \"$DECL_COMP_KEY\"[[:space:]]*:[[:space:]]*\"([a-z0-9][a-z0-9._-]{0,127})\" ]] && cid=${BASH_REMATCH[1]}
+    [[ $obj =~ \"$DECL_DIGEST_KEY\"[[:space:]]*:[[:space:]]*\"(sha256:[0-9a-f]{64})\" ]] && cdigest=${BASH_REMATCH[1]}
+    [[ -n $cid && -n $cdigest ]] || continue
+    alias=${DECL_ALIAS/'{id}'/$cid}
+    if [[ $indexes == *"\"$alias\""* && $indexes == *"\"$cdigest\""* ]]; then
+      MANI_PRESENT=$((MANI_PRESENT + 1))
+    fi
+  done < <(grep -oE '\{[^{}]*\}' <<<"$doc" | grep -F "\"$DECL_COMP_KEY\"" || true)
+}
+
+# ---------------------------------------------------------------------------
 # Screen.
 # ---------------------------------------------------------------------------
 ESC=$'\033'
@@ -377,6 +602,7 @@ PRODUCT=$(product_name)
 VERSION=$(os_version)
 IMAGE=$(booted_image_short)
 CHANNEL=$(device_channel)
+ID_LABEL=channel; ID_VALUE=$CHANNEL
 MODEL="$(dmi sys_vendor 24) $(dmi product_name 32)"
 SERIAL=$(dmi product_serial 40)
 [[ -n ${SERIAL// /} ]] || SERIAL="unknown"
@@ -393,7 +619,7 @@ iteration=0
 while :; do
   iteration=$((iteration + 1))
   for u in "$UNIT_STORAGE" "$UNIT_DATA_MOUNT" "$UNIT_CEREMONY" "$UNIT_NETWORK" \
-           "$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD" "${TTY1_OWNERS[@]}" "${CORE_SERVICES[@]}"; do
+           "${IMG_UNITS[@]}" "${TTY1_OWNERS[@]}" "${CORE_SERVICES[@]}"; do
     query_unit "$u"
   done
 
@@ -408,7 +634,7 @@ while :; do
   # Did every probe answer? A systemctl failure is not a state.
   probing=0
   for u in "$UNIT_STORAGE" "$UNIT_DATA_MOUNT" "$UNIT_CEREMONY" "$UNIT_NETWORK" \
-           "$UNIT_SEED_IMPORT" "$UNIT_PAYLOAD" "${CORE_SERVICES[@]}"; do
+           "${IMG_UNITS[@]}" "${CORE_SERVICES[@]}"; do
     unit_unknown "$u" && { probing=1; break; }
   done
 
@@ -490,15 +716,43 @@ while :; do
   fi
 
   # --- images ---------------------------------------------------------------
-  collect_image_refs
-  read -r img_present img_total <<<"$(count_images)"
-  images_done=0; img_extra=""
-  if unit_failed "$UNIT_SEED_IMPORT" || unit_failed "$UNIT_PAYLOAD"; then
+  images_done=0; img_extra=""; img_failed=0; img_unknown=0; img_steps_done=1
+  if [[ -n $DECL_IMG_FILE ]]; then
+    # Declared: the components of the image manifest; done only when the declared
+    # steps are done themselves (a pull that has fetched every image is still
+    # committing its aliases until the unit ends).
+    manifest_read
+    img_present=$MANI_PRESENT; img_total=$MANI_TOTAL
+    if [[ -n $DECL_RELEASE_KEY ]]; then ID_LABEL=release; ID_VALUE=$MANI_RELEASE; fi
+  else
+    collect_image_refs
+    read -r img_present img_total <<<"$(count_images)"
+  fi
+  for u in "${IMG_UNITS[@]}"; do
+    unit_failed "$u" && img_failed=1
+    unit_unknown "$u" && img_unknown=1
+    step_done "$u" || img_steps_done=0
+  done
+  if (( img_failed )); then
     img_mark=fail; img_text="$img_present/$img_total present -- image import failed"
-    unit_failed "$UNIT_SEED_IMPORT" && set_failure NI-E04 "image pull" "$UNIT_SEED_IMPORT"
-    unit_failed "$UNIT_PAYLOAD" && set_failure NI-E04 "image pull" "$UNIT_PAYLOAD"
-  elif unit_unknown "$UNIT_SEED_IMPORT" || unit_unknown "$UNIT_PAYLOAD"; then
+    for u in "${IMG_UNITS[@]}"; do
+      ! unit_failed "$u" || set_failure NI-E04 "image pull" "$u"
+    done
+  elif (( img_unknown )); then
     img_mark="wait"; img_text="$img_present/$img_total present -- probing..."
+  elif [[ -n $DECL_IMG_FILE ]] && (( img_total == 0 )); then
+    # No component to count: the release is not imported yet (or the manifest is
+    # unreadable). Never the v1 "no inventory" skip: a declared image phase
+    # always has one.
+    img_mark="wait"
+    if (( MANI_SEEN )); then img_text="release manifest names no readable component"
+    else img_text="waiting for the release manifest"; fi
+  elif [[ -n $DECL_IMG_FILE ]]; then
+    if (( img_present >= img_total && img_steps_done )); then
+      img_mark=ok; img_text="$img_present/$img_total present"; images_done=1
+    else
+      img_mark=run; img_text="$img_present/$img_total present"; img_extra=$rx_text
+    fi
   elif (( img_total == 0 )); then
     img_mark=skip; img_text="no product image inventory on this image"; images_done=1
   elif (( img_present >= img_total )); then
@@ -529,6 +783,13 @@ while :; do
   fi
   core_done=$(( core_ok >= core_total ? 1 : 0 ))
 
+  # --- declarations ---------------------------------------------------------
+  # A refused declaration is a fault of the image, not of a boot phase: it ranks
+  # after every phase above, but it is never silent and it withholds READY.
+  if (( ${#DECL_FAULTS[@]} > 0 )); then
+    set_failure NI-E06 "status declaration: ${DECL_FAULTS[0]#*|}" "${DECL_FAULTS[0]%%|*}"
+  fi
+
   # --- ready ------------------------------------------------------------------
   network_done=0
   { [[ $net_mark == ok ]] || unit_absent "$UNIT_NETWORK"; } && network_done=1
@@ -541,8 +802,12 @@ while :; do
   fi
 
   # --- serial mirror (stable lines only, on change) ---------------------------
+  # v1: once. A declared release id appears when the import publishes the
+  # manifest, so the (change-only) mirror is fed on every pass then.
+  if (( iteration == 1 )) || [[ -n $DECL_RELEASE_KEY ]]; then
+    mirror header "$PRODUCT | OS $VERSION | image $IMAGE | $ID_LABEL $ID_VALUE"
+  fi
   if (( iteration == 1 )); then
-    mirror header "$PRODUCT | OS $VERSION | image $IMAGE | channel $CHANNEL"
     mirror identity "model $MODEL | serial $SERIAL"
   fi
   mirror storage "$(mark "$storage_mark") Storage: $storage_text"
@@ -559,7 +824,7 @@ while :; do
   # --- draw -------------------------------------------------------------------
   uptime_s=$(( ($(now_ms) - START_MS) / 1000 ))
   line " NEURAL ICE   $PRODUCT"
-  line " OS $VERSION   image $IMAGE   channel $CHANNEL"
+  line " OS $VERSION   image $IMAGE   $ID_LABEL $ID_VALUE"
   line " Model $MODEL   Serial $SERIAL   Host $(hostname_now)"
   line " ------------------------------------------------------------------------------"
   line " $(mark "$storage_mark")  Storage         $storage_text"
