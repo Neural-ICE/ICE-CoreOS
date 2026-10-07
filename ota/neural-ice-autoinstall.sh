@@ -1736,33 +1736,62 @@ assert_mirror_name_resolves() { # $1=host[:port] -> logs the address, or dies by
   die "${MIRROR_NAME_UNRESOLVABLE}: the LAN mirror ${host} did not resolve by mDNS (avahi-resolve via the resolve-only avahi-daemon on the management port) in ${MIRROR_MDNS_RESOLVE_ATTEMPTS} attempts of ${MIRROR_MDNS_RESOLVE_TIMEOUT_SECONDS}s; the bench must announce this name on the management LAN (lan-mirror-mdns.service) or the medium must seal an address; nothing has been written to the target disk"
 }
 
-esp_staged_file() { # $1=basename $2=expected sha256 $3=destination -> stages it or fails
-  local name=$1 expected=$2 destination=$3 esp mountpoint mounted=0 observed
+# With a class prefix the refusal is EXACTLY that slug (its failure-evidence detail is then
+# deterministic); the diagnostic, which may quote a digest, goes to the log.
+esp_die() { # $1=class prefix (may be empty) $2=diagnostic
+  if [[ -n "$1" ]]; then
+    log "$1: $2"
+    die "$1"
+  fi
+  die "$2"
+}
+
+esp_snapshot_file() { # $1=basename $2=destination $3=die prefix (optional) -> copies it or fails
+  local name=$1 destination=$2 prefix=${3:-} esp mountpoint mounted=0
   esp="$(media_vfat_partition || true)"
-  [[ -n "${esp:-}" ]] || die "this medium carries no ESP to read ${name} from"
+  [[ -n "${esp:-}" ]] || esp_die "$prefix" "this medium carries no ESP to read ${name} from"
   mountpoint="$(mounted_at "/dev/$esp" || true)"
   if [[ -z "$mountpoint" ]]; then
     mountpoint=/run/neural-ice-installer/esp
     install -d -m 0700 "$mountpoint"
     mount -o ro,nodev,nosuid,noexec "/dev/$esp" "$mountpoint" \
-      || die "cannot mount the installer ESP read-only to read ${name}"
+      || esp_die "$prefix" "cannot mount the installer ESP read-only to read ${name}"
     mounted=1
   fi
   if [[ -f "$mountpoint/ice-coreos/$name" && ! -L "$mountpoint/ice-coreos/$name" ]]; then
     install -m 0600 "$mountpoint/ice-coreos/$name" "$destination" \
-      || die "cannot snapshot ${name} from the installer ESP"
+      || esp_die "$prefix" "cannot snapshot ${name} from the installer ESP"
   else
     (( mounted == 1 )) && umount "$mountpoint"
-    die "the installer ESP carries no ${name}; this medium's signature says it must"
+    esp_die "$prefix" "the installer ESP carries no ${name}; this medium's signature says it must"
   fi
-  (( mounted == 1 )) && { umount "$mountpoint" || die "cannot unmount the installer ESP after reading ${name}"; }
+  (( mounted == 1 )) && { umount "$mountpoint" || esp_die "$prefix" "cannot unmount the installer ESP after reading ${name}"; }
+  return 0
+}
+
+esp_staged_file() { # $1=basename $2=expected sha256 $3=destination $4=die prefix (optional) -> stages it or fails
+  local name=$1 expected=$2 destination=$3 prefix=${4:-} observed
+  esp_snapshot_file "$name" "$destination" "${4:-}"
   # 🔴 THE HASH IS THE POINT. The ESP is a mutable vfat partition an attacker
   # holding the medium can rewrite; the value it is compared against is inside
   # the UKI's signed .cmdline. Compare AFTER the copy, on the bytes that will
   # actually be used, so the file cannot change between the check and the use.
   observed="$(sha256sum -- "$destination" | awk '{print tolower($1)}')"
   [[ "$observed" == "$expected" ]] \
-    || die "the ESP's ${name} hashes to ${observed}, not the ${expected} this medium's signature seals"
+    || esp_die "$prefix" "the ESP's ${name} hashes to ${observed}, not the ${expected} this medium's signature seals"
+  return 0
+}
+
+# A file whose authenticity is not its hash but a signature the caller verifies
+# over these very bytes. Bounded, so a hostile medium cannot hand the verifier an
+# unbounded document.
+esp_staged_file_unsealed() { # $1=basename $2=destination $3=die prefix (optional)
+  local name=$1 destination=$2 prefix=${3:-} size
+  esp_snapshot_file "$name" "$destination" "${3:-}"
+  size="$(stat -c %s -- "$destination")"
+  if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size == 0 || size > 4096 )); then
+    esp_die "$prefix" "the ESP's ${name} is empty or larger than 4096 bytes"
+  fi
   return 0
 }
 
@@ -2029,6 +2058,221 @@ readonly LIVE_PCR7 LIVE_PCR7_POLICY AVAILABLE_PCR7_POLICIES
 log "Live SHA-256 PCR7 = $LIVE_PCR7"
 log "Live PCR7 PolicyPCR digest = $LIVE_PCR7_POLICY"
 log "Available signed PolicyPCR digests = $AVAILABLE_PCR7_POLICIES"
+
+# --------------------------------------------------------------------------- #
+# NI-P7-RULES (ADR-0045 D2, T5). Beside NI-P7-COVERAGE, which stays: the LUKS
+# enrolment below is still a PolicyAuthorize under the Owner key, so a PCR7 the
+# signed list does not cover cannot unlock whatever the rules say. This gate adds
+# the other question -- is this machine in a Secure Boot state the Owner's signed
+# RULES admit -- and asks it before any destructive step.
+#
+# 🔴 WHAT IT PROVES, AND WHAT IT DOES NOT. The engine replays the TCG event log
+# and requires the replay to equal the LIVE PCR7 (read from the TPM here, never
+# passed in), so the authority chain it judges is the one the firmware measured.
+# On a GB10 the firmware measures the NAMES of SecureBoot, PK, KEK, db and dbx
+# with zero-length data (PR #245): their contents are read from efivarfs and are
+# OBSERVED, not attested. A rules file may refuse such firmware outright
+# (`unbound_variables: refuse`); one that allows it is a signed Owner decision and
+# the verdict, the console and the installed evidence all say `names-only`.
+#
+# The gate is sealed by two optional kernel arguments, both or neither:
+# neuralice.pcr_rules (sha256 of the rules file) and neuralice.pcr_rules_seq (the
+# lowest acceptable sequence). Absent, the medium predates the rules path and
+# NI-P7-COVERAGE is its only PCR7 gate (logged, never silent). The rules are
+# signed by the Owner key already pinned by neuralice.pcr_policy_key; the
+# signature domain ("neural-ice-pcr-rules/v1") keeps a policy signature from
+# authorising rules and the reverse.
+# --------------------------------------------------------------------------- #
+PCR_RULES_DIGEST="$(karg_once neuralice.pcr_rules)"
+PCR_RULES_SEQ="$(karg_once neuralice.pcr_rules_seq)"
+# The engine ships beside the helper it imports, in the repository's own layout
+# (image/Containerfile.installer links ota/neural-ice-tpm-policy.py into it).
+PCR_RULES_TOOL="$(ni_path NEURALICE_PCR_RULES_TOOL /usr/lib/neural-ice/pcr-rules/tools/ni-pcr-rules/ni-pcr-rules.py)"
+PCR_RULES_EVENTLOG="$(ni_path NEURALICE_TCG_EVENTLOG /sys/kernel/security/tpm0/binary_bios_measurements)"
+PCR_RULES_EFIVARS="$(ni_path NEURALICE_EFIVARS_DIR /sys/firmware/efi/efivars)"
+PCR_RULES_RUNTIME=/run/neural-ice-installer/pcr-rules.json
+PCR_RULES_SIGNATURE_RUNTIME=/run/neural-ice-installer/pcr-rules.json.sig
+PCR_RULES_VERDICT_RUNTIME=/run/neural-ice-installer/pcr-rules-verdict.json
+PCR_RULES_STATE=absent
+PCR_RULES_RULES_SHA256="" PCR_RULES_SEQUENCE="" PCR_RULES_BINDING="" PCR_RULES_OBSERVED=""
+
+verify_pcr_rules() {
+  local rc=0 spki efivars_magic decision='' engine_err
+  # The pin of the Owner key is derived from the key file whose bytes were just
+  # compared with the sealed hash (neuralice.pcr_policy_key).
+  spki="$(openssl pkey -pubin -in "$PCR_POLICY_KEY_RUNTIME" -outform DER 2>/dev/null \
+            | sha256sum | awk '{print $1}')" || spki=''
+  [[ "$spki" =~ ^[0-9a-f]{64}$ ]] || die "NI-P7-RULES: rules-signature"
+  # The variables must come from the firmware's own store, not from a directory a
+  # caller can populate. Only the armed test seam may point elsewhere.
+  if [[ -z "$NI_INSTALLER_TEST_SEAM" ]]; then
+    efivars_magic="$(stat -f -c %t "$PCR_RULES_EFIVARS" 2>/dev/null || true)"
+    [[ "$efivars_magic" == de5e81e4 ]] || die "NI-P7-RULES: state-unreadable"
+  fi
+  engine_err="$(mktemp "${INSTALLER_STATE_DIR}/pcr-rules-engine.XXXXXX")"
+  python3 -I "$PCR_RULES_TOOL" evaluate \
+    --rules "$PCR_RULES_RUNTIME" \
+    --signature "$PCR_RULES_SIGNATURE_RUNTIME" \
+    --pubkey "$PCR_POLICY_KEY_RUNTIME" \
+    --pubkey-sha256 "$spki" \
+    --min-sequence "$PCR_RULES_SEQ" \
+    --expect-rules-sha256 "$PCR_RULES_DIGEST" \
+    --eventlog "$PCR_RULES_EVENTLOG" \
+    --efivars "$PCR_RULES_EFIVARS" \
+    --live \
+    >"$PCR_RULES_VERDICT_RUNTIME" 2>"$engine_err" </dev/null || rc=$?
+  # The engine's diagnostics name digests, certificates and authority names read from
+  # the firmware's event log. They go to the log (journal AND console, like every
+  # other line here), reduced to printable ASCII and bounded, and never into the
+  # failure code or the die() message.
+  while IFS= read -r _line; do
+    _line="$(printf '%s' "$_line" | LC_ALL=C tr -cd '\040-\176')"
+    log "NI-P7-RULES engine: ${_line:0:300}"
+  done < <(head -n 20 "$engine_err")
+  rm -f -- "$engine_err"
+  # The decision is the installer's, taken on a CLOSED reading of the verdict:
+  # exit status and `accepted` must agree, every rule check must have reported
+  # and passed, the digest and the sequence must be the sealed ones. Anything the
+  # reader does not recognise is a refusal, not an accept.
+  decision="$(python3 -I - "$PCR_RULES_VERDICT_RUNTIME" "$rc" "$PCR_RULES_DIGEST" "$PCR_RULES_SEQ" <<'PCR_RULES_VERDICT_PY' 2>/dev/null
+import json
+import re
+import sys
+
+path, rc, sealed_digest, floor = sys.argv[1:]
+SLUGS = {
+    "inputs": "state-unreadable",
+    "rules-signature": "rules-signature",
+    "rules-schema": "rules-schema",
+    "rules-sequence": "rules-rollback",
+    "rules-digest": "rules-digest",
+    "replay-equals-live": "eventlog-mismatch",
+    "log-digests-attest-data": "eventlog-mismatch",
+    "variables-bound": "variables-contradict-log",
+    "variables-parse": "variables-contradict-log",
+    "unbound-variables": "unbound-variables-refused",
+    "secure-boot": "secure-boot-state",
+    "pk-present": "secure-boot-state",
+    "pk-approved": "secure-boot-state",
+    "kek-approved": "secure-boot-state",
+    "setup-mode": "secure-boot-state",
+    "db-subset-of-approved": "variable-rule",
+    "dbx-superset-of-floor": "variable-rule",
+    "authorities-approved": "authority-rule",
+    "authority-in-db": "authority-rule",
+    }
+# Every one of these must have run for an accept: an engine that silently drops a
+# rule cannot be told apart from one that passed it.
+REQUIRED = set(SLUGS) - {"inputs", "variables-parse", "rules-schema", "rules-digest"}
+
+
+def refuse(slug):
+    print(f"refuse {slug}")
+    raise SystemExit(0)
+
+
+def closed_pairs(items):
+    out = {}
+    for key, value in items:
+        if key in out:
+            raise ValueError(f"duplicate field {key}")
+        out[key] = value
+    return out
+
+
+try:
+    with open(path, "rb") as handle:
+        raw = handle.read(1 << 20)
+    verdict = json.loads(raw, object_pairs_hook=closed_pairs)
+    assert isinstance(verdict, dict) and isinstance(verdict.get("checks"), list)
+    checks = []
+    for check in verdict["checks"]:
+        assert isinstance(check, dict) and set(check) == {"name", "ok", "binding", "detail"}
+        assert isinstance(check["name"], str) and isinstance(check["ok"], bool)
+        assert check["binding"] in ("attested", "observed")
+        checks.append(check)
+    accepted = verdict.get("accepted")
+    assert isinstance(accepted, bool)
+    assert int(rc) == (0 if accepted else 1)
+except (OSError, ValueError, AssertionError, KeyError):
+    refuse("verdict-malformed")
+
+# Several checks can fail together; the console gets the most specific class. The
+# "names only" refusal is last on purpose: a machine in setup mode logs its empty
+# PK/db the same way, and `secure-boot-state` is the better diagnosis.
+PRIORITY = ("state-unreadable", "rules-signature", "rules-schema", "rules-rollback", "rules-digest",
+            "eventlog-mismatch", "variables-contradict-log", "secure-boot-state", "variable-rule",
+            "authority-rule", "unbound-variables-refused", "verdict-malformed")
+if not accepted:
+    failed = {SLUGS.get(check["name"], "verdict-malformed") for check in checks if not check["ok"]}
+    refuse(next((slug for slug in PRIORITY if slug in failed), "verdict-malformed"))
+
+try:
+    assert set(verdict) == {"accepted", "binding", "observed", "rules_sha256", "sequence", "checks"}
+    names = [check["name"] for check in checks]
+    # Exactly the checks this reader knows: an unknown one is an engine this reader
+    # was not written for, and "ok" from it means nothing here.
+    assert len(names) == len(set(names)) and REQUIRED <= set(names) and set(names) <= set(SLUGS)
+    assert all(check["ok"] for check in checks)
+    assert verdict["rules_sha256"] == sealed_digest
+    assert isinstance(verdict["sequence"], int) and not isinstance(verdict["sequence"], bool)
+    assert int(floor) <= verdict["sequence"] <= 2**53 - 1
+    assert verdict["binding"] in ("contents", "names-only")
+    observed = verdict["observed"]
+    assert isinstance(observed, list) and observed == [c["name"] for c in checks if c["binding"] == "observed"]
+    assert all(re.fullmatch(r"[a-z][a-z0-9-]{0,40}", name) for name in observed)
+    # `observed` and the binding must tell the same story: names-only means the
+    # log carried a variable by name only, contents means no variable was.
+    assert (verdict["binding"] == "names-only") == ("unbound-variables" in observed)
+    # SetupMode is read from efivarfs, never measured: it is always observed. And a
+    # names-only log leaves at least one of the variable-derived checks observed.
+    assert "setup-mode" in observed
+    if verdict["binding"] == "names-only":
+        assert observed and set(observed) & {"secure-boot", "pk-present", "pk-approved", "kek-approved",
+                                             "db-subset-of-approved", "dbx-superset-of-floor"}
+except (AssertionError, KeyError, TypeError, ValueError):
+    refuse("verdict-malformed")
+print("accept {} {} {} {}".format(
+    verdict["rules_sha256"], verdict["sequence"], verdict["binding"], ",".join(observed) or "none"))
+PCR_RULES_VERDICT_PY
+  )" || decision=''
+  case "$decision" in
+    accept\ *)
+      read -r _ PCR_RULES_RULES_SHA256 PCR_RULES_SEQUENCE PCR_RULES_BINDING PCR_RULES_OBSERVED <<<"$decision"
+      [[ "$PCR_RULES_RULES_SHA256" == "$PCR_RULES_DIGEST" && "$PCR_RULES_SEQUENCE" =~ ^[1-9][0-9]{0,18}$ \
+         && "$PCR_RULES_BINDING" =~ ^(contents|names-only)$ && "$PCR_RULES_OBSERVED" =~ ^[a-z0-9,-]{1,400}$ ]] \
+        || die "NI-P7-RULES: verdict-malformed"
+      ;;
+    refuse\ state-unreadable)           die "NI-P7-RULES: state-unreadable" ;;
+    refuse\ rules-signature)            die "NI-P7-RULES: rules-signature" ;;
+    refuse\ rules-schema)               die "NI-P7-RULES: rules-schema" ;;
+    refuse\ rules-rollback)             die "NI-P7-RULES: rules-rollback" ;;
+    refuse\ rules-digest)               die "NI-P7-RULES: rules-digest" ;;
+    refuse\ eventlog-mismatch)          die "NI-P7-RULES: eventlog-mismatch" ;;
+    refuse\ variables-contradict-log)   die "NI-P7-RULES: variables-contradict-log" ;;
+    refuse\ unbound-variables-refused)  die "NI-P7-RULES: unbound-variables-refused" ;;
+    refuse\ secure-boot-state)          die "NI-P7-RULES: secure-boot-state" ;;
+    refuse\ variable-rule)              die "NI-P7-RULES: variable-rule" ;;
+    refuse\ authority-rule)             die "NI-P7-RULES: authority-rule" ;;
+    *)                                  die "NI-P7-RULES: verdict-malformed" ;;
+  esac
+  log "NI-P7-RULES: accepted (rules sha256 ${PCR_RULES_RULES_SHA256:0:16}…, sequence $PCR_RULES_SEQUENCE, binding $PCR_RULES_BINDING, observed-not-attested: $PCR_RULES_OBSERVED)"
+}
+
+if (( $(karg_count neuralice.pcr_rules) == 0 && $(karg_count neuralice.pcr_rules_seq) == 0 )); then
+  log "NI-P7-RULES: this medium seals no PCR rules; NI-P7-COVERAGE is its only PCR7 gate"
+else
+  [[ "$PCR_RULES_DIGEST" =~ ^[0-9a-f]{64}$ && "$PCR_RULES_SEQ" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || die "NI-P7-RULES: payload-unavailable"
+  esp_staged_file pcr-rules/rules.json "$PCR_RULES_DIGEST" "$PCR_RULES_RUNTIME" "NI-P7-RULES: payload-unavailable"
+  # The signature is not hash-sealed: it is verified under the pinned Owner key
+  # over the exact rules bytes, so another valid signature of those bytes changes
+  # nothing.
+  esp_staged_file_unsealed pcr-rules/rules.json.sig "$PCR_RULES_SIGNATURE_RUNTIME" "NI-P7-RULES: payload-unavailable"
+  verify_pcr_rules
+  PCR_RULES_STATE=accepted
+fi
+readonly PCR_RULES_STATE
 # ADR-0015 N: installation is a factory operation. The check refuses a device
 # that already holds a sealed owner authorization (TPM2_Clear first) and never
 # compares the medium's generation to this chip's counter history; it prints 0.
@@ -4355,6 +4599,21 @@ install -m 0644 /dev/null "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr7-at-install.txt
 printf 'schema=1\npcr7_sha256=%s\npolicy_pcr_sha256=%s\navailable_policy_pcr_sha256=%s\n' \
   "$LIVE_PCR7" "$LIVE_PCR7_POLICY" "$AVAILABLE_PCR7_POLICIES" \
   > "$TGT/boot/efi/EFI/neural-ice/tpm2-pcr7-at-install.txt"
+# What the rules gate decided, on the machine it decided for (ADR-0045 verification
+# clause: "rules of sequence N retrievable"). The record never says more than the
+# engine proved: `binding=names-only` and the observed (unattested) checks stay in
+# it, and a medium without rules says so instead of leaving the file out.
+install -m 0644 /dev/null "$TGT/boot/efi/EFI/neural-ice/pcr-rules-at-install.txt"
+if [[ "$PCR_RULES_STATE" == accepted ]]; then
+  install -d -m 0755 "$TGT/boot/efi/EFI/neural-ice/pcr-rules"
+  install -m 0644 "$PCR_RULES_RUNTIME" "$TGT/boot/efi/EFI/neural-ice/pcr-rules/rules.json"
+  install -m 0644 "$PCR_RULES_SIGNATURE_RUNTIME" "$TGT/boot/efi/EFI/neural-ice/pcr-rules/rules.json.sig"
+  printf 'schema=1\nstate=accepted\nrules_sha256=%s\nsequence=%s\nbinding=%s\nobserved=%s\n' \
+    "$PCR_RULES_RULES_SHA256" "$PCR_RULES_SEQUENCE" "$PCR_RULES_BINDING" "$PCR_RULES_OBSERVED" \
+    > "$TGT/boot/efi/EFI/neural-ice/pcr-rules-at-install.txt"
+else
+  printf 'schema=1\nstate=absent\n' > "$TGT/boot/efi/EFI/neural-ice/pcr-rules-at-install.txt"
+fi
 # Make the target (+ submounts) shared so they propagate into the container.
 mount --rbind "$TGT" "$TGT"
 mount --make-rshared "$TGT"

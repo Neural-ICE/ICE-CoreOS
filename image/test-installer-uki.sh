@@ -319,4 +319,28 @@ done
 ni_sealed_cmdline_classify "$(sed -n 's/^==> sealed cmdline: //p' "$TMP/size-150.out") neuralice.systemsize=100" >/dev/null 2>&1 \
   && fail "the closed grammar accepted two system sizes"
 
+# --------------------------------------------------------------------------- #
+# 8) THE SIGNED PCR7 RULES PAIR (ADR-0045, T5). The producer seals
+#    `neuralice.pcr_rules` / `neuralice.pcr_rules_seq` through EXTRA_KARGS; the
+#    real renderer must carry both verbatim after the sealed fields, and the real
+#    closed grammar must classify the rendered line -- as Install when the pair is
+#    whole, and refuse it by name when it is not.
+# --------------------------------------------------------------------------- #
+RULES_PAIR="neuralice.pcr_rules=$(printf 'a%.0s' {1..64}) neuralice.pcr_rules_seq=12"
+build "$TMP/rules-pair" VARIANT=sealed-lab EXTRA_KARGS="$INSTALL_WORDS $RULES_PAIR" >"$TMP/rules-pair.out" \
+  || fail "the UKI build refused the PCR rules pair"
+rules_line="$(sed -n 's/^==> sealed cmdline: //p' "$TMP/rules-pair.out")"
+for term in $RULES_PAIR; do
+  case " $rules_line " in *" $term "*) ;; *) fail "the rendered cmdline lost $term" ;; esac
+done
+[ "$(ni_sealed_cmdline_classify "$rules_line")" = install ] \
+  || fail "the closed grammar refused the rendered PCR rules pair: $NI_SEALED_CMDLINE_REASON"
+for half in "neuralice.pcr_rules=$(printf 'a%.0s' {1..64})" "neuralice.pcr_rules_seq=12"; do
+  build "$TMP/rules-half" VARIANT=sealed-lab EXTRA_KARGS="$INSTALL_WORDS $half" >"$TMP/rules-half.out" \
+    || fail "the UKI build refused a lone rules term (the grammar, not the renderer, is the judge)"
+  half_line="$(sed -n 's/^==> sealed cmdline: //p' "$TMP/rules-half.out")"
+  ni_sealed_cmdline_classify "$half_line" >/dev/null 2>&1 \
+    && fail "the closed grammar accepted a lone rules term: $half"
+done
+
 echo "INSTALLER_UKI_TEST_OK"

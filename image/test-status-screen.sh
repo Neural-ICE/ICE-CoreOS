@@ -7,7 +7,13 @@
 #      key, no LUKS/TPM material, no licence, no token, no fingerprint path;
 #   3. the script, run through its unprivileged test seam against crafted
 #      fixtures, shows the phases, the counters, the receive rate, the failure
-#      block with the stable NI-Exx code, READY, and the serial mirror lines.
+#      block with the stable NI-Exx code, READY, and the serial mirror lines;
+#   4. the same script on a host whose image ships a product declaration
+#      (/usr/lib/neural-ice/status-screen.d/*.conf, the exact file the v2 host
+#      image ships): Images from the manifest the declaration names, the declared
+#      image units, READY only once those are done and the declared core units
+#      are active; and every malformed declaration is refused and reported
+#      (NI-E06), never half-applied.
 set -euo pipefail
 
 if (( EUID == 0 )); then
@@ -157,6 +163,7 @@ allowed=(
   /var/lib/containers/storage/overlay-images/images.json /usr/lib/bootc/storage/overlay-images/images.json
   /sys/class/net /sys/class/dmi/id
   /proc/cmdline /proc/sys/kernel/hostname /sys/class/tty/console/active /dev /dev/null
+  /usr/lib/neural-ice/status-screen.d
 )
 while IFS= read -r found; do
   ok=0
@@ -166,6 +173,15 @@ while IFS= read -r found; do
   (( ok )) || fail "status screen code names a path outside its allow-list: $found"
 done < <(grep -oE '(^|[^A-Za-z0-9_])/(usr|etc|var|sys|proc|dev|run|root|home|tmp|boot|opt|srv|sysroot|ostree|mnt|media)(/[A-Za-z0-9_.@-]+)*' "$CODE" \
            | sed -E 's/^[^\/]//' | sort -u)
+# Open-core boundary (ADR-0032): the OS names no product unit, no product file
+# layout and no product manifest key. All of it comes from a declaration.
+for product in 'ni-v2' 'icecore' 'product-payload' 'neural-ice-applied' 'neural-ice-v2' 'release-manifest' \
+  'component_id' 'release_id' 'ota-state-profile' 'owner-sealed' 'first-pull'; do
+  ! grep -Fq -- "$product" "$CODE" || fail "status screen code names product knowledge ($product); it belongs in a declaration"
+done
+# A declaration is only honoured from an image-owned, plain, bounded file.
+grep -Fq 'DECL_UID=0' "$CODE" || fail "declarations are not held to root ownership"
+grep -Fq 'decl_owner_ok' "$CODE" || fail "declaration owner/mode check is missing"
 # The management NIC is the one hostname-init selected and published (one rule,
 # neural-ice-mgmt-port); a NetworkManager profile can carry credentials and this
 # code must not read any profile at all.
@@ -512,4 +528,397 @@ reject "$out" 'FAILURE' "degraded inventory is not a failure"
 ! env NI_STATUS_SCREEN_TESTING=1 NI_STATUS_TEST_ROOT="$FX/root" bash "$SCRIPT" >/dev/null 2>&1 \
   || fail "test seam ran without an explicit systemctl"
 
-echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, 13 behaviour scenes)"
+# --- 4. a host whose image ships a product declaration --------------------------
+# Field bug, first production-grade v2 appliance (ASUS GX10, lane-2 preload=none
+# medium): the v1 screen showed "Images [--] no product image inventory on this
+# image", "channel unset", and READY while the first pull was still pulling. The
+# OS knows nothing of that product: its image ships /usr/lib/neural-ice/status-screen.d/
+# appliance-v2.conf, and the fixture below is byte for byte that file. A host
+# without the directory keeps the v1 screen (sections 3a-3i run without it).
+DECL_NAME=appliance-v2.conf
+read -r -d '' DECL_V2 <<'EOF' || true
+# Boot status screen declaration of the Neural ICE v2 appliance (grammar:
+# ICE-CoreOS image/firstboot/status-error-codes.md, "Product declarations").
+version=1
+images_units=ni-v2-seed-import.service ni-v2-first-pull.service
+images_manifest=/var/lib/neural-ice-v2/current-release/release-manifest.json
+images_component_key=component_id
+images_digest_key=digest
+images_alias=localhost/neural-ice-applied/{id}:v1
+images_release_key=release_id
+core_units=neural-ice-product-payload-apply.service icecore-api.service
+tty1_owners=neural-ice-console-compositor.service
+EOF
+V2_REL=v2-lab-train-3-20261006-b
+v2_digest() { printf 'sha256:%064d' "$1"; }
+write_decl() { # <name> <content>: a declaration as the image ships it (0644)
+  mkdir -p "$FX/root/usr/lib/neural-ice/status-screen.d"
+  chmod 0755 "$FX/root/usr/lib/neural-ice/status-screen.d"
+  printf '%s\n' "$2" > "$FX/root/usr/lib/neural-ice/status-screen.d/$1"
+  chmod 0644 "$FX/root/usr/lib/neural-ice/status-screen.d/$1"
+}
+make_v2_fixture() { # tonight's screen: first pull activating, 1 of 3 components pulled, nothing else started
+  make_fixture
+  rm -rf "$FX/root/usr/lib/bootc/bound-images.d" "$FX/root/usr/share/containers/systemd" "$FX/root/etc/containers/systemd" \
+    "$FX/root/usr/lib/neural-ice/status-screen" "$FX/root/var/lib/neural-ice/data/release"
+  write_decl "$DECL_NAME" "$DECL_V2"
+  mkdir -p "$FX/root/var/lib/neural-ice-v2/current-release"
+  # compact canonical JSON, as signed: 3 components, the host entry and an evidence entry are NOT components
+  printf '{"bundle_seq":3,"compatibility":{"minimum_reader":1},"components":[%s,%s,%s],"content":[],"evidence":[{"digest":"%s","kind":"attestation"}],"hardware_target":"nvidia-gb10-arm64","host":{"contract":"host-bootc-v1","digest":"%s","reboot_required":true,"repository":"rg.fr-par.scw.cloud/neural-ice-v2-lab/host-appliance","restart_scope":["bootc-fetch-apply-updates.service"]},"release_id":"%s","schema":"neural-ice-release-manifest-v1"}\n' \
+    "{\"component_id\":\"agentic-core\",\"contract\":\"oci-component-v1\",\"digest\":\"$(v2_digest 11)\",\"reboot_required\":false,\"repository\":\"rg.fr-par.scw.cloud/neural-ice-v2-lab/agentic-core\",\"restart_scope\":[\"agentic-core.service\"]}" \
+    "{\"component_id\":\"caddy\",\"contract\":\"oci-component-v1\",\"digest\":\"$(v2_digest 12)\",\"reboot_required\":false,\"repository\":\"rg.fr-par.scw.cloud/neural-ice-v2-lab/caddy\",\"restart_scope\":[\"caddy.service\"]}" \
+    "{\"component_id\":\"icecore-api\",\"contract\":\"oci-component-v1\",\"digest\":\"$(v2_digest 13)\",\"reboot_required\":false,\"repository\":\"rg.fr-par.scw.cloud/neural-ice-v2-lab/icecore-api\",\"restart_scope\":[\"icecore-api.service\"]}" \
+    "$(v2_digest 99)" "$(v2_digest 98)" "$V2_REL" > "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+  v2_store 1
+  cat > "$FX/scene" <<'EOF'
+systemd-cryptsetup@data.service loaded active exited 0 yes
+var-lib-neural\x2dice-data.mount loaded active mounted 0 yes
+neural-ice-firstboot-tpm-ceremony.service loaded active exited 0 yes
+NetworkManager.service loaded active running 0 yes
+neural-ice-hostname-init.service loaded active exited 0 yes
+neural-ice-device-root.service loaded inactive dead 4242 no
+neural-ice-payload-apply.service loaded inactive dead 4242 no
+avahi-daemon.service loaded active running 0 yes
+ni-v2-seed-import.service loaded active exited 0 yes
+ni-v2-first-pull.service loaded activating start 0 yes
+neural-ice-product-payload-apply.service loaded inactive dead 0 no
+icecore-api.service loaded inactive dead 0 no
+EOF
+}
+v2_store() { # <n>: containers-storage holds the aliases of the first n components, digest-for-digest
+  local n=$1 i out="" ids=(agentic-core caddy icecore-api)
+  for ((i = 0; i < n; i++)); do
+    out+="${out:+,}{\"id\":\"x$i\",\"digest\":\"$(v2_digest $((11 + i)))\",\"names\":[\"localhost/neural-ice-applied/${ids[i]}:v1\",\"rg.fr-par.scw.cloud/neural-ice-v2-lab/${ids[i]}@$(v2_digest $((11 + i)))\"]}"
+  done
+  printf '[%s]\n' "$out" > "$FX/root/var/lib/containers/storage/overlay-images/images.json"
+}
+v2_ready_scene() { # first pull done, every component present, product core units up
+  v2_store 3
+  set_state ni-v2-first-pull.service loaded active exited 0 yes
+  set_state neural-ice-product-payload-apply.service loaded active exited 0 yes
+  set_state icecore-api.service loaded active running 0 yes
+}
+
+# 4a. tonight's screen, reproduced: first pull at 1/3, product units not started.
+make_v2_fixture
+out="$(run_screen)"
+expect "$out" "release $V2_REL" "header carries the declared release id"
+reject "$out" 'channel unset' "a declared host has no v1 CHANNEL file; the header must not claim an unset channel"
+reject "$out" 'channel ' "the header names the release, not a v1 channel"
+expect "$out" '[ .. ]  Images          1/3 present  RX ' "Images row: components present / components of the declared manifest, first pull running"
+reject "$out" 'no product image inventory' "a declared host has an inventory: the components of its manifest"
+reject "$out" 'READY' "no READY while the declared first pull is still activating"
+reject "$out" 'FAILURE' "a first pull in progress is not a failure"
+expect "$out" '[ .. ]  Core services   3/5 active' "core list: hostname-init, device-root, avahi + the two declared units"
+expect "$out" 'no input is read' "footer still says starting"
+serial="$(serial_out)"
+expect "$serial" "neural-ice-status: Neural ICE CoreOS | OS 0.51.11 | image deploy ab0000000000 | release $V2_REL" "serial header names the release"
+expect "$serial" 'neural-ice-status: [ .. ] Images: 1/3 present' "serial image counter"
+reject "$serial" 'READY' "serial never announces READY during the first pull"
+
+# 4b. READY only after the declared image units are done AND the declared core units are active.
+make_v2_fixture
+v2_ready_scene
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+expect "$out" '[ OK ]  Images          3/3 present' "all components present, image units done"
+expect "$out" '[ OK ]  Core services   5/5 active' "declared core units all active"
+expect "$out" 'READY -- login available.' "READY once everything is done"
+expect "$(serial_out)" 'neural-ice-status: READY -- login available' "serial READY marker"
+# every component present but the unit has not committed yet (aliases, DONE marker): not ready
+set_state ni-v2-first-pull.service loaded activating start 0 yes
+out="$(run_screen 1 0)"
+expect "$out" '[ .. ]  Images          3/3 present' "all components present but the last image unit still running"
+reject "$out" 'READY' "READY waits for the image unit itself, not for the last alias"
+# queued behind the seed import: not started yet, not done
+set_state ni-v2-first-pull.service loaded inactive dead 0 no
+out="$(run_screen 1 0)"
+reject "$out" 'READY' "an image unit that has not started is not done"
+# a full-preload host: the first pull is skipped by its Condition and counts as done
+set_state ni-v2-first-pull.service loaded inactive dead 4242 no
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+expect "$out" 'READY -- login available.' "a condition-skipped image unit is done"
+# the declared core units are part of READY
+set_state icecore-api.service loaded inactive dead 0 no
+out="$(run_screen 1 0)"
+expect "$out" '[ .. ]  Core services   4/5 active' "declared core unit not started yet"
+reject "$out" 'READY' "READY waits for the declared core units"
+set_state icecore-api.service loaded failed failed 0 no
+out="$(run_screen 1 0)"
+expect "$out" 'FAILURE  NI-E05  (core service)' "a failed declared core unit is a core-service failure"
+expect "$out" 'unit:    icecore-api.service' "the declared core unit is named"
+# a declared core unit the image does not ship is skipped, not waited for
+make_v2_fixture
+v2_ready_scene
+sed -i '/^icecore-api.service /d' "$FX/scene"
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+expect "$out" '[ OK ]  Core services   4/4 active' "an unshipped declared unit is skipped"
+expect "$out" 'READY -- login available.' "an unshipped declared unit does not hold READY"
+
+# 4c. a digest that is not the manifest's is not "present"; an alias without its image neither.
+make_v2_fixture
+printf '[{"digest":"%s","names":["localhost/neural-ice-applied/agentic-core:v1"]},{"digest":"%s","names":["localhost/neural-ice-applied/caddy:v1"]}]\n' \
+  "$(v2_digest 77)" "$(v2_digest 12)" > "$FX/root/var/lib/containers/storage/overlay-images/images.json"
+out="$(run_screen 1 0)"
+expect "$out" 'Images          1/3 present' "a stale alias (other digest) does not count; the matching one does"
+
+# 4d. failures: NI-E04 names the declared unit; earliest phase wins.
+make_v2_fixture
+set_state ni-v2-first-pull.service loaded failed failed 0 yes
+out="$(run_screen)"
+expect "$out" 'FAILURE  NI-E04  (image pull)' "image unit failure code"
+expect "$out" 'unit:    ni-v2-first-pull.service' "failed image unit named"
+expect "$out" '[FAIL]  Images          1/3 present -- image import failed' "images row fails"
+reject "$out" 'READY' "no READY on a failed image unit"
+expect "$(serial_out)" 'neural-ice-status: FAILURE NI-E04 (image pull) unit=ni-v2-first-pull.service serial=SN-1234-5678' "serial failure marker"
+set_state ni-v2-seed-import.service loaded failed failed 0 yes
+out="$(run_screen)"
+expect "$out" 'unit:    ni-v2-seed-import.service' "the first declared unit is the one named"
+# the OS's own v1 image units are not watched once a declaration replaces them
+make_v2_fixture
+set_state neural-ice-seed-import.service loaded failed failed 0 yes
+set_state neural-ice-payload-apply.service loaded failed failed 0 yes
+out="$(run_screen)"
+reject "$out" 'NI-E04' "v1 import units are not watched under a declared image phase"
+reject "$out" 'NI-E05' "the v1 payload apply is not a core service under a declared image phase"
+
+# 4e. no manifest yet: nothing to count, never READY, never a v1 "no inventory" skip.
+make_v2_fixture
+rm -f "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen)"
+expect "$out" 'release unset' "no manifest: the header says so"
+expect "$out" '[    ]  Images          waiting for the release manifest' "no manifest: waiting, not skipped"
+reject "$out" 'no product image inventory' "an absent manifest is not an empty inventory"
+reject "$out" 'READY' "no READY without a manifest"
+# a manifest that names no component cannot be READY either
+printf '{"release_id":"%s","components":[]}\n' "$V2_REL" > "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen 50 0 NI_STATUS_READY_LINGER=0)"
+reject "$out" 'READY' "a manifest with zero components must not be READY"
+# the manifest is read as a regular file, never through a symlink, and its release id is character-checked
+rm -f "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+printf '{"release_id":"x","components":[]}\n' > "$FX/elsewhere.json"
+ln -s "$FX/elsewhere.json" "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen)"
+reject "$out" 'release x' "a symlinked manifest is not read"
+make_v2_fixture
+sed -i "s/$V2_REL/bad id;\$(touch pwned)/" "$FX/root/var/lib/neural-ice-v2/current-release/release-manifest.json"
+out="$(run_screen)"
+expect "$out" 'release unset' "a release id outside [A-Za-z0-9._-] is not shown"
+[[ ! -e pwned && ! -e $FX/pwned ]] || fail "manifest content reached a shell"
+
+# 4f. unknown is not a state on a declared host either.
+make_v2_fixture
+out="$(run_screen 1 0 NI_STATUS_TEST_SYSTEMCTL=/bin/false NI_STATUS_READY_LINGER=0)"
+expect "$out" 'Images          1/3 present -- probing...' "unknown image unit state probes"
+reject "$out" 'READY' "a failing systemctl never yields READY"
+reject "$out" 'FAILURE' "a failing systemctl is not a failure"
+
+# 4g. no declaration, no change: no directory (even with the old v2 marker), or an
+# empty directory, is the v1 screen.
+make_v2_fixture
+mkdir -p "$FX/root/var/lib/neural-ice/data/release"; printf 'beta-debug\n' > "$FX/root/var/lib/neural-ice/data/release/CHANNEL"   # a v1 host has one
+rm -rf "$FX/root/usr/lib/neural-ice/status-screen.d"
+printf 'owner-sealed-ota-state-v2\n' > "$FX/root/usr/lib/neural-ice/ota-state-profile"
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "no declaration directory: v1 header, whatever the image markers say"
+expect "$out" 'no product image inventory on this image' "no declaration directory: v1 images row"
+reject "$out" 'release ' "no declaration directory: no release in the header"
+reject "$out" 'NI-E06' "an absent directory is not a fault"
+mkdir -p "$FX/root/usr/lib/neural-ice/status-screen.d"; chmod 0755 "$FX/root/usr/lib/neural-ice/status-screen.d"
+printf 'notes\n' > "$FX/root/usr/lib/neural-ice/status-screen.d/README"          # not *.conf: ignored
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "empty directory: v1 header"
+reject "$out" 'NI-E06' "files that are not *.conf are ignored, as systemd drop-ins are"
+
+# 4h. core_units alone (no image phase): v1 images row, the declared units are core services.
+make_fixture
+write_decl extra.conf $'version=1\ncore_units=product-a.service product-b.socket'
+printf 'product-a.service loaded active running 0 yes\nproduct-b.socket loaded active running 0 yes\n' >> "$FX/scene"
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "core_units alone keeps the v1 header"
+expect "$out" 'Images          1/2 present' "core_units alone keeps the v1 inventory"
+expect "$out" 'Core services   4/7 active' "declared core units join the OS and extension lists"
+# the same unit named twice (declaration + the older extension file) is counted once
+write_decl extra.conf $'version=1\ncore_units=neural-ice-agentic-core.service avahi-daemon.service'
+out="$(run_screen)"
+expect "$out" 'Core services   2/5 active' "a unit already in the list is not counted twice"
+# two declarations may both add core units; both are applied
+write_decl extra.conf $'version=1\ncore_units=product-a.service'
+write_decl more.conf $'version=1\ncore_units=product-b.socket'
+out="$(run_screen)"
+expect "$out" 'Core services   4/7 active' "core_units add up across files"
+
+# 4i. every malformed declaration is refused AND reported (NI-E06 + the file); its
+# facts are never applied, and READY is withheld.
+refuse() { # <scenario> <file name> <content> <expected reason>
+  make_v2_fixture
+  v2_ready_scene
+  write_decl "$2" "$3"
+  local out serial
+  out="$(run_screen 1 0)"
+  expect "$out" "FAILURE  NI-E06  (status declaration: $4" "$1: reported as a status fault"
+  expect "$out" "unit:    $2" "$1: the offending file is named"
+  reject "$out" 'READY' "$1: no READY while a declaration is refused"
+  serial="$(serial_out)"
+  expect "$serial" "neural-ice-status: FAILURE NI-E06 (status declaration: $4" "$1: serial failure marker"
+  expect "$serial" "unit=$2 serial=SN-1234-5678" "$1: serial names the file"
+  # the good declaration still applies (a refused file contributes nothing, others stand)
+  expect "$out" "release $V2_REL" "$1: the valid declaration is still applied"
+}
+BAD_NAME=zz-bad.conf
+refuse "unknown key" "$BAD_NAME" $'version=1\ncore_units=x.service\nimages_unit=y.service' "unknown key images_unit"
+refuse "unknown key (typo of a valid one)" "$BAD_NAME" $'version=1\ncore_unit=x.service' "unknown key core_unit"
+refuse "duplicate key" "$BAD_NAME" $'version=1\ncore_units=x.service\ncore_units=y.service' "key core_units given twice"
+refuse "missing version" "$BAD_NAME" 'core_units=x.service' "version=1 missing or unsupported"
+refuse "unsupported version" "$BAD_NAME" $'version=2\ncore_units=x.service' "version=1 missing or unsupported"
+refuse "declares nothing" "$BAD_NAME" 'version=1' "declares nothing"
+refuse "not key=value" "$BAD_NAME" $'version=1\nthis is not a declaration' "line 2 is not key=value"
+refuse "space around =" "$BAD_NAME" $'version=1\ncore_units = x.service' "line 2 is not key=value"
+refuse "empty value" "$BAD_NAME" $'version=1\ncore_units=' "line 2 is not key=value"
+refuse "leading space in value" "$BAD_NAME" $'version=1\ncore_units= x.service' "line 2 is not key=value"
+refuse "indented line" "$BAD_NAME" $'version=1\n core_units=x.service' "line 2 is not key=value"
+refuse "uppercase key" "$BAD_NAME" $'version=1\nCore_Units=x.service' "line 2 is not key=value"
+refuse "unit name with a path" "$BAD_NAME" $'version=1\ncore_units=../../etc/shadow' "bad core_units"
+refuse "unit name without a type" "$BAD_NAME" $'version=1\ncore_units=sshd' "bad core_units"
+refuse "unit name with shell metacharacters" "$BAD_NAME" $'version=1\ncore_units=x$(touch pwned).service' "bad core_units"
+refuse "double space in a list" "$BAD_NAME" $'version=1\ncore_units=a.service  b.service' "bad core_units"
+refuse "trailing space in a list" "$BAD_NAME" $'version=1\ncore_units=a.service ' "bad core_units"
+refuse "repeated unit in a list" "$BAD_NAME" $'version=1\ncore_units=a.service a.service' "bad core_units"
+refuse "too many core units" "$BAD_NAME" "$(printf 'version=1\ncore_units='; for i in $(seq 1 17); do printf 'u%d.service ' "$i"; done | sed 's/ $//')" "bad core_units"
+refuse "image unit that is not a service" "$BAD_NAME" "$(printf '%s\n' "$DECL_V2" | sed 's/^images_units=.*/images_units=x.socket/')" "bad images_units"
+refuse "second image declaration" "$BAD_NAME" "$DECL_V2" "images declared by another file"
+refuse "incomplete images_*" "$BAD_NAME" $'version=1\nimages_units=a.service\nimages_manifest=/var/lib/x/m.json' "missing key images_component_key"
+refuse "images_release_key alone" "$BAD_NAME" $'version=1\nimages_release_key=release_id' "missing key images_units"
+bad_images() { printf '%s\n' "$DECL_V2" | sed -E "s|^$1=.*|$1=$2|; /^# /d; /^core_units=/d" | sed "s/^images_units=.*/images_units=a.service/"; }
+refuse "manifest path outside the allowed roots" "$BAD_NAME" "$(bad_images images_manifest /etc/shadow)" "bad images_manifest"
+refuse "manifest path into /sys" "$BAD_NAME" "$(bad_images images_manifest /sys/class/net/x)" "bad images_manifest"
+refuse "manifest path with .." "$BAD_NAME" "$(bad_images images_manifest /var/lib/x/../../etc/shadow)" "bad images_manifest"
+refuse "manifest path with //" "$BAD_NAME" "$(bad_images images_manifest /var/lib//x)" "bad images_manifest"
+refuse "manifest path relative" "$BAD_NAME" "$(bad_images images_manifest var/lib/x/m.json)" "bad images_manifest"
+refuse "manifest path with a space" "$BAD_NAME" "$(bad_images images_manifest '/var/lib/x y')" "bad images_manifest"
+refuse "manifest path ending in a slash" "$BAD_NAME" "$(bad_images images_manifest /var/lib/x/)" "bad images_manifest"
+refuse "manifest key with a quote" "$BAD_NAME" "$(bad_images images_component_key 'a"b')" "bad images_component_key"
+refuse "manifest key in upper case" "$BAD_NAME" "$(bad_images images_digest_key Digest)" "bad images_digest_key"
+refuse "release key with a regex metacharacter" "$BAD_NAME" "$(bad_images images_release_key 'a.*')" "bad images_release_key"
+refuse "alias without {id}" "$BAD_NAME" "$(bad_images images_alias localhost/x:v1)" "bad images_alias"
+refuse "alias with two {id}" "$BAD_NAME" "$(bad_images images_alias 'localhost/{id}/{id}:v1')" "bad images_alias"
+refuse "alias with a glob character" "$BAD_NAME" "$(bad_images images_alias 'localhost/*/{id}:v1')" "bad images_alias"
+refuse "alias in upper case" "$BAD_NAME" "$(bad_images images_alias 'Localhost/{id}:v1')" "bad images_alias"
+refuse "carriage return" "$BAD_NAME" $'version=1\r\ncore_units=x.service' "not printable ASCII"
+refuse "tab" "$BAD_NAME" $'version=1\ncore_units=x.service\t' "not printable ASCII"
+refuse "non-ASCII" "$BAD_NAME" $'version=1\n# caf\xc3\xa9\ncore_units=x.service' "not printable ASCII"
+refuse "comment in the middle of a line" "$BAD_NAME" $'version=1\ncore_units=x.service # comment' "bad core_units"
+refuse "file name outside the grammar" "Bad_Name.conf" $'version=1\ncore_units=x.service' "bad file name"
+
+# file-level refusals: NUL, size, mode, symlink, non-regular, count, directory.
+refuse_file() { # <scenario> <expected reason> <name>: the caller prepared the file in $FX/root/.../status-screen.d
+  local out
+  out="$(run_screen 1 0)"
+  expect "$out" "FAILURE  NI-E06  (status declaration: $2" "$1: reported as a status fault"
+  expect "$out" "unit:    $3" "$1: the offending entry is named"
+  reject "$out" 'READY' "$1: no READY"
+}
+DD="$FX/root/usr/lib/neural-ice/status-screen.d"
+make_v2_fixture; v2_ready_scene
+printf 'version=1\ncore_units=x.service\n\0' > "$DD/$BAD_NAME"; chmod 0644 "$DD/$BAD_NAME"
+refuse_file "NUL byte" "not printable ASCII" "$BAD_NAME"
+make_v2_fixture; v2_ready_scene
+{ printf 'version=1\ncore_units=x.service\n'; head -c 5000 /dev/zero | tr '\0' '#'; printf '\n'; } > "$DD/$BAD_NAME"; chmod 0644 "$DD/$BAD_NAME"
+refuse_file "oversize" "larger than 4096 bytes" "$BAD_NAME"
+make_v2_fixture; v2_ready_scene
+printf 'version=1\ncore_units=x.service\n' > "$DD/$BAD_NAME"; chmod 0666 "$DD/$BAD_NAME"
+refuse_file "world-writable" "unsafe owner or mode" "$BAD_NAME"
+printf 'version=1\ncore_units=x.service\n' > "$DD/$BAD_NAME"; chmod 0664 "$DD/$BAD_NAME"
+refuse_file "group-writable" "unsafe owner or mode" "$BAD_NAME"
+make_v2_fixture; v2_ready_scene
+printf 'version=1\ncore_units=x.service\n' > "$FX/elsewhere.conf"; chmod 0644 "$FX/elsewhere.conf"
+ln -s "$FX/elsewhere.conf" "$DD/$BAD_NAME"
+refuse_file "symlink" "not a regular file" "$BAD_NAME"
+make_v2_fixture; v2_ready_scene
+mkdir "$DD/$BAD_NAME"
+refuse_file "directory named *.conf" "not a regular file" "$BAD_NAME"
+make_v2_fixture; v2_ready_scene
+for i in $(seq 1 16); do printf 'version=1\ncore_units=p%d.service\n' "$i" > "$DD/extra-$(printf '%02d' "$i").conf"; chmod 0644 "$DD/extra-$(printf '%02d' "$i").conf"; done
+refuse_file "more than 16 declarations" "more than 16 declarations" "status-screen.d"
+make_v2_fixture; v2_ready_scene
+mv "$DD" "$FX/real-status-screen.d"; ln -s "$FX/real-status-screen.d" "$DD"
+refuse_file "directory symlink" "not a plain directory" "status-screen.d"
+make_v2_fixture; v2_ready_scene
+chmod 0777 "$DD"
+refuse_file "world-writable directory" "unsafe owner or mode" "status-screen.d"
+chmod 0755 "$DD"
+make_v2_fixture; v2_ready_scene
+rm -rf "$DD"; : > "$FX/root/usr/lib/neural-ice/status-screen.d"
+refuse_file "directory replaced by a file" "not a plain directory" "status-screen.d"
+# a refused file never leaks its facts: a lone refused images declaration leaves the v1 screen
+make_fixture
+write_decl "$BAD_NAME" "$(printf '%s\n' "$DECL_V2" | sed 's/^images_alias=.*/images_alias=oops/')"
+out="$(run_screen)"
+expect "$out" 'channel beta-debug' "a refused images declaration is not half-applied (header)"
+expect "$out" 'Images          1/2 present' "a refused images declaration is not half-applied (v1 inventory)"
+expect "$out" 'NI-E06' "and it is reported"
+[[ ! -e pwned && ! -e $FX/pwned ]] || fail "declaration content reached a shell"
+# 4j. tty1_owners: the units that take tty1 over from the status screen are declared by
+# the product, not named by the OS. A declared owner that is active ends the screen
+# exactly as getty@tty1 does; one that is only starting, or failed, owns nothing.
+CMP=neural-ice-console-compositor.service
+make_v2_fixture; v2_ready_scene
+out="$(run_screen 1 0)"
+expect "$out" 'READY' "4j baseline: the v2 fixture draws while the compositor is not running"
+set_state "$CMP" loaded active running
+out="$(run_screen 5 0)"
+[[ -z $out ]] || fail "a declared tty1 owner (the console compositor) is active: the screen must leave tty1 alone: $out"
+for st in activating:start failed:failed inactive:dead; do
+  set_state "$CMP" loaded "${st%%:*}" "${st##*:}"
+  out="$(run_screen 1 0)"
+  expect "$out" 'READY' "a declared owner that is ${st%%:*} does not own tty1"
+done
+# the OS's own owners still count on a declared host
+v2_ready_scene; set_state 'getty@tty1.service' loaded active running
+out="$(run_screen 5 0)"
+[[ -z $out ]] || fail "getty@tty1 still owns tty1 on a declared host: $out"
+# no declaration, no new owner: the compositor means nothing to the v1 screen
+make_fixture
+set_state "$CMP" loaded active running
+out="$(run_screen 1 0)"
+expect "$out" 'NEURAL ICE   Neural ICE CoreOS' "without a declaration the screen never reads tty1_owners: v1 screen unchanged"
+# ownership taken between the loop's snapshot and the write drops the frame (second query of the owner)
+make_v2_fixture; v2_ready_scene
+out="$(run_screen 3 0 NI_TEST_FLIP_UNIT=$CMP NI_TEST_FLIP_AFTER=2)"
+[[ -z $out ]] || fail "a declared owner that appeared between snapshot and write must suppress the frame: $out"
+out="$(run_screen 3 0 NI_TEST_FLIP_UNIT=$CMP NI_TEST_FLIP_AFTER=3)"
+[[ "$(grep -c 'NEURAL ICE   Neural ICE CoreOS' <<<"$out")" -eq 1 ]] \
+  || fail "after the declared owner took tty1 mid-run no further frame may be drawn: $out"
+# tty1_owners alone is a declaration, and several files add up
+make_fixture
+write_decl own1.conf $'version=1\ntty1_owners=product-a.service'
+write_decl own2.conf $'version=1\ntty1_owners=product-b.service product-c.service'
+out="$(run_screen 1 0)"
+reject "$out" 'NI-E06' "tty1_owners alone is a valid declaration"
+for u in product-a.service product-b.service product-c.service; do
+  set_state "$u" loaded active running
+  out="$(run_screen 3 0)"
+  [[ -z $out ]] || fail "owner $u declared across files must own tty1: $out"
+  set_state "$u" loaded inactive dead
+done
+# a valid tty1_owners followed by a fault in the same file: the whole file is refused, the owner is NOT applied
+make_v2_fixture; v2_ready_scene
+write_decl "$BAD_NAME" $'version=1\ntty1_owners=product-x.service\nbogus_key=1'
+set_state product-x.service loaded active running
+out="$(run_screen 1 0)"
+expect "$out" 'FAILURE  NI-E06  (status declaration: unknown key bogus_key' "a faulty file is reported"
+expect "$out" 'unit:    zz-bad.conf' "the faulty file is named"
+# malformed tty1_owners: refused and reported, never half-applied
+refuse "tty1 owner that is not a service" "$BAD_NAME" $'version=1\ntty1_owners=x.socket' "bad tty1_owners"
+refuse "tty1 owner with a path" "$BAD_NAME" $'version=1\ntty1_owners=../x.service' "bad tty1_owners"
+refuse "tty1 owner given twice in a list" "$BAD_NAME" $'version=1\ntty1_owners=a.service a.service' "bad tty1_owners"
+refuse "too many tty1 owners" "$BAD_NAME" $'version=1\ntty1_owners=a.service b.service c.service d.service e.service' "bad tty1_owners"
+refuse "tty1_owners key twice" "$BAD_NAME" $'version=1\ntty1_owners=a.service\ntty1_owners=b.service' "key tty1_owners given twice"
+refuse "tty1 owner with shell metacharacters" "$BAD_NAME" $'version=1\ntty1_owners=x$(touch pwned).service' "bad tty1_owners"
+[[ ! -e pwned && ! -e $FX/pwned ]] || fail "tty1_owners content reached a shell"
+# the grammar paragraph of the doc names every key the parser accepts, and only those
+for k in version images_units images_manifest images_component_key images_digest_key images_release_key images_alias core_units tty1_owners; do
+  grep -qE "^\| \`$k=\` " "$CODES" || fail "declaration key $k is not documented in status-error-codes.md"
+  grep -qE "^      $k\)" "$SCRIPT" || fail "declaration key $k is not parsed"
+done
+
+echo "STATUS_SCREEN_OFFLINE_TEST_OK (unit contract, secret allow-list, open-core boundary, 13 v1 behaviour scenes, declared-product scenes, tty1 owners, malformed-declaration refusals)"
