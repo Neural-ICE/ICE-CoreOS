@@ -153,9 +153,38 @@ for value in "$ROOT_HASH" "$PAYLOAD_DIGEST"; do
   [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "the payload manifest carries a malformed digest"
 done
 
+# 🔴 THE UKI BUILDER REFUSES A TOOL OVERRIDE IN A PRIVILEGED PROCESS, and this
+# fixture drives it through NI_UKI_TEST_TOOLS. The guard is a security control and
+# stays as it is. A caller that needs root for its own loop-device and mount work
+# (image/test-verify-preloaded-media.sh) therefore builds each UKI as the
+# unprivileged `nobody` identity: the builder only reads $IN, the policy, the
+# throwaway key and the payload manifest, and only writes into $SEALED.
+UKI_BUILD_UID=65534
+UKI_DROP=() # the privilege-drop prefix; empty when the caller is already unprivileged
+uki_build_identity() {
+  UKI_DROP=()
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || return 0
+  command -v setpriv >/dev/null 2>&1 \
+    || fail "a privileged caller needs setpriv to build the UKI unprivileged"
+  # Only what the builder must WRITE or cannot otherwise read changes hands: its
+  # output directory and the 0600 throwaway signing key. The inputs and the pinned
+  # trust policy stay root-owned and world-readable, so the builder cannot rewrite
+  # what it is checked against.
+  chown "$UKI_BUILD_UID:$UKI_BUILD_UID" "$SEALED" "$TMP/uki.key" \
+    || fail "cannot hand the UKI output and key to the unprivileged builder"
+  UKI_DROP=(setpriv "--reuid=$UKI_BUILD_UID" "--regid=$UKI_BUILD_UID" --clear-groups --)
+  # The builder's mktemp honours the caller's TMPDIR, so the writability probe runs
+  # in the dropped process and reads it there.
+  # shellcheck disable=SC2016 # the probe expands in the dropped process, on purpose
+  local reach='test -r "$1/uki.key" -a -w "$2" -a -x "$1" -a -r "$3" -a -w "${TMPDIR:-/tmp}"'
+  if ! "${UKI_DROP[@]}" bash -c "$reach" reach "$TMP" "$SEALED" "$ROOT/image/build-installer-uki.sh"; then
+    fail "the unprivileged UKI builder cannot reach its inputs: $TMP and the checkout $ROOT must be traversable and readable, the temporary directory writable (work directory mode 0711)"
+  fi
+}
 build_uki() { # $1=name  $2=extra kargs  $3...=env overrides
   local name=$1 kargs=$2; shift 2
-  env KERNEL="$IN/vmlinuz" INITRD="$IN/initrd" STUB="$IN/stub.efi" OSREL="$IN/os-release" \
+  uki_build_identity
+  "${UKI_DROP[@]}" env KERNEL="$IN/vmlinuz" INITRD="$IN/initrd" STUB="$IN/stub.efi" OSREL="$IN/os-release" \
     ROOT_VERITY_HASH="$ROOT_HASH" PAYLOAD_DIGEST="$PAYLOAD_DIGEST" \
     VARIANT=sealed-lab HARDWARE_TARGET=nvidia-gb10-arm64 \
     HARDWARE_IDENTITY_FILE="$IN/gb10.fingerprints" \

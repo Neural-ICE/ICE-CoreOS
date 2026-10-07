@@ -24,6 +24,9 @@ for command in blockdev findmnt losetup lsblk mkfs.vfat mkfs.xfs mknod mount pyt
 done
 
 work="$(mktemp -d /var/tmp/ni-final-media-test.XXXXXX)"
+# The fixture builds its UKIs as an unprivileged identity (the builder refuses a
+# tool override as root): that identity must be able to traverse the work directory.
+chmod 0711 "$work"
 loop=''
 mountpoint="$work/mnt"
 cleanup() {

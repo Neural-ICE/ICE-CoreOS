@@ -48,11 +48,13 @@ jobs:
           shellcheck ota/neural-ice-autoinstall.sh \
             image/installer/neural-ice-sealed-cmdline-grammar.sh \
             image/lib/access-policy.sh \
+            image/lib/bound-images.sh \
             image/lib/hardware-identity.sh \
             image/lib/installer-payload.sh \
             image/lib/installer-ssh-key.sh \
             image/lib/installer-trust.sh \
             image/lib/release-authorization.sh \
+            ota/neural-ice-v2-owner-seal.sh \
             ota/neural-ice-lab-baseline-handoff.sh \
             ota/test-neural-ice-lab-baseline-handoff.sh \
             ota/neural-ice-device-root-tpm.sh \
