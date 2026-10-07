@@ -173,9 +173,13 @@ uki_build_identity() {
   chown "$UKI_BUILD_UID:$UKI_BUILD_UID" "$SEALED" "$TMP/uki.key" \
     || fail "cannot hand the UKI output and key to the unprivileged builder"
   UKI_DROP=(setpriv "--reuid=$UKI_BUILD_UID" "--regid=$UKI_BUILD_UID" --clear-groups --)
-  "${UKI_DROP[@]}" test -r "$TMP/uki.key" -a -w "$SEALED" -a -x "$TMP" \
-    -a -r "$ROOT/image/build-installer-uki.sh" -a -w "${TMPDIR:-/tmp}" \
-    || fail "the unprivileged UKI builder cannot reach its inputs: $TMP and the checkout $ROOT must be traversable and readable, ${TMPDIR:-/tmp} writable (work directory mode 0711)"
+  # The builder's mktemp honours the caller's TMPDIR, so the writability probe runs
+  # in the dropped process and reads it there.
+  # shellcheck disable=SC2016 # the probe expands in the dropped process, on purpose
+  local reach='test -r "$1/uki.key" -a -w "$2" -a -x "$1" -a -r "$3" -a -w "${TMPDIR:-/tmp}"'
+  if ! "${UKI_DROP[@]}" bash -c "$reach" reach "$TMP" "$SEALED" "$ROOT/image/build-installer-uki.sh"; then
+    fail "the unprivileged UKI builder cannot reach its inputs: $TMP and the checkout $ROOT must be traversable and readable, the temporary directory writable (work directory mode 0711)"
+  fi
 }
 build_uki() { # $1=name  $2=extra kargs  $3...=env overrides
   local name=$1 kargs=$2; shift 2
