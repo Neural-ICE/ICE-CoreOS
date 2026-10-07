@@ -521,9 +521,23 @@ manifest_read() {
 # Screen.
 # ---------------------------------------------------------------------------
 ESC=$'\033'
-cursor_hide() { printf '%s[?25l' "$ESC"; }
-cursor_show() { printf '%s[?25h' "$ESC"; }
-clear_screen() { printf '%s[H%s[2J' "$ESC" "$ESC"; }
+# Every write to the screen goes through tty_out. A compositor that takes tty1
+# hangs it up (TTYVHangup=yes) while it is still `activating`, before this screen
+# sees it `active`: our descriptor is then dead and writes fail with EIO. Under
+# `set -e` that used to end the script with status 1 and fail the unit at every
+# boot of a v2 host, with a working console (seq 5 rehearsal, 07.10.2026). A
+# dead descriptor is not a failure of the screen: the frame is dropped, and the
+# loop ends as before once the declared owner is active (or at READY + linger).
+# The screen is NOT redrawn on a reopened tty1: the compositor's session owns the
+# device node (mode 0620, its uid) and this unit holds no capability, so a reopen
+# would only succeed where it must not draw.
+tty_out() { # <printf format> [args]
+  # shellcheck disable=SC2059 # the callers pass the format
+  printf "$@" 2>/dev/null || true
+}
+cursor_hide() { tty_out '%s[?25l' "$ESC"; }
+cursor_show() { tty_out '%s[?25h' "$ESC"; }
+clear_screen() { tty_out '%s[H%s[2J' "$ESC" "$ESC"; }
 FRAME=""
 line() { FRAME+="$*${ESC}[K"$'\n'; }
 mark() { # <ok|run|wait|fail|skip> -> "[ok] "
@@ -535,7 +549,7 @@ mark() { # <ok|run|wait|fail|skip> -> "[ok] "
     skip) printf '[ -- ]' ;;
   esac
 }
-flush_frame() { printf '%s[H%s%s[J' "$ESC" "$FRAME" "$ESC"; FRAME=""; }
+flush_frame() { tty_out '%s[H%s%s[J' "$ESC" "$FRAME" "$ESC"; FRAME=""; }
 
 # ---------------------------------------------------------------------------
 # Serial mirror. The headless QEMU harness (image/qualify-installer-qemu.sh)
@@ -592,7 +606,7 @@ tty1_owner_active() {
   return 1
 }
 DREW=0
-finish() { (( DREW )) || return 0; tty1_owner_active || { cursor_show; printf '\n'; }; }
+finish() { (( DREW )) || return 0; tty1_owner_active || { cursor_show; tty_out '\n'; }; }
 trap 'finish; exit 0' TERM INT HUP
 # First failure wins: the code shown is the earliest phase that broke.
 set_failure() { [[ -n $fail_code ]] || { fail_code=$1; fail_what=$2; fail_unit=$3; }; }
