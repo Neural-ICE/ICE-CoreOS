@@ -18,7 +18,7 @@ jobs:
   validate-request:
     # This architecture-neutral guard runs without checkout or token privileges,
     # so an invalid manual ref fails visibly without reserving the Spark.
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     env:

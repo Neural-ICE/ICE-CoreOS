@@ -91,13 +91,13 @@ jobs:
   linux-x86_64-portable:
     # `github.ref == refs/heads/main` skipped every pull request, so widening the
     # trigger alone changed nothing -- the jobs still opted out. Keep the
-    # repository guard (forks must not schedule our self-hosted runners) and
-    # admit pull requests targeting main.
+    # repository guard (forks must not run this suite) and admit pull requests
+    # targeting main.
     if: >-
       github.repository == 'Neural-ICE/ICE-CoreOS'
       && (github.ref == 'refs/heads/main'
           || (github.event_name == 'pull_request' && github.base_ref == 'main'))
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -139,13 +139,13 @@ jobs:
   linux-arm64:
     # `github.ref == refs/heads/main` skipped every pull request, so widening the
     # trigger alone changed nothing -- the jobs still opted out. Keep the
-    # repository guard (forks must not schedule our self-hosted runners) and
-    # admit pull requests targeting main.
+    # repository guard (forks must not run this suite) and admit pull requests
+    # targeting main.
     if: >-
       github.repository == 'Neural-ICE/ICE-CoreOS'
       && (github.ref == 'refs/heads/main'
           || (github.event_name == 'pull_request' && github.base_ref == 'main'))
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -184,6 +184,20 @@ jobs:
             image/test-preloaded-output-set.sh \
             image/test-lib/sealed-medium-fixture.sh \
             image/test-verify-preloaded-media.sh
+      # The raw-media fixture builds a real sealed medium: it needs the full
+      # signing, verity and media toolchain (the former self-hosted Spark runner
+      # had it installed; the hosted image does not). Same package set as
+      # test-artifact-generation, plus the XFS and udev tools of the seed
+      # partition. Push only, like the step it serves.
+      - name: Install the media toolchain for the raw-media integration
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            skopeo cryptsetup-bin sbsigntool binutils mtools dosfstools gdisk \
+            squashfs-tools tpm2-tools swtpm swtpm-tools openssl \
+            xfsprogs udev util-linux zstd
       - name: Final raw-media integration
         if: github.event_name == 'push'
         # A missing tool (mtools) must fail this step, never skip it silently:
