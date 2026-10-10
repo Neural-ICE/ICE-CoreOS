@@ -1,0 +1,399 @@
+{
+  "schema": "adr0073-planner-vectors-v1",
+  "authority": "registry.example.test",
+  "note": "Unit existence/policy require actual preview, outside pure classifier capabilities. Expected S1 outcomes, not baseline snapshots.",
+  "cases": [
+    {
+      "id": "evidence-only",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"},{\"digest\":\"sha256:9999999999999999999999999999999999999999999999999999999999999999\",\"kind\":\"receipt\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "no-op",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": []
+      }
+    },
+    {
+      "id": "content-digest",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "gemma-4"
+        ],
+        "restart_scope": [
+          "vllm-inference.service"
+        ]
+      }
+    },
+    {
+      "id": "content-add",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"extra\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-extra\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]},{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "extra"
+        ],
+        "restart_scope": [
+          "vllm-inference.service"
+        ]
+      }
+    },
+    {
+      "id": "content-remove",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "gemma-4"
+        ],
+        "restart_scope": [
+          "vllm-inference.service"
+        ]
+      }
+    },
+    {
+      "id": "content-restart-scope",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"replacement.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "gemma-4"
+        ],
+        "restart_scope": [
+          "replacement.service",
+          "vllm-inference.service"
+        ]
+      }
+    },
+    {
+      "id": "unit-set-add",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]},{\"content_id\":\"units-renderers\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.unit-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-units-renderers\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"renderer.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "units-renderers"
+        ],
+        "restart_scope": [
+          "renderer.service"
+        ]
+      }
+    },
+    {
+      "id": "unit-set-remove",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"units-renderers\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.unit-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-units-renderers\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"renderer.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "units-renderers"
+        ],
+        "restart_scope": [
+          "renderer.service"
+        ]
+      }
+    },
+    {
+      "id": "unit-set-digest",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"units-renderers\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.unit-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-units-renderers\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"renderer.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"units-renderers\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"media_type\":\"application/vnd.neural-ice.unit-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-units-renderers\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"renderer.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [
+          "units-renderers"
+        ],
+        "restart_scope": [
+          "renderer.service"
+        ]
+      }
+    },
+    {
+      "id": "component-add",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"extra\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/extra\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"extra.service\"]},{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [
+          "extra"
+        ],
+        "changed_content": [],
+        "restart_scope": [
+          "extra.service"
+        ]
+      }
+    },
+    {
+      "id": "component-remove",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "component-content",
+        "reboot_required": false,
+        "changed_components": [
+          "ice-ac1"
+        ],
+        "changed_content": [],
+        "restart_scope": [
+          "icecore-api.service"
+        ]
+      }
+    },
+    {
+      "id": "supported-contract-add",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\",\"unused-supported-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "no-op",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": []
+      }
+    },
+    {
+      "id": "supported-contract-remove",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\",\"unused-supported-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "no-op",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": []
+      }
+    },
+    {
+      "id": "minimum-reader-change",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":2,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "host",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": []
+      }
+    },
+    {
+      "id": "unknown-contract",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\",\"unknown-contract-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "refusal",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": [],
+        "refusal_reason_contains": "does not support required contracts"
+      }
+    },
+    {
+      "id": "content-entitlement-change",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-EXTRA\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "refusal",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": [],
+        "refusal_reason_contains": "content contract changed"
+      }
+    },
+    {
+      "id": "content-repository-change",
+      "current_json": "{\"bundle_seq\":41,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-gemma-4\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "candidate_json": "{\"bundle_seq\":42,\"compatibility\":{\"minimum_reader\":1,\"required_contracts\":[\"host-bootc-v1\",\"oci-component-v1\",\"oci-content-set-v1\"]},\"components\":[{\"component_id\":\"ice-ac1\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/ice-ac1\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"icecore-api.service\"]},{\"component_id\":\"paddleocr-vl\",\"contract\":\"oci-component-v1\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reboot_required\":false,\"repository\":\"registry.example.test/vendor/paddleocr-vl-api\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"paddleocr-vl-api.service\"]}],\"content\":[{\"content_id\":\"gemma-4\",\"contract\":\"oci-content-set-v1\",\"digest\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"media_type\":\"application/vnd.neural-ice.content-set.v1\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/content-other\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"vllm-inference.service\"]}],\"evidence\":[{\"digest\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"kind\":\"attestation\"},{\"digest\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"bom\"}],\"hardware_target\":\"nvidia-dgx-spark-gb10\",\"host\":{\"contract\":\"host-bootc-v1\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"reboot_required\":false,\"repository\":\"registry.example.test/neural-ice/neural-ice-appliance\",\"required_entitlement\":\"ICE-CORE\",\"restart_scope\":[\"bootc-fetch-apply-updates.service\"]},\"release_id\":\"release-41\",\"schema\":\"neural-ice-release-manifest-v1\"}\n",
+      "device": {
+        "hardware_target": "nvidia-dgx-spark-gb10",
+        "reader_version": 2,
+        "supported_contracts": [
+          "host-bootc-v1",
+          "oci-component-v1",
+          "oci-content-set-v1",
+          "unused-supported-v1"
+        ]
+      },
+      "expected": {
+        "classification": "refusal",
+        "reboot_required": false,
+        "changed_components": [],
+        "changed_content": [],
+        "restart_scope": [],
+        "refusal_reason_contains": "content contract changed"
+      }
+    }
+  ]
+}
